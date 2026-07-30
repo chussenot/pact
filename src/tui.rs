@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -45,7 +48,8 @@ pub fn run(repo_root: PathBuf, agent: Option<String>) -> Result<()> {
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode().context("enabling terminal raw mode")?;
-    execute!(io::stdout(), EnterAlternateScreen).context("entering alternate screen")?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
+        .context("entering alternate screen")?;
     install_panic_hook();
     Terminal::new(CrosstermBackend::new(io::stdout())).context("initializing terminal backend")
 }
@@ -61,7 +65,7 @@ fn install_panic_hook() {
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -123,6 +127,12 @@ struct App {
 
     status: Option<String>,
     last_refresh: Instant,
+
+    /// Where the tab bar and the active tab's content were last drawn —
+    /// recorded each frame so mouse clicks can be mapped back to a tab or a
+    /// row without reimplementing ratatui's own layout math.
+    header_area: Rect,
+    content_area: Rect,
 }
 
 impl App {
@@ -142,6 +152,8 @@ impl App {
             doctor_report: None,
             status: None,
             last_refresh: Instant::now(),
+            header_area: Rect::default(),
+            content_area: Rect::default(),
         };
         app.refresh_leases();
         app
@@ -272,6 +284,27 @@ impl App {
             .select(Some((current + delta).rem_euclid(len) as usize));
     }
 
+    /// Click on the leases table: select whichever row is under `y`, if any.
+    fn click_lease_row(&mut self, y: u16) {
+        if let Some(index) = row_at(self.content_area, y, 1, self.table_state.offset()) {
+            if index < self.leases.len() {
+                self.table_state.select(Some(index));
+                self.confirm_release = None;
+            }
+        }
+    }
+
+    /// Click on the messages list: select whichever row is under `y`, if any
+    /// (only while looking at the list — a click during the thread detail
+    /// view is a no-op, there's nothing there to select).
+    fn click_message_row(&mut self, y: u16) {
+        if let Some(index) = row_at(self.content_area, y, 0, self.message_list_state.offset()) {
+            if index < self.messages.len() {
+                self.message_list_state.select(Some(index));
+            }
+        }
+    }
+
     /// First press on someone else's lease asks for confirmation; a second
     /// press on the same row forces the release. A press on your own lease
     /// releases it immediately — no confirmation needed for your own claim.
@@ -324,13 +357,15 @@ fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
 
         let timeout = REFRESH_INTERVAL.saturating_sub(app.last_refresh.elapsed());
         if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if is_quit(key.code, key.modifiers) {
                         return Ok(());
                     }
                     handle_key(app, key.code);
                 }
+                Event::Mouse(mouse) => handle_mouse(app, mouse),
+                _ => {}
             }
         } else {
             app.refresh_active_tab();
@@ -387,12 +422,76 @@ fn handle_doctor_key(app: &mut App, code: KeyCode) {
     }
 }
 
+fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => handle_click(app, mouse.column, mouse.row),
+        MouseEventKind::ScrollDown => handle_scroll(app, 1),
+        MouseEventKind::ScrollUp => handle_scroll(app, -1),
+        _ => {}
+    }
+}
+
+fn handle_click(app: &mut App, x: u16, y: u16) {
+    if rect_contains(app.header_area, x, y) {
+        if let Some(tab) = tab_at(app.header_area, x) {
+            app.jump_tab(tab);
+        }
+        return;
+    }
+    if !rect_contains(app.content_area, x, y) {
+        return;
+    }
+    match app.tab {
+        Tab::Leases => app.click_lease_row(y),
+        Tab::Messages if app.thread.is_none() => app.click_message_row(y),
+        _ => {}
+    }
+}
+
+fn handle_scroll(app: &mut App, delta: isize) {
+    match app.tab {
+        Tab::Leases => app.move_lease_selection(delta),
+        Tab::Messages if app.thread.is_none() => app.move_message_selection(delta),
+        _ => {}
+    }
+}
+
+fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
+}
+
+/// Which tab a click at `x` (inside `header_area`) lands on. Divides the tab
+/// bar into equal-width zones rather than reproducing the `Tabs` widget's
+/// internal divider/padding math — close enough for a handful of
+/// similarly-sized labels, and far simpler than exact hit-testing.
+fn tab_at(header_area: Rect, x: u16) -> Option<Tab> {
+    if header_area.width == 0 {
+        return None;
+    }
+    let relative = x.saturating_sub(header_area.x) as usize;
+    let zone_width = (header_area.width as usize).div_ceil(Tab::ALL.len());
+    let index = (relative / zone_width.max(1)).min(Tab::ALL.len() - 1);
+    Some(Tab::ALL[index])
+}
+
+/// Which row (as an index into the underlying `Vec`) a click at `y` (inside
+/// `content_area`) lands on, given how many header rows the widget draws
+/// before its data (1 for the leases table's column header, 0 for the
+/// messages list) and how far the list is currently scrolled.
+fn row_at(content_area: Rect, y: u16, header_rows: u16, offset: usize) -> Option<usize> {
+    let first_data_row = content_area.y + header_rows;
+    if y < first_data_row {
+        return None;
+    }
+    Some(offset + (y - first_data_row) as usize)
+}
+
 fn is_quit(code: KeyCode, modifiers: KeyModifiers) -> bool {
     matches!(code, KeyCode::Char('q'))
         || (matches!(code, KeyCode::Char('c')) && modifiers.contains(KeyModifiers::CONTROL))
 }
 
-fn draw(frame: &mut Frame, app: &App) {
+fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -401,6 +500,8 @@ fn draw(frame: &mut Frame, app: &App) {
             Constraint::Length(1),
         ])
         .split(frame.area());
+    app.header_area = chunks[0];
+    app.content_area = chunks[1];
 
     render_header(frame, chunks[0], app);
     match app.tab {
@@ -679,6 +780,8 @@ mod tests {
             doctor_report: None,
             status: None,
             last_refresh: Instant::now(),
+            header_area: Rect::new(0, 0, 80, 3),
+            content_area: Rect::new(0, 3, 80, 8),
         }
     }
 
@@ -704,6 +807,92 @@ mod tests {
 
         let no_identity = app_with(None, vec![]);
         assert!(!no_identity.is_mine(&entry("agent-a", "x", false)));
+    }
+
+    #[test]
+    fn tab_at_divides_the_header_into_equal_zones() {
+        let header = Rect::new(0, 0, 90, 3); // 3 tabs, 30 columns each
+        assert_eq!(tab_at(header, 0), Some(Tab::Leases));
+        assert_eq!(tab_at(header, 29), Some(Tab::Leases));
+        assert_eq!(tab_at(header, 30), Some(Tab::Messages));
+        assert_eq!(tab_at(header, 59), Some(Tab::Messages));
+        assert_eq!(tab_at(header, 60), Some(Tab::Doctor));
+        assert_eq!(tab_at(header, 89), Some(Tab::Doctor));
+        // a click past the header's own width still resolves to the last
+        // tab rather than panicking or returning None.
+        assert_eq!(tab_at(header, 200), Some(Tab::Doctor));
+    }
+
+    #[test]
+    fn row_at_accounts_for_header_rows_and_scroll_offset() {
+        let content = Rect::new(0, 3, 80, 8);
+        // leases table: 1 header row, no scroll yet
+        assert_eq!(row_at(content, 3, 1, 0), None); // clicked the column header itself
+        assert_eq!(row_at(content, 4, 1, 0), Some(0));
+        assert_eq!(row_at(content, 5, 1, 0), Some(1));
+        // scrolled down by 2: same click now lands on a later row
+        assert_eq!(row_at(content, 4, 1, 2), Some(2));
+        // messages list: no header row
+        assert_eq!(row_at(content, 3, 0, 0), Some(0));
+    }
+
+    #[test]
+    fn clicking_a_lease_row_selects_it() {
+        let mut app = app_with(
+            Some("agent-a"),
+            vec![
+                entry("agent-a", "one.rs", false),
+                entry("agent-a", "two.rs", false),
+                entry("agent-a", "three.rs", false),
+            ],
+        );
+        app.content_area = Rect::new(0, 3, 80, 8);
+        // row 0 ("one.rs") is at content_area.y + 1 (header row) + 0
+        app.click_lease_row(4);
+        assert_eq!(app.table_state.selected(), Some(0));
+        app.click_lease_row(6);
+        assert_eq!(app.table_state.selected(), Some(2));
+        // out-of-range click is a no-op, not a panic or a bogus selection
+        app.click_lease_row(50);
+        assert_eq!(app.table_state.selected(), Some(2));
+    }
+
+    #[test]
+    fn clicking_a_message_row_selects_it() {
+        let mut app = app_with(Some("agent-a"), vec![]);
+        app.content_area = Rect::new(0, 3, 80, 8);
+        app.messages = vec![
+            message("m1", "first", false),
+            message("m2", "second", false),
+        ];
+        app.click_message_row(4);
+        assert_eq!(app.message_list_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn clicking_the_header_switches_tabs() {
+        let mut app = app_with(Some("agent-a"), vec![]);
+        app.header_area = Rect::new(0, 0, 90, 3);
+        app.content_area = Rect::new(0, 3, 90, 8);
+        assert_eq!(app.tab, Tab::Leases);
+
+        handle_click(&mut app, 60, 1); // inside the Doctor third
+        assert_eq!(app.tab, Tab::Doctor);
+    }
+
+    #[test]
+    fn scrolling_moves_the_active_tabs_selection() {
+        let mut app = app_with(
+            Some("agent-a"),
+            vec![
+                entry("agent-a", "one.rs", false),
+                entry("agent-a", "two.rs", false),
+            ],
+        );
+        handle_scroll(&mut app, 1);
+        assert_eq!(app.table_state.selected(), Some(1));
+        handle_scroll(&mut app, -1);
+        assert_eq!(app.table_state.selected(), Some(0));
     }
 
     #[test]
@@ -785,7 +974,7 @@ mod tests {
         app.table_state.select(Some(0));
 
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let rendered = render_to_string(&terminal);
         assert!(rendered.contains("pact ui"));
@@ -805,7 +994,7 @@ mod tests {
         // app_with already seeds `bd` as Err, matching "bd not on PATH".
 
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let rendered = render_to_string(&terminal);
         assert!(rendered.contains("Messages"));
@@ -822,7 +1011,7 @@ mod tests {
         app.thread = Some(vec![message("msg-1", "renamed foo()", true)]);
 
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let rendered = render_to_string(&terminal);
         assert!(rendered.contains("thread"));
@@ -838,7 +1027,7 @@ mod tests {
         app.tab = Tab::Doctor;
 
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert!(render_to_string(&terminal).contains("press r"));
 
         app.doctor_report = Some(doctor::DoctorReport {
@@ -849,7 +1038,7 @@ mod tests {
                 detail: "bd not found on PATH".to_string(),
             }],
         });
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = render_to_string(&terminal);
         assert!(rendered.contains("Beads CLI"));
         assert!(rendered.contains("bd not found on PATH"));
