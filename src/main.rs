@@ -1,5 +1,6 @@
 mod agents_md;
 mod beads;
+mod doctor;
 mod identity;
 mod lease;
 mod msg;
@@ -262,88 +263,12 @@ fn run_msg(
     }
 }
 
-#[derive(serde::Serialize)]
-struct DoctorCheck {
-    name: &'static str,
-    ok: bool,
-    detail: String,
-}
-
-#[derive(serde::Serialize)]
-struct DoctorReport {
-    healthy: bool,
-    checks: Vec<DoctorCheck>,
-}
-
 fn run_doctor(cwd: &std::path::Path, json: bool) -> Result<()> {
     // Without a repo root none of the other checks mean anything, so this one
     // is a hard prerequisite rather than a soft check: propagate its exit
     // code (4) straight through instead of folding it into the report.
     let root = repo::find_repo_root(cwd)?;
-    let mut checks = vec![DoctorCheck {
-        name: "git repo",
-        ok: true,
-        detail: root.display().to_string(),
-    }];
-
-    let pact_present = root.join(".pact").join("leases").is_dir();
-    checks.push(DoctorCheck {
-        name: ".pact/ present",
-        ok: pact_present,
-        detail: if pact_present {
-            "present".to_string()
-        } else {
-            "missing — run `pact init`".to_string()
-        },
-    });
-
-    let agents_md_current = agents_md::is_current(&root).unwrap_or(false);
-    checks.push(DoctorCheck {
-        name: "AGENTS.md block current",
-        ok: agents_md_current,
-        detail: if agents_md_current {
-            "up to date".to_string()
-        } else {
-            "missing or stale — run `pact init`".to_string()
-        },
-    });
-
-    checks.push(match beads::BeadsCli::locate() {
-        Ok(cli) => {
-            let version = cli.version(&root).unwrap_or_else(|e| {
-                format!("found, but `{} --version` failed: {e:#}", cli.binary())
-            });
-            DoctorCheck {
-                name: "Beads CLI",
-                ok: true,
-                detail: format!("{} ({version})", cli.binary()),
-            }
-        }
-        Err(e) => DoctorCheck {
-            name: "Beads CLI",
-            ok: false,
-            detail: format!("{e:#}"),
-        },
-    });
-
-    match lease::list(&root, true) {
-        Ok(entries) => {
-            let stale = entries.iter().filter(|e| e.expired).count();
-            checks.push(DoctorCheck {
-                name: "stale leases",
-                ok: true,
-                detail: format!("{stale} stale (garbage-collected)"),
-            });
-        }
-        Err(e) => checks.push(DoctorCheck {
-            name: "stale leases",
-            ok: false,
-            detail: format!("{e:#}"),
-        }),
-    }
-
-    let healthy = checks.iter().all(|c| c.ok);
-    let report = DoctorReport { healthy, checks };
+    let report = doctor::checks(&root);
 
     output::emit(json, &report, |r| {
         let mut lines: Vec<String> = r
@@ -360,7 +285,7 @@ fn run_doctor(cwd: &std::path::Path, json: bool) -> Result<()> {
         lines.join("\n")
     });
 
-    if healthy {
+    if report.healthy {
         Ok(())
     } else {
         std::process::exit(1);
