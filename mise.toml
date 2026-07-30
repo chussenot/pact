@@ -24,3 +24,7 @@ run = "cargo clippy --all-targets -- -D warnings"
 [tasks.check]
 description = "Run the full CI check locally: fmt, lint, test"
 depends = ["fmt-check", "lint", "test"]
+
+[tasks.install]
+description = "Build and install the pact binary locally (cargo install --path .)"
+run = "cargo install --path . --force"
