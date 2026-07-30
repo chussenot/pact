@@ -118,7 +118,27 @@ sequenceDiagram
 See [docs/messaging.md](docs/messaging.md) for how this maps onto Beads
 issues, and why it doesn't rely on Beads' own `--thread` flag.
 
+### `pact ui` — see and act on all of it at once
+
+An interactive terminal dashboard (built on [ratatui](https://ratatui.rs))
+over the leases table, your message inbox, and a live `pact doctor` panel,
+with keys instead of re-typing CLI invocations. `Tab` switches views, `j/k`
+navigate, `Enter` opens a thread or releases a lease. Still a single
+foreground process — no daemon, nothing left running after you quit.
+
+```bash
+pact ui
+```
+
+See [docs/tui.md](docs/tui.md) for the full keybindings reference.
+
 ## Install
+
+```bash
+mise run install   # cargo install --path . --force
+```
+
+Or manually:
 
 ```bash
 cargo build --release
@@ -140,6 +160,7 @@ pact msg send --to <agent> [--thread <id>] [--subject <text>] <body>
 pact msg inbox [--unread-only]
 pact msg read <id>
 pact doctor
+pact ui
 ```
 
 Every subcommand accepts a global `--agent <name>` (or `PACT_AGENT` env var)
@@ -178,6 +199,8 @@ that reads state, maybe changes it, and exits — see
   period, steal vs. expiry, path encoding.
 - [docs/messaging.md](docs/messaging.md) — how `pact msg` maps onto Beads
   issues and tracks read state.
+- [docs/tui.md](docs/tui.md) — `pact ui`'s tabs and full keybindings
+  reference.
 
 ## Development
 
@@ -189,6 +212,7 @@ mise run test    # cargo test
 mise run fmt     # cargo fmt
 mise run lint    # cargo clippy --all-targets -- -D warnings
 mise run check   # fmt-check + lint + test, same gates as CI
+mise run install # cargo install --path . --force
 ```
 
 Or run the underlying `cargo` commands directly if you don't use mise.
