@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "pact",
+  "project_id": "13f40cbf-4c2c-4b23-bbd0-b678ba87460e"
+}
