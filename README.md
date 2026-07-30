@@ -122,8 +122,9 @@ issues, and why it doesn't rely on Beads' own `--thread` flag.
 
 An interactive terminal dashboard (built on [ratatui](https://ratatui.rs))
 over the leases table, your message inbox, and a live `pact doctor` panel,
-with keys instead of re-typing CLI invocations. `Tab` switches views, `j/k`
-navigate, `Enter` opens a thread or releases a lease. Still a single
+with keyboard or mouse instead of re-typing CLI invocations. `Tab` or a
+click switches views; `j/k`, the arrows, the scroll wheel, or a click
+navigate; `Enter` opens a thread or releases a lease. Still a single
 foreground process — no daemon, nothing left running after you quit.
 
 ```bash

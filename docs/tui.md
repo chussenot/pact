@@ -28,8 +28,22 @@ stateDiagram-v2
 ```
 
 `Tab` / `Shift+Tab` cycle through the three tabs; `1`/`2`/`3` jump directly
-to one. The status line at the bottom always shows the keys that apply to
-whatever you're looking at.
+to one, or click a tab's label directly. The status line at the bottom
+always shows the keys that apply to whatever you're looking at.
+
+## Mouse
+
+Every keyboard-driven selection also works with the mouse:
+
+| Action | Effect |
+|---|---|
+| Click a tab label | switch to that tab |
+| Click a row (Leases or Messages) | select it, same as moving there with `j`/`k` |
+| Scroll wheel | move the selection up/down, same as `j`/`k` |
+
+Clicking never triggers a release or opens a thread by itself — those stay
+explicit keypresses (`Enter`/`d`, and the confirm-before-force-release
+step), since they have real side effects. A click only selects.
 
 ### Leases
 
