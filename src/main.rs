@@ -119,7 +119,11 @@ fn run(cli: Cli) -> Result<()> {
         Command::Lease { action } => run_lease(&cwd, cli.agent.as_deref(), cli.json, action),
         Command::Msg { action } => run_msg(&cwd, cli.agent.as_deref(), cli.json, action),
         Command::Doctor => run_doctor(&cwd, cli.json),
-        Command::Ui => tui::run(),
+        Command::Ui => {
+            let root = repo::find_repo_root(&cwd)?;
+            let agent = identity::resolve_agent(cli.agent.as_deref()).ok();
+            tui::run(root, agent)
+        }
     }
 }
 
