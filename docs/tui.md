@@ -37,9 +37,15 @@ Every keyboard-driven selection also works with the mouse:
 
 | Action | Effect |
 |---|---|
+| Hover a tab label or a row | highlighted, so you can see what a click would do before clicking |
 | Click a tab label | switch to that tab |
 | Click a row (Leases or Messages) | select it, same as moving there with `j`/`k` |
 | Scroll wheel | move the selection up/down, same as `j`/`k` |
+
+Each tab's clickable area is exactly the rect its label was rendered into —
+not an equal-width guess across the header — so hit-testing can't drift out
+of sync with what's on screen no matter how the label text or terminal width
+changes. Hovering highlights confirm this before you commit to a click.
 
 Clicking never triggers a release or opens a thread by itself — those stay
 explicit keypresses (`Enter`/`d`, and the confirm-before-force-release

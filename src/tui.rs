@@ -21,7 +21,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState, Tabs,
+    Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState,
 };
 use ratatui::{Frame, Terminal};
 
@@ -128,11 +128,16 @@ struct App {
     status: Option<String>,
     last_refresh: Instant,
 
-    /// Where the tab bar and the active tab's content were last drawn —
-    /// recorded each frame so mouse clicks can be mapped back to a tab or a
-    /// row without reimplementing ratatui's own layout math.
+    /// Where the tab bar (its inner, post-border area) and the active tab's
+    /// content were last drawn — recorded each frame so mouse clicks and
+    /// hover both read the exact same rects rendering used, rather than a
+    /// second, possibly-drifted approximation of the layout.
     header_area: Rect,
     content_area: Rect,
+    /// Tab currently under the mouse cursor (for hover highlighting), if any.
+    hovered_tab: Option<Tab>,
+    /// Row currently under the mouse cursor in the active tab's list/table.
+    hovered_row: Option<usize>,
 }
 
 impl App {
@@ -154,6 +159,8 @@ impl App {
             last_refresh: Instant::now(),
             header_area: Rect::default(),
             content_area: Rect::default(),
+            hovered_tab: None,
+            hovered_row: None,
         };
         app.refresh_leases();
         app
@@ -177,6 +184,10 @@ impl App {
         }
         self.tab = tab;
         self.status = None;
+        // Stale from the previous tab's list — cleared here rather than left
+        // to the next mouse-move event, so a keyboard-driven switch never
+        // shows a leftover highlight on an unrelated row.
+        self.hovered_row = None;
         self.refresh_active_tab();
     }
 
@@ -427,15 +438,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         MouseEventKind::Down(MouseButton::Left) => handle_click(app, mouse.column, mouse.row),
         MouseEventKind::ScrollDown => handle_scroll(app, 1),
         MouseEventKind::ScrollUp => handle_scroll(app, -1),
+        MouseEventKind::Moved => update_hover(app, mouse.column, mouse.row),
         _ => {}
     }
 }
 
 fn handle_click(app: &mut App, x: u16, y: u16) {
-    if rect_contains(app.header_area, x, y) {
-        if let Some(tab) = tab_at(app.header_area, x) {
-            app.jump_tab(tab);
-        }
+    if let Some(tab) = tab_at(app.header_area, x, y) {
+        app.jump_tab(tab);
         return;
     }
     if !rect_contains(app.content_area, x, y) {
@@ -456,22 +466,68 @@ fn handle_scroll(app: &mut App, delta: isize) {
     }
 }
 
+/// Updates hover state so the header/list can highlight whatever's directly
+/// under the cursor, before a click commits to anything. Requested after a
+/// user found the tab bar unresponsive on their terminal: with nothing to
+/// show which zone a click would land in, a slight hit-test mismatch (the
+/// old equal-thirds approximation vs. the tabs' real, unequal widths) just
+/// looked like "mouse doesn't work" rather than "clicked the wrong spot".
+fn update_hover(app: &mut App, x: u16, y: u16) {
+    app.hovered_tab = tab_at(app.header_area, x, y);
+
+    app.hovered_row = if rect_contains(app.content_area, x, y) {
+        match app.tab {
+            Tab::Leases => row_at(app.content_area, y, 1, app.table_state.offset())
+                .filter(|i| *i < app.leases.len()),
+            Tab::Messages if app.thread.is_none() => {
+                row_at(app.content_area, y, 0, app.message_list_state.offset())
+                    .filter(|i| *i < app.messages.len())
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+}
+
 fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
     x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
 }
 
-/// Which tab a click at `x` (inside `header_area`) lands on. Divides the tab
-/// bar into equal-width zones rather than reproducing the `Tabs` widget's
-/// internal divider/padding math — close enough for a handful of
-/// similarly-sized labels, and far simpler than exact hit-testing.
-fn tab_at(header_area: Rect, x: u16) -> Option<Tab> {
-    if header_area.width == 0 {
-        return None;
+/// The exact rects the tab bar renders into: one per tab, in `Tab::ALL`
+/// order, each `" Label "`-wide, separated by a 1-column (non-clickable)
+/// gap. Used for both rendering and hit-testing so the two can never drift
+/// apart the way an independent approximation (e.g. equal-width zones) can.
+fn tab_rects(header_area: Rect) -> Vec<Rect> {
+    let mut constraints = Vec::with_capacity(Tab::ALL.len() * 2 - 1);
+    for (i, tab) in Tab::ALL.iter().enumerate() {
+        constraints.push(Constraint::Length(tab_width(*tab)));
+        if i + 1 < Tab::ALL.len() {
+            constraints.push(Constraint::Length(1)); // gap between tabs
+        }
     }
-    let relative = x.saturating_sub(header_area.x) as usize;
-    let zone_width = (header_area.width as usize).div_ceil(Tab::ALL.len());
-    let index = (relative / zone_width.max(1)).min(Tab::ALL.len() - 1);
-    Some(Tab::ALL[index])
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(header_area)
+        .iter()
+        .step_by(2) // skip the gap chunks, keep only the tab-label chunks
+        .copied()
+        .collect()
+}
+
+fn tab_width(tab: Tab) -> u16 {
+    tab.label().chars().count() as u16 + 2 // " Label " padding
+}
+
+/// Which tab a click/hover at `(x, y)` lands on, using the same rects
+/// `tab_rects` hands to rendering.
+fn tab_at(header_area: Rect, x: u16, y: u16) -> Option<Tab> {
+    tab_rects(header_area)
+        .into_iter()
+        .zip(Tab::ALL)
+        .find(|(rect, _)| rect_contains(*rect, x, y))
+        .map(|(_, tab)| tab)
 }
 
 /// Which row (as an index into the underlying `Vec`) a click at `y` (inside
@@ -500,7 +556,6 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Constraint::Length(1),
         ])
         .split(frame.area());
-    app.header_area = chunks[0];
     app.content_area = chunks[1];
 
     render_header(frame, chunks[0], app);
@@ -512,22 +567,34 @@ fn draw(frame: &mut Frame, app: &mut App) {
     render_status(frame, chunks[2], app);
 }
 
-fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
     let agent_label = app.agent.as_deref().unwrap_or("(none — set PACT_AGENT)");
-    let titles = Tab::ALL.iter().map(|t| Line::from(t.label()));
-    let tabs = Tabs::new(titles)
-        .select(app.tab.index())
-        .highlight_style(
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" pact ui — agent: {agent_label} "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // Recorded so hit-testing (tab_at) and hover (update_hover) use the
+    // exact same area rendering just used — see tab_rects.
+    app.header_area = inner;
+
+    for (tab, rect) in Tab::ALL.into_iter().zip(tab_rects(inner)) {
+        let selected = tab == app.tab;
+        let hovered = !selected && app.hovered_tab == Some(tab);
+        let style = if selected {
             Style::default()
                 .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" pact ui — agent: {agent_label} ")),
+                .add_modifier(Modifier::BOLD)
+        } else if hovered {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(
+            Paragraph::new(format!(" {} ", tab.label())).style(style),
+            rect,
         );
-    frame.render_widget(tabs, area);
+    }
 }
 
 fn render_leases(frame: &mut Frame, area: Rect, app: &App) {
@@ -553,7 +620,8 @@ fn render_leases(frame: &mut Frame, area: Rect, app: &App) {
     let rows: Vec<Row> = app
         .leases
         .iter()
-        .map(|entry| lease_row(app, entry))
+        .enumerate()
+        .map(|(i, entry)| lease_row(app, i, entry))
         .collect();
 
     let widths = [
@@ -573,7 +641,7 @@ fn render_leases(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(table, area, &mut app.table_state.clone());
 }
 
-fn lease_row<'a>(app: &App, entry: &'a LeaseEntry) -> Row<'a> {
+fn lease_row<'a>(app: &App, index: usize, entry: &'a LeaseEntry) -> Row<'a> {
     let agent_style = if app.is_mine(entry) {
         Style::default().fg(Color::Green)
     } else {
@@ -585,14 +653,22 @@ fn lease_row<'a>(app: &App, entry: &'a LeaseEntry) -> Row<'a> {
         ("active", Style::default().fg(Color::Green))
     };
 
-    Row::new(vec![
+    let row = Row::new(vec![
         Cell::from(entry.lease.path.as_str()),
         Cell::from(entry.lease.agent.as_str()).style(agent_style),
         Cell::from(format!("{}s", entry.age_secs)),
         Cell::from(format!("{}s", entry.remaining_secs)),
         Cell::from(status_text).style(status_style),
         Cell::from(entry.lease.note.as_deref().unwrap_or("")),
-    ])
+    ]);
+
+    // Selection's own reversed style is already a strong indicator; hover
+    // only adds anything on rows that aren't already selected.
+    if is_hovered_not_selected(app.hovered_row, app.table_state.selected(), index) {
+        row.style(hover_style())
+    } else {
+        row
+    }
 }
 
 fn render_messages(frame: &mut Frame, area: Rect, app: &App) {
@@ -624,22 +700,40 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let items: Vec<ListItem> = app.messages.iter().map(message_list_item).collect();
+    let items: Vec<ListItem> = app
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| message_list_item(app, i, m))
+        .collect();
     let list = List::new(items)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("> ");
     frame.render_stateful_widget(list, area, &mut app.message_list_state.clone());
 }
 
-fn message_list_item(message: &msg::Message) -> ListItem<'_> {
+fn message_list_item<'a>(app: &App, index: usize, message: &'a msg::Message) -> ListItem<'a> {
     let marker = if message.read { "  " } else { "* " };
     let subject = message.subject.as_deref().unwrap_or("(no subject)");
-    let style = if message.read {
+    let mut style = if message.read {
         Style::default().fg(Color::DarkGray)
     } else {
         Style::default()
     };
+    if is_hovered_not_selected(app.hovered_row, app.message_list_state.selected(), index) {
+        style = style.patch(hover_style());
+    }
     ListItem::new(format!("{marker}{}  {subject}", message.id)).style(style)
+}
+
+/// Whether `index` is hovered but not the current selection — selection's
+/// own reversed style is already a strong enough indicator on its own.
+fn is_hovered_not_selected(hovered: Option<usize>, selected: Option<usize>, index: usize) -> bool {
+    hovered == Some(index) && selected != Some(index)
+}
+
+fn hover_style() -> Style {
+    Style::default().bg(Color::Rgb(50, 50, 65))
 }
 
 fn render_thread(frame: &mut Frame, area: Rect, thread: &[msg::Message]) {
@@ -780,8 +874,10 @@ mod tests {
             doctor_report: None,
             status: None,
             last_refresh: Instant::now(),
-            header_area: Rect::new(0, 0, 80, 3),
+            header_area: Rect::new(0, 0, 80, 1),
             content_area: Rect::new(0, 3, 80, 8),
+            hovered_tab: None,
+            hovered_row: None,
         }
     }
 
@@ -810,17 +906,27 @@ mod tests {
     }
 
     #[test]
-    fn tab_at_divides_the_header_into_equal_zones() {
-        let header = Rect::new(0, 0, 90, 3); // 3 tabs, 30 columns each
-        assert_eq!(tab_at(header, 0), Some(Tab::Leases));
-        assert_eq!(tab_at(header, 29), Some(Tab::Leases));
-        assert_eq!(tab_at(header, 30), Some(Tab::Messages));
-        assert_eq!(tab_at(header, 59), Some(Tab::Messages));
-        assert_eq!(tab_at(header, 60), Some(Tab::Doctor));
-        assert_eq!(tab_at(header, 89), Some(Tab::Doctor));
-        // a click past the header's own width still resolves to the last
-        // tab rather than panicking or returning None.
-        assert_eq!(tab_at(header, 200), Some(Tab::Doctor));
+    fn tab_at_agrees_with_tab_rects_exact_geometry() {
+        let header = Rect::new(0, 0, 90, 1);
+        let rects = tab_rects(header);
+        assert_eq!(rects.len(), 3);
+
+        // Every point inside a tab's own rendered rect resolves back to it —
+        // not an equal-width approximation, the exact rect rendering used.
+        for (tab, rect) in Tab::ALL.into_iter().zip(rects.iter()) {
+            assert_eq!(tab_at(header, rect.x, rect.y), Some(tab));
+            assert_eq!(tab_at(header, rect.x + rect.width - 1, rect.y), Some(tab));
+        }
+
+        // The 1-column gap between tabs belongs to neither (not clickable).
+        let gap_x = rects[0].x + rects[0].width;
+        assert!(gap_x < rects[1].x, "expected a gap between tab rects");
+        assert_eq!(tab_at(header, gap_x, 0), None);
+
+        // Empty header space past the last tab matches nothing, rather than
+        // falling back to "closest tab" the way an equal-zone division would.
+        let last = rects.last().unwrap();
+        assert_eq!(tab_at(header, last.x + last.width + 10, 0), None);
     }
 
     #[test]
@@ -872,12 +978,48 @@ mod tests {
     #[test]
     fn clicking_the_header_switches_tabs() {
         let mut app = app_with(Some("agent-a"), vec![]);
-        app.header_area = Rect::new(0, 0, 90, 3);
-        app.content_area = Rect::new(0, 3, 90, 8);
+        app.header_area = Rect::new(0, 0, 90, 1);
+        app.content_area = Rect::new(0, 1, 90, 8);
         assert_eq!(app.tab, Tab::Leases);
 
-        handle_click(&mut app, 60, 1); // inside the Doctor third
+        let doctor_rect = tab_rects(app.header_area)[2];
+        handle_click(&mut app, doctor_rect.x, doctor_rect.y);
         assert_eq!(app.tab, Tab::Doctor);
+    }
+
+    #[test]
+    fn hovering_a_tab_sets_hovered_tab_without_switching() {
+        let mut app = app_with(Some("agent-a"), vec![]);
+        app.header_area = Rect::new(0, 0, 90, 1);
+        app.content_area = Rect::new(0, 1, 90, 8);
+
+        let messages_rect = tab_rects(app.header_area)[1];
+        update_hover(&mut app, messages_rect.x, messages_rect.y);
+        assert_eq!(app.hovered_tab, Some(Tab::Messages));
+        assert_eq!(app.tab, Tab::Leases); // hover alone never switches tabs
+
+        // moving off the header clears it
+        update_hover(&mut app, 0, 50);
+        assert_eq!(app.hovered_tab, None);
+    }
+
+    #[test]
+    fn hovering_a_lease_row_sets_hovered_row() {
+        let mut app = app_with(
+            Some("agent-a"),
+            vec![
+                entry("agent-a", "one.rs", false),
+                entry("agent-a", "two.rs", false),
+            ],
+        );
+        app.content_area = Rect::new(0, 3, 80, 8);
+
+        update_hover(&mut app, 0, 5); // second data row (first is the column header)
+        assert_eq!(app.hovered_row, Some(1));
+
+        // switching tabs clears a stale hover from the previous list
+        app.next_tab();
+        assert_eq!(app.hovered_row, None);
     }
 
     #[test]
@@ -951,10 +1093,11 @@ mod tests {
 
     #[test]
     fn message_list_item_marks_unread_with_asterisk() {
+        let app = app_with(Some("agent-a"), vec![]);
         let unread_msg = message("m1", "hello", false);
         let read_msg = message("m2", "world", true);
-        let unread = message_list_item(&unread_msg);
-        let read = message_list_item(&read_msg);
+        let unread = message_list_item(&app, 0, &unread_msg);
+        let read = message_list_item(&app, 0, &read_msg);
         // ListItem doesn't expose its text for direct comparison, so compare
         // Debug output instead of reaching into private state.
         assert_ne!(format!("{unread:?}"), format!("{read:?}"));
