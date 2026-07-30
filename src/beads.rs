@@ -30,6 +30,11 @@ impl BeadsCli {
         self.binary
     }
 
+    /// `bd --version` output, trimmed, for `pact doctor`.
+    pub fn version(&self, repo_root: &Path) -> Result<String> {
+        Ok(self.run(repo_root, &["--version"])?.trim().to_string())
+    }
+
     /// Run `bd <args>` in `repo_root`, capturing stdout; stderr is surfaced on failure.
     pub fn run(&self, repo_root: &Path, args: &[&str]) -> Result<String> {
         let output = Command::new(self.binary)
@@ -56,4 +61,17 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
     std::env::split_paths(&path)
         .map(|dir| dir.join(bin))
         .find(|p| p.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn which_finds_a_real_binary_on_path() {
+        // `sh` is a safe cross-platform stand-in; asserts the PATH-walking
+        // logic itself works without depending on `bd` being installed here.
+        assert!(which("sh").is_some());
+        assert!(which("definitely-not-a-real-binary-xyz").is_none());
+    }
 }

@@ -7,9 +7,7 @@ pub fn resolve_agent(flag: Option<&str>) -> Result<String> {
         Some(v) => v.to_string(),
         None => match std::env::var("PACT_AGENT") {
             Ok(v) => v,
-            Err(_) => bail!(
-                "no agent identity: pass --agent <name> or set PACT_AGENT"
-            ),
+            Err(_) => bail!("no agent identity: pass --agent <name> or set PACT_AGENT"),
         },
     };
     validate(&raw)?;
@@ -29,9 +27,7 @@ pub fn validate(name: &str) -> Result<()> {
     if len_ok && first_ok && rest_ok {
         Ok(())
     } else {
-        bail!(
-            "invalid agent name {name:?}: must match [a-z0-9][a-z0-9-]{{1,31}}"
-        )
+        bail!("invalid agent name {name:?}: must match [a-z0-9][a-z0-9-]{{1,31}}")
     }
 }
 
