@@ -16,13 +16,14 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+    Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState, Tabs,
 };
 use ratatui::{Frame, Terminal};
 
 use crate::beads::BeadsCli;
+use crate::doctor;
 use crate::lease::{self, LeaseEntry};
 use crate::msg;
 
@@ -67,21 +68,30 @@ fn restore_terminal() {
 enum Tab {
     Leases,
     Messages,
+    Doctor,
 }
 
 impl Tab {
+    const ALL: [Tab; 3] = [Tab::Leases, Tab::Messages, Tab::Doctor];
+
     fn label(self) -> &'static str {
         match self {
             Tab::Leases => "Leases",
             Tab::Messages => "Messages",
+            Tab::Doctor => "Doctor",
         }
     }
 
+    fn index(self) -> usize {
+        Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
+    }
+
     fn next(self) -> Tab {
-        match self {
-            Tab::Leases => Tab::Messages,
-            Tab::Messages => Tab::Leases,
-        }
+        Tab::ALL[(self.index() + 1) % Tab::ALL.len()]
+    }
+
+    fn prev(self) -> Tab {
+        Tab::ALL[(self.index() + Tab::ALL.len() - 1) % Tab::ALL.len()]
     }
 }
 
@@ -107,6 +117,10 @@ struct App {
     /// `Some` while viewing a thread's detail pane instead of the inbox list.
     thread: Option<Vec<msg::Message>>,
 
+    /// `None` until the Doctor tab has been visited (or refreshed) at least
+    /// once — same lazy-load pattern as messages, since it also shells out.
+    doctor_report: Option<doctor::DoctorReport>,
+
     status: Option<String>,
     last_refresh: Instant,
 }
@@ -125,6 +139,7 @@ impl App {
             messages: Vec::new(),
             message_list_state: ListState::default(),
             thread: None,
+            doctor_report: None,
             status: None,
             last_refresh: Instant::now(),
         };
@@ -132,20 +147,38 @@ impl App {
         app
     }
 
-    fn switch_tab(&mut self) {
-        self.tab = self.tab.next();
-        self.status = None;
-        match self.tab {
-            Tab::Leases => self.refresh_leases(),
-            Tab::Messages => self.refresh_messages(),
+    fn next_tab(&mut self) {
+        self.set_tab(self.tab.next());
+    }
+
+    fn prev_tab(&mut self) {
+        self.set_tab(self.tab.prev());
+    }
+
+    fn jump_tab(&mut self, tab: Tab) {
+        self.set_tab(tab);
+    }
+
+    fn set_tab(&mut self, tab: Tab) {
+        if self.tab == tab {
+            return;
         }
+        self.tab = tab;
+        self.status = None;
+        self.refresh_active_tab();
     }
 
     fn refresh_active_tab(&mut self) {
         match self.tab {
             Tab::Leases => self.refresh_leases(),
             Tab::Messages => self.refresh_messages(),
+            Tab::Doctor => self.refresh_doctor(),
         }
+    }
+
+    fn refresh_doctor(&mut self) {
+        self.doctor_report = Some(doctor::checks(&self.repo_root));
+        self.last_refresh = Instant::now();
     }
 
     fn refresh_leases(&mut self) {
@@ -306,13 +339,18 @@ fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
 }
 
 fn handle_key(app: &mut App, code: KeyCode) {
-    if code == KeyCode::Tab {
-        app.switch_tab();
-        return;
+    match code {
+        KeyCode::Tab => return app.next_tab(),
+        KeyCode::BackTab => return app.prev_tab(),
+        KeyCode::Char('1') => return app.jump_tab(Tab::Leases),
+        KeyCode::Char('2') => return app.jump_tab(Tab::Messages),
+        KeyCode::Char('3') => return app.jump_tab(Tab::Doctor),
+        _ => {}
     }
     match app.tab {
         Tab::Leases => handle_leases_key(app, code),
         Tab::Messages => handle_messages_key(app, code),
+        Tab::Doctor => handle_doctor_key(app, code),
     }
 }
 
@@ -343,6 +381,12 @@ fn handle_messages_key(app: &mut App, code: KeyCode) {
     }
 }
 
+fn handle_doctor_key(app: &mut App, code: KeyCode) {
+    if code == KeyCode::Char('r') {
+        app.refresh_doctor();
+    }
+}
+
 fn is_quit(code: KeyCode, modifiers: KeyModifiers) -> bool {
     matches!(code, KeyCode::Char('q'))
         || (matches!(code, KeyCode::Char('c')) && modifiers.contains(KeyModifiers::CONTROL))
@@ -362,14 +406,27 @@ fn draw(frame: &mut Frame, app: &App) {
     match app.tab {
         Tab::Leases => render_leases(frame, chunks[1], app),
         Tab::Messages => render_messages(frame, chunks[1], app),
+        Tab::Doctor => render_doctor(frame, chunks[1], app),
     }
     render_status(frame, chunks[2], app);
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let agent_label = app.agent.as_deref().unwrap_or("(none — set PACT_AGENT)");
-    let title = format!(" pact ui — {} — agent: {agent_label} ", app.tab.label());
-    frame.render_widget(Block::default().borders(Borders::ALL).title(title), area);
+    let titles = Tab::ALL.iter().map(|t| Line::from(t.label()));
+    let tabs = Tabs::new(titles)
+        .select(app.tab.index())
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" pact ui — agent: {agent_label} ")),
+        );
+    frame.render_widget(tabs, area);
 }
 
 fn render_leases(frame: &mut Frame, area: Rect, app: &App) {
@@ -507,11 +564,53 @@ fn render_thread(frame: &mut Frame, area: Rect, thread: &[msg::Message]) {
     );
 }
 
+fn render_doctor(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(report) = &app.doctor_report else {
+        frame.render_widget(
+            Paragraph::new("press r to run health checks")
+                .style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
+        return;
+    };
+
+    let lines: Vec<Line> = report
+        .checks
+        .iter()
+        .map(|c| {
+            let (symbol, style) = if c.ok {
+                ("✓", Style::default().fg(Color::Green))
+            } else {
+                ("✗", Style::default().fg(Color::Red))
+            };
+            Line::from(Span::styled(
+                format!("{symbol} {}: {}", c.name, c.detail),
+                style,
+            ))
+        })
+        .collect();
+
+    let title = if report.healthy {
+        " all checks passed "
+    } else {
+        " some checks failed "
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
+        area,
+    );
+}
+
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let help = match app.tab {
-        Tab::Leases => "j/k: move  r: refresh  enter/d: release  esc: cancel  tab: switch  q: quit",
-        Tab::Messages if app.thread.is_some() => "esc: back  tab: switch  q: quit",
-        Tab::Messages => "j/k: move  r: refresh  enter: open thread  tab: switch  q: quit",
+        Tab::Leases => {
+            "j/k: move  r: refresh  enter/d: release  esc: cancel  tab: switch  1/2/3: jump  q: quit"
+        }
+        Tab::Messages if app.thread.is_some() => "esc: back  tab: switch  1/2/3: jump  q: quit",
+        Tab::Messages => {
+            "j/k: move  r: refresh  enter: open thread  tab: switch  1/2/3: jump  q: quit"
+        }
+        Tab::Doctor => "r: refresh  tab: switch  1/2/3: jump  q: quit",
     };
     let line = match &app.status {
         Some(status) => format!("{status}   ({help})"),
@@ -577,6 +676,7 @@ mod tests {
             messages: Vec::new(),
             message_list_state: ListState::default().with_selected(Some(0)),
             thread: None,
+            doctor_report: None,
             status: None,
             last_refresh: Instant::now(),
         }
@@ -617,19 +717,39 @@ mod tests {
     }
 
     #[test]
-    fn tab_switches_between_leases_and_messages_and_clears_thread() {
+    fn tab_cycles_forward_and_backward_through_all_three() {
+        let mut app = app_with(Some("agent-a"), vec![]);
+        assert_eq!(app.tab, Tab::Leases);
+
+        app.next_tab();
+        assert_eq!(app.tab, Tab::Messages);
+        app.next_tab();
+        assert_eq!(app.tab, Tab::Doctor);
+        app.next_tab();
+        assert_eq!(app.tab, Tab::Leases);
+
+        app.prev_tab();
+        assert_eq!(app.tab, Tab::Doctor);
+    }
+
+    #[test]
+    fn jump_tab_goes_directly_to_the_requested_tab() {
+        let mut app = app_with(Some("agent-a"), vec![]);
+        app.jump_tab(Tab::Doctor);
+        assert_eq!(app.tab, Tab::Doctor);
+        app.jump_tab(Tab::Leases);
+        assert_eq!(app.tab, Tab::Leases);
+    }
+
+    #[test]
+    fn switching_tabs_does_not_itself_close_an_open_thread() {
+        // Only closing the thread view (Esc) does that — exercised in
+        // close_thread_returns_to_the_list below.
         let mut app = app_with(Some("agent-a"), vec![]);
         app.thread = Some(vec![message("m1", "hi", true)]);
-        assert_eq!(app.tab, Tab::Leases);
-
-        app.switch_tab();
-        assert_eq!(app.tab, Tab::Messages);
-        // switching away from Leases doesn't itself close an open thread —
-        // only closing the thread view (Esc) does. Confirm the tab changed;
-        // thread-clearing is exercised separately via close_thread below.
-
-        app.switch_tab();
-        assert_eq!(app.tab, Tab::Leases);
+        app.next_tab();
+        app.jump_tab(Tab::Messages);
+        assert!(app.thread.is_some());
     }
 
     #[test]
@@ -708,6 +828,32 @@ mod tests {
         assert!(rendered.contains("thread"));
         assert!(rendered.contains("renamed foo()"));
         assert!(rendered.contains("body of msg-1"));
+    }
+
+    #[test]
+    fn doctor_tab_prompts_before_first_refresh_then_shows_checks() {
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(Some("agent-a"), vec![]);
+        app.tab = Tab::Doctor;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(render_to_string(&terminal).contains("press r"));
+
+        app.doctor_report = Some(doctor::DoctorReport {
+            healthy: false,
+            checks: vec![doctor::DoctorCheck {
+                name: "Beads CLI",
+                ok: false,
+                detail: "bd not found on PATH".to_string(),
+            }],
+        });
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(rendered.contains("Beads CLI"));
+        assert!(rendered.contains("bd not found on PATH"));
+        assert!(rendered.contains("some checks failed"));
     }
 
     fn render_to_string(terminal: &Terminal<ratatui::backend::TestBackend>) -> String {
