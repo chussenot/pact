@@ -10,7 +10,9 @@ use anyhow::{Context, Result};
 use crate::output::exit_with;
 
 pub struct BeadsCli {
-    binary: &'static str,
+    // pub(crate) so tui.rs's tests can construct one directly without a real
+    // `bd` on PATH, instead of adding a test-only constructor for one field.
+    pub(crate) binary: &'static str,
 }
 
 impl BeadsCli {
