@@ -1,2 +1,26 @@
 [tools]
 rust = "latest"
+
+[tasks.build]
+description = "Build the pact binary"
+run = "cargo build"
+
+[tasks.test]
+description = "Run the pact test suite"
+run = "cargo test"
+
+[tasks.fmt]
+description = "Format the code"
+run = "cargo fmt"
+
+[tasks."fmt-check"]
+description = "Check formatting without writing changes"
+run = "cargo fmt -- --check"
+
+[tasks.lint]
+description = "Run clippy with warnings denied"
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.check]
+description = "Run the full CI check locally: fmt, lint, test"
+depends = ["fmt-check", "lint", "test"]
