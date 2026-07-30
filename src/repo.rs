@@ -18,7 +18,10 @@ pub fn find_repo_root(start: &Path) -> Result<PathBuf> {
         if !dir.pop() {
             return Err(exit_with(
                 4,
-                format!("not in a git repository (no .git found above {})", start.display()),
+                format!(
+                    "not in a git repository (no .git found above {})",
+                    start.display()
+                ),
             ));
         }
     }
