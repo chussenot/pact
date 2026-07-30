@@ -5,6 +5,7 @@ mod lease;
 mod msg;
 mod output;
 mod repo;
+mod tui;
 
 use std::path::PathBuf;
 
@@ -48,6 +49,8 @@ enum Command {
     },
     /// Check that pact, AGENTS.md, and the Beads CLI are all in a healthy state.
     Doctor,
+    /// Interactive terminal dashboard over leases, messages, and doctor status.
+    Ui,
 }
 
 #[derive(Subcommand)]
@@ -116,6 +119,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Lease { action } => run_lease(&cwd, cli.agent.as_deref(), cli.json, action),
         Command::Msg { action } => run_msg(&cwd, cli.agent.as_deref(), cli.json, action),
         Command::Doctor => run_doctor(&cwd, cli.json),
+        Command::Ui => tui::run(),
     }
 }
 
