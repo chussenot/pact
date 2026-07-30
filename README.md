@@ -86,12 +86,17 @@ locking costs you a deadlock at 2am with no daemon to ask why.
 
 ## Development
 
+Via [mise](https://mise.jdx.dev) tasks (`mise tasks ls` to list them):
+
 ```bash
-cargo build
-cargo test
-cargo fmt
-cargo clippy --all-targets -- -D warnings
+mise run build   # cargo build
+mise run test    # cargo test
+mise run fmt     # cargo fmt
+mise run lint    # cargo clippy --all-targets -- -D warnings
+mise run check   # fmt-check + lint + test, same gates as CI
 ```
+
+Or run the underlying `cargo` commands directly if you don't use mise.
 
 State lives under `.pact/` at the repo root (found by walking up to `.git`):
 `.pact/leases/*.lock` (gitignored by `pact init`) and `.pact/read.json`
