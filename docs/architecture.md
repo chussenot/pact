@@ -14,8 +14,8 @@ flowchart TB
         B[Agent B]
     end
 
-    A -->|pact lease / msg / init / doctor| P[pact CLI]
-    B -->|pact lease / msg / init / doctor| P
+    A -->|pact lease / msg / agents / whoami / init / doctor| P[pact CLI]
+    B -->|pact lease / msg / agents / whoami / init / doctor| P
 
     P -->|reads/writes| L[".pact/leases/*.lock"]
     P -->|reads/writes| R[".pact/read.json"]
@@ -41,15 +41,51 @@ subdirectory and it'll find the right place.
 
 | Path | What | Committed? |
 |------|------|------------|
-| `.pact/leases/*.lock` | one JSON file per active lease | no (gitignored by `pact init`) |
-| `.pact/read.json` | per-agent read/unread state for messages | no (gitignored) |
+| `.pact/leases/*.lock` | one JSON file per active lease | no |
+| `.pact/read.json` | per-agent read/unread state for messages | no |
 | `AGENTS.md` (managed block) | the coordination protocol, for agents to read | yes |
+
+`pact init` gitignores the whole directory with a single `.pact/` line rather
+than one rule per file, so anything an agent writes under `.pact/` is already
+covered. Re-running `init` on a repo that has the older `.pact/leases/` +
+`.pact/read.json` pair recognises them and appends nothing.
 
 Leases and read-state are transient, per-machine, per-agent bookkeeping —
 committing them would just create merge conflicts between agents that have
 nothing to do with each other. The `AGENTS.md` block is the opposite: it's
 the one artifact meant to travel with the repo, so every agent that clones it
 learns the protocol on its own.
+
+## Introspection: derived, never stored
+
+Two commands answer questions *about* pact, and neither adds state.
+
+`pact whoami` reports the identity it resolved and where it resolved it from,
+the pact binary actually running (`current_exe`), the repo root, `.pact/`, and
+the `bd` it will shell out to. Three properties are deliberate:
+
+- **It never fails.** No identity, no `bd`, not in a git repo — each becomes a
+  reported problem, and the command still exits 0. You run `whoami` *because*
+  something else broke; it must not break too.
+- **It probes `bd`, not just `bd`'s existence.** `bd --version` is happy in a
+  repo with no reachable Beads database, while every `bd`-backed pact command
+  fails. So `whoami` runs the query those commands actually run and reports the
+  failure as a problem.
+- **It creates nothing**, including `.pact/` — a read-only question shouldn't
+  write. It says `(not created yet)` instead.
+
+`pact agents` answers "who is working in this repo" with **no registry**: it
+unions the identities already visible in the two places pact writes them —
+lease holders (with `acquired_at`) and message traffic (`from` and `to`) — keyed
+by name, and sorts by most recent sighting. There is nothing to enrol in, and
+nothing to keep in sync with reality, because it *is* the reality. `bd` is
+optional: without it you get the lease half, the same way `pact lease` works
+without `bd`.
+
+That derivation is also why `pact agents` distinguishes an identity that has
+*acted* (held a lease or sent a message) from one that has only been *addressed*
+— the latter is what a typo leaves behind, and the command marks it `?` rather
+than confirming it as an agent.
 
 ## What pact deliberately doesn't do
 
@@ -81,6 +117,13 @@ humans, its exit codes are documented behavior, not incidental:
 An agent scripting against pact can branch on these without parsing error
 text — check the exit code, and only fall back to reading stderr for the
 human-readable reason.
+
+Two conventions follow from that. `pact doctor` exits 1 when a check fails, so
+it works in a CI gate. And an **advisory warning never changes the exit code**:
+`acquire --steal`, `release --force` on someone else's claim, and
+`msg send` to an unseen recipient all write to stderr and exit 0. Warnings are
+for the reader; exit codes are for the caller, and conflating them would make
+every polite heads-up look like a failure.
 
 ## Further reading
 

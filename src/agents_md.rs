@@ -16,18 +16,32 @@ pact coordinates multiple coding agents working in this repository. Follow
 this protocol whenever you touch shared files or hand off work to others.
 
 - **Identity**: your agent identity comes from the `PACT_AGENT` environment
-  variable (or `--agent <name>` on any pact command). Set one before running
-  pact commands; it will never guess or generate an identity for you.
-- **Check your inbox first**: run `pact msg inbox` at the start of every task
-  to see messages other agents have sent you.
-- **Lease before you edit**: run `pact lease acquire <path>` before editing a
-  file another agent might also be working on. Leases are advisory, not
-  enforced by the filesystem — respect them anyway.
-- **Release when you're done**: run `pact lease release <path>` as soon as
-  you finish, so the file is free for the next agent.
-- **Announce interface changes**: if you change an API, schema, CLI flag, or
-  any other contract another agent might depend on, send them a message:
-  `pact msg send --to <agent> "what changed and why"`.
+  variable (or `--agent <name>`). Set one before running pact commands; pact
+  never guesses an identity. `pact whoami` shows the identity and paths it
+  resolved.
+- **Announce intent before you research, not just before you write.** Your
+  first pact commands come *before* you read the first file: `pact msg inbox`,
+  then `pact msg send --to <peer-or-human>` saying what you are about to work
+  on, then `pact lease acquire <path> --note "<what>"` for the files you expect
+  to own. Do it even if you will only be reading for the next ten minutes. Why:
+  a peer planning against the same file can renegotiate now instead of at the
+  end, when both plans are sunk cost — and a fleet that has announced nothing
+  looks exactly like a fleet that crashed on startup.
+- **Ownership, and its one carve-out, stated together**: lease every file you
+  edit that another agent might also touch, and release it when done. The
+  single exception is a file that is yours alone by assignment (your own
+  evidence log, your own scratch dir) — nobody else writes it, so it needs no
+  lease. Anything else: lease it. Leases are advisory, not enforced by the
+  filesystem; respect them anyway.
+- **Keep a lease alive, then let it all go**: `pact lease renew <path>`
+  refreshes the TTL — a long task must not outlive its lease. `pact lease
+  release <path>` frees one file, `pact lease release --all` frees everything
+  you hold in a single call, so nothing gets half-forgotten. Release before
+  you report yourself finished, not after.
+- **Announce contract changes**: if you change an API, schema, CLI flag, or
+  any other contract another agent depends on, message them:
+  `pact msg send --to <agent> "what changed and why"`. Check the recipient
+  exists with `pact agents` first — a mistyped name sends into the void.
 - **Everything is scriptable**: every pact command accepts `--json` for
   machine-readable output; prefer it over parsing human-formatted text.
 
@@ -76,15 +90,26 @@ pub fn apply(repo_root: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Add a single `.pact/leases/` line to `.gitignore`, idempotently, only if missing.
+/// Add a single `.pact/` line to `.gitignore`, idempotently, only if missing.
+/// Everything under `.pact/` is local runtime state — leases, message read
+/// state, and whatever else pact or an agent writes there — so the rule is the
+/// directory, not an enumeration of filenames. A repo that already ignores
+/// `.pact/`, or that carries the legacy pair (`.pact/leases/` plus
+/// `.pact/read.json`), is already covered and is left untouched.
 pub fn ensure_gitignore(repo_root: &Path) -> Result<()> {
     let path = repo_root.join(".gitignore");
     let existing = read_or_empty(&path)?;
 
-    let already_present = existing
-        .lines()
-        .any(|l| l.trim().trim_end_matches('/') == ".pact/leases");
-    if already_present {
+    let (mut dir, mut leases, mut read_state) = (false, false, false);
+    for line in existing.lines() {
+        match line.trim().trim_end_matches('/') {
+            ".pact" => dir = true,
+            ".pact/leases" => leases = true,
+            ".pact/read.json" => read_state = true,
+            _ => {}
+        }
+    }
+    if dir || (leases && read_state) {
         return Ok(());
     }
 
@@ -92,7 +117,7 @@ pub fn ensure_gitignore(repo_root: &Path) -> Result<()> {
     if !new_content.is_empty() && !new_content.ends_with('\n') {
         new_content.push('\n');
     }
-    new_content.push_str(".pact/leases/\n");
+    new_content.push_str(".pact/\n");
 
     std::fs::write(&path, new_content).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
@@ -216,7 +241,45 @@ mod tests {
         ensure_gitignore(tmp.path()).unwrap();
 
         let content = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
-        assert!(content.lines().any(|l| l.trim() == ".pact/leases/"));
+        assert!(content.lines().any(|l| l.trim() == ".pact/"));
+    }
+
+    /// The whole point of pact-rnc.16: agent-written files under `.pact/`
+    /// (e.g. `.pact/evidence/*`) must not need a new gitignore rule each.
+    #[test]
+    fn ensure_gitignore_does_not_duplicate_existing_rules() {
+        let cases = [
+            ".pact/\n",
+            ".pact\n",
+            "target/\n.pact/leases/\n.pact/read.json\n", // legacy pair
+        ];
+        for original in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(".gitignore");
+            std::fs::write(&path, original).unwrap();
+
+            ensure_gitignore(tmp.path()).unwrap();
+
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(after, original, "should have been left alone: {original:?}");
+        }
+    }
+
+    /// An agent only knows the commands this block tells it about.
+    #[test]
+    fn managed_block_teaches_the_protocol_commands() {
+        let block = managed_block();
+        for needle in [
+            "before you research",
+            "pact msg inbox",
+            "pact lease acquire",
+            "pact lease renew",
+            "release --all",
+            "pact agents",
+            "pact whoami",
+        ] {
+            assert!(block.contains(needle), "managed_block missing {needle:?}");
+        }
     }
 
     #[test]
@@ -246,7 +309,7 @@ mod tests {
         let content = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
         let count = content
             .lines()
-            .filter(|l| l.trim().trim_end_matches('/') == ".pact/leases")
+            .filter(|l| l.trim().trim_end_matches('/') == ".pact")
             .count();
         assert_eq!(count, 1);
         assert!(content.contains("target/"));
