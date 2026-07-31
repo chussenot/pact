@@ -3,6 +3,7 @@ mod beads;
 mod doctor;
 mod identity;
 mod lease;
+mod mascot;
 mod msg;
 mod output;
 mod repo;
