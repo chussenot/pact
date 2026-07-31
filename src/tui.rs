@@ -37,6 +37,16 @@ use crate::msg;
 /// Leases doesn't spawn a `bd` subprocess every second for Messages.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How often the Messages tab's unread badge is refreshed from a tab that
+/// isn't Messages. The badge has to be current from ANY tab (an arriving
+/// message is invisible otherwise), but the whole point of the rule above is
+/// that idling on Leases doesn't spawn `bd` every second — so the badge gets
+/// its own, deliberately slower clock. It is checked on the 1 s wake that
+/// already happens, so it adds no event-loop wakeups and never touches the
+/// animation clock. On the Messages tab it costs nothing at all: the inbox
+/// fetch there recomputes the count for free.
+const UNREAD_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Floor on how often the mascot may wake the event loop. The animation asks
 /// for 70–380 ms frames, so this only ever kicks in to stop a zero/near-zero
 /// `next_frame_in` from turning `event::poll` into a 100% CPU spin.
@@ -139,6 +149,12 @@ struct App {
     /// once — same lazy-load pattern as messages, since it also shells out.
     doctor_report: Option<doctor::DoctorReport>,
 
+    /// Unread messages in this agent's inbox, rendered as a badge on the
+    /// Messages tab label so new traffic is visible from any tab. Kept fresh
+    /// on `UNREAD_INTERVAL` rather than only while the tab is open.
+    unread: usize,
+    last_unread_refresh: Instant,
+
     status: Option<String>,
     last_refresh: Instant,
 
@@ -162,6 +178,7 @@ struct App {
 impl App {
     fn new(repo_root: PathBuf, agent: Option<String>) -> Self {
         let bd = BeadsCli::locate().map_err(|e| format!("{e:#}"));
+        let now = Instant::now();
         let mut app = App {
             repo_root,
             agent,
@@ -174,13 +191,18 @@ impl App {
             message_list_state: ListState::default(),
             thread: None,
             doctor_report: None,
+            unread: 0,
+            // Backdated so the badge is filled in on the first refresh tick
+            // instead of a whole UNREAD_INTERVAL after launch — a message
+            // already waiting at startup should show up right away.
+            last_unread_refresh: now.checked_sub(UNREAD_INTERVAL).unwrap_or(now),
             status: None,
-            last_refresh: Instant::now(),
+            last_refresh: now,
             header_area: Rect::default(),
             content_area: Rect::default(),
             hovered_tab: None,
             hovered_row: None,
-            mascot: Mascot::new(Instant::now()),
+            mascot: Mascot::new(now),
         };
         app.refresh_leases();
         app
@@ -222,6 +244,22 @@ impl App {
             Tab::Leases => self.refresh_leases(),
             Tab::Messages => self.refresh_messages(),
             Tab::Doctor => self.refresh_doctor(),
+        }
+        self.refresh_unread_if_due();
+    }
+
+    /// Keeps the tab-bar unread badge current from tabs that don't poll the
+    /// inbox. On Messages this is already a no-op — refresh_messages() above
+    /// just reset the clock with the count it fetched — so the only `bd` this
+    /// can spawn is one call per UNREAD_INTERVAL while you sit elsewhere.
+    fn refresh_unread_if_due(&mut self) {
+        // A background status-line write would replace the "press release
+        // again to force it" prompt mid-decision; the badge can wait.
+        if self.confirm_release.is_some() {
+            return;
+        }
+        if self.last_unread_refresh.elapsed() >= UNREAD_INTERVAL {
+            self.refresh_messages();
         }
     }
 
@@ -265,6 +303,9 @@ impl App {
 
     fn refresh_messages(&mut self) {
         self.last_refresh = Instant::now();
+        // Set even on the early returns below: with no agent or no bd there is
+        // no inbox to count, and retrying that every second buys nothing.
+        self.last_unread_refresh = self.last_refresh;
         let Some(agent) = self.agent.clone() else {
             return; // rendered inline by render_messages; nothing to fetch
         };
@@ -274,6 +315,7 @@ impl App {
         match msg::inbox(cli, &self.repo_root, &agent, false) {
             Ok(messages) => {
                 self.messages = messages;
+                self.unread = self.messages.iter().filter(|m| !m.read).count();
                 let selected = match self.message_list_state.selected() {
                     _ if self.messages.is_empty() => None,
                     Some(i) => Some(i.min(self.messages.len() - 1)),
@@ -378,8 +420,16 @@ impl App {
                 .clone()
                 .unwrap_or_else(|| entry.lease.agent.clone());
             match lease::release(&self.repo_root, &agent, &path, true) {
-                Ok(()) => {
-                    self.status = Some(format!("force-released {path}"));
+                // Some(holder) means force actually took the lease off someone
+                // else. Naming them is the whole value of the force path here:
+                // the ui is where a human does this, and "who did I just step
+                // on" is the one fact they need to go tell that agent.
+                Ok(Some(displaced)) => {
+                    self.status = Some(format!("force-released {path} (was held by {displaced})"));
+                    self.mascot.play(Gesture::Cheer, now);
+                }
+                Ok(None) => {
+                    self.status = Some(format!("released {path}"));
                     self.mascot.play(Gesture::Cheer, now);
                 }
                 Err(e) => {
@@ -393,7 +443,9 @@ impl App {
         } else if self.is_mine(entry) {
             let agent = self.agent.clone().expect("is_mine implies agent is set");
             match lease::release(&self.repo_root, &agent, &path, false) {
-                Ok(()) => {
+                // Never Some without force: you can only displace yourself,
+                // which release() reports as None.
+                Ok(_) => {
                     self.status = Some(format!("released {path}"));
                     self.mascot.play(Gesture::Cheer, now);
                 }
@@ -528,7 +580,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 }
 
 fn handle_click(app: &mut App, x: u16, y: u16) {
-    if let Some(tab) = tab_at(app.header_area, x, y) {
+    if let Some(tab) = tab_at(app.header_area, app.unread, x, y) {
         app.jump_tab(tab);
         return;
     }
@@ -560,7 +612,7 @@ fn update_hover(app: &mut App, x: u16, y: u16) {
     let had_tab = app.hovered_tab.is_some();
     let had_row = app.hovered_row.is_some();
 
-    app.hovered_tab = tab_at(app.header_area, x, y);
+    app.hovered_tab = tab_at(app.header_area, app.unread, x, y);
 
     app.hovered_row = if rect_contains(app.content_area, x, y) {
         match app.tab {
@@ -592,10 +644,10 @@ fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
 /// order, each `" Label "`-wide, separated by a 1-column (non-clickable)
 /// gap. Used for both rendering and hit-testing so the two can never drift
 /// apart the way an independent approximation (e.g. equal-width zones) can.
-fn tab_rects(header_area: Rect) -> Vec<Rect> {
+fn tab_rects(header_area: Rect, unread: usize) -> Vec<Rect> {
     let mut constraints = Vec::with_capacity(Tab::ALL.len() * 2 - 1);
     for (i, tab) in Tab::ALL.iter().enumerate() {
-        constraints.push(Constraint::Length(tab_width(*tab)));
+        constraints.push(Constraint::Length(tab_width(*tab, unread)));
         if i + 1 < Tab::ALL.len() {
             constraints.push(Constraint::Length(1)); // gap between tabs
         }
@@ -610,14 +662,25 @@ fn tab_rects(header_area: Rect) -> Vec<Rect> {
         .collect()
 }
 
-fn tab_width(tab: Tab) -> u16 {
-    tab.label().chars().count() as u16 + 2 // " Label " padding
+/// The label as it is actually rendered, unread badge included. Everything
+/// that measures a tab goes through this one function, so widening "Messages"
+/// to "Messages (3)" widens its rect too — a badge that only rendering knew
+/// about would shift every later tab out from under its own hit-box.
+fn tab_label(tab: Tab, unread: usize) -> String {
+    match tab {
+        Tab::Messages if unread > 0 => format!("{} ({unread})", tab.label()),
+        _ => tab.label().to_string(),
+    }
+}
+
+fn tab_width(tab: Tab, unread: usize) -> u16 {
+    tab_label(tab, unread).chars().count() as u16 + 2 // " Label " padding
 }
 
 /// Which tab a click/hover at `(x, y)` lands on, using the same rects
 /// `tab_rects` hands to rendering.
-fn tab_at(header_area: Rect, x: u16, y: u16) -> Option<Tab> {
-    tab_rects(header_area)
+fn tab_at(header_area: Rect, unread: usize, x: u16, y: u16) -> Option<Tab> {
+    tab_rects(header_area, unread)
         .into_iter()
         .zip(Tab::ALL)
         .find(|(rect, _)| rect_contains(*rect, x, y))
@@ -718,7 +781,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
     // exact same area rendering just used — see tab_rects.
     app.header_area = inner;
 
-    for (tab, rect) in Tab::ALL.into_iter().zip(tab_rects(inner)) {
+    for (tab, rect) in Tab::ALL.into_iter().zip(tab_rects(inner, app.unread)) {
         let selected = tab == app.tab;
         let hovered = !selected && app.hovered_tab == Some(tab);
         let style = if selected {
@@ -727,11 +790,17 @@ fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
                 .add_modifier(Modifier::BOLD)
         } else if hovered {
             Style::default().fg(Color::Black).bg(Color::Yellow)
+        } else if tab == Tab::Messages && app.unread > 0 {
+            // The count alone is easy to miss while you're reading another
+            // tab, which is the exact situation this badge exists for.
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
         frame.render_widget(
-            Paragraph::new(format!(" {} ", tab.label())).style(style),
+            Paragraph::new(format!(" {} ", tab_label(tab, app.unread))).style(style),
             rect,
         );
     }
@@ -747,15 +816,13 @@ fn render_leases(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let header = Row::new(vec![
-        "Path",
-        "Held by",
-        "Age",
-        "Remaining",
-        "Status",
-        "Note",
-    ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    // pact-rnc.10: no raw "Remaining" countdown. A four-digit second count next
+    // to a seconds-old lease read as "this long lease" and got a live agent's
+    // claim force-released — and in here --force is two keystrokes away. Age and
+    // state say what an operator needs; both come from lease.rs, so this table
+    // and `pact lease ls` cannot disagree.
+    let header = Row::new(vec!["Path", "Held by", "Age", "State", "Note"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = app
         .leases
@@ -765,12 +832,14 @@ fn render_leases(frame: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     let widths = [
-        Constraint::Percentage(28),
+        Constraint::Percentage(26),
         Constraint::Percentage(14),
-        Constraint::Percentage(10),
-        Constraint::Percentage(12),
-        Constraint::Percentage(11),
-        Constraint::Percentage(25),
+        Constraint::Length(8),
+        // Fixed, not a percentage: "stale (reclaimable in 20s)" is the widest
+        // label and the one an operator must never have truncated out from under
+        // them — a half-read state is how pact-rnc.10 happened.
+        Constraint::Length(26),
+        Constraint::Percentage(20),
     ];
 
     let table = Table::new(rows, widths)
@@ -787,18 +856,17 @@ fn lease_row<'a>(app: &App, index: usize, entry: &'a LeaseEntry) -> Row<'a> {
     } else {
         Style::default()
     };
-    let (status_text, status_style) = if entry.expired {
-        ("expired", Style::default().fg(Color::Red))
-    } else {
-        ("active", Style::default().fg(Color::Green))
+    let state_style = match entry.state() {
+        "expired" => Style::default().fg(Color::Red),
+        "stale" => Style::default().fg(Color::Yellow),
+        _ => Style::default().fg(Color::Green),
     };
 
     let row = Row::new(vec![
         Cell::from(entry.lease.path.as_str()),
         Cell::from(entry.lease.agent.as_str()).style(agent_style),
-        Cell::from(format!("{}s", entry.age_secs)),
-        Cell::from(format!("{}s", entry.remaining_secs)),
-        Cell::from(status_text).style(status_style),
+        Cell::from(lease::human_secs(entry.age_secs)),
+        Cell::from(entry.state_label()).style(state_style),
         Cell::from(entry.lease.note.as_deref().unwrap_or("")),
     ]);
 
@@ -991,6 +1059,7 @@ mod tests {
         msg::Message {
             id: id.to_string(),
             thread: id.to_string(),
+            from: "agent-b".to_string(),
             to: "agent-a".to_string(),
             subject: Some(subject.to_string()),
             body: format!("body of {id}"),
@@ -1012,6 +1081,8 @@ mod tests {
             message_list_state: ListState::default().with_selected(Some(0)),
             thread: None,
             doctor_report: None,
+            unread: 0,
+            last_unread_refresh: Instant::now(),
             status: None,
             last_refresh: Instant::now(),
             header_area: Rect::new(0, 0, 80, 1),
@@ -1061,25 +1132,106 @@ mod tests {
     #[test]
     fn tab_at_agrees_with_tab_rects_exact_geometry() {
         let header = Rect::new(0, 0, 90, 1);
-        let rects = tab_rects(header);
-        assert_eq!(rects.len(), 3);
+        // Including badged widths: "Messages (3)" and the two-digit "(12)" are
+        // wider labels, and hit-testing has to move with them.
+        for unread in [0, 3, 12] {
+            let rects = tab_rects(header, unread);
+            assert_eq!(rects.len(), 3);
 
-        // Every point inside a tab's own rendered rect resolves back to it —
-        // not an equal-width approximation, the exact rect rendering used.
-        for (tab, rect) in Tab::ALL.into_iter().zip(rects.iter()) {
-            assert_eq!(tab_at(header, rect.x, rect.y), Some(tab));
-            assert_eq!(tab_at(header, rect.x + rect.width - 1, rect.y), Some(tab));
+            // Every point inside a tab's own rendered rect resolves back to it —
+            // not an equal-width approximation, the exact rect rendering used.
+            for (tab, rect) in Tab::ALL.into_iter().zip(rects.iter()) {
+                assert_eq!(tab_at(header, unread, rect.x, rect.y), Some(tab));
+                assert_eq!(
+                    tab_at(header, unread, rect.x + rect.width - 1, rect.y),
+                    Some(tab)
+                );
+                assert_eq!(
+                    rect.width,
+                    tab_label(tab, unread).chars().count() as u16 + 2
+                );
+            }
+
+            // The 1-column gap between tabs belongs to neither (not clickable).
+            let gap_x = rects[0].x + rects[0].width;
+            assert!(gap_x < rects[1].x, "expected a gap between tab rects");
+            assert_eq!(tab_at(header, unread, gap_x, 0), None);
+
+            // Empty header space past the last tab matches nothing, rather than
+            // falling back to "closest tab" the way an equal-zone division would.
+            let last = rects.last().unwrap();
+            assert_eq!(tab_at(header, unread, last.x + last.width + 10, 0), None);
         }
+    }
 
-        // The 1-column gap between tabs belongs to neither (not clickable).
-        let gap_x = rects[0].x + rects[0].width;
-        assert!(gap_x < rects[1].x, "expected a gap between tab rects");
-        assert_eq!(tab_at(header, gap_x, 0), None);
+    #[test]
+    fn unread_badge_widens_the_messages_tab_and_shifts_doctor_with_it() {
+        let header = Rect::new(0, 0, 90, 1);
+        let plain = tab_rects(header, 0);
+        let badged = tab_rects(header, 3);
 
-        // Empty header space past the last tab matches nothing, rather than
-        // falling back to "closest tab" the way an equal-zone division would.
-        let last = rects.last().unwrap();
-        assert_eq!(tab_at(header, last.x + last.width + 10, 0), None);
+        assert_eq!(badged[0], plain[0], "Leases sits before Messages");
+        assert_eq!(
+            badged[1].width,
+            plain[1].width + 4, // " (3)"
+            "the badge must be part of the measured label"
+        );
+        // The tab AFTER the badge is the one a naive fix breaks: rendering
+        // pushes it right while hit-testing keeps the old rect.
+        assert_eq!(badged[2].x, plain[2].x + 4);
+        assert_eq!(tab_at(header, 3, badged[2].x, 0), Some(Tab::Doctor));
+        assert_eq!(tab_at(header, 3, plain[2].x, 0), Some(Tab::Messages));
+    }
+
+    #[test]
+    fn header_renders_the_unread_count_from_another_tab() {
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(Some("agent-a"), vec![]);
+        app.tab = Tab::Leases; // the tab the human was on in pact-rnc.14
+        app.unread = 3;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(render_to_string(&terminal).contains("Messages (3)"));
+
+        // No badge at all when there's nothing unread.
+        app.unread = 0;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(rendered.contains("Messages"));
+        assert!(!rendered.contains("Messages ("));
+    }
+
+    #[test]
+    fn the_unread_badge_refreshes_on_its_own_slower_clock() {
+        // The badge must not turn the Leases tab into a once-a-second `bd`
+        // spawner, so it has a clock of its own that gates the inbox fetch.
+        assert!(UNREAD_INTERVAL >= REFRESH_INTERVAL * 5);
+
+        let mut app = app_with(Some("agent-a"), vec![]);
+        // bd is Err here, so refresh_messages() sets last_refresh and returns
+        // without spawning anything — last_refresh is the observable for "the
+        // inbox fetch ran".
+        app.last_refresh = Instant::now() - Duration::from_secs(60);
+        app.last_unread_refresh = Instant::now();
+        app.refresh_unread_if_due();
+        assert!(
+            app.last_refresh.elapsed() >= Duration::from_secs(60),
+            "not due yet: the inbox must not be fetched"
+        );
+
+        app.last_unread_refresh = Instant::now() - UNREAD_INTERVAL;
+        app.refresh_unread_if_due();
+        assert!(app.last_refresh.elapsed() < Duration::from_secs(1));
+
+        // Armed for a force-release: the fetch would overwrite the confirmation
+        // prompt in the status line, so it waits.
+        app.last_refresh = Instant::now() - Duration::from_secs(60);
+        app.last_unread_refresh = Instant::now() - UNREAD_INTERVAL;
+        app.confirm_release = Some(0);
+        app.refresh_unread_if_due();
+        assert!(app.last_refresh.elapsed() >= Duration::from_secs(60));
     }
 
     #[test]
@@ -1135,8 +1287,18 @@ mod tests {
         app.content_area = Rect::new(0, 1, 90, 8);
         assert_eq!(app.tab, Tab::Leases);
 
-        let doctor_rect = tab_rects(app.header_area)[2];
+        let doctor_rect = tab_rects(app.header_area, app.unread)[2];
         handle_click(&mut app, doctor_rect.x, doctor_rect.y);
+        assert_eq!(app.tab, Tab::Doctor);
+
+        // Same click path with an unread badge widening the Messages label:
+        // handle_click reads app.unread, so the rects it tests against are the
+        // ones that were rendered, not the unbadged ones.
+        app.unread = 3;
+        let shifted_doctor = tab_rects(app.header_area, app.unread)[2];
+        assert_ne!(shifted_doctor.x, doctor_rect.x);
+        app.jump_tab(Tab::Leases);
+        handle_click(&mut app, shifted_doctor.x, shifted_doctor.y);
         assert_eq!(app.tab, Tab::Doctor);
     }
 
@@ -1146,7 +1308,7 @@ mod tests {
         app.header_area = Rect::new(0, 0, 90, 1);
         app.content_area = Rect::new(0, 1, 90, 8);
 
-        let messages_rect = tab_rects(app.header_area)[1];
+        let messages_rect = tab_rects(app.header_area, app.unread)[1];
         update_hover(&mut app, messages_rect.x, messages_rect.y);
         assert_eq!(app.hovered_tab, Some(Tab::Messages));
         assert_eq!(app.tab, Tab::Leases); // hover alone never switches tabs
@@ -1279,6 +1441,42 @@ mod tests {
         assert!(rendered.contains("theirs.rs"));
         assert!(rendered.contains("expired"));
         assert!(rendered.contains("active"));
+    }
+
+    /// pact-rnc.10 on the surface where the incident happened: the dashboard is
+    /// where a force-release gets decided, and it used to render the misreadable
+    /// `80s  3520s  active`.
+    #[test]
+    fn leases_table_shows_age_and_state_never_a_raw_countdown() {
+        use ratatui::backend::TestBackend;
+
+        let fresh = LeaseEntry {
+            age_secs: 80,
+            remaining_secs: 3520,
+            ..entry("animator", "docs/m.md", false)
+        };
+        let stale = LeaseEntry {
+            age_secs: 910,
+            remaining_secs: -10,
+            ..entry("gone", "src/z.rs", false)
+        };
+        let mut app = app_with(Some("animator"), vec![fresh, stale]);
+        app.table_state.select(Some(0));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let rendered = render_to_string(&terminal);
+        assert!(rendered.contains("1m20s"), "age must be human: {rendered}");
+        assert!(
+            !rendered.contains("3520"),
+            "a raw ttl countdown is the whole defect: {rendered}"
+        );
+        assert!(!rendered.contains("Remaining"), "{rendered}");
+        assert!(
+            rendered.contains("stale (reclaimable in 20s)"),
+            "the third band exists in the TUI too: {rendered}"
+        );
     }
 
     #[test]
@@ -1421,7 +1619,7 @@ mod tests {
 
         // A click on a different tab label goes through the same path.
         app.header_area = Rect::new(0, 0, 90, 1);
-        let leases_rect = tab_rects(app.header_area)[0];
+        let leases_rect = tab_rects(app.header_area, app.unread)[0];
         handle_click(&mut app, leases_rect.x, leases_rect.y);
         assert_eq!(app.tab, Tab::Leases);
         assert_eq!(app.mascot.gesture(), Gesture::Jump);
@@ -1439,7 +1637,7 @@ mod tests {
         app.header_area = Rect::new(0, 0, 90, 1);
         app.content_area = Rect::new(0, 3, 80, 8);
 
-        let tab_rect = tab_rects(app.header_area)[1];
+        let tab_rect = tab_rects(app.header_area, app.unread)[1];
         update_hover(&mut app, tab_rect.x, tab_rect.y);
         assert_eq!(app.hovered_tab, Some(Tab::Messages));
         assert_eq!(app.mascot.gesture(), Gesture::Wave);

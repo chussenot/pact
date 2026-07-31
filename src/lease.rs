@@ -40,6 +40,56 @@ pub struct LeaseEntry {
     pub expired: bool,
 }
 
+impl LeaseEntry {
+    /// What an operator actually needs to know: is this claim fresh, probably
+    /// abandoned, or reclaimable? `remaining_secs` alone reads as "long-held"
+    /// on a lease that is seconds old (pact-rnc.10).
+    ///   "active"  — within its ttl
+    ///   "stale"   — past its ttl but inside the GRACE_SECS clock-skew window,
+    ///               i.e. probably abandoned but not yet reclaimable
+    ///   "expired" — past ttl + GRACE_SECS; another agent may take it
+    pub fn state(&self) -> &'static str {
+        // Keyed off `expired` rather than recomputing, so the label can never
+        // disagree with the GC decision made in `list`.
+        if self.expired {
+            "expired"
+        } else if self.remaining_secs < 0 {
+            "stale"
+        } else {
+            "active"
+        }
+    }
+
+    /// The state as an operator reads it, including when a stale lease becomes
+    /// reclaimable. Lives here, not in a renderer: `pact lease ls` and `pact ui`
+    /// both show lease state, and having each format it its own way is what left
+    /// the dashboard printing a raw `80s 3520s active` after pact-rnc.10 was
+    /// "fixed" in the CLI. One implementation, both surfaces.
+    pub fn state_label(&self) -> String {
+        match self.state() {
+            "stale" => format!(
+                "stale (reclaimable in {})",
+                human_secs(self.remaining_secs + GRACE_SECS)
+            ),
+            other => other.to_string(),
+        }
+    }
+}
+
+/// Compact duration: `45s`, `2m5s`, `1h3m`. Here for the same reason as
+/// `state_label`: a bare four-digit second count next to an age is what made
+/// pact-rnc.10 misreadable, so no renderer gets to reinvent it.
+pub fn human_secs(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m{}s", s / 60, s % 60)
+    } else {
+        format!("{}h{}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
 /// Encode a repo-root-relative path into a lock filename: `/` -> `__`.
 /// Collision caveat: a path containing literal `__` can collide with a
 /// different path whose separators encode to the same string. Acceptable in v1.
@@ -187,17 +237,25 @@ pub fn acquire(
     }
 }
 
-pub fn release(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<()> {
+/// Release a lease. Returns `Some(displaced_agent)` when `force` destroyed a
+/// *different* agent's live claim, so the caller can warn and name them the way
+/// `acquire --steal` already does (pact-rnc.11); `None` when the caller held it
+/// or nothing was held.
+pub fn release(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<Option<String>> {
     let relative = normalize_path(repo_root, path);
     let lock_path = lock_file_path(repo_root, &relative)?;
 
     let existing = match read_lease(&lock_path) {
         Ok(lease) => lease,
-        Err(_) if !lock_path.exists() => return Ok(()), // idempotent: nothing to release
+        Err(_) if !lock_path.exists() => return Ok(None), // idempotent: nothing to release
         Err(e) => return Err(e),
     };
 
-    if existing.agent != agent && !force {
+    let displaced = if existing.agent == agent {
+        None
+    } else if force {
+        Some(existing.agent.clone())
+    } else {
         return Err(exit_with(
             2,
             format!(
@@ -205,13 +263,59 @@ pub fn release(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result
                 existing.agent
             ),
         ));
-    }
+    };
 
     match std::fs::remove_file(&lock_path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(displaced),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(displaced),
         Err(e) => Err(e).with_context(|| format!("removing {}", lock_path.display())),
     }
+}
+
+/// Release every lease held by `agent`, so "release everything I hold" is one
+/// call that cannot be half-forgotten (pact-rnc.8). Returns the released paths,
+/// sorted; holding nothing is success with an empty Vec.
+pub fn release_all(repo_root: &Path, agent: &str) -> Result<Vec<String>> {
+    let mut paths: Vec<String> = list(repo_root, true)?
+        .into_iter()
+        .filter(|e| e.lease.agent == agent)
+        .map(|e| e.lease.path)
+        .collect();
+    paths.sort();
+    for path in &paths {
+        release(repo_root, agent, path, false)?;
+    }
+    Ok(paths)
+}
+
+/// Refresh `acquired_at` on a lease `agent` already holds, so a long task can
+/// outlive its TTL on purpose instead of by accident (pact-rnc.9).
+/// Deliberately does NOT create a missing lease: a typo'd path must not
+/// silently claim something new.
+pub fn renew(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
+    let relative = normalize_path(repo_root, path);
+    let lock_path = lock_file_path(repo_root, &relative)?;
+
+    if !lock_path.exists() {
+        anyhow::bail!("no lease on {relative} to renew (use `pact lease acquire` to claim it)");
+    }
+    let existing = read_lease(&lock_path)?;
+    if existing.agent != agent {
+        return Err(exit_with(
+            2,
+            format!(
+                "lease on {relative} is held by {}, not {agent}",
+                existing.agent
+            ),
+        ));
+    }
+
+    let renewed = LeaseInfo {
+        acquired_at: Utc::now().to_rfc3339(),
+        ..existing
+    };
+    write_lease_atomic(&lock_path, &renewed)?;
+    Ok(renewed)
 }
 
 /// List active leases, garbage-collecting expired ones as a side effect.
@@ -296,5 +400,159 @@ mod tests {
 
         let (lease, now) = lease_aged(ttl, ttl as i64 + GRACE_SECS + 1);
         assert!(is_expired(&lease, now), "ttl+grace+1s should be expired");
+    }
+
+    /// Same boundary style as `expiry_respects_grace_period_boundary`, one age
+    /// per state.
+    #[test]
+    fn state_labels_the_three_ttl_bands() {
+        let ttl = 100u64;
+        let entry_at = |age: i64| {
+            let (lease, now) = lease_aged(ttl, age);
+            let (age_secs, remaining_secs) = age_and_remaining(&lease, now);
+            let expired = is_expired(&lease, now);
+            LeaseEntry {
+                lease,
+                age_secs,
+                remaining_secs,
+                expired,
+            }
+        };
+
+        assert_eq!(entry_at(1).state(), "active");
+        assert_eq!(entry_at(ttl as i64 - 1).state(), "active");
+        // Past ttl but inside the grace window: probably abandoned, not yet
+        // reclaimable.
+        assert_eq!(entry_at(ttl as i64 + 1).state(), "stale");
+        assert_eq!(entry_at(ttl as i64 + GRACE_SECS - 1).state(), "stale");
+        assert_eq!(entry_at(ttl as i64 + GRACE_SECS + 1).state(), "expired");
+
+        // The label every renderer shows, so `pact ui` and `pact lease ls`
+        // cannot drift apart again (pact-rnc.10).
+        assert_eq!(entry_at(1).state_label(), "active");
+        assert!(entry_at(ttl as i64 + 1)
+            .state_label()
+            .starts_with("stale (reclaimable in "));
+        assert_eq!(
+            entry_at(ttl as i64 + GRACE_SECS + 1).state_label(),
+            "expired"
+        );
+    }
+
+    #[test]
+    fn human_secs_bands() {
+        assert_eq!(human_secs(0), "0s");
+        assert_eq!(human_secs(-5), "0s");
+        assert_eq!(human_secs(59), "59s");
+        assert_eq!(human_secs(125), "2m5s");
+        assert_eq!(human_secs(3725), "1h2m");
+    }
+
+    fn repo() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    fn claim(root: &Path, agent: &str, path: &str) {
+        acquire(root, agent, path, DEFAULT_TTL_SECS, false, None).unwrap();
+    }
+
+    fn held_by(root: &Path, agent: &str) -> Vec<String> {
+        let mut paths: Vec<String> = list(root, true)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.lease.agent == agent)
+            .map(|e| e.lease.path)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn release_all_releases_only_the_callers_leases() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim(root, "agent-a", "src/b.rs");
+        claim(root, "agent-a", "src/a.rs");
+        claim(root, "agent-b", "src/other.rs");
+
+        assert_eq!(
+            release_all(root, "agent-a").unwrap(),
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
+        assert!(held_by(root, "agent-a").is_empty());
+        assert_eq!(held_by(root, "agent-b"), vec!["src/other.rs".to_string()]);
+    }
+
+    #[test]
+    fn release_all_with_nothing_held_succeeds_empty() {
+        let tmp = repo();
+        claim(tmp.path(), "agent-b", "src/other.rs");
+        assert!(release_all(tmp.path(), "agent-a").unwrap().is_empty());
+        assert_eq!(
+            held_by(tmp.path(), "agent-b"),
+            vec!["src/other.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn release_reports_the_displaced_holder_only_when_forced() {
+        let tmp = repo();
+        let root = tmp.path();
+
+        claim(root, "agent-a", "mine.rs");
+        assert_eq!(release(root, "agent-a", "mine.rs", false).unwrap(), None);
+        assert_eq!(release(root, "agent-a", "mine.rs", false).unwrap(), None); // idempotent
+
+        claim(root, "agent-a", "theirs.rs");
+        assert!(release(root, "agent-b", "theirs.rs", false).is_err());
+        assert_eq!(
+            release(root, "agent-b", "theirs.rs", true).unwrap(),
+            Some("agent-a".to_string())
+        );
+    }
+
+    #[test]
+    fn renew_refreshes_acquired_at_for_the_holder() {
+        let tmp = repo();
+        let root = tmp.path();
+        let first = acquire(root, "agent-a", "f.rs", 42, false, Some("note".into()))
+            .unwrap()
+            .lease;
+
+        let renewed = renew(root, "agent-a", "f.rs").unwrap();
+        assert_ne!(renewed.acquired_at, first.acquired_at);
+        assert_eq!(renewed.ttl_secs, 42, "renew keeps the original ttl");
+        assert_eq!(renewed.note.as_deref(), Some("note"));
+        assert_eq!(
+            read_lease(&lock_file_path(root, "f.rs").unwrap())
+                .unwrap()
+                .acquired_at,
+            renewed.acquired_at,
+            "renew persists to disk"
+        );
+    }
+
+    #[test]
+    fn renew_without_an_existing_lease_errors() {
+        let tmp = repo();
+        assert!(renew(tmp.path(), "agent-a", "typo.rs").is_err());
+        assert!(
+            !lock_file_path(tmp.path(), "typo.rs").unwrap().exists(),
+            "renew must not create a lease"
+        );
+    }
+
+    #[test]
+    fn renew_of_another_agents_lease_exits_2() {
+        let tmp = repo();
+        claim(tmp.path(), "agent-a", "f.rs");
+        let err = renew(tmp.path(), "agent-b", "f.rs").unwrap_err();
+        assert_eq!(crate::output::code_for(&err), 2);
+        assert_eq!(
+            read_lease(&lock_file_path(tmp.path(), "f.rs").unwrap())
+                .unwrap()
+                .agent,
+            "agent-a"
+        );
     }
 }

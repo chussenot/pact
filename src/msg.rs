@@ -25,6 +25,12 @@ use crate::repo::pact_dir;
 pub struct Message {
     pub id: String,
     pub thread: String,
+    /// bd's `created_by`: whoever bd recorded as the author. That is the pact
+    /// agent name when `send()` passed `--actor` ("tui-dev"), but a git user
+    /// name ("Ada Lovelace") for beads created outside pact, so it is passed
+    /// through verbatim and is NOT guaranteed to be a pact identity. Empty
+    /// string when bd reports no author.
+    pub from: String,
     pub to: String,
     pub subject: Option<String>,
     pub body: String,
@@ -41,11 +47,35 @@ struct BdIssue {
     description: Option<String>,
     #[serde(default)]
     assignee: Option<String>,
+    #[serde(default)]
+    created_by: Option<String>,
     created_at: String,
     #[serde(default)]
     issue_type: String,
     #[serde(default)]
     parent: Option<String>,
+}
+
+impl BdIssue {
+    /// The one BdIssue -> Message mapping, shared by every read path so `from`
+    /// cannot go missing on just one of them. `thread` pins the thread id
+    /// (read_thread pins every row to the root); otherwise it is the parent,
+    /// falling back to the message's own id for a thread root.
+    fn into_message(self, thread: Option<&str>, read: bool) -> Message {
+        Message {
+            thread: thread
+                .map(str::to_string)
+                .or(self.parent)
+                .unwrap_or_else(|| self.id.clone()),
+            from: self.created_by.unwrap_or_default(),
+            to: self.assignee.unwrap_or_default(),
+            subject: Some(self.title),
+            body: self.description.unwrap_or_default(),
+            created_at: self.created_at,
+            id: self.id,
+            read,
+        }
+    }
 }
 
 pub fn send(
@@ -90,6 +120,8 @@ pub fn send(
     Ok(Message {
         id: issue.id,
         thread: thread_id,
+        // The calling agent, not bd's echo: send() always passes --actor=agent.
+        from: agent.to_string(),
         to: to.to_string(),
         subject: Some(title),
         body: body.to_string(),
@@ -109,26 +141,7 @@ pub fn inbox(
         repo_root,
         &["list", "--include-infra", "--json", &assignee_arg],
     )?;
-    let issues: Vec<BdIssue> =
-        serde_json::from_str(&stdout).context("parsing `bd list --json` output")?;
-
-    let read_state = ReadState::load(repo_root)?;
-    let mut messages: Vec<Message> = issues
-        .into_iter()
-        .filter(|i| i.issue_type == "message")
-        .map(|i| {
-            let read = read_state.is_read(agent, &i.id);
-            Message {
-                thread: i.parent.clone().unwrap_or_else(|| i.id.clone()),
-                subject: Some(i.title),
-                body: i.description.unwrap_or_default(),
-                created_at: i.created_at,
-                to: agent.to_string(),
-                id: i.id,
-                read,
-            }
-        })
-        .collect();
+    let mut messages = parse_messages(&stdout, &ReadState::load(repo_root)?)?;
 
     if unread_only {
         messages.retain(|m| !m.read);
@@ -165,24 +178,44 @@ pub fn read_thread(
     all.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
     let mut read_state = ReadState::load(repo_root)?;
-    let thread_id = id.to_string();
     let messages: Vec<Message> = all
         .into_iter()
         .map(|i| {
             read_state.mark_read(agent, &i.id);
-            Message {
-                thread: thread_id.clone(),
-                to: i.assignee.unwrap_or_default(),
-                subject: Some(i.title),
-                body: i.description.unwrap_or_default(),
-                created_at: i.created_at,
-                id: i.id,
-                read: true,
-            }
+            i.into_message(Some(id), true)
         })
         .collect();
     read_state.save(repo_root)?;
 
+    Ok(messages)
+}
+
+/// Every message bead in the repo, regardless of recipient, oldest first.
+///
+/// `bd list` hides message beads unless `--include-infra` is passed and has no
+/// `--type` filter, so `issue_type == "message"` is filtered client-side, same
+/// as `inbox()`. `read` is resolved per recipient, since read state is
+/// per-agent and each message only has one.
+pub fn all_messages(cli: &BeadsCli, repo_root: &Path) -> Result<Vec<Message>> {
+    let stdout = cli.run(repo_root, &["list", "--include-infra", "--json"])?;
+    parse_messages(&stdout, &ReadState::load(repo_root)?)
+}
+
+/// `bd list --json` output -> message beads only, oldest first. `read` is keyed
+/// on each message's own recipient, which for `inbox()` is the requesting agent
+/// (bd already filtered by `--assignee`).
+fn parse_messages(stdout: &str, read_state: &ReadState) -> Result<Vec<Message>> {
+    let issues: Vec<BdIssue> =
+        serde_json::from_str(stdout).context("parsing `bd list --json` output")?;
+    let mut messages: Vec<Message> = issues
+        .into_iter()
+        .filter(|i| i.issue_type == "message")
+        .map(|i| {
+            let read = read_state.is_read(i.assignee.as_deref().unwrap_or_default(), &i.id);
+            i.into_message(None, read)
+        })
+        .collect();
+    messages.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     Ok(messages)
 }
 
@@ -240,7 +273,8 @@ impl ReadState {
 
 /// `.pact/read.json` is local runtime state, same as leases — keep it out of
 /// git. Deliberately self-contained rather than reusing `agents_md`'s
-/// `.gitignore` helper, since that one only manages the `.pact/leases/` line.
+/// `.gitignore` helper, but a `.pact/` line written by that helper (pact-rnc.16)
+/// already covers this file, so don't add a redundant rule under it.
 fn ensure_ignored(repo_root: &Path) -> Result<()> {
     let path = repo_root.join(".gitignore");
     let existing = match std::fs::read_to_string(&path) {
@@ -249,7 +283,10 @@ fn ensure_ignored(repo_root: &Path) -> Result<()> {
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
 
-    if existing.lines().any(|l| l.trim() == ".pact/read.json") {
+    if existing
+        .lines()
+        .any(|l| matches!(l.trim(), ".pact/read.json" | ".pact/"))
+    {
         return Ok(());
     }
 
@@ -276,6 +313,78 @@ mod tests {
         assert!(subject.ends_with("..."));
     }
 
+    /// Shape copied from real `bd list --include-infra --json` output.
+    const LIST_JSON: &str = r#"[
+      {"id":"pact-wisp-1","title":"hi","description":"body one",
+       "assignee":"msg-fix","created_by":"tui-dev","created_at":"2026-07-31T07:20:00Z",
+       "issue_type":"message"},
+      {"id":"pact-wisp-2","title":"re: hi","description":"body two",
+       "assignee":"msg-fix","created_by":"Clement HUSSENOT-DESENONGES",
+       "created_at":"2026-07-31T07:10:00Z","issue_type":"message","parent":"pact-wisp-1"},
+      {"id":"pact-wisp-3","title":"anon","assignee":"msg-fix",
+       "created_at":"2026-07-31T07:30:00Z","issue_type":"message"},
+      {"id":"pact-rnc.1","title":"a real bug, not a message",
+       "created_at":"2026-07-31T07:00:00Z","issue_type":"bug","created_by":"someone"}
+    ]"#;
+
+    #[test]
+    fn parse_messages_keeps_from_and_drops_non_messages() {
+        let msgs = parse_messages(LIST_JSON, &ReadState::default()).unwrap();
+
+        // "bug" filtered out client-side; oldest first.
+        let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["pact-wisp-2", "pact-wisp-1", "pact-wisp-3"]);
+
+        // from survives the round trip, verbatim -- a pact agent name for
+        // --actor sends, a git user name otherwise, "" when bd reports none.
+        let from: Vec<&str> = msgs.iter().map(|m| m.from.as_str()).collect();
+        assert_eq!(
+            from,
+            ["Clement HUSSENOT-DESENONGES", "tui-dev", ""],
+            "missing created_by must yield \"\", not a panic"
+        );
+
+        // Reply is pinned to its parent thread; roots thread on themselves.
+        assert_eq!(msgs[0].thread, "pact-wisp-1");
+        assert_eq!(msgs[1].thread, "pact-wisp-1");
+        assert_eq!(msgs[2].thread, "pact-wisp-3");
+        assert!(msgs.iter().all(|m| m.to == "msg-fix"));
+        assert_eq!(
+            msgs[2].body, "",
+            "missing description is empty, not a panic"
+        );
+    }
+
+    #[test]
+    fn parse_messages_resolves_read_per_recipient() {
+        let mut state = ReadState::default();
+        state.mark_read("msg-fix", "pact-wisp-1");
+        state.mark_read("someone-else", "pact-wisp-3");
+
+        let read: Vec<bool> = parse_messages(LIST_JSON, &state)
+            .unwrap()
+            .iter()
+            .map(|m| m.read)
+            .collect();
+        // Only the one read by its own recipient counts.
+        assert_eq!(read, [false, true, false]);
+    }
+
+    #[test]
+    fn read_thread_mapping_pins_thread_to_root() {
+        let issue: BdIssue = serde_json::from_str(
+            r#"{"id":"pact-wisp-9","title":"deep reply","assignee":"human",
+                "created_by":"lease-fix","created_at":"2026-07-31T08:00:00Z",
+                "issue_type":"message","parent":"pact-wisp-8"}"#,
+        )
+        .unwrap();
+        let m = issue.into_message(Some("pact-wisp-root"), true);
+        assert_eq!(m.thread, "pact-wisp-root");
+        assert_eq!(m.from, "lease-fix");
+        assert_eq!(m.to, "human");
+        assert!(m.read);
+    }
+
     #[test]
     fn read_state_round_trips_and_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -293,5 +402,19 @@ mod tests {
 
         let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
         assert_eq!(gitignore.matches(".pact/read.json").count(), 1);
+    }
+
+    /// pact-rnc.16: agents_md now writes a single `.pact/` line, which already
+    /// covers read.json — don't append a redundant rule under it.
+    #[test]
+    fn read_state_respects_a_broad_pact_gitignore_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "/target\n.pact/\n").unwrap();
+
+        ReadState::default().save(tmp.path()).unwrap();
+
+        let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(gitignore, "/target\n.pact/\n");
     }
 }
