@@ -542,13 +542,20 @@ pub fn renew(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
 /// differ in exactly one thing (whether expired locks are unlinked) and share
 /// everything else — parsing, skipping, age and state computation.
 fn scan(repo_root: &Path) -> Result<Vec<(PathBuf, LeaseEntry)>> {
-    let leases_dir = pact_dir(repo_root)?.join("leases");
+    // Non-creating path: listing leases is a question, and a question must not
+    // leave a `.pact/` behind in a repo that has never used pact (pact-rnc.27).
+    let leases_dir = crate::repo::pact_dir_path(repo_root).join("leases");
     let now = Utc::now();
     let mut entries = Vec::new();
 
-    for entry in std::fs::read_dir(&leases_dir)
-        .with_context(|| format!("reading {}", leases_dir.display()))?
-    {
+    let dir = match std::fs::read_dir(&leases_dir) {
+        Ok(d) => d,
+        // No directory yet simply means no leases have ever been taken.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", leases_dir.display())),
+    };
+
+    for entry in dir {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("lock") {
@@ -826,6 +833,21 @@ mod tests {
     }
 
     // ---- pact-rnc.19: peek() answers without mutating -------------------
+
+    #[test]
+    fn listing_creates_nothing_on_a_repo_that_has_never_used_pact() {
+        // pact-rnc.27: same principle as peek() not sweeping (pact-rnc.19) --
+        // asking what is leased must not leave a `.pact/` behind, and a missing
+        // directory means "nothing leased yet", not an error.
+        let tmp = repo();
+        let root = tmp.path();
+        assert!(peek(root, true).unwrap().is_empty());
+        assert!(list(root, true).unwrap().is_empty());
+        assert!(
+            !root.join(".pact").exists(),
+            "listing leases created .pact/ on a repo that never used pact"
+        );
+    }
 
     #[test]
     fn peek_does_not_delete_an_expired_lock_but_list_does() {
