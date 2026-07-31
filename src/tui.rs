@@ -285,7 +285,10 @@ impl App {
     }
 
     fn refresh_leases(&mut self) {
-        match lease::list(&self.repo_root, true) {
+        // peek, not list: this runs on a refresh timer, and a dashboard that
+        // garbage-collects expired locks on every tick is deleting the evidence
+        // an operator opened it to look at (pact-rnc.19).
+        match lease::peek(&self.repo_root, true) {
             Ok(mut entries) => {
                 entries.sort_by(|a, b| a.lease.path.cmp(&b.lease.path));
                 self.leases = entries;
@@ -1065,6 +1068,7 @@ mod tests {
             body: format!("body of {id}"),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             read,
+            read_by: Vec::new(),
         }
     }
 

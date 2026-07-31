@@ -26,7 +26,7 @@ the protocol without you explaining it each session.
 flowchart LR
     A[Agent A] -->|lease / msg| P(pact)
     B[Agent B] -->|lease / msg| P
-    P --> F[".pact/ (leases, read state)"]
+    P --> F[".pact/ (leases, event log)"]
     P --> G["AGENTS.md (protocol)"]
     P --> D["bd (Beads)"]
 ```
@@ -57,11 +57,13 @@ The protocol itself is short:
   file. A peer planning against the same file can renegotiate now instead of
   at the end, when both plans are sunk cost.
 - **Lease before you edit** a file another agent might touch, and
-  `pact lease renew <path>` if the task outlasts the TTL.
+  `pact lease renew <path>` if the task outlasts the TTL. Several paths in one
+  `acquire` are taken all-or-nothing.
 - **Release when done**: `pact lease release <path>`, or
   `pact lease release --all` so nothing gets half-forgotten.
 - **Announce interface changes**: `pact msg send --to <agent> "..."`, after
-  checking the recipient exists with `pact agents`.
+  checking the recipient exists with `pact agents`. Repeat `--to` to tell
+  several agents in one thread.
 - **Everything is scriptable**: every command supports `--json`.
 
 `pact init --print` writes the block to stdout instead of `AGENTS.md`, which
@@ -99,7 +101,23 @@ human (or another agent) knows better than the lease does.
 Two commands exist because a real fleet needed them: `pact lease renew <path>`
 refreshes a lease a long task would otherwise outlive, and
 `pact lease release --all` frees everything one agent holds in a single call,
-so an agent finishing up can't half-forget. `pact lease ls` leads with the
+so an agent finishing up can't half-forget (it reports only the leases it
+really held — an already-expired one is swept from disk but not claimed as a
+release). `acquire` takes several paths at once, all-or-nothing:
+
+```
+$ pact lease acquire src/parser.rs src/main.rs --note "new module + its mod line"
+took 2 lease(s) for cli-wire:
+  acquired src/parser.rs
+  acquired src/main.rs
+```
+
+If any path is held by someone else, none are taken — the ones already grabbed
+in that call are rolled back and the error names the path you have to negotiate
+over. An agent that needs a module *and* the line that registers it can claim
+both or neither, instead of sitting on half a change.
+
+`pact lease ls` leads with the
 lease's age, an `active` / `stale` / `expired` state, and the holder's
 `--note`:
 
@@ -110,7 +128,8 @@ slow.rs      agent-a   1m15s   stale (reclaimable in 15s)  long refactor
 ```
 
 See [docs/leases.md](docs/leases.md) for the full lifecycle, what `stale`
-means, the path-encoding caveat, and garbage collection.
+means, the path-encoding caveat, and which commands garbage-collect (only
+`lease ls` and `acquire`; read-only commands no longer do).
 
 ### Messaging — hand off context without a human relay
 
@@ -154,6 +173,40 @@ the envelope: from, to, subject, time, thread. `--body-file <path|->` reads
 the body from a file or stdin, so a multi-paragraph message full of quotes,
 backslashes and `->` never has to survive a shell.
 
+**One decision, one thread, however many agents.** Repeat `--to` and the
+recipients' messages are stitched into a single conversation, so a fleet-wide
+announcement is one thing to read and reply to instead of N near-duplicates:
+
+```
+$ pact msg send --to cli-wire --to human --subject probe --body-file -
+sent 2 message(s) in thread pact-wisp-8mz
+  pact-wisp-8mz → cli-wire
+  pact-wisp-8mz.1 → human
+```
+
+`pact msg read pact-wisp-8mz` then returns the whole announcement. A single
+`--to` prints the old one-line form and is otherwise unchanged.
+
+**`pact msg sent` is the outbox**, and its marker answers the sender's actual
+question — whether the *recipient* has looked, not whether you have:
+
+```
+$ pact msg sent
+ID                TO         SUBJECT                                          BODY
+pact-wisp-mbw  *  human      docs-writer done: docs match the binary          docs updated from the built binary, not the…
+pact-wisp-8mz     cli-wire   probe                                            probe body with a table…
+
+2 message(s), 1 not read yet (*) by the recipient
+```
+
+That is possible because read state moved out of a local file and into shared
+`bd` labels: an agent that reads a message labels the bead `read-by-<agent>`, so
+every reader is visible to everyone — including the sender. Previously read
+state was per-machine bookkeeping in `.pact/read.json`, which meant a sender
+could never tell whether a decision had landed, retried on a false negative, and
+delivered the same notice four times. The local file is *gone*, not
+supplemented: one source of truth, in the place the message already lives.
+
 Sending to a name nobody has ever acted under prints a warning — with a
 suggestion, if one is close — and **sends anyway**:
 
@@ -167,6 +220,34 @@ sent pact-wisp-tdv
 See [docs/messaging.md](docs/messaging.md) for how this maps onto Beads
 issues, why the warning is advisory, and why it doesn't rely on Beads' own
 `--thread` flag.
+
+### `pact log` — what has been happening in this repo
+
+`lease ls` shows the instantaneous set of claims, and a lease that was taken and
+released while you were away leaves nothing behind at all — releasing deletes the
+only record of it. `pact log` is the chronological view: lease events from
+`.pact/events.jsonl`, messages derived from `bd`, merged into one feed, oldest
+first.
+
+```
+$ pact log -n 5
+WHEN       AGENT        EVENT     TARGET                DETAIL
+5m02s ago  fixer        released  src/lease.rs          fixing confirmed findings rnc.13/21/4/22
+1m21s ago  docs-writer  acquired  README.md             pact-rnc.23 docs sync
+1m21s ago  docs-writer  acquired  docs/leases.md        pact-rnc.23 docs sync
+
+3 event(s), oldest first
+```
+
+`-n` defaults to 30. Ages, not timestamps, because the question is "is this
+happening now". The two sources are merged on parsed instants rather than string
+order, since `bd` writes `…Z` and pact writes `…+00:00` and those sort
+differently as bytes than as time. `bd` is optional, as it is for `pact agents`:
+without it you get the lease half and a warning.
+
+The history is deliberately asymmetric. Messages reach back as far as the Beads
+database, while lease events start at the first `acquire` after this shipped — an
+empty or missing feed is normal, not an error.
 
 ### `pact whoami` and `pact agents` — answer questions about pact with pact
 
@@ -231,7 +312,8 @@ cp target/release/pact /usr/local/bin/  # or anywhere on your PATH
 ```
 
 Requires `bd` (beads) on `PATH` for the `msg` subcommands; `init`, `lease`,
-and `doctor` (partially) work without it. v0.1.0 targets `bd` only; `br`
+`whoami`, and `agents`, `log` and `doctor` (partially — the lease half plus a
+warning) work without it. v0.1.0 targets `bd` only; `br`
 (beads-rust) compatibility is a deliberate later phase.
 
 ## Commands
@@ -240,14 +322,16 @@ and `doctor` (partially) work without it. v0.1.0 targets `bd` only; `br`
 pact init [--print]
 pact whoami
 pact agents
-pact lease acquire <path> [--ttl <seconds>] [--steal] [--note <text>]
+pact lease acquire <path>... [--ttl <seconds>] [--steal] [--note <text>]
 pact lease renew <path>
 pact lease release <path> [--force]
 pact lease release --all
 pact lease ls [--all]
-pact msg send --to <agent> [--thread <id>] [--subject <text>] (<body> | --body-file <path|->)
+pact msg send --to <agent> [--to <agent>...] [--thread <id>] [--subject <text>] (<body> | --body-file <path|->)
 pact msg inbox [--unread-only] [--full]
+pact msg sent
 pact msg read <id>
+pact log [-n <count>]
 pact doctor
 pact ui
 ```
@@ -256,6 +340,12 @@ Every subcommand accepts a global `--agent <name>` (or `PACT_AGENT` env var)
 and `--json` flag. `--all` on `release` is mutually exclusive with both
 `<path>` and `--force`; `--body-file` is mutually exclusive with the positional
 body. clap rejects those combinations rather than silently ignoring one.
+
+Batching doesn't change the shape a one-path script already parses: a single-path
+`lease acquire --json` still emits the lease *object* (several paths emit an
+array), and a single `--to` still prints `sent <id> to <who> (thread <id>)`.
+`lease release --json` now emits an object — `{"path": …, "displaced": …}` — so a
+scripted caller can see whose claim a `--force` destroyed.
 
 ## Exit codes
 
@@ -270,6 +360,16 @@ body. clap rejects those combinations rather than silently ignoring one.
 `pact doctor` exits 1 when a check fails. `pact whoami` is the one command
 that always exits 0: a missing identity, a missing `bd`, or an unreadable repo
 root are reported as `!` problems, not raised.
+
+**A closed pipe is not one of these codes.** `pact … | head -1` used to panic
+mid-write and exit 101, which an agent reading only the status could not tell
+from "the send failed" — so it retried, and the fleet got duplicate messages.
+pact now drops the unwritten bytes silently and keeps whatever status its actual
+work earned, normally 0. That is deliberate rather than the conventional
+SIGPIPE-emulating 141: the side effect (the bead created, the lock file written)
+has already landed by the time anything is printed, and losing the tail of a
+report whose reader walked away is cheaper than making a completed action look
+failed.
 
 ## FAQ
 
@@ -311,16 +411,20 @@ A few examples, because the shape of the evidence matters more than the list:
   complaint: they could not tell which pact binary they were running. Hence
   `pact whoami` printing the resolved path.
 
-**Four findings were deliberately deferred**, not missed:
-`pact-rnc.4` (`--to` takes one recipient, so a decision for three agents
-becomes three threads), `pact-rnc.7` (no outbox: a sender cannot confirm a
-message went out, which is why one agent delivered the same notice four times
-after retrying on a false negative), `pact-rnc.13` (no chronological activity
-feed) and `pact-rnc.17` (no way to require acknowledgement from N agents). All
-four are real and all four are multi-recipient or new-storage features — each
-needs a data-model decision this batch didn't have evidence to settle, and
-shipping a guess would have been worse than shipping nothing. They are open
-beads with their evidence attached.
+- `pact msg inbox | head -1` panicked and exited 101. The message had already
+  been sent; the agent read the status, concluded the send failed, and re-sent.
+  Hence a closed pipe that changes nothing about the exit code.
+
+**The four findings the previous batch deferred have now shipped**, each because
+a later fleet supplied the data-model evidence the first one lacked:
+`pact-rnc.4` (one send, one thread, N recipients), `pact-rnc.7`
+(`pact msg sent`), `pact-rnc.13` (`pact log`, backed by `.pact/events.jsonl`)
+and `pact-rnc.17` (read state as shared `bd` labels, so a sender can see who
+looked). Two residues are still open and honestly so: the owner of a *new* file
+still cannot `cargo build` it when the line that registers it belongs to another
+agent (`pact-rnc.21`/`pact-v66` — multi-path `acquire` helps, but the real
+problem is ownership, not claiming), and the `AGENTS.md` block `pact init`
+generates does not yet teach the commands above (`pact-sri`).
 
 The habit is the point: if you run agents against your own repo, ask each one
 what the tooling did to it, and require a quoted command as evidence. That is
@@ -333,7 +437,7 @@ where this list came from.
 - [docs/leases.md](docs/leases.md) — the full lease lifecycle: TTL, grace
   period, steal vs. expiry, path encoding.
 - [docs/messaging.md](docs/messaging.md) — how `pact msg` maps onto Beads
-  issues and tracks read state.
+  issues, multi-recipient threading, and read state as shared `bd` labels.
 - [docs/tui.md](docs/tui.md) — `pact ui`'s tabs and full keybindings
   reference.
 
@@ -353,7 +457,8 @@ mise run install # cargo install --path . --force
 Or run the underlying `cargo` commands directly if you don't use mise.
 
 State lives under `.pact/` at the repo root (found by walking up to `.git`):
-`.pact/leases/*.lock` and `.pact/read.json` (message read-state, since Beads
-has no read/unread lifecycle for message issues). `pact init` gitignores the
-whole directory with a single `.pact/` line, so anything else an agent writes
-there is covered without a new rule.
+`.pact/leases/*.lock` and `.pact/events.jsonl` (the bounded lease-event log
+behind `pact log`). Message read state is not there — it lives in `bd`, as one
+`read-by-<agent>` label per reader. `pact init` gitignores the whole directory
+with a single `.pact/` line, so anything else an agent writes there is covered
+without a new rule.

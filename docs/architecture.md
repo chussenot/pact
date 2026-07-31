@@ -14,11 +14,11 @@ flowchart TB
         B[Agent B]
     end
 
-    A -->|pact lease / msg / agents / whoami / init / doctor| P[pact CLI]
-    B -->|pact lease / msg / agents / whoami / init / doctor| P
+    A -->|pact lease / msg / log / agents / whoami / init / doctor| P[pact CLI]
+    B -->|pact lease / msg / log / agents / whoami / init / doctor| P
 
     P -->|reads/writes| L[".pact/leases/*.lock"]
-    P -->|reads/writes| R[".pact/read.json"]
+    P -->|appends/reads| R[".pact/events.jsonl"]
     P -->|writes| M["AGENTS.md
     (managed block)"]
     P -->|shells out to| BD[bd CLI]
@@ -42,19 +42,56 @@ subdirectory and it'll find the right place.
 | Path | What | Committed? |
 |------|------|------------|
 | `.pact/leases/*.lock` | one JSON file per active lease | no |
-| `.pact/read.json` | per-agent read/unread state for messages | no |
+| `.pact/events.jsonl` | append-only lease-event log behind `pact log`, bounded | no |
 | `AGENTS.md` (managed block) | the coordination protocol, for agents to read | yes |
+
+Message read state is deliberately *not* in this table: it lives in `bd`, as a
+`read-by-<agent>` label on the message bead. It used to be `.pact/read.json`, and
+that file is gone rather than kept alongside — see
+[docs/messaging.md](messaging.md).
 
 `pact init` gitignores the whole directory with a single `.pact/` line rather
 than one rule per file, so anything an agent writes under `.pact/` is already
-covered. Re-running `init` on a repo that has the older `.pact/leases/` +
-`.pact/read.json` pair recognises them and appends nothing.
+covered — including `events.jsonl`, which needed no new rule. Re-running `init`
+on a repo that has the older `.pact/leases/` + `.pact/read.json` pair recognises
+them and appends nothing.
 
-Leases and read-state are transient, per-machine, per-agent bookkeeping —
-committing them would just create merge conflicts between agents that have
-nothing to do with each other. The `AGENTS.md` block is the opposite: it's
-the one artifact meant to travel with the repo, so every agent that clones it
-learns the protocol on its own.
+Leases and the event log are transient, per-machine bookkeeping — committing
+them would just create merge conflicts between agents that have nothing to do
+with each other. The `AGENTS.md` block is the opposite: it's the one artifact
+meant to travel with the repo, so every agent that clones it learns the protocol
+on its own.
+
+### `.pact/events.jsonl`: the one thing pact stores that it can't derive
+
+pact's bias is that state it can derive, it doesn't keep (see the next two
+sections). The lease event log is the exception, and it is worth being explicit
+about why rather than quietly widening the non-goal:
+
+**Lease history cannot be derived, because releasing a lease deletes the only
+record of it.** `lease ls` shows the instantaneous set; a lease taken and dropped
+between two of your commands left nothing at all behind. `pact log` needed a
+trace, so the trace has to be written when the transition happens.
+
+What keeps it from becoming a database:
+
+- **Lease events only.** Messages are already in `bd` and are derived from there
+  for `pact log` — duplicating them here would create two sources of truth for
+  one fact, which is the thing this whole design avoids.
+- **One append-only file**, one JSON line per event, already covered by the
+  `.pact/` gitignore rule.
+- **A write failure never breaks a lease.** Appending is infallible by signature:
+  the error is swallowed. A lease `acquire` that failed because *logging* failed
+  would be a coordination bug caused by bookkeeping, which is exactly backwards.
+- **Bounded, dumbly.** Past 5000 lines the file is rewritten with the newest
+  4000. No rotation, no index, no sidecar state to keep in sync.
+- **Unparsable lines are skipped**, not fatal, the same way an unreadable lock
+  file is skipped; a missing file is an empty feed, not an error.
+
+Consequence to expect: the feed starts at the first `acquire` after it shipped,
+while `pact log`'s message half reaches back as far as the Beads database. That
+asymmetry is by design — backfilling lease history from nothing would mean
+inventing it.
 
 ## Introspection: derived, never stored
 
@@ -87,6 +124,17 @@ That derivation is also why `pact agents` distinguishes an identity that has
 — the latter is what a typo leaves behind, and the command marks it `?` rather
 than confirming it as an agent.
 
+`pact log` follows the same rule from the other direction: it *reads* the two
+places the facts already are (`.pact/events.jsonl` and `bd`) and merges them on
+parsed instants, keeping no third copy and no index.
+
+**A read-only command must not mutate.** `whoami` not creating `.pact/` is one
+case of a general rule that took a bug to learn: every command that only *shows*
+leases used to inherit the expired-lock sweep from the listing code, so `pact
+agents`, `pact doctor` and `pact ui`'s refresh timer all pruned lock files as a
+side effect, and asking twice gave two answers. Collecting is now confined to
+`lease ls` and `acquire` — see [docs/leases.md](leases.md).
+
 ## What pact deliberately doesn't do
 
 - **No daemon or background process.** Every command is a single invocation
@@ -100,6 +148,10 @@ than confirming it as an agent.
   [docs/leases.md](leases.md) for why that's a feature, not a gap.
 - **No config file, no network I/O.** Everything is either a CLI flag, an
   environment variable (`PACT_AGENT`), or a file under `.pact/`.
+- **No stored state that could be derived.** Exactly one thing is stored that
+  can't be — the lease event log, for the reason given above. Message read state
+  went the other way: it moved *out* of a local file and into the bead it
+  describes.
 
 ## Exit codes are part of the contract
 
@@ -117,6 +169,16 @@ humans, its exit codes are documented behavior, not incidental:
 An agent scripting against pact can branch on these without parsing error
 text — check the exit code, and only fall back to reading stderr for the
 human-readable reason.
+
+That table is the whole set, which is why **a closed pipe adds nothing to it**.
+`pact … | head -1` used to panic in the middle of a write and exit 101; a caller
+that only reads the status could not distinguish that from "the command failed",
+so it retried an action that had already happened. Output now drops the unwritten
+bytes silently and the process keeps whatever status its work earned. Not even the
+conventional SIGPIPE-emulating 141: by the time anything is printed, the bead has
+been created and the lock file written, so a non-zero status would report a
+completed action as failed. A write error that is *not* a broken pipe gets a
+one-line stderr warning and is likewise non-fatal.
 
 Two conventions follow from that. `pact doctor` exits 1 when a check fails, so
 it works in a CI gate. And an **advisory warning never changes the exit code**:

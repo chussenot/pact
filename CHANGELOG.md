@@ -6,9 +6,55 @@ Everything in this batch came from running a real multi-agent fleet against
 pact itself and recording what pact did to it; each item traces to an
 evidence-backed bead under the `pact-rnc` epic. See
 [README](README.md#where-these-features-came-from) for the provenance, including
-the four findings deliberately deferred (`pact-rnc.4`/`.7`/`.13`/`.17`).
+the four findings that were deferred once and have now shipped
+(`pact-rnc.4`/`.7`/`.13`/`.17`).
+
+### Fixed
+
+- **Piping any pact command into a reader that exits first no longer panics.**
+  `pact msg inbox | head -1` died with `failed printing to stdout: Broken pipe`
+  and exit 101 — *after* the message had been sent. An agent reading only the
+  exit status concluded the send had failed and re-sent it. Output now drops the
+  unwritten bytes silently and keeps whatever status the work earned (normally
+  0); a broken pipe adds no new exit code, deliberately not even 141, because the
+  side effect has already landed by the time anything is printed.
+- Read-only commands no longer garbage-collect expired lock files. `pact agents`,
+  `pact msg send`'s recipient check, `pact doctor` and `pact ui` (whose refresh
+  timer swept on every tick) all inherited the sweep from the listing code, so
+  asking the same question twice gave two different answers. Only `pact lease ls`
+  and `acquire` collect now; `doctor`'s wording changed to match, since calling
+  them garbage-collected became false.
+- `pact lease release --all` no longer reports an already-expired lease as
+  released. It was never held, so claiming it was is the same overstatement
+  `--all` existed to fix. The lock file is still removed from disk, and logged as
+  the expiry it actually was.
+- `pact msg send --body-file` strips exactly one trailing newline instead of all
+  trailing whitespace, so a body ending in a blank line or an indented code block
+  arrives as written.
 
 ### Added
+
+- `pact log [-n <count>]`: one chronological feed of lease events and messages,
+  oldest first. Lease history can't be derived — releasing a lease deletes the
+  only record of it — so lease transitions are appended to a new
+  `.pact/events.jsonl`; messages are derived from `bd` and not duplicated there.
+  The two sources are merged on parsed instants, since `bd` writes `…Z` and pact
+  writes `…+00:00`. The log file is bounded (rewritten to the newest 4000 lines
+  past 5000), covered by the existing `.pact/` gitignore rule, and a failed write
+  can never fail the lease operation that triggered it. An empty feed is normal.
+- `pact msg sent`: the outbox — what you sent, newest first, with `*` marking
+  *the recipient hasn't read it*, which is the sender's actual question. A sender
+  with no confirmation re-sends; that is where the fleet's duplicate
+  announcements came from.
+- `pact msg send --to` repeats: one send to N agents is **one thread**, with the
+  thread id printed once, so `pact msg read <root>` shows the whole announcement
+  instead of N unrelated near-duplicates. A single `--to` prints and behaves
+  exactly as before.
+- `pact lease acquire <path>...` takes several paths all-or-nothing: on the first
+  unavailable path the leases taken during that call are rolled back and the
+  error names the contended path (exit 2). Rollback never releases a lease the
+  agent already held. A single path renders and serializes unchanged, including
+  `--json` emitting the object rather than a one-element array.
 
 - `pact whoami`: the resolved identity and its source, the running pact binary,
   repo root, `.pact/`, and the `bd` it will use. Reports problems instead of
@@ -58,6 +104,26 @@ the four findings deliberately deferred (`pact-rnc.4`/`.7`/`.13`/`.17`).
 - `pact init` gitignores `.pact/` as one line instead of a rule per file, and
   recognises the older `.pact/leases/` + `.pact/read.json` pair without
   appending to it.
+- **Message read state moved from local `.pact/read.json` into shared `bd`
+  labels** (`read-by-<agent>`, one per reader). The local file was useless to
+  everyone but the reader: a sender could not tell whether anyone had read a
+  decision. The file is **removed**, not shadowed — two sources of truth for one
+  fact would be worse than none. There is no migration, so every agent's read
+  flags reset once at the changeover.
+- `pact lease release --json` emits an object (`{"path": …, "displaced": …}`)
+  instead of a bare string, so a scripted `--force` caller can see whose live
+  claim it destroyed. The human line is unchanged.
+- Every timestamp comparison parses RFC3339 first. `bd` stamps end in `Z` and
+  pact's in `+00:00`, which sort differently as bytes than as time.
+
+### Known gaps
+
+- The `AGENTS.md` block `pact init` generates does not yet teach `pact log`,
+  `pact msg sent`, multi-recipient `--to` or multi-path `acquire` (`pact-sri`).
+- Multi-path `acquire` lets an agent claim a new module and the line that
+  registers it together, but if that line is owned by another agent, the new
+  file's author still cannot build or test their own work (`pact-rnc.21`,
+  `pact-v66`).
 
 ## 0.1.0
 

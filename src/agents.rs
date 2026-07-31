@@ -52,12 +52,12 @@ impl AgentInfo {
 /// and it used to take the whole command down with it (pact-rnc.6). The lease
 /// half is on disk and readable, so it is still reported.
 ///
-/// Note: this inherits `lease::list`'s garbage collection — reading who is
-/// active also prunes expired lock files from disk, same as `pact lease list`.
+/// Reads leases with `lease::peek`, not `lease::list`: asking who is active
+/// must not change the answer (pact-rnc.19).
 pub fn list(cli: Option<&BeadsCli>, repo_root: &Path) -> Result<Vec<AgentInfo>> {
     let mut seen: BTreeMap<String, AgentInfo> = BTreeMap::new();
 
-    for entry in lease::list(repo_root, true)? {
+    for entry in lease::peek(repo_root, true)? {
         observe(&mut seen, &entry.lease.agent, &entry.lease.acquired_at).leases_held += 1;
     }
 
@@ -71,7 +71,7 @@ pub fn list(cli: Option<&BeadsCli>, repo_root: &Path) -> Result<Vec<AgentInfo>> 
             }
             // Loud but not fatal: the caller asked who is working here, and the
             // lease answer is still true.
-            Err(e) => eprintln!("warning: message history unavailable: {e:#}"),
+            Err(e) => crate::output::warn(&format!("warning: message history unavailable: {e:#}")),
         }
     }
 

@@ -2,6 +2,7 @@ mod agents;
 mod agents_md;
 mod beads;
 mod doctor;
+mod events;
 mod identity;
 mod lease;
 mod mascot;
@@ -56,6 +57,12 @@ enum Command {
         #[command(subcommand)]
         action: MsgAction,
     },
+    /// Chronological activity feed: lease events and messages, oldest first.
+    Log {
+        /// How many events to show.
+        #[arg(short = 'n', long, default_value_t = 30)]
+        limit: usize,
+    },
     /// Check that pact, AGENTS.md, and the Beads CLI are all in a healthy state.
     Doctor,
     /// Interactive terminal dashboard over leases, messages, and doctor status.
@@ -64,9 +71,12 @@ enum Command {
 
 #[derive(Subcommand)]
 enum LeaseAction {
-    /// Acquire a lease on a path.
+    /// Acquire a lease on one or more paths, all-or-nothing.
     Acquire {
-        path: String,
+        /// Paths to claim. Several are taken atomically (pact-rnc.21): if any
+        /// is held by someone else, none are taken.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<String>,
         #[arg(long, default_value_t = lease::DEFAULT_TTL_SECS)]
         ttl: u64,
         /// Force takeover of a non-expired lease.
@@ -98,10 +108,12 @@ enum LeaseAction {
 
 #[derive(Subcommand)]
 enum MsgAction {
-    /// Send a message to another agent.
+    /// Send a message to one or more agents, as one thread.
     Send {
-        #[arg(long)]
-        to: String,
+        /// Recipient; repeat for several (`--to a --to b`). One send is one
+        /// thread, however many recipients (pact-rnc.4).
+        #[arg(long, required = true)]
+        to: Vec<String>,
         /// Reply within an existing thread; omit to start a new one.
         #[arg(long)]
         thread: Option<String>,
@@ -122,6 +134,8 @@ enum MsgAction {
         #[arg(long)]
         full: bool,
     },
+    /// List messages you sent, newest first, and whether they were read.
+    Sent,
     /// Read a message (or its thread) by id.
     Read { id: String },
 }
@@ -129,7 +143,7 @@ enum MsgAction {
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
-        eprintln!("error: {e:#}");
+        output::warn(&format!("error: {e:#}"));
         std::process::exit(output::code_for(&e));
     }
 }
@@ -143,6 +157,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Agents => run_agents(&cwd, cli.json),
         Command::Lease { action } => run_lease(&cwd, cli.agent.as_deref(), cli.json, action),
         Command::Msg { action } => run_msg(&cwd, cli.agent.as_deref(), cli.json, action),
+        Command::Log { limit } => run_log(&cwd, cli.json, limit),
         Command::Doctor => run_doctor(&cwd, cli.json),
         Command::Ui => {
             let root = repo::find_repo_root(&cwd)?;
@@ -154,7 +169,10 @@ fn run(cli: Cli) -> Result<()> {
 
 fn run_init(cwd: &Path, print: bool, json: bool) -> Result<()> {
     if print {
-        print!("{}", agents_md::managed_block());
+        // Through output::line like everything else, so `init --print | head`
+        // cannot panic on a closed pipe (pact-rnc.26). trim_end because line()
+        // supplies the trailing newline the block already ends with.
+        output::line(agents_md::managed_block().trim_end());
         return Ok(());
     }
     let root = repo::find_repo_root(cwd)?;
@@ -293,8 +311,9 @@ fn run_whoami(cwd: &Path, agent_flag: Option<&str>, json: bool) -> Result<()> {
 /// database `bd --version` is perfectly happy while every bd-backed pact command
 /// exits 1. So probe with the query those commands actually run, and report the
 /// failure as a problem rather than an exit code (pact-rnc.12). Deliberately
-/// `cli.run` and not `msg::all_messages`: the latter reads `.pact/read.json` and
-/// would create `.pact/`, and whoami is a read-only question.
+/// `cli.run` and not `msg::all_messages`: parsing every message in the repo to
+/// answer "can bd read this database" is far more work than the question needs,
+/// and whoami must stay a cheap read-only probe.
 fn bd_health(bd: &beads::BeadsCli, root: &Path) -> (Option<String>, Vec<String>) {
     let mut problems = Vec::new();
     let version = match bd.version(root) {
@@ -366,20 +385,38 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
     let root = repo::find_repo_root(cwd)?;
     match action {
         LeaseAction::Acquire {
-            path,
+            paths,
             ttl,
             steal,
             note,
         } => {
             let agent = identity::resolve_agent(agent_flag)?;
-            let outcome = lease::acquire(&root, &agent, &path, ttl, steal, note)?;
-            output::emit(json, &outcome, |o| {
-                if o.stolen {
-                    format!("stolen lease on {} for {}", o.lease.path, o.lease.agent)
-                } else {
-                    format!("acquired lease on {} for {}", o.lease.path, o.lease.agent)
-                }
-            });
+            let mut outcomes = lease::acquire_many(&root, &agent, &paths, ttl, steal, note)?;
+            // One path renders and serializes exactly as it always did — a
+            // script doing `lease acquire f --json | jq .lease.path` must not
+            // start getting an array back because the command learned to batch.
+            if outcomes.len() == 1 {
+                let outcome = outcomes.pop().expect("len == 1");
+                output::emit(json, &outcome, |o: &lease::AcquireOutcome| {
+                    format!(
+                        "{} lease on {} for {}",
+                        acquire_verb(o),
+                        o.lease.path,
+                        o.lease.agent
+                    )
+                });
+            } else {
+                output::emit(json, &outcomes, |os: &Vec<lease::AcquireOutcome>| {
+                    format!(
+                        "took {} lease(s) for {agent}:\n{}",
+                        os.len(),
+                        os.iter()
+                            .map(|o| format!("  {} {}", acquire_verb(o), o.lease.path))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                });
+            }
             Ok(())
         }
         LeaseAction::Renew { path } => {
@@ -418,15 +455,24 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
             }
             // clap enforces `path` unless `--all`, which returned above.
             let path = path.expect("clap requires <path> unless --all");
-            if let Some(displaced) = lease::release(&root, &agent, &path, force)? {
+            let displaced = lease::release(&root, &agent, &path, force)?;
+            if let Some(who) = &displaced {
                 // pact-rnc.11: overriding someone else's claim is loud in the
                 // `acquire --steal` direction; make it loud here too.
-                eprintln!(
-                    "warning: force-released {path} — destroyed {displaced}'s live claim; \
-                     they were not notified (`pact msg send --to {displaced}`)"
-                );
+                output::warn(&format!(
+                    "warning: force-released {path} — destroyed {who}'s live claim; \
+                     they were not notified (`pact msg send --to {who}`)"
+                ));
             }
-            output::emit(json, &path, |p: &String| format!("released lease on {p}"));
+            // pact-rnc.25: the displaced holder used to exist only in that
+            // stderr prose, so `--json` callers — the scripted ones, the ones
+            // that most need to go apologise — could not see whose claim they
+            // destroyed. This changes `release --json` from a bare string to
+            // an object; the human line is unchanged.
+            let released = Released { path, displaced };
+            output::emit(json, &released, |r: &Released| {
+                format!("released lease on {}", r.path)
+            });
             Ok(())
         }
         LeaseAction::Ls { all } => {
@@ -458,9 +504,12 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
             if body.trim().is_empty() {
                 anyhow::bail!("empty message body — nothing to send");
             }
-            check_recipient(&to)?;
+            for recipient in &to {
+                check_recipient(recipient)?;
+            }
+            // One registry lookup for all recipients, not one per --to.
             warn_if_unknown(&cli, &root, &to);
-            let m = msg::send(
+            let sent = msg::send(
                 &cli,
                 &root,
                 &agent,
@@ -469,7 +518,38 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
                 subject.as_deref(),
                 &body,
             )?;
-            output::emit(json, &m, |m| format!("sent {} (thread {})", m.id, m.thread));
+            output::emit(json, &sent, |sent: &Vec<msg::Message>| {
+                let root_msg = &sent[0]; // send() errors on an empty recipient list
+                if sent.len() == 1 {
+                    return format!(
+                        "sent {} to {} (thread {})",
+                        root_msg.id, root_msg.to, root_msg.thread
+                    );
+                }
+                // The thread id ONCE, not once per recipient: the whole point
+                // of pact-rnc.4 is that this is one conversation, so `msg read
+                // <thread>` shows the announcement instead of N near-duplicates.
+                format!(
+                    "sent {} message(s) in thread {}\n{}",
+                    sent.len(),
+                    root_msg.thread,
+                    sent.iter()
+                        .map(|m| format!("  {} → {}", m.id, m.to))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            });
+            Ok(())
+        }
+        MsgAction::Sent => {
+            let messages = msg::sent(&cli, &root, &agent)?;
+            output::emit(json, &messages, |messages: &Vec<msg::Message>| {
+                if messages.is_empty() {
+                    format!("{agent} has sent nothing yet")
+                } else {
+                    render_sent(messages)
+                }
+            });
             Ok(())
         }
         MsgAction::Inbox { unread_only, full } => {
@@ -493,6 +573,66 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
             Ok(())
         }
     }
+}
+
+/// One row of the activity feed. Deliberately one flat shape for both sources,
+/// because the question `pact log` answers — "is the fleet alive and what is it
+/// doing" — does not care which storage a fact came from.
+#[derive(serde::Serialize)]
+struct LogEvent {
+    at: String,
+    agent: String,
+    kind: String,
+    /// The leased path, or the recipient of a message.
+    target: Option<String>,
+    detail: Option<String>,
+}
+
+/// pact-rnc.13: lease events and messages in ONE chronological stream, so
+/// nobody has to `ls .pact/leases/` and `bd list --json | jq` to find out what
+/// happened — the anti-pattern docs/architecture.md warns against.
+///
+/// The two halves have different histories and that is fine, not an error:
+/// messages are derived from bd, so they go back as far as the repo does, while
+/// `.pact/events.jsonl` only starts when a lease was first taken after this
+/// feature shipped. An existing repo therefore shows message history with no
+/// lease history until the next acquire; an empty (or missing) feed is normal.
+/// bd is optional the same way it is for `pact agents`: without it you still
+/// get the lease half, with a warning.
+fn run_log(cwd: &Path, json: bool, limit: usize) -> Result<()> {
+    let root = repo::find_repo_root(cwd)?;
+
+    let mut feed: Vec<LogEvent> = events::recent(&root, limit)?
+        .into_iter()
+        .map(|e| LogEvent {
+            at: e.at,
+            agent: e.agent,
+            kind: e.kind,
+            target: e.path,
+            detail: e.detail,
+        })
+        .collect();
+
+    match beads::BeadsCli::locate().and_then(|cli| msg::all_messages(&cli, &root)) {
+        Ok(messages) => feed.extend(messages.into_iter().map(|m| LogEvent {
+            at: m.created_at,
+            agent: m.from,
+            kind: "message".to_string(),
+            target: Some(m.to),
+            detail: Some(m.subject.unwrap_or(m.body)),
+        })),
+        Err(e) => output::warn(&format!("warning: message history unavailable: {e:#}")),
+    }
+
+    // Parsed instants, not string order: bd stamps end in `Z` and pact's in
+    // `+00:00`, which sort differently as bytes than as time (pact-rnc.20).
+    feed.sort_by_key(|e| instant(&e.at));
+    if feed.len() > limit {
+        feed.drain(..feed.len() - limit);
+    }
+
+    output::emit(json, &feed, |feed: &Vec<LogEvent>| render_log(feed));
+    Ok(())
 }
 
 fn run_doctor(cwd: &Path, json: bool) -> Result<()> {
@@ -536,8 +676,12 @@ fn read_body(path: &str) -> Result<String> {
         std::fs::read_to_string(path)
             .with_context(|| format!("reading message body from {path}"))?
     };
-    // A file ends in a newline; that is punctuation, not content.
-    Ok(raw.trim_end().to_string())
+    // A file ends in a newline; that is punctuation, not content. Exactly one,
+    // though: `trim_end()` ate trailing blank lines out of a deliberately
+    // formatted body — an ASCII table, an indented code block — and --body-file
+    // exists to promise byte fidelity (pact-rnc.25). An all-whitespace body is
+    // still refused, by the caller's `body.trim().is_empty()` check.
+    Ok(raw.strip_suffix('\n').unwrap_or(&raw).to_string())
 }
 
 /// A recipient that violates pact's own identity grammar is not merely unseen,
@@ -556,10 +700,12 @@ fn check_recipient(to: &str) -> Result<()> {
 /// fleet legitimately messages agents that have not acted yet, so this must
 /// never become a wall — and a lookup that only feeds a warning must never
 /// break a send, hence the swallowed error.
-fn warn_if_unknown(cli: &beads::BeadsCli, root: &Path, to: &str) {
+fn warn_if_unknown(cli: &beads::BeadsCli, root: &Path, to: &[String]) {
     let known = agents::list(Some(cli), root).unwrap_or_default();
-    if let Some(warning) = unknown_recipient_warning(&known, to) {
-        eprintln!("{warning}");
+    for recipient in to {
+        if let Some(warning) = unknown_recipient_warning(&known, recipient) {
+            output::warn(&warning);
+        }
     }
 }
 
@@ -610,6 +756,95 @@ fn render_leases(entries: &[lease::LeaseEntry]) -> String {
         ]
     }));
     table(&rows)
+}
+
+/// Whether a lease was taken from a live holder or simply claimed. The single
+/// path wording is unchanged from before batching, so scripts and eyes that
+/// grew up on "acquired lease on X for Y" still read it.
+fn acquire_verb(o: &lease::AcquireOutcome) -> &'static str {
+    if o.stolen {
+        "stolen"
+    } else {
+        "acquired"
+    }
+}
+
+/// `lease release --json`: the path, plus whoever's live claim `--force`
+/// destroyed (pact-rnc.25).
+#[derive(serde::Serialize)]
+struct Released {
+    path: String,
+    displaced: Option<String>,
+}
+
+/// Sortable instant. Unparsable stamps sort oldest, so a corrupt line ends up
+/// out of the way instead of pretending to be the latest news.
+fn instant(rfc3339: &str) -> (i64, u32) {
+    match chrono::DateTime::parse_from_rfc3339(rfc3339) {
+        Ok(t) => (t.timestamp(), t.timestamp_subsec_nanos()),
+        Err(_) => (i64::MIN, 0),
+    }
+}
+
+/// The feed, oldest last — a log reads top-to-bottom, newest at the bottom
+/// where a terminal leaves the cursor. Ages rather than timestamps, because the
+/// question is "is this happening now" (same reasoning as `pact agents`).
+fn render_log(feed: &[LogEvent]) -> String {
+    if feed.is_empty() {
+        return "no activity recorded yet".to_string();
+    }
+    let mut rows = vec![vec![
+        "WHEN".to_string(),
+        "AGENT".to_string(),
+        "EVENT".to_string(),
+        "TARGET".to_string(),
+        "DETAIL".to_string(),
+    ]];
+    rows.extend(feed.iter().map(|e| {
+        vec![
+            since(&e.at),
+            e.agent.clone(),
+            e.kind.clone(),
+            e.target.clone().unwrap_or_default(),
+            one_line(e.detail.as_deref().unwrap_or(""), 50),
+        ]
+    }));
+    format!("{}\n\n{} event(s), oldest first", table(&rows), feed.len())
+}
+
+/// pact-rnc.7: the outbox. Same shape as the inbox with TO instead of FROM, and
+/// the marker means something different and more useful: whether the *recipient*
+/// has read it (pact-rnc.17's shared read state). An agent that cannot confirm a
+/// send re-sends it — that is where the fleet's duplicate messages came from.
+fn render_sent(messages: &[msg::Message]) -> String {
+    let mut rows = vec![vec![
+        "ID".to_string(),
+        String::new(), // unread marker; a header would be wider than the column
+        "TO".to_string(),
+        "SUBJECT".to_string(),
+        "BODY".to_string(),
+    ]];
+    rows.extend(messages.iter().map(|m| {
+        vec![
+            m.id.clone(),
+            if read_by_recipient(m) { " " } else { "*" }.to_string(),
+            m.to.clone(),
+            one_line(m.subject.as_deref().unwrap_or(""), 50),
+            one_line(&m.body, 60),
+        ]
+    }));
+    let unread = messages.iter().filter(|m| !read_by_recipient(m)).count();
+    format!(
+        "{}\n\n{} message(s), {unread} not read yet (*) by the recipient",
+        table(&rows),
+        messages.len(),
+    )
+}
+
+/// `Message.read` is read-by-*me*, which is always true for something I sent.
+/// The sender's question is whether the person they told has looked.
+fn read_by_recipient(m: &msg::Message) -> bool {
+    m.read_by.contains(&m.to)
 }
 
 /// pact-rnc.1 + pact-rnc.2: one line per message with the sender and an unread
@@ -756,6 +991,11 @@ mod tests {
             body: body.to_string(),
             created_at: "2026-07-31T09:00:00Z".to_string(),
             read,
+            read_by: if read {
+                vec!["cli-wire".to_string()]
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -886,6 +1126,108 @@ mod tests {
         );
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("beads database"), "{problems:?}");
+    }
+
+    /// pact-rnc.25: --body-file promises byte fidelity, so trailing blank lines
+    /// inside a deliberately formatted body are content. Exactly one newline
+    /// comes off — the one a file or heredoc ends with.
+    #[test]
+    fn body_file_strips_one_trailing_newline_not_all_whitespace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("body.md");
+        let table = "| a | b |\n|---|---|\n| 1 | 2 |\n\n\n";
+        std::fs::write(&path, table).unwrap();
+
+        let got = read_body(path.to_str().unwrap()).unwrap();
+        assert_eq!(got, "| a | b |\n|---|---|\n| 1 | 2 |\n\n");
+        // Trailing spaces are content too (indented code blocks).
+        std::fs::write(&path, "x\n    \n").unwrap();
+        assert_eq!(read_body(path.to_str().unwrap()).unwrap(), "x\n    ");
+        // A body with no trailing newline at all is left alone.
+        std::fs::write(&path, "no newline").unwrap();
+        assert_eq!(read_body(path.to_str().unwrap()).unwrap(), "no newline");
+        // And an all-whitespace body still has nothing in it to send: the
+        // send path rejects on `body.trim().is_empty()`, which this satisfies.
+        std::fs::write(&path, "\n\n  \n").unwrap();
+        assert!(read_body(path.to_str().unwrap()).unwrap().trim().is_empty());
+    }
+
+    fn log_event(at: &str, agent: &str, kind: &str, target: &str) -> LogEvent {
+        LogEvent {
+            at: at.to_string(),
+            agent: agent.to_string(),
+            kind: kind.to_string(),
+            target: Some(target.to_string()),
+            detail: Some("wiring the CLI".to_string()),
+        }
+    }
+
+    /// pact-rnc.13 + pact-rnc.20: the feed merges two sources that stamp time
+    /// differently — bd writes `Z`, pact writes `+00:00` — and a byte compare
+    /// interleaves them wrongly. `+02:00` is the trap: its digits are the
+    /// largest while its instant is the earliest.
+    #[test]
+    fn log_merges_both_sources_in_real_time_order() {
+        let mut feed = vec![
+            log_event("2026-07-31T09:00:05Z", "msg-fix", "message", "cli-wire"),
+            // 08:59:00Z — the earliest instant, but the largest byte string.
+            log_event("2026-07-31T10:59:00+02:00", "lease-fix", "acquired", "l.rs"),
+            log_event("2026-07-31T09:00:00+00:00", "cli-wire", "acquired", "m.rs"),
+        ];
+        feed.sort_by_key(|e| instant(&e.at));
+        let order: Vec<&str> = feed.iter().map(|e| e.agent.as_str()).collect();
+        assert_eq!(order, vec!["lease-fix", "cli-wire", "msg-fix"]);
+        let mut by_bytes = feed.iter().map(|e| e.at.clone()).collect::<Vec<_>>();
+        by_bytes.sort();
+        assert_ne!(
+            by_bytes.first().map(String::as_str),
+            Some(feed[0].at.as_str()),
+            "a string sort really does produce a different order here"
+        );
+        assert!(
+            instant("not a timestamp") < instant("2026-07-31T09:00:00Z"),
+            "garbage sorts out of the way, not to the top of the news"
+        );
+
+        let out = render_log(&feed);
+        let rows: Vec<&str> = out.lines().take(4).collect();
+        assert!(
+            rows[1].contains("lease-fix") && rows[1].contains("acquired"),
+            "{out}"
+        );
+        assert!(
+            rows[3].contains("message") && rows[3].contains("cli-wire"),
+            "{out}"
+        );
+        assert!(out.contains("3 event(s)"), "{out}");
+        // An existing repo has message history and an empty lease feed; that
+        // is normal, not an error.
+        assert_eq!(render_log(&[]), "no activity recorded yet");
+    }
+
+    /// pact-rnc.7 + pact-rnc.17: the outbox exists so a sender can stop
+    /// guessing. `read` is read-by-me and always true for my own sends, so the
+    /// marker has to come from the recipient's own read-by label.
+    #[test]
+    fn sent_shows_the_recipient_and_whether_they_read_it() {
+        let mut read_by_them = message("pact-wisp-aaa", "cli-wire", "the body", true);
+        read_by_them.to = "lease-fix".to_string();
+        read_by_them.read_by = vec!["lease-fix".to_string()];
+        let mut unread_by_them = message("pact-wisp-bbb", "cli-wire", "the body", true);
+        unread_by_them.to = "msg-fix".to_string();
+        unread_by_them.read_by = vec!["cli-wire".to_string()];
+
+        let out = render_sent(&[read_by_them, unread_by_them]);
+        let rows: Vec<&str> = out.lines().take(3).collect();
+        assert!(
+            rows[1].contains("lease-fix") && !rows[1].contains('*'),
+            "{out}"
+        );
+        assert!(
+            rows[2].contains("msg-fix") && rows[2].contains('*'),
+            "{out}"
+        );
+        assert!(out.contains("1 not read yet"), "{out}");
     }
 
     #[test]
