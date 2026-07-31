@@ -70,13 +70,17 @@ pub fn checks(root: &Path) -> DoctorReport {
         },
     });
 
-    match lease::list(root, true) {
+    // peek, not list: a diagnostic that mutates is not a diagnostic — running
+    // doctor twice used to give two different stale counts because the first run
+    // unlinked the locks it was reporting (pact-rnc.19). `pact lease ls` still
+    // collects them.
+    match lease::peek(root, true) {
         Ok(entries) => {
             let stale = entries.iter().filter(|e| e.expired).count();
             checks.push(DoctorCheck {
                 name: "stale leases",
                 ok: true,
-                detail: format!("{stale} stale (garbage-collected)"),
+                detail: format!("{stale} stale (`pact lease ls` collects them)"),
             });
         }
         Err(e) => checks.push(DoctorCheck {

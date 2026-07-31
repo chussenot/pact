@@ -53,6 +53,11 @@ bd create --type=message --title=<subject> --description=<body> \
 | body | `--description` |
 | thread | the root message's own issue id |
 | reply | a child issue, linked via `--parent <thread-id>` |
+| read state | a `read-by-<agent>` label on the message bead, one per reader |
+
+Every `bd create` pact runs passes `--no-inherit-labels`. Without it a child
+inherits its parent's labels, so a reply to a message you had already read would
+be born carrying your own `read-by-` label and arrive pre-read.
 
 ### The `from` field
 
@@ -102,24 +107,62 @@ assigned to you (`bd list --assignee=<agent> --include-infra --json`,
 `--include-infra` because message issues are otherwise hidden from `bd list`
 by default) and filters to `issue_type == "message"` on pact's side.
 
-## Read state
+## One send is one thread, however many recipients
 
-Beads has no read/unread lifecycle for message issues, so pact tracks it
-itself in `.pact/read.json`, keyed by agent:
-
-```json
-{
-  "agent-b": ["msg-123", "msg-123.1"]
-}
+```
+pact msg send --to cli-wire --to tui-dev --to human --subject "…" --body-file -
 ```
 
-`pact msg read <id>` marks every message it displays (the root plus its
-replies) as read for the *current* agent — so `agent-b` reading a thread
-doesn't affect what `agent-a` sees as unread. `pact msg inbox --unread-only`
-filters against this same file.
+`--to` repeats. All the recipients' messages are stitched into a single
+conversation — the first recipient's bead is the thread root, and every other
+recipient's is created with `--parent=<thread root>` — so `pact msg read <root>`
+returns the whole announcement:
 
-Like leases, `.pact/read.json` is local, gitignored runtime state — it's
-bookkeeping for you, not something to commit or sync between machines.
+```
+$ pact msg send --to cli-wire --to human --subject probe --body-file -
+sent 2 message(s) in thread pact-wisp-8mz
+  pact-wisp-8mz → cli-wire
+  pact-wisp-8mz.1 → human
+```
+
+The thread id is printed **once**, because that is the point: one decision to
+read, one place to reply. `--to` used to take a single name, so telling three
+agents about one interface change meant three unrelated threads, none of which
+contained the others' replies. Recipients 2..N are parented on the thread root
+rather than on the first recipient's message, because `read_thread` walks *direct*
+children only — grandchildren would be invisible in the thread the reader opens,
+which is the exact failure this fixes.
+
+An empty recipient list is an error before `bd` is ever run. If a send fails part
+way through, the error names who already received it, so nobody re-sends blind.
+
+A single `--to` behaves and prints exactly as before:
+`sent <id> to <who> (thread <id>)`.
+
+## Read state: shared labels, not a local file
+
+An agent that reads a message adds a `read-by-<agent>` label to the bead. That's
+the whole mechanism. `Message.read_by` lists every reader; `read` — the `*` in
+your inbox — is just "does `read_by` contain the agent asking".
+
+It used to live in `.pact/read.json`, a local file keyed by agent. That worked for
+the reader and was useless for everyone else: **a sender could not tell whether
+anyone had read a decision.** An agent with no confirmation re-sends, and that is
+where the fleet's duplicate announcements came from — one notice delivered four
+times after a false negative. Read state is a fact about a message, so it now
+lives with the message, where every agent can see it.
+
+Note what this *removed*: `.pact/read.json` is gone, not shadowed. Keeping both
+would have meant two sources of truth for one fact. A leftover `read.json` from an
+older pact is inert, and the single `.pact/` gitignore line covers it either way.
+There is no migration, so the changeover resets every agent's read flags once —
+an inbox full of things you already handled is expected exactly once.
+
+`pact msg read <id>` marks every message it displays (the root plus its replies)
+as read for the *current* agent; `agent-b` reading a thread doesn't affect what
+`agent-a` sees. `pact msg inbox --unread-only` filters on the same labels. A
+failed label write degrades to a warning rather than losing the thread body you
+asked for.
 
 ## Reading your mail: one line each, full text on demand
 
@@ -157,8 +200,26 @@ author bd never recorded shows `from: ?`.
 
 `pact msg inbox --full` prints every message through that same renderer — one
 full-text format, not two — for when you genuinely do want the whole inbox.
-`--json` is unchanged and complete: all eight fields, including `from` and
-`read`.
+`--json` is complete: all nine fields, including `from`, `read` (by the agent
+asking) and `read_by` (everyone who has read it).
+
+## Reading back what you sent: `pact msg sent`
+
+```
+$ pact msg sent
+ID                TO         SUBJECT                                          BODY
+pact-wisp-mbw  *  human      docs-writer done: docs match the binary          docs updated from the built binary, not the…
+pact-wisp-8mz     cli-wire   probe                                            probe body with a table…
+
+2 message(s), 1 not read yet (*) by the recipient
+```
+
+Same shape as the inbox, with `TO` instead of `FROM`, newest first. The marker
+means something different and more useful here: `*` is *the recipient hasn't
+looked*, not "I haven't". `Message.read` is read-by-me, which is trivially true
+for something I sent; the sender's actual question is whether the peer they told
+has seen it. Answering it requires the shared read state above — with a local
+`read.json` there was nothing to show.
 
 ## Bodies that don't survive a shell: `--body-file`
 
@@ -173,8 +234,9 @@ positional argument, that either gets mangled or gets abandoned — agents
 reported simply dropping content rather than hand-escaping it. `--body-file`
 takes it from a file or, with `-`, from stdin.
 
-The trailing newline a file ends with is stripped (that's punctuation, not
-content). An all-whitespace body is refused: silently sending an empty message
+Exactly one trailing newline is stripped — the one a text file ends with, which
+is punctuation rather than content. Not all trailing whitespace: a body ending in
+a blank line, or in an indented code block, arrives as written. An all-whitespace body is refused: silently sending an empty message
 is the same silent failure this whole area is about. `--body-file` and the
 positional body are mutually exclusive; clap rejects the combination.
 
@@ -226,16 +288,15 @@ nobody could read it: invalid agent name "Bad Name!": must match [a-z0-9][a-z0-9
 ## Command reference
 
 ```
-pact msg send --to <agent> [--thread <id>] [--subject <text>] (<body> | --body-file <path|->)
+pact msg send --to <agent> [--to <agent>...] [--thread <id>] [--subject <text>] (<body> | --body-file <path|->)
 pact msg inbox [--unread-only] [--full]
+pact msg sent
 pact msg read <id>
 ```
 
-All three require `bd` on `PATH` (exit code 3 if it isn't) and a resolved
+All four require `bd` on `PATH` (exit code 3 if it isn't) and a resolved
 agent identity — `--agent <name>` or `PACT_AGENT` (see the
 [README](../README.md) for identity resolution rules).
 
-There is currently no way to read back what you *sent* — only what was sent to
-you. That gap is a known, open finding (`pact-rnc.7`); it is why a sender who
-sees an ambiguous failure has to choose between a duplicate and a dropped
-message.
+Messages also show up in `pact log`, merged with lease events into one
+chronological feed.

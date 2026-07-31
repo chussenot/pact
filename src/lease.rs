@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::events;
 use crate::output::exit_with;
 use crate::repo::pact_dir;
 
@@ -163,6 +164,26 @@ fn read_lease(lock_path: &Path) -> Result<LeaseInfo> {
         .with_context(|| format!("parsing lease at {}", lock_path.display()))
 }
 
+/// Record a lease transition in the activity log (pact-rnc.13). Releasing a
+/// lease deletes the only record that it ever existed, so lease history cannot
+/// be reconstructed after the fact — it has to be written as it happens.
+///
+/// Infallible on purpose: `events::append` swallows its own I/O errors, and
+/// this returns `()`, so no lease operation can ever fail *because* logging
+/// failed. A missing line in the feed is cheaper than a refused claim.
+fn log_event(repo_root: &Path, agent: &str, kind: &str, path: &str, detail: Option<String>) {
+    events::append(
+        repo_root,
+        &events::Event {
+            at: Utc::now().to_rfc3339(),
+            agent: agent.to_string(),
+            kind: kind.to_string(),
+            path: Some(path.to_string()),
+            detail,
+        },
+    );
+}
+
 pub fn acquire(
     repo_root: &Path,
     agent: &str,
@@ -191,6 +212,13 @@ pub fn acquire(
             let json = serde_json::to_string_pretty(&new_lease)?;
             f.write_all(json.as_bytes())
                 .with_context(|| format!("writing {}", lock_path.display()))?;
+            log_event(
+                repo_root,
+                agent,
+                "acquired",
+                &relative,
+                new_lease.note.clone(),
+            );
             Ok(AcquireOutcome {
                 lease: new_lease,
                 stolen: false,
@@ -201,6 +229,36 @@ pub fn acquire(
 
             if is_expired(&existing, now) {
                 write_lease_atomic(&lock_path, &new_lease)?;
+                // The previous claim ended here, and this is the only moment
+                // anyone notices (pact-rnc.13). Without this row the feed's last
+                // word on `existing.agent` is still "acquired", i.e. it reports a
+                // dead agent as the current holder. It also tells a consumer
+                // grouping by `kind` which "stolen" rows are routine reclaims: a
+                // reclaim is always preceded by an "expired" row for the same
+                // path, a `--steal` override never is.
+                log_event(
+                    repo_root,
+                    &existing.agent,
+                    "expired",
+                    &relative,
+                    Some(format!(
+                        "lease lapsed (ttl {}s), taken over by {agent}",
+                        existing.ttl_secs
+                    )),
+                );
+                // Reported as `stolen` by AcquireOutcome, so logged as "stolen"
+                // too — but the detail says *why*, because taking over a dead
+                // claim is not the same act as overriding a live one.
+                log_event(
+                    repo_root,
+                    agent,
+                    "stolen",
+                    &relative,
+                    Some(format!(
+                        "took over expired lease of {} (ttl {}s)",
+                        existing.agent, existing.ttl_secs
+                    )),
+                );
                 Ok(AcquireOutcome {
                     lease: new_lease,
                     stolen: true,
@@ -208,16 +266,33 @@ pub fn acquire(
             } else if existing.agent == agent {
                 // Re-entrant refresh: same holder, just bump acquired_at.
                 write_lease_atomic(&lock_path, &new_lease)?;
+                log_event(
+                    repo_root,
+                    agent,
+                    "renewed",
+                    &relative,
+                    new_lease.note.clone(),
+                );
                 Ok(AcquireOutcome {
                     lease: new_lease,
                     stolen: false,
                 })
             } else if steal {
-                eprintln!(
+                crate::output::warn(&format!(
                     "warning: stealing non-expired lease on {relative} held by {} (advisory override via --steal)",
                     existing.agent
-                );
+                ));
                 write_lease_atomic(&lock_path, &new_lease)?;
+                log_event(
+                    repo_root,
+                    agent,
+                    "stolen",
+                    &relative,
+                    Some(format!(
+                        "displaced live holder {} via --steal",
+                        existing.agent
+                    )),
+                );
                 Ok(AcquireOutcome {
                     lease: new_lease,
                     stolen: true,
@@ -235,6 +310,79 @@ pub fn acquire(
         }
         Err(e) => Err(e).with_context(|| format!("creating lock file {}", lock_path.display())),
     }
+}
+
+/// `agent`'s own live lease on `relative`, if it has one — the whole lease, not
+/// just "yes": an [`acquire_many`] rollback has to put back exactly what it
+/// found, TTL and note included, not merely leave *a* lease behind.
+fn held_by_self(repo_root: &Path, agent: &str, relative: &str) -> Option<LeaseInfo> {
+    let lock_path = lock_file_path(repo_root, relative).ok()?;
+    let existing = read_lease(&lock_path).ok()?;
+    (existing.agent == agent && !is_expired(&existing, Utc::now())).then_some(existing)
+}
+
+/// Acquire several paths atomically: either the agent ends up holding all of
+/// them, or it holds exactly what it held before the call (pact-rnc.21).
+///
+/// Why all-or-nothing: an agent that owns a new module also needs the one line
+/// in `main.rs` that declares it. Claiming them one at a time and failing
+/// halfway leaves it holding claims it must remember to unwind — the kind of
+/// bookkeeping that gets forgotten and shows up later as a stale lock nobody
+/// owns. On failure this returns the *first* unavailable path's error, so the
+/// message the agent sees names the path it actually has to negotiate over.
+///
+/// Rollback releases what this call took and *restores* what it merely
+/// refreshed. A path the agent already held survives the rollback with the lease
+/// it walked in with: `acquire` on a pre-held path is a re-entrant refresh, so it
+/// has already overwritten that lease's `acquired_at`, TTL and note by the time
+/// a later path in the batch turns out to be unavailable. Leaving the refresh in
+/// place is how a call that reports "nothing was taken" silently downgraded a
+/// live 900s claim with a note to a 30s claim without one, after which peers saw
+/// it as reclaimable and stole a file the agent was still editing (pact-rnc.21).
+pub fn acquire_many(
+    repo_root: &Path,
+    agent: &str,
+    paths: &[String],
+    ttl_secs: u64,
+    steal: bool,
+    note: Option<String>,
+) -> Result<Vec<AcquireOutcome>> {
+    let mut outcomes: Vec<AcquireOutcome> = Vec::new();
+    let mut newly_taken: Vec<String> = Vec::new();
+    let mut refreshed: Vec<LeaseInfo> = Vec::new();
+
+    for path in paths {
+        let relative = normalize_path(repo_root, path);
+        let pre_held = held_by_self(repo_root, agent, &relative);
+        match acquire(repo_root, agent, path, ttl_secs, steal, note.clone()) {
+            Ok(outcome) => {
+                match pre_held {
+                    Some(before) => refreshed.push(before),
+                    None => newly_taken.push(outcome.lease.path.clone()),
+                }
+                outcomes.push(outcome);
+            }
+            Err(e) => {
+                // Best-effort unwind: a rollback failure must not mask the
+                // conflict that caused it, which is what the caller has to act
+                // on. Any lock we cannot remove expires on its own TTL.
+                for taken in &newly_taken {
+                    let _ = release(repo_root, agent, taken, false);
+                }
+                // Put the pre-held leases back byte for byte. The "renewed"
+                // event the refresh already logged stays in the feed — an
+                // overstatement worth less than the code to retract it.
+                for before in &refreshed {
+                    if let Ok(lock_path) = lock_file_path(repo_root, &before.path) {
+                        let _ = write_lease_atomic(&lock_path, before);
+                    }
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(outcomes)
 }
 
 /// Release a lease. Returns `Some(displaced_agent)` when `force` destroyed a
@@ -266,26 +414,96 @@ pub fn release(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result
     };
 
     match std::fs::remove_file(&lock_path) {
-        Ok(()) => Ok(displaced),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(displaced),
-        Err(e) => Err(e).with_context(|| format!("removing {}", lock_path.display())),
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("removing {}", lock_path.display())),
+    }
+
+    match &displaced {
+        Some(holder) => log_event(
+            repo_root,
+            agent,
+            "force-released",
+            &relative,
+            Some(format!("destroyed live claim of {holder}")),
+        ),
+        None => log_event(repo_root, agent, "released", &relative, existing.note),
+    }
+    Ok(displaced)
+}
+
+/// Unlink an expired lock file and record the lapse as an `"expired"` event
+/// (pact-rnc.13).
+///
+/// The event is the point, not the unlink. A lease that ends by expiry used to
+/// leave the feed's last word on its holder as `"acquired"`, so the one moment
+/// `pact log` is most needed — an agent died holding a file, its TTL lapsed,
+/// someone ran `lease ls` and collected the lock — was the moment it lied,
+/// naming a dead agent as the current holder of a file whose lock is already
+/// gone. A permanently false trace is worse than the missing trace the bead was
+/// filed for.
+///
+/// `agent` is the holder whose lease lapsed, never whoever happened to run the
+/// command that collected it. Logged only by the process that actually won the
+/// unlink, so two concurrent `lease ls` runs cannot report one lapse twice.
+fn collect_expired(repo_root: &Path, lock_path: &Path, lease: &LeaseInfo) {
+    if std::fs::remove_file(lock_path).is_ok() {
+        log_event(
+            repo_root,
+            &lease.agent,
+            "expired",
+            &lease.path,
+            Some(format!(
+                "lease lapsed (ttl {}s), lock collected",
+                lease.ttl_secs
+            )),
+        );
     }
 }
 
 /// Release every lease held by `agent`, so "release everything I hold" is one
 /// call that cannot be half-forgotten (pact-rnc.8). Returns the released paths,
 /// sorted; holding nothing is success with an empty Vec.
+///
+/// Only leases that were genuinely held are reported (pact-rnc.24). An expired
+/// lease was already nobody's, so calling its removal a "release" overstates
+/// what happened — the same dishonesty as pact-rnc.8, where agents announced
+/// releases that never occurred. The agent's own expired lock files are still
+/// deleted from disk (leaving them behind would leak a lock nobody owns); they
+/// are just not claimed as releases in the report.
+///
+/// Reads via [`peek`], not [`list`]: `list`'s GC used to unlink the expired
+/// locks mid-iteration, after which `release` found nothing and returned
+/// `Ok(None)` — and the path was printed as released anyway.
 pub fn release_all(repo_root: &Path, agent: &str) -> Result<Vec<String>> {
-    let mut paths: Vec<String> = list(repo_root, true)?
-        .into_iter()
-        .filter(|e| e.lease.agent == agent)
-        .map(|e| e.lease.path)
-        .collect();
-    paths.sort();
-    for path in &paths {
+    let mut held = Vec::new();
+    let mut expired = Vec::new();
+    for entry in peek(repo_root, true)? {
+        if entry.lease.agent != agent {
+            continue;
+        }
+        if entry.expired {
+            expired.push(entry.lease);
+        } else {
+            held.push(entry.lease.path);
+        }
+    }
+    held.sort();
+
+    for path in &held {
         release(repo_root, agent, path, false)?;
     }
-    Ok(paths)
+    // Swept, not reported — and deliberately not via `release`, which would
+    // append a "released" event and put the same overstatement back into the
+    // activity feed. It is logged as what it actually was, an "expired" lease
+    // collected. Best-effort: a lock we cannot remove is not a reason to fail
+    // "release everything", and nothing in the fleet respects it anyway.
+    for lease in &expired {
+        if let Ok(lock_path) = lock_file_path(repo_root, &lease.path) {
+            collect_expired(repo_root, &lock_path, lease);
+        }
+    }
+    Ok(held)
 }
 
 /// Refresh `acquired_at` on a lease `agent` already holds, so a long task can
@@ -315,12 +533,15 @@ pub fn renew(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
         ..existing
     };
     write_lease_atomic(&lock_path, &renewed)?;
+    log_event(repo_root, agent, "renewed", &relative, renewed.note.clone());
     Ok(renewed)
 }
 
-/// List active leases, garbage-collecting expired ones as a side effect.
-/// `all` includes expired leases in the returned list (still GC'd from disk).
-pub fn list(repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>> {
+/// Read every lock file, paired with the file it came from. The single reader
+/// behind both [`list`] and [`peek`], so the two cannot drift apart: they
+/// differ in exactly one thing (whether expired locks are unlinked) and share
+/// everything else — parsing, skipping, age and state computation.
+fn scan(repo_root: &Path) -> Result<Vec<(PathBuf, LeaseEntry)>> {
     let leases_dir = pact_dir(repo_root)?.join("leases");
     let now = Utc::now();
     let mut entries = Vec::new();
@@ -345,22 +566,53 @@ pub fn list(repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>> {
         let (age_secs, remaining_secs) = age_and_remaining(&lease, now);
         let expired = is_expired(&lease, now);
 
-        if expired {
-            let _ = std::fs::remove_file(&path);
+        entries.push((
+            path,
+            LeaseEntry {
+                lease,
+                age_secs,
+                remaining_secs,
+                expired,
+            },
+        ));
+    }
+
+    Ok(entries)
+}
+
+/// List active leases, garbage-collecting expired ones as a side effect.
+/// `all` includes expired leases in the returned list (still GC'd from disk).
+///
+/// The sweep is documented behaviour for `pact lease ls` (docs/leases.md), so
+/// it stays. Anything merely *asking* who holds what — `pact agents`, the TUI,
+/// `msg send`'s recipient check — must use [`peek`] instead (pact-rnc.19).
+pub fn list(repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>> {
+    let mut entries = Vec::new();
+    for (lock_path, entry) in scan(repo_root)? {
+        if entry.expired {
+            collect_expired(repo_root, &lock_path, &entry.lease);
             if !all {
                 continue;
             }
         }
-
-        entries.push(LeaseEntry {
-            lease,
-            age_secs,
-            remaining_secs,
-            expired,
-        });
+        entries.push(entry);
     }
-
     Ok(entries)
+}
+
+/// The non-mutating twin of [`list`]: same view, nothing deleted (pact-rnc.19).
+///
+/// Answering "who holds what" must not change the answer. With `list`, an agent
+/// whose lease had just expired showed up in the first `pact agents` and was
+/// gone from the second, because the first call unlinked the evidence — and two
+/// concurrent readers raced on the same unlink. `peek` is safe to call
+/// repeatedly and concurrently; GC belongs on `acquire` and on `lease ls`.
+pub fn peek(repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>> {
+    Ok(scan(repo_root)?
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .filter(|entry| all || !entry.expired)
+        .collect())
 }
 
 #[cfg(test)]
@@ -554,5 +806,376 @@ mod tests {
                 .agent,
             "agent-a"
         );
+    }
+
+    /// Plant a lock file that is already `age_secs` old, without going through
+    /// `acquire` — the only way to test expiry without sleeping.
+    fn claim_aged(root: &Path, agent: &str, path: &str, ttl_secs: u64, age_secs: i64) {
+        let lease = LeaseInfo {
+            agent: agent.into(),
+            path: path.into(),
+            acquired_at: (Utc::now() - Duration::seconds(age_secs)).to_rfc3339(),
+            ttl_secs,
+            note: None,
+        };
+        write_lease_atomic(&lock_file_path(root, path).unwrap(), &lease).unwrap();
+    }
+
+    fn lock_exists(root: &Path, path: &str) -> bool {
+        lock_file_path(root, path).unwrap().exists()
+    }
+
+    // ---- pact-rnc.19: peek() answers without mutating -------------------
+
+    #[test]
+    fn peek_does_not_delete_an_expired_lock_but_list_does() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim_aged(root, "agent-a", "dead.rs", 100, 100 + GRACE_SECS + 1);
+        claim(root, "agent-b", "live.rs");
+
+        // Asking twice must give the same answer, and leave the evidence alone.
+        for _ in 0..2 {
+            let paths: Vec<String> = peek(root, true)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.lease.path)
+                .collect();
+            assert!(
+                paths.contains(&"dead.rs".to_string()),
+                "peek must keep reporting the expired lease: {paths:?}"
+            );
+            assert!(lock_exists(root, "dead.rs"), "peek must not unlink");
+        }
+
+        // Same view, minus expired, still without deleting.
+        let active: Vec<String> = peek(root, false)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.lease.path)
+            .collect();
+        assert_eq!(active, vec!["live.rs".to_string()]);
+        assert!(lock_exists(root, "dead.rs"));
+
+        // list() keeps sweeping: documented behaviour for `pact lease ls`.
+        let listed = list(root, true).unwrap();
+        assert_eq!(listed.len(), 2, "--all still shows the swept lease once");
+        assert!(!lock_exists(root, "dead.rs"), "list must GC");
+        assert!(lock_exists(root, "live.rs"));
+    }
+
+    // ---- pact-rnc.21: atomic multi-path claims ---------------------------
+
+    #[test]
+    fn acquire_many_takes_every_path_or_none() {
+        let tmp = repo();
+        let root = tmp.path();
+        let paths = vec!["src/agents.rs".to_string(), "src/main.rs".to_string()];
+
+        let outcomes =
+            acquire_many(root, "agent-a", &paths, 900, false, Some("mod line".into())).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(|o| !o.stolen));
+        assert_eq!(held_by(root, "agent-a"), paths);
+        assert!(outcomes
+            .iter()
+            .all(|o| o.lease.note.as_deref() == Some("mod line")));
+    }
+
+    #[test]
+    fn acquire_many_rolls_back_everything_it_took_on_conflict() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim(root, "agent-b", "src/main.rs");
+
+        let err = acquire_many(
+            root,
+            "agent-a",
+            &[
+                "src/agents.rs".to_string(),
+                "src/main.rs".to_string(),
+                "src/never.rs".to_string(),
+            ],
+            900,
+            false,
+            None,
+        )
+        .unwrap_err();
+
+        // The error names the path that actually has to be negotiated over.
+        assert!(
+            err.to_string().contains("src/main.rs"),
+            "error should name the contended path: {err}"
+        );
+        assert_eq!(crate::output::code_for(&err), 2);
+
+        // Nothing taken, nothing left behind, and the other agent is untouched.
+        assert!(
+            held_by(root, "agent-a").is_empty(),
+            "rollback must leave agent-a holding nothing"
+        );
+        assert!(
+            !lock_exists(root, "src/agents.rs"),
+            "stray lock file left on disk after rollback"
+        );
+        assert!(!lock_exists(root, "src/never.rs"), "never reached");
+        assert_eq!(held_by(root, "agent-b"), vec!["src/main.rs".to_string()]);
+    }
+
+    /// A failed multi-claim must not destroy a claim the agent walked in with —
+    /// and "the claim", not "some claim on the same path": the TTL and the note
+    /// are what peers use to decide whether the file is reclaimable, so a batch
+    /// that reports "nothing was taken" while having downgraded a 900s claim with
+    /// a note to a 30s claim without one has destroyed it just as effectively
+    /// (pact-rnc.21).
+    #[test]
+    fn acquire_many_rollback_keeps_a_lease_the_agent_already_held() {
+        let tmp = repo();
+        let root = tmp.path();
+        let before = acquire(
+            root,
+            "agent-a",
+            "src/mine.rs",
+            900,
+            false,
+            Some("IMPORTANT: refactor in progress".into()),
+        )
+        .unwrap()
+        .lease;
+        claim(root, "agent-b", "src/theirs.rs");
+
+        assert!(acquire_many(
+            root,
+            "agent-a",
+            &["src/mine.rs".to_string(), "src/theirs.rs".to_string()],
+            30, // the downgrade a failed batch used to leave behind
+            false,
+            None,
+        )
+        .is_err());
+
+        assert_eq!(
+            held_by(root, "agent-a"),
+            vec!["src/mine.rs".to_string()],
+            "rollback released a pre-existing lease"
+        );
+        let after = read_lease(&lock_file_path(root, "src/mine.rs").unwrap()).unwrap();
+        assert_eq!(after.ttl_secs, 900, "the batch's --ttl overwrote the lease");
+        assert_eq!(
+            after.note.as_deref(),
+            Some("IMPORTANT: refactor in progress"),
+            "the batch erased the note peers read"
+        );
+        assert_eq!(
+            after.acquired_at, before.acquired_at,
+            "the batch reset the lease's age, so peers see it as fresher than it is"
+        );
+    }
+
+    // ---- pact-rnc.24: release_all reports only real releases -------------
+
+    #[test]
+    fn release_all_omits_expired_leases_but_still_sweeps_them() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim(root, "agent-a", "live.rs");
+        claim_aged(root, "agent-a", "dead.rs", 100, 100 + GRACE_SECS + 1);
+
+        assert_eq!(
+            release_all(root, "agent-a").unwrap(),
+            vec!["live.rs".to_string()],
+            "an expired lease was already nobody's; do not claim it as released"
+        );
+        assert!(!lock_exists(root, "live.rs"));
+        assert!(
+            !lock_exists(root, "dead.rs"),
+            "the expired lock must still be swept from disk, just not reported"
+        );
+    }
+
+    // ---- pact-rnc.13: every transition lands in the activity log ---------
+
+    fn event_kinds(root: &Path) -> Vec<(String, String)> {
+        crate::events::recent(root, 100)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.kind, e.path.unwrap_or_default()))
+            .collect()
+    }
+
+    #[test]
+    fn each_lease_operation_appends_its_event() {
+        let tmp = repo();
+        let root = tmp.path();
+
+        acquire(root, "agent-a", "f.rs", 900, false, Some("why".into())).unwrap();
+        renew(root, "agent-a", "f.rs").unwrap();
+        acquire(root, "agent-a", "f.rs", 900, false, None).unwrap(); // re-entrant
+        acquire(root, "agent-b", "f.rs", 900, true, None).unwrap(); // steal
+        release(root, "agent-a", "f.rs", true).unwrap(); // force-release
+        acquire(root, "agent-a", "g.rs", 900, false, None).unwrap();
+        release(root, "agent-a", "g.rs", false).unwrap();
+
+        assert_eq!(
+            event_kinds(root),
+            vec![
+                ("acquired".to_string(), "f.rs".to_string()),
+                ("renewed".to_string(), "f.rs".to_string()),
+                ("renewed".to_string(), "f.rs".to_string()),
+                ("stolen".to_string(), "f.rs".to_string()),
+                ("force-released".to_string(), "f.rs".to_string()),
+                ("acquired".to_string(), "g.rs".to_string()),
+                ("released".to_string(), "g.rs".to_string()),
+            ]
+        );
+
+        let events = crate::events::recent(root, 100).unwrap();
+        assert_eq!(events[0].agent, "agent-a");
+        assert_eq!(
+            events[0].detail.as_deref(),
+            Some("why"),
+            "acquire logs the note — the reason the claim exists"
+        );
+        assert_eq!(events[3].agent, "agent-b");
+        assert!(
+            events[3].detail.as_deref().unwrap().contains("agent-a"),
+            "a steal must name the displaced holder: {:?}",
+            events[3].detail
+        );
+        assert!(
+            events[4].detail.as_deref().unwrap().contains("agent-b"),
+            "a force-release must name the displaced holder: {:?}",
+            events[4].detail
+        );
+    }
+
+    /// Taking over a dead claim is logged, and says so.
+    #[test]
+    fn taking_over_an_expired_lease_logs_a_steal_naming_the_previous_holder() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim_aged(root, "agent-a", "dead.rs", 100, 100 + GRACE_SECS + 1);
+
+        assert!(
+            acquire(root, "agent-b", "dead.rs", 900, false, None)
+                .unwrap()
+                .stolen
+        );
+
+        // Two rows: the previous claim ending, then the takeover (see
+        // `a_reclaim_logs_the_previous_holders_expiry_before_the_takeover`).
+        let events = crate::events::recent(root, 10).unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[1].kind, "stolen");
+        assert_eq!(events[1].agent, "agent-b");
+        let detail = events[1].detail.clone().unwrap();
+        assert!(detail.contains("agent-a"), "{detail}");
+        assert!(detail.contains("expired"), "{detail}");
+    }
+
+    /// pact-rnc.13: the crashed-agent case. An agent dies holding a file, its TTL
+    /// lapses, someone runs `lease ls` and the lock is collected — and before
+    /// this, the feed's last word was still "agent-a acquired gone.rs", so `pact
+    /// log` named a dead agent as the current holder of a file whose lock was
+    /// already gone.
+    #[test]
+    fn collecting_an_expired_lock_logs_the_lapse_against_its_holder() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim_aged(root, "agent-a", "gone.rs", 60, 60 + GRACE_SECS + 1);
+
+        // Whoever happens to run the command that collects it.
+        assert!(list(root, false).unwrap().is_empty());
+        assert!(!lock_exists(root, "gone.rs"), "list must still GC");
+
+        let events = crate::events::recent(root, 10).unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].kind, "expired");
+        assert_eq!(
+            events[0].agent, "agent-a",
+            "the event belongs to the holder whose lease lapsed, not the collector"
+        );
+        assert_eq!(events[0].path.as_deref(), Some("gone.rs"));
+
+        // The lock is gone, so a second listing has nothing left to report: one
+        // lapse, one event, however many agents run `lease ls`.
+        assert!(list(root, true).unwrap().is_empty());
+        assert_eq!(crate::events::recent(root, 10).unwrap().len(), 1);
+    }
+
+    /// The read-only twin stays read-only: [`peek`] unlinks nothing, so it must
+    /// not claim a lapse either (pact-rnc.19 + pact-rnc.13).
+    #[test]
+    fn peek_does_not_log_an_expiry() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim_aged(root, "agent-a", "dead.rs", 60, 60 + GRACE_SECS + 1);
+
+        assert_eq!(peek(root, true).unwrap().len(), 1);
+        assert!(crate::events::recent(root, 10).unwrap().is_empty());
+    }
+
+    /// `release --all` sweeps the caller's own expired locks. That is not a
+    /// release (pact-rnc.24) — it is an expiry, and it is logged as one.
+    #[test]
+    fn release_all_logs_its_expired_sweep_as_an_expiry_not_a_release() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim(root, "agent-a", "live.rs");
+        claim_aged(root, "agent-a", "dead.rs", 100, 100 + GRACE_SECS + 1);
+
+        assert_eq!(release_all(root, "agent-a").unwrap(), vec!["live.rs"]);
+        assert_eq!(
+            event_kinds(root),
+            vec![
+                ("acquired".to_string(), "live.rs".to_string()),
+                ("released".to_string(), "live.rs".to_string()),
+                ("expired".to_string(), "dead.rs".to_string()),
+            ],
+            "the swept lock must not be reported as a release"
+        );
+    }
+
+    /// Taking over a dead claim ends the previous one, and the feed says so — the
+    /// only way a consumer grouping by `kind` can tell a routine reclaim from a
+    /// `--steal` override of a live claim.
+    #[test]
+    fn a_reclaim_logs_the_previous_holders_expiry_before_the_takeover() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim_aged(root, "agent-a", "dead.rs", 60, 60 + GRACE_SECS + 1);
+
+        acquire(root, "agent-b", "dead.rs", 900, false, None).unwrap();
+
+        let events = crate::events::recent(root, 10).unwrap();
+        assert_eq!(
+            events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+            ["expired", "stolen"]
+        );
+        assert_eq!(events[0].agent, "agent-a");
+        assert_eq!(events[1].agent, "agent-b");
+
+        // A --steal of a LIVE claim has no "expired" row: that is the difference.
+        acquire(root, "agent-c", "dead.rs", 900, true, None).unwrap();
+        let kinds: Vec<String> = crate::events::recent(root, 10)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(kinds, ["expired", "stolen", "stolen"]);
+    }
+
+    /// A broken event log must not break a lease operation: `append` swallows
+    /// its own errors, so `acquire` still succeeds with the log unwritable.
+    #[test]
+    fn a_failing_event_log_does_not_fail_the_lease() {
+        let tmp = repo();
+        let root = tmp.path();
+        // A directory where the log file belongs: every append fails.
+        std::fs::create_dir_all(root.join(".pact/events.jsonl")).unwrap();
+
+        assert!(acquire(root, "agent-a", "f.rs", 900, false, None).is_ok());
+        assert_eq!(held_by(root, "agent-a"), vec!["f.rs".to_string()]);
+        assert!(release(root, "agent-a", "f.rs", false).is_ok());
     }
 }

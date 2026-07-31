@@ -61,6 +61,50 @@ stderr names the current holder, how old the lease is, and how much TTL is
 left — enough for an agent to decide whether to wait, pick different work, or
 `--steal`.
 
+## Claiming several paths at once
+
+```
+pact lease acquire <path>...
+```
+
+Several paths in one `acquire` are taken **all-or-nothing**:
+
+```
+$ pact lease acquire src/parser.rs src/main.rs --note "new module + its mod line"
+took 2 lease(s) for cli-wire:
+  acquired src/parser.rs
+  acquired src/main.rs
+```
+
+If any path is unavailable, pact rolls back the leases it took earlier *in that
+same call* and returns that path's error, exit code 2:
+
+```
+$ pact lease acquire q2.rs q1.rs
+error: lease on q1.rs is held by probe-peer (0s old, 60s remaining); use --steal to override
+```
+
+No lock for `q2.rs` is left behind, and `probe-peer`'s claim is untouched. The
+error names the contended path, because that is the one thing the caller has to
+act on — negotiate over `q1.rs`, or pick different work.
+
+Two deliberate details:
+
+- **Rollback never releases a lease you already held** when the call started.
+  Re-running a long task refreshes its own claims; a failed multi-claim must not
+  destroy a claim the agent walked in with.
+- **Rollback is best-effort.** A lock that can't be removed expires on its own
+  TTL, and a rollback failure must not mask the conflict the caller needs to see.
+
+The motivating case is a new module and the line that registers it (`mod
+parser;`): an agent that can't hold both atomically ends up sitting on half a
+change. Note what this does *not* fix — if the registration line belongs to
+another agent by assignment, being able to claim it doesn't mean you may edit it.
+That is still open (`pact-rnc.21`/`pact-v66`).
+
+A single path renders and serializes exactly as it always did, including
+`--json` emitting the lease object rather than a one-element array.
+
 ## Lifecycle: expiry and stealing
 
 A lease doesn't require its holder to still be alive. Every lease carries a
@@ -87,9 +131,13 @@ stateDiagram-v2
     note right of Expired
         next acquire reports
         stolen: true; swept from
-        disk by the next listing
+        disk by the next lease ls
     end note
 ```
+
+Every transition in that diagram also appends a line to `.pact/events.jsonl`, so
+`pact log` can show a lease that was taken and released while you weren't
+looking — see [The event log](#the-event-log) below.
 
 ### The three states
 
@@ -191,7 +239,14 @@ not notified (`pact msg send --to agent-a`)
 
 pact does not send that notification itself. It would need `bd`, it can fail,
 and a release must not die because a notification did. The warning names the
-command instead.
+command instead. `--json` carries the same fact for scripted callers, which is
+why `release --json` emits an object rather than a bare path:
+
+```json
+{ "path": "other.rs", "displaced": "agent-a" }
+```
+
+`displaced` is `null` when you released your own claim.
 
 `--all` releases every lease the calling agent holds, in one call, and prints
 what it released:
@@ -207,7 +262,15 @@ Holding nothing is success with an empty list (`<agent> held no leases`), so
 "release everything I hold" is safe to run unconditionally at the end of a
 task. This exists because an agent holding several files would release some and
 announce all of them — the failure that motivated it took an hour to become
-visible. `--all` is mutually exclusive with a path (clap rejects the
+visible.
+
+**It reports only the leases you genuinely held.** An already-expired lease was
+nobody's, so calling its removal a "release" is the same overstatement the
+command was written to fix. Those lock files are still deleted from disk —
+leaving them would leak a lock nobody owns — they're just logged as what actually
+happened (an `expired` event) rather than counted as releases. One consequence
+worth knowing: an agent whose only leases had expired now correctly gets
+`<agent> held no leases`, which reads like a bug and isn't. `--all` is mutually exclusive with a path (clap rejects the
 combination) and with `--force`, which is meaningless when you only touch your
 own claims.
 
@@ -224,11 +287,45 @@ silence.
 
 Listing garbage-collects expired lock files from disk as a side effect — `ls`
 (without `--all`) simply doesn't show you the ones it just swept away; `--all`
-shows them anyway, for the moment before they're cleaned up. Note that
-`pact agents` and `pact msg send` read the lease list too (to name agents and
-to check a recipient), so they inherit that sweep: a read-only-looking question
-can prune expired locks. That's tracked as a bug (`pact-rnc.19`), not a design
-choice — it needs a non-GC read path in the lease module.
+shows them anyway, for the moment before they're cleaned up.
+
+**Only `lease ls` and `acquire` collect.** Read-only commands used to inherit the
+sweep, because they all went through the same listing function: `pact agents`,
+`pact msg send`'s recipient check, `pact doctor`, and worst of all `pact ui`,
+whose refresh timer unlinked expired locks every tick. Asking the same question
+twice gave two different answers. Those callers now use a non-mutating read, so a
+question that looks read-only is read-only. `pact doctor` now reports stale
+leases as ``<n> stale (`pact lease ls` collects them)`` for the same reason:
+after the fix, calling them garbage-collected would have been a lie.
+
+## The event log
+
+`.pact/events.jsonl` records one JSON line per lease transition — `acquired`,
+`renewed`, `released`, `stolen`, `force-released`, `expired` — with the agent,
+the path, and a free-text detail (the `--note`, or the displaced holder's name).
+`pact log` reads it.
+
+It exists because lease history genuinely cannot be derived: `lease ls` shows
+only the instantaneous set, and **releasing a lease deletes the only record of
+it**. A lease taken and dropped while you looked away left no trace at all.
+
+What keeps it small:
+
+- **Lease events only.** Message events are derivable from `bd` and are
+  deliberately *not* duplicated here.
+- **Writing can't fail the lease.** Appending is infallible by signature; a
+  logging error is swallowed, because a lease operation that failed because
+  logging failed would be a coordination bug.
+- **Bounded.** Past 5000 lines the file is rewritten with the newest 4000. No
+  rotation, no index, no sidecar state. At roughly 150 bytes a line it stays
+  under a megabyte.
+- **Corrupt lines are skipped**, not fatal, exactly as an unparsable lock file
+  is skipped. A missing file is an empty feed.
+
+The `expired` event is the one whose `agent` didn't run the command that wrote
+it: a lapse is noticed by whoever collects the lock, and the event belongs to the
+holder whose claim ended. Without it, the feed's last word on a dead agent was
+`acquired` — naming it as current holder of a file whose lock was already gone.
 
 ## Why advisory, not mandatory
 
