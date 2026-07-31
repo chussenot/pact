@@ -35,6 +35,14 @@ pub fn pact_dir(repo_root: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Where `.pact/` would be, without creating anything. Read-only callers use
+/// this: asking a question must not leave a directory behind (pact-rnc.27, and
+/// the same principle as the non-mutating `lease::peek` in pact-rnc.19).
+/// Callers must treat a missing directory as "no state yet", not an error.
+pub fn pact_dir_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(".pact")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -54,8 +54,14 @@ pub struct Event {
     pub detail: Option<String>,
 }
 
+/// For appending: creates `.pact/` if needed.
 fn events_file(repo_root: &Path) -> Result<PathBuf> {
     Ok(pact_dir(repo_root)?.join("events.jsonl"))
+}
+
+/// For reading: never creates anything (pact-rnc.27).
+fn events_file_path(repo_root: &Path) -> PathBuf {
+    crate::repo::pact_dir_path(repo_root).join("events.jsonl")
 }
 
 /// Append one event to `.pact/events.jsonl`.
@@ -102,7 +108,7 @@ fn append_bounded(repo_root: &Path, ev: &Event, max_lines: usize, keep_lines: us
 /// like a log), at most `limit`. A missing file is an empty feed, not an error.
 /// Unparsable lines are skipped.
 pub fn recent(repo_root: &Path, limit: usize) -> Result<Vec<Event>> {
-    let path = events_file(repo_root)?;
+    let path = events_file_path(repo_root);
     let contents = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -129,6 +135,18 @@ mod tests {
             path: Some(path.into()),
             detail: None,
         }
+    }
+
+    #[test]
+    fn recent_creates_nothing_on_a_repo_that_has_never_used_pact() {
+        // pact-rnc.27: reading the feed is a question. It must not leave a
+        // `.pact/` behind, and a missing one means "no events", not an error.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(recent(tmp.path(), 10).unwrap().is_empty());
+        assert!(
+            !tmp.path().join(".pact").exists(),
+            "a pure read created .pact/"
+        );
     }
 
     #[test]

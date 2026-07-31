@@ -41,7 +41,18 @@ this protocol whenever you touch shared files or hand off work to others.
 - **Announce contract changes**: if you change an API, schema, CLI flag, or
   any other contract another agent depends on, message them:
   `pact msg send --to <agent> "what changed and why"`. Check the recipient
-  exists with `pact agents` first — a mistyped name sends into the void.
+  exists with `pact agents` first — a mistyped name sends into the void. One
+  decision that affects several agents goes out as ONE message: repeat `--to`
+  and they all land in a single thread anyone can read and reply into.
+- **Use a file for anything longer than a sentence**: `--body-file <path>`, or
+  `--body-file -` for stdin. Quotes, backslashes and aligned tables do not
+  survive a shell, and handing over an API is exactly that kind of content.
+- **Confirm, don't re-send**: `pact msg sent` shows what you sent and whether
+  the recipient has read it. If you are unsure a message went out, check
+  there — a blind re-send is how a peer's inbox fills with duplicates.
+- **Orient with `pact log`**: one chronological feed of who leased what and
+  who said what. Read it when you join, and when you need to know whether a
+  peer is still moving.
 - **Everything is scriptable**: every pact command accepts `--json` for
   machine-readable output; prefer it over parsing human-formatted text.
 
