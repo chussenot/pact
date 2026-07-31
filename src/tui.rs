@@ -28,6 +28,7 @@ use ratatui::{Frame, Terminal};
 use crate::beads::BeadsCli;
 use crate::doctor;
 use crate::lease::{self, LeaseEntry};
+use crate::mascot::{self, Gesture, Mascot};
 use crate::msg;
 
 /// How often the active tab refreshes itself when the user isn't pressing
@@ -35,6 +36,19 @@ use crate::msg;
 /// manual 'r'. Only the active tab refreshes on this timer, so idling on
 /// Leases doesn't spawn a `bd` subprocess every second for Messages.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Floor on how often the mascot may wake the event loop. The animation asks
+/// for 70–380 ms frames, so this only ever kicks in to stop a zero/near-zero
+/// `next_frame_in` from turning `event::poll` into a 100% CPU spin.
+const MIN_ANIMATION_TICK: Duration = Duration::from_millis(10);
+
+/// Bordered mascot box: the fixed art box plus its border.
+const MASCOT_WIDTH: u16 = mascot::ART_WIDTH + 2;
+const MASCOT_HEIGHT: u16 = mascot::ART_HEIGHT + 2;
+/// Below this the mascot is dropped entirely and the list gets the full width —
+/// a squeezed leases table is worse than no mascot.
+const MASCOT_MIN_COLS: u16 = 70;
+const MASCOT_MIN_ROWS: u16 = 16;
 
 pub fn run(repo_root: PathBuf, agent: Option<String>) -> Result<()> {
     let mut terminal = init_terminal()?;
@@ -138,6 +152,11 @@ struct App {
     hovered_tab: Option<Tab>,
     /// Row currently under the mouse cursor in the active tab's list/table.
     hovered_row: Option<usize>,
+
+    /// The little ASCII creature in the corner. Purely decorative, but it
+    /// reacts to the same events the status line reports, giving a second,
+    /// pre-attentive channel for "that worked" / "careful".
+    mascot: Mascot,
 }
 
 impl App {
@@ -161,6 +180,7 @@ impl App {
             content_area: Rect::default(),
             hovered_tab: None,
             hovered_row: None,
+            mascot: Mascot::new(Instant::now()),
         };
         app.refresh_leases();
         app
@@ -183,6 +203,12 @@ impl App {
             return;
         }
         self.tab = tab;
+        // Fired here rather than in handle_key: the early return above means
+        // pressing '1' while already on Leases changes nothing, and a Jump for
+        // a no-op keypress would be a lie. Note refresh_active_tab() below can
+        // supersede this with Flex/Shrug on the Doctor tab — that's wanted, the
+        // health verdict is more informative than "you switched tabs".
+        self.mascot.play(Gesture::Jump, Instant::now());
         self.status = None;
         // Stale from the previous tab's list — cleared here rather than left
         // to the next mouse-move event, so a keyboard-driven switch never
@@ -200,7 +226,23 @@ impl App {
     }
 
     fn refresh_doctor(&mut self) {
-        self.doctor_report = Some(doctor::checks(&self.repo_root));
+        let report = doctor::checks(&self.repo_root);
+        // Only on a CHANGE of verdict (and on the first one). This is the same
+        // edge-not-level rule update_hover uses, and for the same reason: the
+        // event loop calls refresh_active_tab() every REFRESH_INTERVAL, so
+        // playing unconditionally would restart Flex once a second for as long
+        // as you sit on the Doctor tab — the mascot would never idle again and
+        // would be claiming an event happened when nothing did.
+        let previous = self.doctor_report.as_ref().map(|r| r.healthy);
+        if previous != Some(report.healthy) {
+            let gesture = if report.healthy {
+                Gesture::Flex
+            } else {
+                Gesture::Shrug
+            };
+            self.mascot.play(gesture, Instant::now());
+        }
+        self.doctor_report = Some(report);
         self.last_refresh = Instant::now();
     }
 
@@ -260,6 +302,7 @@ impl App {
         match result {
             Ok(thread) => {
                 self.thread = Some(thread);
+                self.mascot.play(Gesture::Peek, Instant::now());
                 self.refresh_messages(); // pick up the now-read marker in the list behind it
             }
             Err(e) => self.status = Some(format!("failed to read thread: {e:#}")),
@@ -327,6 +370,7 @@ impl App {
             return;
         };
         let path = entry.lease.path.clone();
+        let now = Instant::now();
 
         if self.confirm_release == Some(index) {
             let agent = self
@@ -334,20 +378,37 @@ impl App {
                 .clone()
                 .unwrap_or_else(|| entry.lease.agent.clone());
             match lease::release(&self.repo_root, &agent, &path, true) {
-                Ok(()) => self.status = Some(format!("force-released {path}")),
-                Err(e) => self.status = Some(format!("release failed: {e:#}")),
+                Ok(()) => {
+                    self.status = Some(format!("force-released {path}"));
+                    self.mascot.play(Gesture::Cheer, now);
+                }
+                Err(e) => {
+                    self.status = Some(format!("release failed: {e:#}"));
+                    self.mascot.play(Gesture::Shrug, now);
+                }
             }
+            // Either gesture also ends the looping Alarmed the arming played.
             self.confirm_release = None;
             self.refresh_leases();
         } else if self.is_mine(entry) {
             let agent = self.agent.clone().expect("is_mine implies agent is set");
             match lease::release(&self.repo_root, &agent, &path, false) {
-                Ok(()) => self.status = Some(format!("released {path}")),
-                Err(e) => self.status = Some(format!("release failed: {e:#}")),
+                Ok(()) => {
+                    self.status = Some(format!("released {path}"));
+                    self.mascot.play(Gesture::Cheer, now);
+                }
+                Err(e) => {
+                    self.status = Some(format!("release failed: {e:#}"));
+                    self.mascot.play(Gesture::Shrug, now);
+                }
             }
             self.refresh_leases();
         } else {
             self.confirm_release = Some(index);
+            // Alarmed loops, so it holds for exactly as long as the armed state
+            // does — every path out of `confirm_release == Some(_)` plays
+            // something else (Cheer/Shrug above, Idle in cancel_confirm).
+            self.mascot.play(Gesture::Alarmed, now);
             self.status = Some(format!(
                 "held by {} — press release again to force it, or Esc to cancel",
                 entry.lease.agent
@@ -358,15 +419,25 @@ impl App {
     fn cancel_confirm(&mut self) {
         if self.confirm_release.take().is_some() {
             self.status = None;
+            self.mascot.play(Gesture::Idle, Instant::now()); // stop Alarmed looping
         }
     }
 }
 
 fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     loop {
+        app.mascot.tick(Instant::now());
         terminal.draw(|frame| draw(frame, app))?;
 
-        let timeout = REFRESH_INTERVAL.saturating_sub(app.last_refresh.elapsed());
+        // Two independent clocks share one poll: the 1 s DATA refresh and the
+        // ~100 ms animation frame. Waking on the sooner of the two is what keeps
+        // the mascot smooth WITHOUT dragging refresh_active_tab() along with it —
+        // that call shells out to `bd`/doctor, so running it at frame rate would
+        // spawn ~10 subprocesses a second.
+        let timeout = poll_timeout(
+            REFRESH_INTERVAL.saturating_sub(app.last_refresh.elapsed()),
+            app.mascot.next_frame_in(Instant::now()),
+        );
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -378,9 +449,22 @@ fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                 Event::Mouse(mouse) => handle_mouse(app, mouse),
                 _ => {}
             }
-        } else {
+        } else if app.last_refresh.elapsed() >= REFRESH_INTERVAL {
+            // The data interval genuinely elapsed. If it hasn't, we only woke for
+            // an animation frame — the tick at the top of the next iteration
+            // handles that, and the data clock keeps running undisturbed.
             app.refresh_active_tab();
         }
+    }
+}
+
+/// Sooner of the two deadlines, with the animation one floored so a mascot that
+/// reports "due now" forever can't spin the CPU. A zero `data_remaining` is left
+/// alone on purpose: that wakes immediately, refreshes, and resets the clock.
+fn poll_timeout(data_remaining: Duration, next_frame_in: Option<Duration>) -> Duration {
+    match next_frame_in {
+        Some(frame) => data_remaining.min(frame.max(MIN_ANIMATION_TICK)),
+        None => data_remaining,
     }
 }
 
@@ -473,6 +557,9 @@ fn handle_scroll(app: &mut App, delta: isize) {
 /// old equal-thirds approximation vs. the tabs' real, unequal widths) just
 /// looked like "mouse doesn't work" rather than "clicked the wrong spot".
 fn update_hover(app: &mut App, x: u16, y: u16) {
+    let had_tab = app.hovered_tab.is_some();
+    let had_row = app.hovered_row.is_some();
+
     app.hovered_tab = tab_at(app.header_area, x, y);
 
     app.hovered_row = if rect_contains(app.content_area, x, y) {
@@ -488,6 +575,13 @@ fn update_hover(app: &mut App, x: u16, y: u16) {
     } else {
         None
     };
+
+    // Only the None -> Some edge. MouseEventKind::Moved floods while the mouse
+    // is in motion and play() restarts a gesture from frame 0 by contract, so
+    // firing on every motion event would pin the mascot to Wave frame 0 forever.
+    if (app.hovered_tab.is_some() && !had_tab) || (app.hovered_row.is_some() && !had_row) {
+        app.mascot.play(Gesture::Wave, Instant::now());
+    }
 }
 
 fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
@@ -556,15 +650,61 @@ fn draw(frame: &mut Frame, app: &mut App) {
             Constraint::Length(1),
         ])
         .split(frame.area());
-    app.content_area = chunks[1];
+
+    let (list_area, mascot_area) = split_off_mascot(chunks[1], frame.area());
+    // The LIST rect, never the whole chunk: row_at/rect_contains/click_lease_row
+    // all hit-test against this, so if it covered the mascot's columns, clicking
+    // the mascot would select rows and hover would drift.
+    app.content_area = list_area;
 
     render_header(frame, chunks[0], app);
     match app.tab {
-        Tab::Leases => render_leases(frame, chunks[1], app),
-        Tab::Messages => render_messages(frame, chunks[1], app),
-        Tab::Doctor => render_doctor(frame, chunks[1], app),
+        Tab::Leases => render_leases(frame, list_area, app),
+        Tab::Messages => render_messages(frame, list_area, app),
+        Tab::Doctor => render_doctor(frame, list_area, app),
+    }
+    if let Some(area) = mascot_area {
+        render_mascot(frame, area, app);
     }
     render_status(frame, chunks[2], app);
+}
+
+/// Carves the mascot's box out of the right edge of the content chunk, bottom
+/// aligned so it sits on the status line like a floor. Returns the list rect and
+/// the mascot rect; on a frame too small for both, the list keeps the whole chunk
+/// and there is no mascot at all (clipped art misaligns, and a 16-column-narrower
+/// leases table on an 80-column terminal is a real cost for a decoration).
+fn split_off_mascot(content: Rect, frame: Rect) -> (Rect, Option<Rect>) {
+    if frame.width < MASCOT_MIN_COLS
+        || frame.height < MASCOT_MIN_ROWS
+        || content.height < MASCOT_HEIGHT
+        || content.width < MASCOT_WIDTH
+    {
+        return (content, None);
+    }
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(MASCOT_WIDTH)])
+        .split(content);
+    let right = columns[1];
+    let mascot = Rect {
+        y: right.y + right.height - MASCOT_HEIGHT,
+        height: MASCOT_HEIGHT,
+        ..right
+    };
+    (columns[0], Some(mascot))
+}
+
+fn render_mascot(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {:?} ", app.mascot.gesture()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // Row by row into a fixed ART_HEIGHT box: blank rows in the art are
+    // load-bearing (they're how the creature changes vertical position).
+    let lines: Vec<Line> = app.mascot.frame().iter().map(|l| Line::raw(*l)).collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -878,7 +1018,20 @@ mod tests {
             content_area: Rect::new(0, 3, 80, 8),
             hovered_tab: None,
             hovered_row: None,
+            mascot: Mascot::new(Instant::now()),
         }
+    }
+
+    /// First non-blank line of the mascot's current frame, trimmed — enough to
+    /// prove the art reached the buffer without this test owning the art.
+    fn visible_art(app: &App) -> String {
+        app.mascot
+            .frame()
+            .iter()
+            .map(|line| line.trim())
+            .find(|line| !line.is_empty())
+            .expect("a mascot frame has at least one non-blank row")
+            .to_string()
     }
 
     #[test]
@@ -1186,6 +1339,213 @@ mod tests {
         assert!(rendered.contains("Beads CLI"));
         assert!(rendered.contains("bd not found on PATH"));
         assert!(rendered.contains("some checks failed"));
+    }
+
+    #[test]
+    fn mascot_is_drawn_on_a_wide_frame_and_dropped_on_a_narrow_one() {
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(Some("agent-a"), vec![entry("agent-a", "mine.rs", false)]);
+        let art = visible_art(&app);
+
+        let mut wide = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        wide.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = render_to_string(&wide);
+        assert!(rendered.contains(&art), "mascot art missing at 100x24");
+        assert!(rendered.contains("Idle"), "gesture title missing");
+        assert!(rendered.contains("mine.rs"), "list must still render");
+
+        // 69 columns: one short of the threshold, so no mascot and the list gets
+        // the whole chunk back.
+        let mut narrow = Terminal::new(TestBackend::new(69, 24)).unwrap();
+        narrow.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!render_to_string(&narrow).contains(&art));
+        assert_eq!(app.content_area.width, 69);
+
+        // Too short, wide enough: same answer.
+        let mut short = Terminal::new(TestBackend::new(100, 15)).unwrap();
+        short.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!render_to_string(&short).contains(&art));
+        assert_eq!(app.content_area.width, 100);
+    }
+
+    #[test]
+    fn content_area_after_a_mascot_draw_still_maps_clicks_to_the_right_rows() {
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(
+            Some("agent-a"),
+            vec![
+                entry("agent-a", "one.rs", false),
+                entry("agent-a", "two.rs", false),
+                entry("agent-a", "three.rs", false),
+            ],
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        // content_area is the LIST sub-area, not the whole content chunk.
+        assert_eq!(app.content_area.width, 100 - MASCOT_WIDTH);
+        assert_eq!(app.content_area.x, 0);
+
+        // Same row arithmetic as the no-mascot case: header row, then data rows.
+        app.click_lease_row(app.content_area.y);
+        assert_eq!(app.table_state.selected(), Some(0)); // column header: no change
+        app.click_lease_row(app.content_area.y + 3);
+        assert_eq!(app.table_state.selected(), Some(2));
+
+        // A click in the mascot's columns is outside content_area, so it neither
+        // selects a row nor sets a hover.
+        let mascot_x = 100 - MASCOT_WIDTH / 2;
+        let mascot_y = 24 - 4;
+        assert!(!rect_contains(app.content_area, mascot_x, mascot_y));
+        handle_click(&mut app, mascot_x, mascot_y);
+        assert_eq!(app.table_state.selected(), Some(2));
+        update_hover(&mut app, mascot_x, mascot_y);
+        assert_eq!(app.hovered_row, None);
+    }
+
+    #[test]
+    fn switching_tabs_plays_jump_and_re_selecting_the_same_tab_does_not() {
+        let mut app = app_with(Some("agent-a"), vec![]);
+        assert_eq!(app.mascot.gesture(), Gesture::Idle);
+
+        app.next_tab(); // Leases -> Messages
+        assert_eq!(app.mascot.gesture(), Gesture::Jump);
+
+        // Back to Idle, then ask for the tab we're already on: set_tab early
+        // returns, so nothing should fire.
+        app.mascot.play(Gesture::Idle, Instant::now());
+        app.jump_tab(Tab::Messages);
+        assert_eq!(app.mascot.gesture(), Gesture::Idle);
+
+        // A click on a different tab label goes through the same path.
+        app.header_area = Rect::new(0, 0, 90, 1);
+        let leases_rect = tab_rects(app.header_area)[0];
+        handle_click(&mut app, leases_rect.x, leases_rect.y);
+        assert_eq!(app.tab, Tab::Leases);
+        assert_eq!(app.mascot.gesture(), Gesture::Jump);
+    }
+
+    #[test]
+    fn hover_waves_once_per_transition_not_on_every_mouse_move() {
+        let mut app = app_with(
+            Some("agent-a"),
+            vec![
+                entry("agent-a", "one.rs", false),
+                entry("agent-a", "two.rs", false),
+            ],
+        );
+        app.header_area = Rect::new(0, 0, 90, 1);
+        app.content_area = Rect::new(0, 3, 80, 8);
+
+        let tab_rect = tab_rects(app.header_area)[1];
+        update_hover(&mut app, tab_rect.x, tab_rect.y);
+        assert_eq!(app.hovered_tab, Some(Tab::Messages));
+        assert_eq!(app.mascot.gesture(), Gesture::Wave);
+
+        // Wave finishes and falls back to Idle; further motion inside the SAME
+        // tab must not re-arm it, or the flood of Moved events pins frame 0.
+        app.mascot.play(Gesture::Idle, Instant::now());
+        update_hover(&mut app, tab_rect.x + 1, tab_rect.y);
+        assert_eq!(app.hovered_tab, Some(Tab::Messages));
+        assert_eq!(app.mascot.gesture(), Gesture::Idle);
+
+        // Leaving everything, then entering a row, is a fresh None -> Some edge.
+        update_hover(&mut app, 0, 50);
+        assert_eq!(app.mascot.gesture(), Gesture::Idle);
+        update_hover(&mut app, 0, 5);
+        assert_eq!(app.hovered_row, Some(1));
+        assert_eq!(app.mascot.gesture(), Gesture::Wave);
+    }
+
+    #[test]
+    fn arming_a_force_release_alarms_and_cancelling_goes_back_to_idle() {
+        let mut app = app_with(Some("agent-a"), vec![entry("agent-b", "shared.rs", false)]);
+        app.handle_release_key();
+        assert_eq!(app.confirm_release, Some(0));
+        assert_eq!(app.mascot.gesture(), Gesture::Alarmed);
+
+        // Alarmed loops, so cancelling has to explicitly stop it.
+        app.cancel_confirm();
+        assert_eq!(app.mascot.gesture(), Gesture::Idle);
+    }
+
+    #[test]
+    fn releasing_your_own_lease_cheers() {
+        // An empty repo_root would resolve relative to the CWD and could touch
+        // the developer's own .pact/leases — a scratch dir keeps this hermetic.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with(Some("agent-a"), vec![entry("agent-a", "mine.rs", false)]);
+        app.repo_root = dir.path().to_path_buf();
+        // lease::release is idempotent, so with no lock file on disk it takes
+        // its Ok path — which is exactly the branch Cheer hangs off.
+        app.handle_release_key();
+        assert_eq!(app.mascot.gesture(), Gesture::Cheer);
+    }
+
+    #[test]
+    fn refreshing_doctor_shrugs_when_a_check_fails() {
+        // Scratch dir, not the CWD: an empty repo_root makes doctor::checks read
+        // whatever `.pact/` the test happens to be run from, which flips this
+        // assertion depending on where you ran cargo test.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with(Some("agent-a"), vec![]);
+        app.repo_root = dir.path().to_path_buf();
+        app.refresh_doctor();
+        assert!(!app.doctor_report.as_ref().unwrap().healthy);
+        assert_eq!(app.mascot.gesture(), Gesture::Shrug);
+    }
+
+    #[test]
+    fn the_one_second_doctor_refresh_does_not_re_arm_the_same_verdict() {
+        // refresh_active_tab() runs every REFRESH_INTERVAL, so on the Doctor tab
+        // refresh_doctor() is called once a second with an unchanged verdict. It
+        // must fire on the edge only, or the mascot is pinned to Flex/Shrug for
+        // as long as the tab is open.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with(Some("agent-a"), vec![]);
+        app.repo_root = dir.path().to_path_buf();
+
+        app.refresh_doctor();
+        assert_eq!(app.mascot.gesture(), Gesture::Shrug);
+
+        // Same verdict a second later: nothing fires, so Idle survives.
+        app.mascot.play(Gesture::Idle, Instant::now());
+        app.refresh_doctor();
+        assert_eq!(app.mascot.gesture(), Gesture::Idle);
+
+        // A verdict that actually flips does fire.
+        app.doctor_report.as_mut().unwrap().healthy = true;
+        app.refresh_doctor();
+        assert_eq!(app.mascot.gesture(), Gesture::Shrug);
+    }
+
+    #[test]
+    fn poll_timeout_takes_the_sooner_deadline_and_never_busy_spins() {
+        let data = Duration::from_millis(900);
+
+        // Animation frame sooner than the data refresh: animation wins.
+        assert_eq!(
+            poll_timeout(data, Some(Duration::from_millis(90))),
+            Duration::from_millis(90)
+        );
+        // Data refresh sooner: data wins, so refreshes stay on their own clock.
+        assert_eq!(
+            poll_timeout(Duration::from_millis(20), Some(Duration::from_millis(380))),
+            Duration::from_millis(20)
+        );
+        // No animation pending (shouldn't happen with a looping Idle, but the
+        // contract allows None): fall back to the data deadline untouched.
+        assert_eq!(poll_timeout(data, None), data);
+        // A mascot reporting "due now" forever must not produce poll(0) forever.
+        assert!(poll_timeout(data, Some(Duration::ZERO)) >= MIN_ANIMATION_TICK);
+        // ...but a due data refresh still wakes immediately; that path resets
+        // last_refresh, so it can't spin either.
+        assert_eq!(
+            poll_timeout(Duration::ZERO, Some(Duration::ZERO)),
+            Duration::ZERO
+        );
     }
 
     fn render_to_string(terminal: &Terminal<ratatui::backend::TestBackend>) -> String {

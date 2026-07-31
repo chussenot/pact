@@ -9,4 +9,10 @@
 # Added by cargo
 
 /target
-.pact/leases/
+
+# Everything under .pact/ is local runtime state (see docs/architecture.md):
+# leases, message read-state, and anything else pact or an agent writes there.
+.pact/
+
+# Generated agent-workflow scripts (.claude/settings.json is tracked)
+.claude/workflows/
