@@ -1,5 +1,6 @@
-//! Subprocess adapter over the Beads CLI. bd-only for v0.1.0 — br
-//! (beads-rust) compatibility is a deliberate later phase, not this one.
+//! Subprocess adapter over the Beads CLI. v0.1.0 targets bd-only; br
+//! (beads-rust) compatibility is still a later phase, but this adapter already
+//! stays on the shared subprocess + JSON surface.
 //! Never reads/writes the Beads database or JSONL directly; always shells out.
 
 use std::path::Path;
@@ -8,6 +9,9 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::output::exit_with;
+
+const TESTED_BD_MIN: (u64, u64, u64) = (1, 1, 0);
+const TESTED_BD_MAX_EXCLUSIVE: (u64, u64, u64) = (1, 2, 0);
 
 pub struct BeadsCli {
     // pub(crate) so tui.rs's tests can construct one directly without a real
@@ -58,6 +62,39 @@ impl BeadsCli {
     }
 }
 
+/// Warning text for versions outside pact's tested bd range.
+pub fn version_compat_warning(version_output: &str) -> Option<String> {
+    let parsed = parse_triplet(version_output)?;
+    if parsed >= TESTED_BD_MIN && parsed < TESTED_BD_MAX_EXCLUSIVE {
+        None
+    } else {
+        Some(format!(
+            "outside tested range {}.{}.{} <= version < {}.{}.{}",
+            TESTED_BD_MIN.0,
+            TESTED_BD_MIN.1,
+            TESTED_BD_MIN.2,
+            TESTED_BD_MAX_EXCLUSIVE.0,
+            TESTED_BD_MAX_EXCLUSIVE.1,
+            TESTED_BD_MAX_EXCLUSIVE.2
+        ))
+    }
+}
+
+fn parse_triplet(s: &str) -> Option<(u64, u64, u64)> {
+    s.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .filter(|p| !p.is_empty())
+        .find_map(|part| {
+            let mut it = part.split('.');
+            let major = it.next()?.parse().ok()?;
+            let minor = it.next()?.parse().ok()?;
+            let patch = it.next()?.parse().ok()?;
+            if it.next().is_some() {
+                return None;
+            }
+            Some((major, minor, patch))
+        })
+}
+
 fn which(bin: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -75,5 +112,22 @@ mod tests {
         // logic itself works without depending on `bd` being installed here.
         assert!(which("sh").is_some());
         assert!(which("definitely-not-a-real-binary-xyz").is_none());
+    }
+
+    #[test]
+    fn detects_versions_outside_the_tested_range() {
+        assert_eq!(version_compat_warning("bd version 1.1.0"), None);
+        assert_eq!(version_compat_warning("bd 1.1.9"), None);
+        assert!(version_compat_warning("bd version 1.2.0")
+            .unwrap()
+            .contains("outside tested range"));
+        assert!(version_compat_warning("bd version 0.9.0")
+            .unwrap()
+            .contains("outside tested range"));
+    }
+
+    #[test]
+    fn ignores_unparseable_versions() {
+        assert_eq!(version_compat_warning("beads unknown"), None);
     }
 }
