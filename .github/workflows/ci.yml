@@ -22,3 +22,9 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - name: Clippy (ui feature)
+        if: runner.os == 'Linux'
+        run: cargo clippy --all-targets --features ui -- -D warnings
+      - name: Test (ui feature)
+        if: runner.os == 'Linux'
+        run: cargo test --features ui
