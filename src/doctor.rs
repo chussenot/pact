@@ -90,6 +90,27 @@ pub fn checks(root: &Path) -> DoctorReport {
         }),
     }
 
+    match lease::corrupt_count(root) {
+        Ok(0) => checks.push(DoctorCheck {
+            name: "corrupt leases",
+            ok: true,
+            detail: "none".to_string(),
+        }),
+        Ok(n) => checks.push(DoctorCheck {
+            name: "corrupt leases",
+            ok: false,
+            detail: format!(
+                "{n} unreadable lock file{} (remove manually from .pact/leases/)",
+                if n == 1 { "" } else { "s" }
+            ),
+        }),
+        Err(e) => checks.push(DoctorCheck {
+            name: "corrupt leases",
+            ok: false,
+            detail: format!("{e:#}"),
+        }),
+    }
+
     let healthy = checks.iter().all(|c| c.ok);
     DoctorReport { healthy, checks }
 }
