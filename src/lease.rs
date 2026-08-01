@@ -1483,7 +1483,7 @@ mod tests {
     /// Note: there is a narrow window where both threads can verify before the
     /// other's rename lands, in which case both return `Ok` but only one is
     /// the actual disk holder. That remaining window is exercised by the
-    /// integration test `concurrent_steal_of_expired_lease_only_one_process_wins`,
+    /// integration test `concurrent_steal_of_expired_lease_has_consistent_outcome`,
     /// where process startup overhead makes the verify effective in practice.
     #[test]
     fn concurrent_double_steal_disk_holder_returned_ok() {
