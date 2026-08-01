@@ -122,6 +122,63 @@ fn reentrant_acquire_by_same_agent_refreshes_without_error() {
 }
 
 #[test]
+fn concurrent_steal_of_expired_lease_only_one_process_wins() {
+    let tmp = init_repo();
+
+    // Plant an already-expired lease (fabricate stale acquired_at directly).
+    let lock_path = tmp.path().join(".pact/leases/contested.txt.lock");
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let stale = chrono::Utc::now() - chrono::Duration::seconds(2000);
+    let expired_lease = serde_json::json!({
+        "agent": "agent-dead",
+        "path": "contested.txt",
+        "acquired_at": stale.to_rfc3339(),
+        "ttl_secs": 900,
+        "note": null
+    });
+    std::fs::write(&lock_path, serde_json::to_string(&expired_lease).unwrap()).unwrap();
+
+    // Spawn both processes without waiting — true parallelism.
+    let mut child_a = Command::new(env!("CARGO_BIN_EXE_pact"))
+        .args(["lease", "acquire", "contested.txt"])
+        .current_dir(tmp.path())
+        .env("PACT_AGENT", "agent-a")
+        .spawn()
+        .expect("failed to spawn agent-a");
+
+    let mut child_b = Command::new(env!("CARGO_BIN_EXE_pact"))
+        .args(["lease", "acquire", "contested.txt"])
+        .current_dir(tmp.path())
+        .env("PACT_AGENT", "agent-b")
+        .spawn()
+        .expect("failed to spawn agent-b");
+
+    let status_a = child_a.wait().expect("agent-a wait failed");
+    let status_b = child_b.wait().expect("agent-b wait failed");
+
+    let successes = [&status_a, &status_b]
+        .iter()
+        .filter(|s| s.success())
+        .count();
+    assert_eq!(
+        successes,
+        1,
+        "exactly one process must win the concurrent expired-lease steal; \
+         agent-a={}, agent-b={}",
+        status_a.code().unwrap_or(-1),
+        status_b.code().unwrap_or(-1),
+    );
+
+    // The loser must exit 2 (lease held by another agent), not any other code.
+    let loser_code = if status_a.success() {
+        status_b.code()
+    } else {
+        status_a.code()
+    };
+    assert_eq!(loser_code, Some(2), "loser must exit 2, got {loser_code:?}");
+}
+
+#[test]
 fn release_of_nonexistent_lease_is_idempotent() {
     let tmp = init_repo();
 
