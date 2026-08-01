@@ -77,6 +77,100 @@ impl LeaseEntry {
     }
 }
 
+/// Storage backend for lease operations.
+pub trait LeaseStore {
+    fn acquire(
+        &self,
+        repo_root: &Path,
+        agent: &str,
+        path: &str,
+        ttl_secs: u64,
+        steal: bool,
+        note: Option<String>,
+    ) -> Result<AcquireOutcome>;
+    fn acquire_many(
+        &self,
+        repo_root: &Path,
+        agent: &str,
+        paths: &[String],
+        ttl_secs: u64,
+        steal: bool,
+        note: Option<String>,
+    ) -> Result<Vec<AcquireOutcome>>;
+    fn release(
+        &self,
+        repo_root: &Path,
+        agent: &str,
+        path: &str,
+        force: bool,
+    ) -> Result<Option<String>>;
+    fn release_all(&self, repo_root: &Path, agent: &str) -> Result<Vec<String>>;
+    fn renew(&self, repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo>;
+    fn list(&self, repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>>;
+    fn peek(&self, repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FileLeaseStore;
+
+impl LeaseStore for FileLeaseStore {
+    fn acquire(
+        &self,
+        repo_root: &Path,
+        agent: &str,
+        path: &str,
+        ttl_secs: u64,
+        steal: bool,
+        note: Option<String>,
+    ) -> Result<AcquireOutcome> {
+        acquire_fs(repo_root, agent, path, ttl_secs, steal, note)
+    }
+
+    fn acquire_many(
+        &self,
+        repo_root: &Path,
+        agent: &str,
+        paths: &[String],
+        ttl_secs: u64,
+        steal: bool,
+        note: Option<String>,
+    ) -> Result<Vec<AcquireOutcome>> {
+        acquire_many_fs(repo_root, agent, paths, ttl_secs, steal, note)
+    }
+
+    fn release(
+        &self,
+        repo_root: &Path,
+        agent: &str,
+        path: &str,
+        force: bool,
+    ) -> Result<Option<String>> {
+        release_fs(repo_root, agent, path, force)
+    }
+
+    fn release_all(&self, repo_root: &Path, agent: &str) -> Result<Vec<String>> {
+        release_all_fs(repo_root, agent)
+    }
+
+    fn renew(&self, repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
+        renew_fs(repo_root, agent, path)
+    }
+
+    fn list(&self, repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>> {
+        list_fs(repo_root, all)
+    }
+
+    fn peek(&self, repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>> {
+        peek_fs(repo_root, all)
+    }
+}
+
+static FILE_LEASE_STORE: FileLeaseStore = FileLeaseStore;
+
+pub fn current_store() -> &'static dyn LeaseStore {
+    &FILE_LEASE_STORE
+}
+
 /// Compact duration: `45s`, `2m5s`, `1h3m`. Here for the same reason as
 /// `state_label`: a bare four-digit second count next to an age is what made
 /// pact-rnc.10 misreadable, so no renderer gets to reinvent it.
@@ -185,6 +279,17 @@ fn log_event(repo_root: &Path, agent: &str, kind: &str, path: &str, detail: Opti
 }
 
 pub fn acquire(
+    repo_root: &Path,
+    agent: &str,
+    path: &str,
+    ttl_secs: u64,
+    steal: bool,
+    note: Option<String>,
+) -> Result<AcquireOutcome> {
+    current_store().acquire(repo_root, agent, path, ttl_secs, steal, note)
+}
+
+fn acquire_fs(
     repo_root: &Path,
     agent: &str,
     path: &str,
@@ -347,6 +452,17 @@ pub fn acquire_many(
     steal: bool,
     note: Option<String>,
 ) -> Result<Vec<AcquireOutcome>> {
+    current_store().acquire_many(repo_root, agent, paths, ttl_secs, steal, note)
+}
+
+fn acquire_many_fs(
+    repo_root: &Path,
+    agent: &str,
+    paths: &[String],
+    ttl_secs: u64,
+    steal: bool,
+    note: Option<String>,
+) -> Result<Vec<AcquireOutcome>> {
     let mut outcomes: Vec<AcquireOutcome> = Vec::new();
     let mut newly_taken: Vec<String> = Vec::new();
     let mut refreshed: Vec<LeaseInfo> = Vec::new();
@@ -390,6 +506,10 @@ pub fn acquire_many(
 /// `acquire --steal` already does (pact-rnc.11); `None` when the caller held it
 /// or nothing was held.
 pub fn release(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<Option<String>> {
+    current_store().release(repo_root, agent, path, force)
+}
+
+fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<Option<String>> {
     let relative = normalize_path(repo_root, path);
     let lock_path = lock_file_path(repo_root, &relative)?;
 
@@ -476,9 +596,13 @@ fn collect_expired(repo_root: &Path, lock_path: &Path, lease: &LeaseInfo) {
 /// locks mid-iteration, after which `release` found nothing and returned
 /// `Ok(None)` — and the path was printed as released anyway.
 pub fn release_all(repo_root: &Path, agent: &str) -> Result<Vec<String>> {
+    current_store().release_all(repo_root, agent)
+}
+
+fn release_all_fs(repo_root: &Path, agent: &str) -> Result<Vec<String>> {
     let mut held = Vec::new();
     let mut expired = Vec::new();
-    for entry in peek(repo_root, true)? {
+    for entry in peek_fs(repo_root, true)? {
         if entry.lease.agent != agent {
             continue;
         }
@@ -491,7 +615,7 @@ pub fn release_all(repo_root: &Path, agent: &str) -> Result<Vec<String>> {
     held.sort();
 
     for path in &held {
-        release(repo_root, agent, path, false)?;
+        release_fs(repo_root, agent, path, false)?;
     }
     // Swept, not reported — and deliberately not via `release`, which would
     // append a "released" event and put the same overstatement back into the
@@ -511,6 +635,10 @@ pub fn release_all(repo_root: &Path, agent: &str) -> Result<Vec<String>> {
 /// Deliberately does NOT create a missing lease: a typo'd path must not
 /// silently claim something new.
 pub fn renew(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
+    current_store().renew(repo_root, agent, path)
+}
+
+fn renew_fs(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
     let relative = normalize_path(repo_root, path);
     let lock_path = lock_file_path(repo_root, &relative)?;
 
@@ -594,6 +722,10 @@ fn scan(repo_root: &Path) -> Result<Vec<(PathBuf, LeaseEntry)>> {
 /// it stays. Anything merely *asking* who holds what — `pact agents`, the TUI,
 /// `msg send`'s recipient check — must use [`peek`] instead (pact-rnc.19).
 pub fn list(repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>> {
+    current_store().list(repo_root, all)
+}
+
+fn list_fs(repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>> {
     let mut entries = Vec::new();
     for (lock_path, entry) in scan(repo_root)? {
         if entry.expired {
@@ -615,6 +747,10 @@ pub fn list(repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>> {
 /// concurrent readers raced on the same unlink. `peek` is safe to call
 /// repeatedly and concurrently; GC belongs on `acquire` and on `lease ls`.
 pub fn peek(repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>> {
+    current_store().peek(repo_root, all)
+}
+
+fn peek_fs(repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>> {
     Ok(scan(repo_root)?
         .into_iter()
         .map(|(_, entry)| entry)
