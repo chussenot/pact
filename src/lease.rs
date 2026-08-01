@@ -267,7 +267,16 @@ fn read_lease(lock_path: &Path) -> Result<LeaseInfo> {
 /// ours, the file will name them instead — and we must return exit 2 rather
 /// than falsely reporting that we hold the lease.
 ///
-/// Cost: one read. Applied to both the expired-takeover path and `--steal`.
+/// Applied to all three post-conflict write paths: expired-lease takeover,
+/// re-entrant refresh (same agent), and `--steal` override.
+///
+/// Residual window: the verify narrows the race from "time since read" to
+/// "between rename and re-read"; it does not close it entirely. This is an
+/// accepted trade-off for an advisory mechanism — a full fix would serialize
+/// takeovers via an `O_EXCL` guard file, deliberately not implemented (YAGNI
+/// until a double-win is observed in practice).
+///
+/// Cost: one read.
 fn verify_own_lease(lock_path: &Path, agent: &str, acquired_at: &str) -> Result<()> {
     let on_disk = read_lease(lock_path)?;
     if on_disk.agent != agent || on_disk.acquired_at != acquired_at {
@@ -397,6 +406,7 @@ fn acquire_fs(
             } else if existing.agent == agent {
                 // Re-entrant refresh: same holder, just bump acquired_at.
                 write_lease_atomic(&lock_path, &new_lease)?;
+                verify_own_lease(&lock_path, agent, &new_lease.acquired_at)?;
                 log_event(
                     repo_root,
                     agent,
@@ -1545,5 +1555,77 @@ mod tests {
         assert!(acquire(root, "agent-a", "f.rs", 900, false, None).is_ok());
         assert_eq!(held_by(root, "agent-a"), vec!["f.rs".to_string()]);
         assert!(release(root, "agent-a", "f.rs", false).is_ok());
+    }
+
+    /// When a concurrent thief steals the lease between the refresh's
+    /// `write_lease_atomic` and `verify_own_lease`, the refreshing agent must
+    /// detect the loss (exit 2) and leave the thief's lease intact on disk.
+    #[test]
+    fn refresh_loses_to_concurrent_steal_at_expiry_boundary() {
+        let tmp = repo();
+        let root = tmp.path();
+
+        // Agent-a holds a lease.
+        claim(root, "agent-a", "boundary.rs");
+        let lock_path = lock_file_path(root, "boundary.rs").unwrap();
+
+        // Simulate: agent-a's refresh just wrote its new acquired_at…
+        let our_acquired_at = Utc::now().to_rfc3339();
+
+        // …but agent-b's takeover rename landed after, overwriting the file.
+        let thief_lease = LeaseInfo {
+            agent: "agent-b".into(),
+            path: "boundary.rs".into(),
+            acquired_at: Utc::now().to_rfc3339(),
+            ttl_secs: DEFAULT_TTL_SECS,
+            note: None,
+        };
+        write_lease_atomic(&lock_path, &thief_lease).unwrap();
+
+        // verify_own_lease must fail for agent-a with exit 2.
+        let err = verify_own_lease(&lock_path, "agent-a", &our_acquired_at).unwrap_err();
+        assert_eq!(
+            crate::output::code_for(&err),
+            2,
+            "refresh that lost the race must exit 2: {err}"
+        );
+
+        // End-to-end: a re-entrant acquire (refresh) after agent-b took over
+        // must return exit 2 and leave agent-b's lease intact.
+        let tmp2 = repo();
+        let root2 = tmp2.path();
+        claim(root2, "agent-a", "boundary.rs");
+        let lock2 = lock_file_path(root2, "boundary.rs").unwrap();
+
+        // Overwrite with agent-b's lease to simulate a concurrent steal.
+        let thief2 = LeaseInfo {
+            agent: "agent-b".into(),
+            path: "boundary.rs".into(),
+            acquired_at: Utc::now().to_rfc3339(),
+            ttl_secs: DEFAULT_TTL_SECS,
+            note: None,
+        };
+        write_lease_atomic(&lock2, &thief2).unwrap();
+
+        // Now agent-a tries to refresh — the verify inside acquire must catch it.
+        let result = acquire(
+            root2,
+            "agent-a",
+            "boundary.rs",
+            DEFAULT_TTL_SECS,
+            false,
+            None,
+        );
+        assert!(result.is_err(), "refresh must fail when lease was stolen");
+        assert_eq!(
+            crate::output::code_for(result.as_ref().unwrap_err()),
+            2,
+            "must be exit code 2"
+        );
+
+        // Agent-b's lease remains on disk.
+        let on_disk = read_lease(&lock2).unwrap();
+        assert_eq!(on_disk.agent, "agent-b");
+        assert_eq!(on_disk.acquired_at, thief2.acquired_at);
     }
 }
