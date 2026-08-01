@@ -5,11 +5,11 @@ mod doctor;
 mod events;
 mod identity;
 mod lease;
+#[cfg(feature = "ui")]
+mod mascot;
 mod msg;
 mod output;
 mod repo;
-#[cfg(feature = "ui")]
-mod mascot;
 #[cfg(feature = "ui")]
 mod tui;
 
