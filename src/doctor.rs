@@ -57,10 +57,14 @@ pub fn checks(root: &Path) -> DoctorReport {
             let version = cli.version(root).unwrap_or_else(|e| {
                 format!("found, but `{} --version` failed: {e:#}", cli.binary())
             });
+            let mut detail = format!("{} ({version})", cli.binary());
+            if let Some(warning) = beads::version_compat_warning(&version) {
+                detail.push_str(&format!(" — warning: {warning}"));
+            }
             DoctorCheck {
                 name: "Beads CLI",
                 ok: true,
-                detail: format!("{} ({version})", cli.binary()),
+                detail,
             }
         }
         Err(e) => DoctorCheck {
