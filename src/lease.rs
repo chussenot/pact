@@ -215,11 +215,14 @@ fn lock_file_path(repo_root: &Path, relative: &str) -> Result<PathBuf> {
 
 fn parse_acquired(lease: &LeaseInfo) -> DateTime<Utc> {
     // A lock file with an unparsable timestamp is a corruption case we don't
-    // expect in practice (we always write RFC3339 ourselves); treat it as
-    // "just now" so it reads as not-yet-expired rather than panicking.
+    // expect in practice (we always write RFC3339 ourselves). For an advisory
+    // lock, corruption should tend towards "expired/claimable": fall back to
+    // the Unix epoch (1970-01-01) so the lease is immediately reclaimable
+    // rather than held forever (the old `Utc::now()` fallback reset the timer
+    // on every read, making a corrupt lease immortal until `--steal`).
     DateTime::parse_from_rfc3339(&lease.acquired_at)
         .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+        .unwrap_or(DateTime::UNIX_EPOCH)
 }
 
 fn is_expired(lease: &LeaseInfo, now: DateTime<Utc>) -> bool {
@@ -758,6 +761,39 @@ fn peek_fs(repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>> {
         .collect())
 }
 
+/// Count lock files under `.pact/leases/` whose JSON cannot be parsed.
+///
+/// These are unreadable by the normal scan and would otherwise be invisible to
+/// the operator. A corrupted lock is not an active hold, but it is noise that
+/// should be surfaced (e.g. by `pact doctor`).
+pub fn corrupt_count(repo_root: &Path) -> Result<usize> {
+    let leases_dir = crate::repo::pact_dir_path(repo_root).join("leases");
+    let dir = match std::fs::read_dir(&leases_dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", leases_dir.display())),
+    };
+    let mut count = 0;
+    for entry in dir {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("lock") {
+            continue;
+        }
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => {
+                count += 1;
+                continue;
+            }
+        };
+        if serde_json::from_str::<LeaseInfo>(&contents).is_err() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,6 +877,53 @@ mod tests {
         assert_eq!(human_secs(59), "59s");
         assert_eq!(human_secs(125), "2m5s");
         assert_eq!(human_secs(3725), "1h2m");
+    }
+
+    #[test]
+    fn corrupt_timestamp_is_treated_as_expired_not_immortal() {
+        // A lease whose `acquired_at` cannot be parsed must fall back to epoch 0,
+        // making it immediately expired — not immortal (the old `Utc::now()`
+        // fallback reset the timer on every read, so the lease never expired).
+        let corrupt = LeaseInfo {
+            agent: "agent-a".into(),
+            path: "x".into(),
+            acquired_at: "not-a-timestamp".into(),
+            ttl_secs: DEFAULT_TTL_SECS,
+            note: None,
+        };
+        assert!(
+            is_expired(&corrupt, Utc::now()),
+            "a corrupt timestamp must be treated as expired"
+        );
+        // parse_acquired must return epoch 0, not something near now.
+        let parsed = parse_acquired(&corrupt);
+        assert_eq!(
+            parsed,
+            DateTime::UNIX_EPOCH,
+            "corrupt timestamp must parse as Unix epoch"
+        );
+    }
+
+    #[test]
+    fn corrupt_count_detects_unreadable_lock_files() {
+        let tmp = repo();
+        let root = tmp.path();
+
+        // No leases dir yet → 0 corrupt.
+        assert_eq!(corrupt_count(root).unwrap(), 0);
+
+        // A valid lease does not count as corrupt.
+        claim(root, "agent-a", "good.rs");
+        assert_eq!(corrupt_count(root).unwrap(), 0);
+
+        // Write a lock file whose contents are not valid JSON.
+        let leases_dir = crate::repo::pact_dir_path(root).join("leases");
+        std::fs::write(leases_dir.join("bad__rs.lock"), b"not json at all").unwrap();
+        assert_eq!(corrupt_count(root).unwrap(), 1);
+
+        // Write a second corrupt lock file.
+        std::fs::write(leases_dir.join("also__rs.lock"), b"{}").unwrap();
+        assert_eq!(corrupt_count(root).unwrap(), 2);
     }
 
     fn repo() -> tempfile::TempDir {
