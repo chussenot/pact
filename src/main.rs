@@ -5,10 +5,12 @@ mod doctor;
 mod events;
 mod identity;
 mod lease;
-mod mascot;
 mod msg;
 mod output;
 mod repo;
+#[cfg(feature = "ui")]
+mod mascot;
+#[cfg(feature = "ui")]
 mod tui;
 
 use std::path::{Path, PathBuf};
@@ -66,6 +68,7 @@ enum Command {
     /// Check that pact, AGENTS.md, and the Beads CLI are all in a healthy state.
     Doctor,
     /// Interactive terminal dashboard over leases, messages, and doctor status.
+    #[cfg(feature = "ui")]
     Ui,
 }
 
@@ -159,6 +162,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Msg { action } => run_msg(&cwd, cli.agent.as_deref(), cli.json, action),
         Command::Log { limit } => run_log(&cwd, cli.json, limit),
         Command::Doctor => run_doctor(&cwd, cli.json),
+        #[cfg(feature = "ui")]
         Command::Ui => {
             let root = repo::find_repo_root(&cwd)?;
             let agent = identity::resolve_agent(cli.agent.as_deref()).ok();
