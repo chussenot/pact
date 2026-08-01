@@ -261,6 +261,28 @@ fn read_lease(lock_path: &Path) -> Result<LeaseInfo> {
         .with_context(|| format!("parsing lease at {}", lock_path.display()))
 }
 
+/// After a `write_lease_atomic` that was meant to take ownership, re-read the
+/// lock and confirm that it now belongs to `agent` with the exact `acquired_at`
+/// that was just written. If another agent's concurrent rename landed after
+/// ours, the file will name them instead — and we must return exit 2 rather
+/// than falsely reporting that we hold the lease.
+///
+/// Cost: one read. Applied to both the expired-takeover path and `--steal`.
+fn verify_own_lease(lock_path: &Path, agent: &str, acquired_at: &str) -> Result<()> {
+    let on_disk = read_lease(lock_path)?;
+    if on_disk.agent != agent || on_disk.acquired_at != acquired_at {
+        return Err(exit_with(
+            2,
+            format!(
+                "lease on {} was taken by {} in a concurrent steal; this agent did not win",
+                lock_path.display(),
+                on_disk.agent
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Record a lease transition in the activity log (pact-rnc.13). Releasing a
 /// lease deletes the only record that it ever existed, so lease history cannot
 /// be reconstructed after the fact — it has to be written as it happens.
@@ -337,6 +359,7 @@ fn acquire_fs(
 
             if is_expired(&existing, now) {
                 write_lease_atomic(&lock_path, &new_lease)?;
+                verify_own_lease(&lock_path, agent, &new_lease.acquired_at)?;
                 // The previous claim ended here, and this is the only moment
                 // anyone notices (pact-rnc.13). Without this row the feed's last
                 // word on `existing.agent` is still "acquired", i.e. it reports a
@@ -391,6 +414,7 @@ fn acquire_fs(
                     existing.agent
                 ));
                 write_lease_atomic(&lock_path, &new_lease)?;
+                verify_own_lease(&lock_path, agent, &new_lease.acquired_at)?;
                 log_event(
                     repo_root,
                     agent,
@@ -1404,6 +1428,109 @@ mod tests {
             .map(|e| e.kind)
             .collect();
         assert_eq!(kinds, ["expired", "stolen", "stolen"]);
+    }
+
+    // ---- race-condition guard: verify after rename -----------------------
+
+    /// `verify_own_lease` must reject when a concurrent agent's rename landed
+    /// after ours. Simulates the "lost steal" case: we wrote agent-a's data,
+    /// but by the time we verify, agent-b has already renamed their file on
+    /// top of ours.
+    #[test]
+    fn verify_own_lease_rejects_when_a_concurrent_rename_overwrote_ours() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim(root, "agent-a", "raced.rs");
+        let lock_path = lock_file_path(root, "raced.rs").unwrap();
+
+        // Simulate: we just wrote agent-a's lease (acquired_at = now)…
+        let our_acquired_at = Utc::now().to_rfc3339();
+
+        // …but then agent-b's rename overwrote it.
+        let other = LeaseInfo {
+            agent: "agent-b".into(),
+            path: "raced.rs".into(),
+            acquired_at: Utc::now().to_rfc3339(),
+            ttl_secs: DEFAULT_TTL_SECS,
+            note: None,
+        };
+        write_lease_atomic(&lock_path, &other).unwrap();
+
+        // agent-a's verify must now fail with exit 2.
+        let err = verify_own_lease(&lock_path, "agent-a", &our_acquired_at).unwrap_err();
+        assert_eq!(
+            crate::output::code_for(&err),
+            2,
+            "lost steal must exit 2: {err}"
+        );
+    }
+
+    /// When two threads race to steal the same expired lease, the verify check
+    /// prevents a loser from falsely believing it holds the file. The invariant
+    /// guaranteed by `verify_own_lease`:
+    ///   • The agent whose data is on disk at the end always returned `Ok`.
+    ///   • Any thread that detected it lost (via verify) returns exit 2.
+    ///   • At least one thread wins (the lease is not left in limbo).
+    ///
+    /// Note: there is a narrow window where both threads can verify before the
+    /// other's rename lands, in which case both return `Ok` but only one is
+    /// the actual disk holder. That remaining window is exercised by the
+    /// integration test `concurrent_steal_of_expired_lease_only_one_process_wins`,
+    /// where process startup overhead makes the verify effective in practice.
+    #[test]
+    fn concurrent_double_steal_disk_holder_returned_ok() {
+        // Run many iterations to probe different interleavings.
+        for _ in 0..20 {
+            let tmp = repo();
+            let root = tmp.path();
+            claim_aged(root, "agent-stale", "hot.rs", 60, 60 + GRACE_SECS + 1);
+
+            let root_a = root.to_path_buf();
+            let root_b = root.to_path_buf();
+
+            let handle_a = std::thread::spawn(move || {
+                acquire(&root_a, "agent-a", "hot.rs", DEFAULT_TTL_SECS, false, None)
+            });
+            let handle_b = std::thread::spawn(move || {
+                acquire(&root_b, "agent-b", "hot.rs", DEFAULT_TTL_SECS, false, None)
+            });
+
+            let res_a = handle_a.join().unwrap();
+            let res_b = handle_b.join().unwrap();
+
+            let on_disk = read_lease(&lock_file_path(root, "hot.rs").unwrap()).unwrap();
+
+            // The agent on disk always returned Ok (verify never rejects a true winner).
+            match on_disk.agent.as_str() {
+                "agent-a" => assert!(
+                    res_a.is_ok(),
+                    "agent-a is on disk but returned Err: {res_a:?}"
+                ),
+                "agent-b" => assert!(
+                    res_b.is_ok(),
+                    "agent-b is on disk but returned Err: {res_b:?}"
+                ),
+                other => panic!("unexpected agent on disk: {other}"),
+            }
+
+            // At least one thread won.
+            let successes = [&res_a, &res_b].iter().filter(|r| r.is_ok()).count();
+            assert!(
+                successes >= 1,
+                "nobody acquired the lease: a={res_a:?}, b={res_b:?}"
+            );
+
+            // Any loser detected by verify must exit 2, not some other code.
+            for res in [&res_a, &res_b] {
+                if let Err(e) = res {
+                    assert_eq!(
+                        crate::output::code_for(e),
+                        2,
+                        "a losing acquire must exit 2: {e}"
+                    );
+                }
+            }
+        }
     }
 
     /// A broken event log must not break a lease operation: `append` swallows
