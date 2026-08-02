@@ -28,3 +28,10 @@ jobs:
       - name: Test (ui feature)
         if: runner.os == 'Linux'
         run: cargo test --features ui
+      # Linux-only: the check walks `pact --help`, which is platform-independent,
+      # and it needs the ui feature built — which only this job does. It shells
+      # out to `pact doctor`, so it must run after checkout in a real git repo;
+      # no `bd` is needed, the check names come back either way.
+      - name: Docs match the CLI
+        if: runner.os == 'Linux'
+        run: ./scripts/check-docs.sh

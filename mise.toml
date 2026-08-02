@@ -21,9 +21,13 @@ run = "cargo fmt -- --check"
 description = "Run clippy with warnings denied (with the ui feature)"
 run = "cargo clippy --all-targets --features ui -- -D warnings"
 
+[tasks."check-docs"]
+description = "Fail if README/docs drift from the real CLI: missing commands or flags, dead relative links, undocumented doctor checks (pact-qbo)"
+run = "./scripts/check-docs.sh"
+
 [tasks.check]
-description = "Run the full CI check locally: fmt, lint, test. CI additionally runs clippy and test without the ui feature, so the dependency-light build stays guarded there."
-depends = ["fmt-check", "lint", "test"]
+description = "Run the full CI check locally: fmt, lint, test, docs. CI additionally runs clippy and test without the ui feature, so the dependency-light build stays guarded there."
+depends = ["fmt-check", "lint", "test", "check-docs"]
 
 [tasks.install]
 description = "Build and install the pact binary locally, ui feature included"
