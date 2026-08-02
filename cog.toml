@@ -1,5 +1,5 @@
 from_latest_tag = false
-ignore_merge_commits = false
+ignore_merge_commits = true
 ignore_fixup_commits = true
 disable_changelog = false
 disable_bump_commit = false
@@ -8,7 +8,11 @@ generate_mono_repository_package_tags = true
 branch_whitelist = []
 skip_ci = "[skip ci]"
 skip_untracked = false
-pre_bump_hooks = []
+pre_bump_hooks = [
+  # keep the crate version in step with the tag; Cargo.lock follows
+  "sed -i '0,/^version = /s//version = \"{{version}}\"/' Cargo.toml",
+  "cargo check --quiet",
+]
 post_bump_hooks = []
 pre_package_bump_hooks = []
 post_package_bump_hooks = []
