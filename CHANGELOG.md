@@ -10,6 +10,14 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.2.2 - 2026-08-02
+#### Bug Fixes
+- **(otel)** record the lease holder on the conflict span - (8af8aef) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(beads)** close the otel epic and its eight children - (f75ecee) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.2.1 - 2026-08-02
 #### Bug Fixes
 - **(cli)** give usage errors exit code 5 so 2 means only a held lease - (2e2f265) - Clement HUSSENOT-DESENONGES
