@@ -43,6 +43,66 @@ pub fn pact_dir_path(repo_root: &Path) -> PathBuf {
     repo_root.join(".pact")
 }
 
+/// Whether a file `pact init` writes will actually reach someone who clones
+/// the repo.
+///
+/// `init`'s whole promise is "run it once, commit the result, every clone is
+/// onboarded". A gitignored `AGENTS.md` breaks that silently and completely:
+/// the file is there locally, `git add` refuses it without a word, and the
+/// clone gets no protocol. It happened in pact's own repo — a global
+/// `~/.gitignore` rule meant `AGENTS.md` was never committed once.
+///
+/// Answering this needs real gitignore semantics — global excludes, nested
+/// ignore files, negations, precedence — so it asks `git` instead of
+/// reimplementing them. This is the only place pact shells out to git: the rest
+/// of the tool needs a `.git` directory, not the binary, so an absent or
+/// failing `git` yields [`Reach::Unknown`] and `doctor` declines to guess.
+pub enum Reach {
+    /// Tracked, so a clone gets it.
+    Tracked,
+    /// Untracked *and* ignored — the silent failure.
+    Ignored { source: String },
+    /// Untracked but committable: normal before the first commit.
+    Untracked,
+    /// No usable `git` to ask.
+    Unknown,
+}
+
+pub fn reach(repo_root: &Path, rel: &str) -> Reach {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(args)
+            .output()
+    };
+
+    match git(&["ls-files", "--error-unmatch", "--", rel]) {
+        Ok(o) if o.status.success() => return Reach::Tracked,
+        // Exit 1 is "not tracked"; 128 is "not a repo". Both fall through to
+        // check-ignore, which distinguishes them.
+        Ok(_) => {}
+        Err(_) => return Reach::Unknown,
+    }
+
+    match git(&["check-ignore", "-v", "--", rel]) {
+        // `-v` prints "<source>:<line>:<pattern>\t<path>"; the source is the
+        // actionable half — knowing *which* file ignores it is the fix.
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let source = stdout
+                .split('\t')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            Reach::Ignored { source }
+        }
+        Ok(o) if o.status.code() == Some(1) => Reach::Untracked,
+        _ => Reach::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

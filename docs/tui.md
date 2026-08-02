@@ -109,9 +109,10 @@ messages map onto Beads issues.
 ### Doctor
 
 The same checks as `pact doctor`, rendered live: git repo, `.pact/` presence,
-`AGENTS.md` freshness, whether `CLAUDE.md` reaches the protocol, the `bd`
-binary and version (warning outside the tested range), stale-lease count, and
-corrupt-lock count.
+`AGENTS.md` freshness, whether `CLAUDE.md` reaches the protocol, whether those
+two files would survive a clone (i.e. aren't gitignored), the `bd` binary and
+version (warning outside the tested range), stale-lease count, and corrupt-lock
+count.
 Lazy-loaded like Messages (only checked once you visit the tab, or press
 `r`), since it shells out to `bd --version` the same way Messages does.
 

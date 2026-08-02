@@ -1040,3 +1040,76 @@ fn init_does_not_write_a_self_import_when_claude_md_symlinks_to_agents_md() {
         .unwrap();
     assert_eq!(check["ok"], true, "{check}");
 }
+
+/// A real git repo, since `git check-ignore` needs one (the bare `.git`
+/// directory `init_repo` fakes is not enough). Skips rather than fails if git
+/// is unavailable, matching `bd_repo`.
+fn git_repo(test: &str) -> Option<TempDir> {
+    let tmp = tempfile::tempdir().unwrap();
+    match Command::new("git")
+        .args(["init", "-q", "."])
+        .current_dir(tmp.path())
+        .output()
+    {
+        Ok(o) if o.status.success() => Some(tmp),
+        Ok(o) => {
+            eprintln!("SKIP {test}: `git init` failed ({})", o.status);
+            None
+        }
+        Err(e) => {
+            eprintln!("SKIP {test}: cannot run git: {e}");
+            None
+        }
+    }
+}
+
+fn reach_check(repo: &Path) -> serde_json::Value {
+    let out = pact(repo, "reach-agent", &["doctor", "--json"]);
+    json_stdout(&out)["checks"]
+        .as_array()
+        .expect("doctor emits a checks array")
+        .iter()
+        .find(|c| c["name"] == "protocol files reach a clone")
+        .cloned()
+        .expect("doctor should report whether the protocol files reach a clone")
+}
+
+/// pact's own repo shipped its entire history this way: a global `~/.gitignore`
+/// rule meant `AGENTS.md` was written by every `pact init`, silently refused by
+/// `git add`, and never once committed. Every other check was green — the block
+/// really was current, it just reached nobody who cloned.
+#[test]
+fn doctor_flags_a_gitignored_agents_md_that_no_clone_will_ever_see() {
+    let Some(tmp) = git_repo("doctor_flags_a_gitignored_agents_md") else {
+        return;
+    };
+    std::fs::write(tmp.path().join(".gitignore"), "AGENTS.md\n").unwrap();
+    assert_ok(&pact(tmp.path(), "reach-agent", &["init"]));
+
+    let check = reach_check(tmp.path());
+    assert_eq!(check["ok"], false, "{check}");
+    let detail = check["detail"].as_str().unwrap();
+    assert!(detail.contains("AGENTS.md"), "{detail}");
+    // The actionable half: *which* ignore rule to go fix.
+    assert!(detail.contains(".gitignore"), "{detail}");
+
+    assert_eq!(
+        pact(tmp.path(), "reach-agent", &["doctor"]).status.code(),
+        Some(1),
+        "a failing check must exit 1"
+    );
+}
+
+/// The positive control, and the reason the check tests tracking too: straight
+/// after `pact init` the files are untracked but perfectly committable. Warning
+/// there would fire on every fresh repo and train people to ignore the check.
+#[test]
+fn doctor_does_not_warn_about_untracked_but_committable_protocol_files() {
+    let Some(tmp) = git_repo("doctor_does_not_warn_about_untracked") else {
+        return;
+    };
+    assert_ok(&pact(tmp.path(), "reach-agent", &["init"]));
+
+    let check = reach_check(tmp.path());
+    assert_eq!(check["ok"], true, "{check}");
+}

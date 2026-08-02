@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::{agents_md, beads, lease};
+use crate::{agents_md, beads, lease, repo};
 
 #[derive(Serialize)]
 pub struct DoctorCheck {
@@ -63,6 +63,32 @@ pub fn checks(root: &Path) -> DoctorReport {
             "imports AGENTS.md".to_string()
         } else {
             "Claude Code loads CLAUDE.md, not AGENTS.md — run `pact init`".to_string()
+        },
+    });
+
+    // The files above can be perfectly current and still reach nobody: a
+    // gitignored AGENTS.md is written, then silently refused by `git add`, and
+    // the clone that was supposed to be onboarded gets nothing. pact's own repo
+    // shipped that way for its whole history.
+    let unreachable: Vec<String> = ["AGENTS.md", "CLAUDE.md"]
+        .iter()
+        .filter(|f| root.join(f).exists())
+        .filter_map(|f| match repo::reach(root, f) {
+            repo::Reach::Ignored { source } => Some(format!("{f} (ignored by {source})")),
+            _ => None,
+        })
+        .collect();
+    checks.push(DoctorCheck {
+        name: "protocol files reach a clone",
+        ok: unreachable.is_empty(),
+        detail: if unreachable.is_empty() {
+            "tracked or committable".to_string()
+        } else {
+            format!(
+                "{} — `git add` refuses these silently, so a clone gets no protocol; \
+                 un-ignore them (e.g. add `!AGENTS.md` to .gitignore) and commit",
+                unreachable.join(", ")
+            )
         },
     });
 

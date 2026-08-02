@@ -63,6 +63,23 @@ pointing any agent at it is enough; re-running `pact init` after upgrading
 pact keeps the block current without touching anything else you've written
 in `AGENTS.md`.
 
+**"Commit the result" is load-bearing, so `pact doctor` checks it.** A
+gitignored `AGENTS.md` fails in the worst possible way: `pact init` writes it,
+`git add` refuses it without a word, every other check stays green, and the
+clone that was supposed to be onboarded gets nothing. A global `~/.gitignore`
+rule did exactly that to pact's own repo for its entire history. The
+**protocol files reach a clone** check asks `git check-ignore` and names the
+rule to go fix:
+
+```
+✗ protocol files reach a clone: AGENTS.md (ignored by .gitignore:1:AGENTS.md) — `git add`
+  refuses these silently, so a clone gets no protocol; un-ignore them (e.g. add
+  `!AGENTS.md` to .gitignore) and commit
+```
+
+Untracked-but-committable is fine and says nothing — that's every repo between
+`pact init` and its first commit.
+
 The protocol itself is short:
 
 - **Identity** comes from `PACT_AGENT` (or `--agent <name>`) — pact never
