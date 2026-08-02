@@ -10,6 +10,53 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.1.0 - 2026-08-02
+#### Bug Fixes
+- **(pact)** read-only commands no longer create .pact/, and teach the new CLI - (720396c) - Clement HUSSENOT-DESENONGES
+- **(pact)** exact per-tab click rects + hover highlighting in pact ui - (30c7c4e) - Clement HUSSENOT-DESENONGES
+- **(release)** make the pre-bump version hook replace the whole line - (eaaa36d) - Clement HUSSENOT-DESENONGES
+- weaken flaky concurrent steal test to match verify_own_lease guarantees - (eb1ac8d) - copilot-swe-agent[bot]
+- add verify_own_lease to re-entrant refresh path, closing race at expiry boundary - (67dc899) - copilot-swe-agent[bot]
+- close race condition on expired-lease steal with post-rename verify - (ffc3116) - copilot-swe-agent[bot]
+- corrupt timestamp treated as epoch 0; doctor reports corrupt locks - (81d5d73) - copilot-swe-agent[bot]
+#### Continuous Integration
+- add clippy and test steps for the ui feature (ubuntu-only) - (96fdde1) - copilot-swe-agent[bot]
+#### Documentation
+- **(pact)** document pact ui — keybindings, tab diagram, README mention - (e783842) - Clement HUSSENOT-DESENONGES
+- **(pact)** explain core features with use cases and mermaid diagrams - (7d82571) - Clement HUSSENOT-DESENONGES
+- bring CLAUDE.md up to date and mirror the pact protocol into it - (f664ac9) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(doctor)** warn when the bd version is outside the tested range - (1384f6b) - copilot-swe-agent[bot]
+- **(pact)** clear the pact-rnc epic — broken-pipe P0, activity feed, outbox - (e2cbf30) - Clement HUSSENOT-DESENONGES
+- **(pact)** coordination fixes found by dogfooding a live agent fleet - (ea8f0ba) - Clement HUSSENOT-DESENONGES
+- **(pact)** animated mascot in pact ui reacting to UI events - (c311129) - Clement HUSSENOT-DESENONGES
+- **(pact)** mouse support in pact ui - (3954549) - Clement HUSSENOT-DESENONGES
+- **(pact)** doctor tab + full tab navigation in pact ui - (58f8ab2) - Clement HUSSENOT-DESENONGES
+- **(pact)** messages tab in pact ui — inbox + thread view - (3f1fc50) - Clement HUSSENOT-DESENONGES
+- **(pact)** leases tab in pact ui — view and release - (4d429c7) - Clement HUSSENOT-DESENONGES
+- **(pact)** scaffold pact ui shell (ratatui + crossterm) - (af9371a) - Clement HUSSENOT-DESENONGES
+- **(pact)** add doctor command, README, CHANGELOG, and CI - (81bf22b) - Clement HUSSENOT-DESENONGES
+- **(pact)** implement beads adapter and threaded messaging - (873137c) - Clement HUSSENOT-DESENONGES
+- **(pact)** implement lease and agents_md modules - (18ab162) - Clement HUSSENOT-DESENONGES
+- **(pact)** crate skeleton with CLI surface for init/lease/msg/doctor - (d4bc1a7) - Clement HUSSENOT-DESENONGES
+- gate ratatui/TUI behind optional `ui` Cargo feature flag - (3f6da26) - copilot-swe-agent[bot]
+#### Miscellaneous Chores
+- **(beads)** initialize beads issue tracking - (1282f26) - Clement HUSSENOT-DESENONGES
+- **(pact)** refresh AGENTS.md protocol block after the coordination fixes - (73ed020) - Clement HUSSENOT-DESENONGES
+- **(pact)** wrap build/test/lint commands as mise tasks - (a8b05b3) - Clement HUSSENOT-DESENONGES
+- **(release)** configure cocogitto and restructure the changelog - (a208066) - Clement HUSSENOT-DESENONGES
+- Add last interactions - (7203404) - Clement HUSSENOT-DESENONGES
+- Add last interactions - (a8e837a) - Clement HUSSENOT-DESENONGES
+- Add an install task - (6fdff44) - Clement HUSSENOT-DESENONGES
+- Add some files - (dc80885) - Clement HUSSENOT-DESENONGES
+- Add the starting brief - (1e9f840) - Clement HUSSENOT-DESENONGES
+- Add a mise file - (d969ad7) - Clement HUSSENOT-DESENONGES
+- Root commit - (ce49501) - Clement HUSSENOT-DESENONGES
+#### Refactoring
+- **(lease)** introduce LeaseStore abstraction with filesystem-backed default store - (e2f0d82) - copilot-swe-agent[bot]
+
+- - -
+
 
 ## Notes — 0.1.0
 
