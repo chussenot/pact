@@ -148,10 +148,20 @@ under time pressure: build a throwaway crate.
 
 ```bash
 scratch=$(mktemp -d)
-cp -r src Cargo.toml Cargo.lock "$scratch"/
+# build.rs too: this crate stamps PACT_* env vars at build time, and without it
+# every compile fails with "environment variable PACT_PROFILE not defined".
+cp -rf src build.rs Cargo.toml Cargo.lock "$scratch"/
+# And pin it as its own workspace, or cargo walks *up* from the scratch dir and
+# tries to parse whatever Cargo.toml it finds in /tmp as a parent workspace.
+printf '\n[workspace]\n' >> "$scratch"/Cargo.toml
 echo 'mod parser;' >> "$scratch"/src/main.rs   # the line you may not write for real
 cd "$scratch" && cargo test parser
 ```
+
+Both of those extra lines are here because the recipe was written without them
+and did not work: the first attempt to follow it verbatim in this repo hit
+`PACT_PROFILE not defined`, and the second hit a stray parent `Cargo.toml`.
+A workaround nobody has run is not a workaround.
 
 Your module compiles and its tests run in a copy nobody else is editing, the
 real tree is untouched, and the owner of `src/main.rs` still adds the real

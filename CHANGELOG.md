@@ -251,6 +251,17 @@ cog's.
   "starting on src/foo.rs" message duplicates a record that wrote itself.
   Messages are now for things that need a reply.
 
+### Fixed — concurrent lease writes from one process
+
+- **`write_lease_atomic` named its temp file `tmp-<pid>-<nanos>`**, and two
+  threads in one process share a pid. When the nanosecond clock repeated under
+  load, both wrote the same temp file: one renamed it into place and the
+  other's rename hit `ENOENT`, so a lease that *had* been written reported
+  failure. The name now includes the thread id. It surfaced as an
+  intermittently red concurrency test, but the bug was in the writer, and any
+  caller leasing from more than one thread could hit it — `pact ui` is one
+  process.
+
 ### Changed — exit code
 
 - **Usage errors now exit `5`, not `2`.** A breaking change to a documented

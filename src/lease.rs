@@ -247,7 +247,18 @@ fn write_lease_atomic(lock_path: &Path, lease: &LeaseInfo) -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let tmp_path = dir.join(format!("tmp-{}-{nanos}", std::process::id()));
+    // Thread id as well as pid. Two threads in ONE process share a pid, so when
+    // the nanosecond clock repeats — which it does under load on a coarse
+    // clock — both wrote the SAME temp file: one renamed it into place and the
+    // other's rename hit ENOENT, reporting failure for a lease that had in fact
+    // been written. That surfaced as an intermittently red concurrency test
+    // (pact-sjg), but the bug is here, not in the test: any caller that leases
+    // from more than one thread can hit it, and `pact ui` is one process.
+    let tmp_path = dir.join(format!(
+        "tmp-{}-{:?}-{nanos}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     let json = serde_json::to_string_pretty(lease)?;
     std::fs::write(&tmp_path, json).with_context(|| format!("writing {}", tmp_path.display()))?;
     std::fs::rename(&tmp_path, lock_path)
