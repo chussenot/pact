@@ -10,6 +10,13 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.3.1 - 2026-08-02
+#### Bug Fixes
+- **(canary)** report failures from one job, not once per matrix leg - (b8e3147) - Clement HUSSENOT-DESENONGES
+- **(canary)** parse bd's version from anywhere in its output - (80c59c5) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.3.0 - 2026-08-02
 #### Bug Fixes
 - **(agents)** keep an agent on the roster after it releases its last lease - (9d8999c) - Clement HUSSENOT-DESENONGES
