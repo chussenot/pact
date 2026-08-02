@@ -22,14 +22,23 @@ this protocol whenever you touch shared files or hand off work to others.
 - **Announce intent before you research, not just before you write.** Your
   first pact commands come *before* you read the first file: `pact msg inbox`
   and `pact lease ls` to see what is already claimed and by whom, then
-  `pact msg send --to <peer-or-human>` saying what you are about to work on,
-  then `pact lease acquire <path>... --note "<what>"` for the files you expect
-  to own. Several paths in one `acquire` are taken all-or-nothing, so you never
-  end up holding half of what you need while a peer holds the rest.
-  Do it even if you will only be reading for the next ten minutes. Why:
-  a peer planning against the same file can renegotiate now instead of at the
-  end, when both plans are sunk cost — and a fleet that has announced nothing
-  looks exactly like a fleet that crashed on startup.
+  `pact lease acquire <path>... --note "<what you are doing and why>"` for the
+  files you expect to own. Several paths in one `acquire` are taken
+  all-or-nothing, so you never end up holding half of what you need while a
+  peer holds the rest. Do it even if you will only be reading for the next ten
+  minutes. Why: a peer planning against the same file can renegotiate now
+  instead of at the end, when both plans are sunk cost — and a fleet that has
+  announced nothing looks exactly like a fleet that crashed on startup.
+- **The lease note IS the announcement — do not also message it.** `pact log`
+  already records every acquire, renew, release and expiry with its note, and
+  `pact ui` shows that live, so a human watching already sees what you claimed
+  and why. A message saying "starting on src/foo.rs" duplicates a record that
+  wrote itself.
+  **Send a message when you need something back**: a decision, a file you do
+  not own, a warning about a contract you changed. Not to report progress.
+  Measured on one fleet: 85 messages, 41 of them status pings to `human`, and
+  an inbox nobody could triage — which is how a real `BLOCKER` message sat
+  unread for 38 minutes in the middle of it.
 - **Lease anything you WRITE, not just files you edit.** A lease is on a path,
   so a directory of shared state is leasable too — `pact lease acquire .beads/
   --note "probing the br CLI"` before you run a tool that might write there.
@@ -550,6 +559,7 @@ mod tests {
             "--thread",
             "pact msg sent",
             "pact lease ls",
+            "lease note IS the announcement",
             "pact agents --for",
             "--to-owner-of",
             "follows the file",

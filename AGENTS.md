@@ -139,14 +139,29 @@ this protocol whenever you touch shared files or hand off work to others.
 - **Announce intent before you research, not just before you write.** Your
   first pact commands come *before* you read the first file: `pact msg inbox`
   and `pact lease ls` to see what is already claimed and by whom, then
-  `pact msg send --to <peer-or-human>` saying what you are about to work on,
-  then `pact lease acquire <path>... --note "<what>"` for the files you expect
-  to own. Several paths in one `acquire` are taken all-or-nothing, so you never
-  end up holding half of what you need while a peer holds the rest.
-  Do it even if you will only be reading for the next ten minutes. Why:
-  a peer planning against the same file can renegotiate now instead of at the
-  end, when both plans are sunk cost — and a fleet that has announced nothing
-  looks exactly like a fleet that crashed on startup.
+  `pact lease acquire <path>... --note "<what you are doing and why>"` for the
+  files you expect to own. Several paths in one `acquire` are taken
+  all-or-nothing, so you never end up holding half of what you need while a
+  peer holds the rest. Do it even if you will only be reading for the next ten
+  minutes. Why: a peer planning against the same file can renegotiate now
+  instead of at the end, when both plans are sunk cost — and a fleet that has
+  announced nothing looks exactly like a fleet that crashed on startup.
+- **The lease note IS the announcement — do not also message it.** `pact log`
+  already records every acquire, renew, release and expiry with its note, and
+  `pact ui` shows that live, so a human watching already sees what you claimed
+  and why. A message saying "starting on src/foo.rs" duplicates a record that
+  wrote itself.
+  **Send a message when you need something back**: a decision, a file you do
+  not own, a warning about a contract you changed. Not to report progress.
+  Measured on one fleet: 85 messages, 41 of them status pings to `human`, and
+  an inbox nobody could triage — which is how a real `BLOCKER` message sat
+  unread for 38 minutes in the middle of it.
+- **Lease anything you WRITE, not just files you edit.** A lease is on a path,
+  so a directory of shared state is leasable too — `pact lease acquire .beads/
+  --note "probing the br CLI"` before you run a tool that might write there.
+  An agent that had correctly leased both source files it edited still
+  corrupted the shared Beads store, because it read the protocol as being about
+  editing files and a CLI wrote a second database behind it at exit 0.
 - **Ownership, and its one carve-out, stated together**: lease every file you
   edit that another agent might also touch, and release it when done. The
   single exception is a file that is yours alone by assignment (your own
@@ -158,6 +173,19 @@ this protocol whenever you touch shared files or hand off work to others.
   not outlive its lease. `pact lease release <path>` frees one file, `pact
   lease release --all` frees everything you hold in a single call, so nothing
   gets half-forgotten. Release before you report yourself finished, not after.
+- **Ask whose file it is before you touch it, and hand it back by name**:
+  `pact agents --for <path>` names the last agent to act on a path even after
+  they released it and exited, and `pact lease acquire` tells you the same
+  thing unprompted. When you need something from that agent, address the FILE,
+  not the name: `pact msg send --to-owner-of <path> "..."`. A path outlives the
+  process that held it, so a handoff sent to a path still reaches whoever picks
+  it up next; one sent to an agent that has finished is a dead letter.
+- **A message about a file follows the file.** `pact msg send --to-owner-of
+  <path>` does not just look up a name — the message is tagged with the path,
+  and whoever leases that path next is told it is waiting, even if the agent it
+  resolved to has exited. So when you are handing off work, address the FILE.
+  And read what `pact lease acquire` tells you before you edit: a message
+  waiting on a path is usually the reason the last agent stopped.
 - **A path someone else holds exits 2** — branch on that, not on the message
   text. `pact lease ls` names the holder; message them and pick up something
   else, which is what announcing early bought you. `pact lease acquire --steal`

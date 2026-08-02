@@ -241,6 +241,16 @@ cog's.
   seen 0s ago". Two sources of truth, and the warning used the one that
   forgets. A name nobody has ever answered to still warns.
 
+### Changed — the lease note is the announcement
+
+- **The protocol block no longer asks agents to message their progress.** One
+  fleet run produced 85 messages, 41 of them status pings to `human`, and an
+  inbox nobody could triage — which is how a real `BLOCKER` message sat unread
+  for 38 minutes in the middle of it. `pact log` already records every acquire,
+  renew, release and expiry with its note, and `pact ui` shows that live, so a
+  "starting on src/foo.rs" message duplicates a record that wrote itself.
+  Messages are now for things that need a reply.
+
 ### Changed — exit code
 
 - **Usage errors now exit `5`, not `2`.** A breaking change to a documented
