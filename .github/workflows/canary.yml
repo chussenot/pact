@@ -29,6 +29,10 @@ concurrency:
 permissions:
   contents: read
   issues: write
+  # The report job asks the API which legs failed. An explicit permissions block
+  # denies everything not listed, so without this that call 403s and the issue
+  # says "unknown".
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -60,9 +64,14 @@ jobs:
           # The tested range comes out of src/beads.rs. Restating it here would
           # create a second copy that drifts from the code it describes, which
           # is the exact failure this canary exists to catch.
+          # No `| head -1`: under pipefail, head exits first, sed takes SIGPIPE
+          # and the step dies with 141 and no output. That is exactly how the
+          # canary script failed its first two runs; this copy has only ever
+          # won the race.
           triplet() {
-            sed -nE "s/^const $1: \(u64, u64, u64\) = \(([0-9]+), ([0-9]+), ([0-9]+)\);/\1.\2.\3/p" \
-              src/beads.rs | head -1
+            local out
+            out="$(sed -nE "s/^const $1: \(u64, u64, u64\) = \(([0-9]+), ([0-9]+), ([0-9]+)\);/\1.\2.\3/p" src/beads.rs)"
+            printf '%s' "${out%%$'\n'*}"
           }
           MIN="$(triplet TESTED_BD_MIN)"
           MAX="$(triplet TESTED_BD_MAX_EXCLUSIVE)"
