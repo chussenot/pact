@@ -132,28 +132,37 @@ jobs:
           CANARY_LEG: ${{ matrix.leg }}
         run: scripts/canary.sh
 
-      - name: Report a failure as an issue
-        if: failure()
+  # A separate job, not a step inside the matrix. As a step it ran once per leg,
+  # and because both legs fail at the same moment neither `gh issue list` saw the
+  # other's issue yet — so the first real failure opened TWO issues, which is the
+  # duplication the dedup was written to prevent. One job, after both legs, can
+  # only race with itself.
+  report:
+    needs: canary
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Open or update the canary issue
         env:
           GH_TOKEN: ${{ github.token }}
-          LEG: ${{ matrix.leg }}
-          VERSION: ${{ steps.bd.outputs.version }}
+          REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          # A red scheduled run nobody sees is worthless, and a new issue every
-          # week is the same thing with extra noise: find an open one first and
-          # comment on it instead.
-          BODY="$(printf '**leg:** `%s`\n**bd version:** `%s`\n**run:** %s\n\nThe canary exercises pact against a real bd release. See the run log for the failing assertion.\n' \
-            "$LEG" "${VERSION:-unresolved}" "$RUN_URL")"
+          # Which legs actually failed, from the API rather than from guesswork —
+          # "pinned failed, latest passed" is a different diagnosis than both.
+          LEGS="$(gh api "repos/$REPO/actions/runs/${{ github.run_id }}/jobs" \
+            --jq '.jobs[] | select(.conclusion == "failure") | .name' | paste -sd', ' || echo unknown)"
+
+          BODY="$(printf '**failing legs:** %s\n**run:** %s\n\nThe canary exercises pact against a real bd release.\n\n| pinned | latest | meaning |\n| --- | --- | --- |\n| fail | fail | pact broke |\n| pass | fail | upstream bd drifted |\n\nSee the run log for the failing assertion.\n' \
+            "$LEGS" "$RUN_URL")"
 
           EXISTING="$(gh issue list --label canary --state open --limit 1 --json number -q '.[0].number' || true)"
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --body "$BODY"
             echo "commented on existing canary issue #$EXISTING"
           else
-            # --label can fail if the label does not exist yet; create it first,
-            # tolerating the case where a concurrent leg already did.
             gh label create canary --description "Scheduled canary against a real bd release" --color B60205 2>/dev/null || true
-            gh issue create --title "Canary failing against bd ${VERSION:-unknown}" --label canary --body "$BODY"
+            gh issue create --title "Canary failing (bd)" --label canary --body "$BODY"
           fi
