@@ -1644,6 +1644,9 @@ fn json_shapes_of_every_command_that_needs_no_beads_backend() {
             "name",
             "last_seen",
             "leases_held",
+            // Added by pact-6sx: lease events from the log, so an agent that
+            // released its last lease is still a known agent.
+            "lease_events",
             "messages_sent",
             "messages_received",
         ],
@@ -2340,5 +2343,85 @@ fn a_refused_acquire_still_reports_the_holder_and_exits_2() {
         stderr_of(&out).contains("holder-agent"),
         "the human-facing error must name the holder too: {}",
         stderr_of(&out)
+    );
+}
+
+/// An agent that acquires a lease, does the work and releases it — the correct
+/// behaviour — used to vanish from `pact agents` the moment its last lock file
+/// was deleted. `msg send` then warned "no agent named X has acted in this
+/// repo" one line after the resolver said "last seen 0s ago": two sources of
+/// truth, and the one behind the warning was the one that forgets (pact-6sx).
+#[test]
+fn an_agent_that_released_its_leases_is_still_a_known_agent() {
+    let tmp = init_repo();
+    assert_ok(&pact(
+        tmp.path(),
+        "first-owner",
+        &["lease", "acquire", "src/otel.rs"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "first-owner",
+        &["lease", "release", "--all"],
+    ));
+
+    let out = pact(tmp.path(), "onlooker", &["agents", "--json"]);
+    assert_ok(&out);
+    let found = json_stdout(&out);
+    let row = found
+        .as_array()
+        .expect("agents emits an array")
+        .iter()
+        .find(|a| a["name"] == "first-owner")
+        .cloned()
+        .expect("an agent that released its lease must still be known");
+    assert_eq!(row["leases_held"], 0, "it really did release: {row}");
+    assert!(
+        row["lease_events"].as_u64().unwrap_or(0) > 0,
+        "and the event log is why it is still here: {row}"
+    );
+}
+
+/// The warning this evidence feeds must keep catching what it exists for: a
+/// name nobody has ever answered to is still a typo, and widening the roster
+/// must not have widened that.
+#[test]
+fn a_name_nobody_ever_used_is_still_reported_as_unknown() {
+    let Some(tmp) = bd_repo("a_name_nobody_ever_used") else {
+        return;
+    };
+    assert_ok(&pact(
+        tmp.path(),
+        "real-agent",
+        &["lease", "acquire", "f.rs"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "real-agent",
+        &["lease", "release", "--all"],
+    ));
+
+    let typo = pact(
+        tmp.path(),
+        "sender",
+        &["msg", "send", "--to", "raal-agent", "body"],
+    );
+    assert_ok(&typo); // warns, still sends
+    assert!(
+        stderr_of(&typo).contains("has acted in this repo"),
+        "a typo must still warn: {}",
+        stderr_of(&typo)
+    );
+
+    let real = pact(
+        tmp.path(),
+        "sender",
+        &["msg", "send", "--to", "real-agent", "body"],
+    );
+    assert_ok(&real);
+    assert!(
+        !stderr_of(&real).contains("has acted in this repo"),
+        "a real, exited agent must not: {}",
+        stderr_of(&real)
     );
 }

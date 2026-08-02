@@ -231,6 +231,16 @@ cog's.
   unread forever and the protocol's "confirm, don't re-send" always answered no
   for the most important recipient.
 
+### Changed — `pact agents` remembers agents that finished cleanly
+
+- **`agents --json` gains `lease_events`**, and an agent that acquired a lease
+  and released it stays on the roster. The roster was built from live lock
+  files plus message traffic, so releasing your last lease — the correct
+  behaviour — erased you from it, and `msg send` warned "no agent named
+  first-owner has acted in this repo" one line after the resolver said "last
+  seen 0s ago". Two sources of truth, and the warning used the one that
+  forgets. A name nobody has ever answered to still warns.
+
 ### Changed — exit code
 
 - **Usage errors now exit `5`, not `2`.** A breaking change to a documented

@@ -188,6 +188,29 @@ pub fn owners(repo_root: &Path) -> Result<Vec<(String, Owner)>> {
     Ok(seen)
 }
 
+/// Every agent the log has ever seen act, with the timestamp of its most
+/// recent event and how many events it produced.
+///
+/// `pact agents` used to build its roster from live lock files plus message
+/// traffic, so an agent that acquired a lease, did the work and released it —
+/// the correct behaviour — vanished the moment its last lock was deleted.
+/// `msg send` then warned "no agent named X has acted in this repo" one line
+/// after the resolver said "last seen 0s ago" (pact-6sx).
+pub fn actors(repo_root: &Path) -> Result<Vec<(String, String, usize)>> {
+    let mut seen: Vec<(String, String, usize)> = Vec::new();
+    for e in all(repo_root)? {
+        match seen.iter_mut().find(|(a, _, _)| *a == e.agent) {
+            Some(row) => {
+                // Oldest-first, so a later event is always the more recent.
+                row.1 = e.at;
+                row.2 += 1;
+            }
+            None => seen.push((e.agent, e.at, 1)),
+        }
+    }
+    Ok(seen)
+}
+
 /// The whole log, oldest-first. `recent` is this truncated to a limit.
 fn all(repo_root: &Path) -> Result<Vec<Event>> {
     let path = events_file_path(repo_root);

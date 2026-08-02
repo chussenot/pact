@@ -22,6 +22,10 @@ pub struct AgentInfo {
     pub name: String,
     pub last_seen: String, // RFC3339, most recent evidence of activity
     pub leases_held: usize,
+    /// Lease events this agent produced, from `.pact/events.jsonl`. Survives
+    /// release, which `leases_held` deliberately does not: one says "is working
+    /// on something now", the other says "has ever worked here".
+    pub lease_events: usize,
     pub messages_sent: usize,
     pub messages_received: usize,
 }
@@ -39,7 +43,10 @@ impl AgentInfo {
     /// and counting it is how one typo'd send used to certify itself forever
     /// (pact-rnc.5).
     pub fn answers(&self) -> bool {
-        self.leases_held > 0 || self.messages_sent > 0 || self.name == HUMAN
+        self.leases_held > 0
+            || self.lease_events > 0
+            || self.messages_sent > 0
+            || self.name == HUMAN
     }
 }
 
@@ -59,6 +66,21 @@ pub fn list(cli: Option<&BeadsCli>, repo_root: &Path) -> Result<Vec<AgentInfo>> 
 
     for entry in lease::peek(repo_root, true)? {
         observe(&mut seen, &entry.lease.agent, &entry.lease.acquired_at).leases_held += 1;
+    }
+
+    // History, not just live locks. Releasing a lease deletes its lock file, so
+    // an agent that finished cleanly used to disappear from this roster while
+    // `pact agents --for <path>` — reading the same event log — still named it.
+    // Two sources of truth for "who is an agent here", and the one behind the
+    // unknown-recipient warning was the one that forgets (pact-6sx).
+    match crate::events::actors(repo_root) {
+        Ok(actors) => {
+            for (agent, at, count) in actors {
+                observe(&mut seen, &agent, &at).lease_events += count;
+            }
+        }
+        // Same rule as the message half below: the lease answer is still true.
+        Err(e) => crate::output::warn(&format!("warning: lease history unavailable: {e:#}")),
     }
 
     if let Some(cli) = cli {
@@ -145,6 +167,7 @@ fn observe<'a>(
         name: key.to_string(),
         last_seen: at.to_string(),
         leases_held: 0,
+        lease_events: 0,
         messages_sent: 0,
         messages_received: 0,
     });
@@ -213,6 +236,7 @@ mod tests {
             name: name.into(),
             last_seen: last_seen.into(),
             leases_held: 1,
+            lease_events: 0,
             messages_sent: 0,
             messages_received: 0,
         }
@@ -224,6 +248,7 @@ mod tests {
             name: name.into(),
             last_seen: last_seen.into(),
             leases_held: 0,
+            lease_events: 0,
             messages_sent: 0,
             messages_received: 2,
         }

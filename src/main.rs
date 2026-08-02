@@ -1670,6 +1670,7 @@ mod tests {
             name: name.to_string(),
             last_seen: "2026-07-31T09:00:00Z".to_string(),
             leases_held: leases,
+            lease_events: 0,
             messages_sent: sent,
             messages_received: received,
         }
