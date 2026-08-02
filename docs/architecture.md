@@ -213,6 +213,39 @@ your `PATH` is not a substitute. When both stores are present — which is what 
 stray `br init` inside a bd repo leaves behind — bd wins, because that is where
 the data is.
 
+### `.beads/interactions.jsonl` is committed, and is not the passive export
+
+Worth stating plainly, because the two files invite exactly one mistake.
+
+`.beads/issues.jsonl` **is** the passive export the Beads docs describe — a
+dump of issue state, regenerated from the Dolt database, never the source of
+truth. It is **not tracked here**, and should not be.
+
+`.beads/interactions.jsonl` is a different thing wearing a similar name: an
+append-only audit log of field changes, each carrying who changed what and the
+prose reason they gave —
+
+```json
+{"kind":"field_change","actor":"…","issue_id":"pact-4xh.1",
+ "extra":{"field":"status","old_value":"in_progress","new_value":"closed",
+          "reason":"Skeleton compiles, clap CLI surface committed (d91a1c7)."}}
+```
+
+It is committed on purpose, and bd's own `.beads/.gitignore` deliberately does
+not list it while ignoring `dolt/`, `embeddeddolt/` and the rest.
+
+**It is not regenerable.** Verified rather than assumed: deleting the file and
+running bd's `pre-commit` hook does not bring it back. Gitignoring it on the
+"JSONL is just an export" reasoning would silently discard the reasoning behind
+every bead ever closed — which is the provenance several beads in this repo were
+diagnosed from.
+
+The cost is real but small: it changes whenever bead state changes, so it needs
+committing, and a handful of `chore(beads):` commits exist only to carry it.
+Fold it into the commit whose work caused the state change where you can; a
+missed one is self-healing on the next commit. What must not happen is the
+tidy-up that mistakes it for the export.
+
 ## What pact deliberately doesn't do
 
 - **No daemon or background process.** Every command is a single invocation
