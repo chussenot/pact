@@ -312,25 +312,56 @@ foreground process — no daemon, nothing left running after you quit.
 pact ui
 ```
 
+**`ui` is an optional Cargo feature**, so that a repo which only wants leases
+and messaging doesn't compile ratatui. A default build has no `ui` subcommand
+at all — `pact ui` answers `error: unrecognized subcommand 'ui'`. Build with
+`--features ui` (the `mise` tasks below already do), and check what you have
+with `pact --version`, whose last line reports the enabled features.
+
 See [docs/tui.md](docs/tui.md) for the full keybindings reference.
 
 ## Install
 
 ```bash
-mise run install   # cargo install --path . --force
+mise run install   # cargo install --path . --force --features ui
 ```
 
 Or manually:
 
 ```bash
-cargo build --release
-cp target/release/pact /usr/local/bin/  # or anywhere on your PATH
+cargo build --release --features ui       # drop --features ui to skip `pact ui`
+cp target/release/pact /usr/local/bin/    # or anywhere on your PATH
 ```
 
 Requires `bd` (beads) on `PATH` for the `msg` subcommands; `init`, `lease`,
 `whoami`, and `agents`, `log` and `doctor` (partially — the lease half plus a
-warning) work without it. v0.1.0 targets `bd` only; `br`
-(beads-rust) compatibility is a deliberate later phase.
+warning) work without it. pact is tested against `bd` `1.1.0 <= version <
+1.2.0`; outside that range everything still runs and `pact doctor` adds a
+warning, since a `bd` that changed its output is the likeliest cause of a
+puzzling `msg` failure. `br` (beads-rust) compatibility is a deliberate later
+phase.
+
+### Which binary am I running?
+
+`-V` prints the bare `pact <semver>` line scripts grep for. `--version` prints
+the build stamp, which answers the question a version number can't — *is the
+binary on my PATH the one I just built?*
+
+```
+$ pact --version
+pact 0.1.2
+commit:   817e3611a727-dirty
+built:    2026-08-02T05:49:06Z
+rustc:    rustc 1.97.1 (8bab26f4f 2026-07-14)
+target:   x86_64-unknown-linux-gnu
+profile:  release
+features: ui
+```
+
+`profile: debug` means you're running `target/debug` rather than the installed
+release build; `features: none` explains a missing `pact ui`; `-dirty` means
+the build had uncommitted changes. A stale `pact` on `PATH` has silently
+rewritten `AGENTS.md` from an old build before — this is how you catch it.
 
 ## Commands
 
@@ -351,6 +382,9 @@ pact log [-n <count>]
 pact doctor
 pact ui
 ```
+
+Plus `pact -V` (bare version) and `pact --version` (version plus build stamp —
+see [Which binary am I running?](#which-binary-am-i-running)).
 
 Every subcommand accepts a global `--agent <name>` (or `PACT_AGENT` env var)
 and `--json` flag. `--all` on `release` is mutually exclusive with both
@@ -456,21 +490,28 @@ where this list came from.
   issues, multi-recipient threading, and read state as shared `bd` labels.
 - [docs/tui.md](docs/tui.md) — `pact ui`'s tabs and full keybindings
   reference.
+- [docs/mascot-animations.md](docs/mascot-animations.md) — the animated mascot
+  in `pact ui`: every gesture, the UI event that triggers it, and the frame
+  data behind it.
 
 ## Development
 
 Via [mise](https://mise.jdx.dev) tasks (`mise tasks ls` to list them):
 
 ```bash
-mise run build   # cargo build
-mise run test    # cargo test
+mise run build   # cargo build --features ui
+mise run test    # cargo test --features ui
 mise run fmt     # cargo fmt
-mise run lint    # cargo clippy --all-targets -- -D warnings
+mise run lint    # cargo clippy --all-targets --features ui -- -D warnings
 mise run check   # fmt-check + lint + test, same gates as CI
-mise run install # cargo install --path . --force
+mise run install # cargo install --path . --force --features ui
 ```
 
 Or run the underlying `cargo` commands directly if you don't use mise.
+
+Every task builds with `--features ui`, so what you test is what you install.
+CI runs clippy and test **both** ways — with and without the feature — so the
+dependency-light default stays guarded even though no local task exercises it.
 
 State lives under `.pact/` at the repo root (found by walking up to `.git`):
 `.pact/leases/*.lock` and `.pact/events.jsonl` (the bounded lease-event log

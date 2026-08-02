@@ -11,6 +11,23 @@ TUIs rather than something to build from scratch.
 Like every other pact command, it's a single foreground process: no daemon,
 nothing left running after you quit.
 
+## Requires the `ui` Cargo feature
+
+Everything on this page is gated behind the optional `ui` feature, so a repo
+that only wants leases and messaging doesn't compile ratatui. **A default build
+has no `ui` subcommand at all** — `pact ui` answers `error: unrecognized
+subcommand 'ui'`, which looks like a missing install rather than a missing
+feature. Build with `--features ui`:
+
+```bash
+mise run install                          # already passes --features ui
+cargo install --path . --force --features ui
+cargo build --release --features ui
+```
+
+`pact --version` ends with the enabled features, so `features: none` is the
+one-line confirmation that this is what happened.
+
 ```bash
 pact ui
 ```
@@ -91,8 +108,10 @@ messages map onto Beads issues.
 
 ### Doctor
 
-The same checks as `pact doctor` — git repo, `.pact/` presence, `AGENTS.md`
-freshness, the `bd` binary and version, stale-lease count — rendered live.
+The same checks as `pact doctor`, rendered live: git repo, `.pact/` presence,
+`AGENTS.md` freshness, whether `CLAUDE.md` reaches the protocol, the `bd`
+binary and version (warning outside the tested range), stale-lease count, and
+corrupt-lock count.
 Lazy-loaded like Messages (only checked once you visit the tab, or press
 `r`), since it shells out to `bd --version` the same way Messages does.
 

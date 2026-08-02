@@ -24,11 +24,30 @@ A lease is one JSON file: `.pact/leases/<encoded-path>.lock`, containing
 `<encoded-path>` replaces `/` with `__` (so `src/auth.rs` becomes
 `src__auth.rs.lock`). This means a path containing a literal `__` could in
 principle collide with a different path — a deliberate v1 simplification, not
-an oversight; see [pact-scaffolding-prompt.md](pact-scaffolding-prompt.md).
+an oversight.
 
-Creating the lock file is atomic (`O_EXCL`-style creation), so two agents
-racing to acquire the same lease at the same instant can't both "win" — one
-gets the lease, the other gets a conflict.
+### How much atomicity you actually get
+
+Claiming a **free** path is atomic: the lock file is created with `O_EXCL`
+semantics (`create_new`), so two agents racing for the same unheld lease can't
+both win — one gets it, the other gets a conflict (exit 2).
+
+**Taking over** an already-existing lock is a weaker guarantee, and worth
+knowing before you rely on it. The three takeover paths — reclaiming an expired
+lease, `--steal`, and a re-entrant refresh by the current holder — can't use
+`O_EXCL`, because the file is already there. They write a sibling temp file and
+`rename` it over the lock (atomic on one filesystem), then **re-read the lock
+and confirm it names them** with the exact timestamp they just wrote. If a
+concurrent takeover landed in between, the loser sees the winner's name and
+exits 2 instead of falsely reporting success.
+
+That verify narrows the race from "everything since we read the file" to
+"between our rename and our re-read". It does not close it: two takeovers
+landing inside that window can still both believe they won. Closing it fully
+would mean serializing takeovers behind an `O_EXCL` guard file, deliberately
+not built until a double-win is actually observed. For an advisory mechanism
+whose worst case is two agents editing one file — the thing leases only ever
+made *less likely*, never impossible — that trade is the honest one.
 
 ## Use case: two agents, one file
 
@@ -162,6 +181,28 @@ looking at, and how long until it changes.
 The state label is derived from the same `expired` flag that garbage collection
 acts on, not recomputed — so the label can never claim something the sweep
 disagrees with.
+
+### The fourth outcome: a lock file pact can't read
+
+A lock whose `acquired_at` won't parse is treated as **epoch 0** — 1970, which
+is comfortably past any TTL — so it reads as `expired` and the next `acquire`
+reclaims it. The alternative, treating an unparsable timestamp as "now", would
+make a corrupt file an immortal lease: nothing could reclaim it, and no agent
+could ever edit that path again. Failing toward reclaimable keeps a truncated
+write (a crash mid-`rename`, a half-synced filesystem) from bricking a path.
+
+A lock that isn't valid JSON at all can't be reclaimed that way, because pact
+can't tell whose it is. Those are counted separately and reported by
+`pact doctor`:
+
+```
+✗ corrupt leases: 2 unreadable lock files (remove manually from .pact/leases/)
+```
+
+Deleting them is a manual step on purpose. Everything else pact garbage-collects
+is a file it wrote and can still read; an unreadable one is the only case where
+it can't tell an abandoned lease from a live agent's claim it merely failed to
+parse, and guessing wrong silently destroys someone's lock.
 
 ### Why `lease ls` leads with age, not remaining TTL
 

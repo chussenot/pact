@@ -21,6 +21,8 @@ flowchart TB
     P -->|appends/reads| R[".pact/events.jsonl"]
     P -->|writes| M["AGENTS.md
     (managed block)"]
+    P -->|writes| C["CLAUDE.md
+    (@AGENTS.md import)"]
     P -->|shells out to| BD[bd CLI]
     BD -->|reads/writes| DB[(Beads database)]
 
@@ -44,6 +46,7 @@ subdirectory and it'll find the right place.
 | `.pact/leases/*.lock` | one JSON file per active lease | no |
 | `.pact/events.jsonl` | append-only lease-event log behind `pact log`, bounded | no |
 | `AGENTS.md` (managed block) | the coordination protocol, for agents to read | yes |
+| `CLAUDE.md` (managed block) | one `@AGENTS.md` import line, because Claude Code loads `CLAUDE.md` and never `AGENTS.md` | yes |
 
 Message read state is deliberately *not* in this table: it lives in `bd`, as a
 `read-by-<agent>` label on the message bead. It used to be `.pact/read.json`, and
@@ -128,6 +131,13 @@ than confirming it as an agent.
 places the facts already are (`.pact/events.jsonl` and `bd`) and merges them on
 parsed instants, keeping no third copy and no index.
 
+One seam exists behind this: lease persistence goes through a `LeaseStore`
+trait, whose only implementation reads and writes the lock files described
+above. It exists so lease *logic* can be tested without a filesystem, not
+because a second backend is planned — a database or network store would
+contradict "no daemon, no server" on the list below. Treat it as a test seam,
+not an extension point.
+
 **A read-only command must not mutate.** `whoami` not creating `.pact/` is one
 case of a general rule that took a bug to learn: every command that only *shows*
 leases used to inherit the expired-lock sweep from the listing code, so `pact
@@ -193,5 +203,5 @@ every polite heads-up look like a failure.
   clock-skew grace period, steal vs. expiry, and the path-encoding caveat.
 - [docs/messaging.md](messaging.md) — how `pact msg` maps onto Beads issues,
   and why it reconstructs threads itself instead of using `bd show --thread`.
-- [docs/pact-scaffolding-prompt.md](pact-scaffolding-prompt.md) — the
-  original design brief this project was built from.
+- [docs/tui.md](tui.md) — `pact ui`'s tabs and keybindings, and the `ui` Cargo
+  feature it lives behind.
