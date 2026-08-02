@@ -1118,12 +1118,23 @@ fn doctor_flags_a_gitignored_agents_md_that_no_clone_will_ever_see() {
     // The actionable half: *which* ignore rule to go fix.
     assert!(detail.contains(".gitignore"), "{detail}");
 
+    // Against a CONTROL, not against a hardcoded 0. The first version of this
+    // asserted `Some(0)` and encoded the author's machine: CI has no Beads CLI,
+    // so that check fails there and doctor exits 1 for a reason that has
+    // nothing to do with this warning. What the test actually means is "the
+    // warning does not change the code", so it compares the same repo with and
+    // without the gitignore rule.
     let out = pact(tmp.path(), "reach-agent", &["doctor"]);
+    let control = git_repo("doctor_flags_control").expect("git was available a moment ago");
+    assert_ok(&pact(control.path(), "reach-agent", &["init"]));
+    let baseline = pact(control.path(), "reach-agent", &["doctor"]);
     assert_eq!(
         out.status.code(),
-        Some(0),
-        "a warning must not change the exit code"
+        baseline.status.code(),
+        "a warning must not change the exit code (baseline stderr: {})",
+        stderr_of(&baseline)
     );
+
     let stdout = stdout_of(&out);
     // Visible without reading every line: a distinct glyph, and a count in the
     // summary so a `!` scrolled off the top is still reported.
@@ -1132,7 +1143,7 @@ fn doctor_flags_a_gitignored_agents_md_that_no_clone_will_ever_see() {
         "warnings render `!`, not `✓`: {stdout}"
     );
     assert!(
-        stdout.contains("all checks passed, 1 warning"),
+        stdout.contains("1 warning"),
         "the summary must count warnings: {stdout}"
     );
 }
