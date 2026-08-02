@@ -25,9 +25,32 @@ run = "cargo clippy --all-targets --features ui -- -D warnings"
 description = "Fail if README/docs drift from the real CLI: missing commands or flags, dead relative links, undocumented doctor checks (pact-qbo)"
 run = "./scripts/check-docs.sh"
 
+[tasks.otel]
+description = "Clippy + test the opt-in `otel` feature, and prove it still costs zero dependencies (pact-aw7)"
+# The `ui` feature rotted unbuilt until CI grew a job for it; `otel` is off by
+# default for the same reason and would rot the same way. The tree comparison is
+# the load-bearing line: the whole reason the exporter is hand-rolled OTLP over
+# std::net is that every `opentelemetry-otlp` combination drags in tonic and
+# tokio, so "adds nothing" is a promise that has to be enforced, not remembered.
+#
+# `--edges normal,build,dev` and not `--edges normal`: the plain form prints
+# neither [build-dependencies] nor [dev-dependencies], so a build-dep or dev-dep
+# added by the feature passed this guard silently. pact already HAS a
+# build-dependency (chrono, via build.rs), and a codegen build-dep is the most
+# likely next thing a hand-rolled JSON encoder reaches for.
+run = [
+  "cargo clippy --all-targets --features ui,otel -- -D warnings",
+  "cargo test --features ui,otel",
+  """
+  test "$(cargo tree --edges normal,build,dev)" = "$(cargo tree --edges normal,build,dev --features otel)" \
+    || { echo 'the otel feature changed the dependency tree:'; \
+         cargo tree --edges normal,build,dev --features otel; exit 1; }
+  """,
+]
+
 [tasks.check]
-description = "Run the full CI check locally: fmt, lint, test, docs. CI additionally runs clippy and test without the ui feature, so the dependency-light build stays guarded there."
-depends = ["fmt-check", "lint", "test", "check-docs"]
+description = "Run the full CI check locally: fmt, lint, test, otel, docs. CI additionally runs clippy and test without the ui feature, so the dependency-light build stays guarded there."
+depends = ["fmt-check", "lint", "test", "otel", "check-docs"]
 
 [tasks.install]
 description = "Build and install the pact binary locally, ui feature included"

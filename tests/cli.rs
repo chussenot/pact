@@ -2036,3 +2036,177 @@ fn doctor_warns_when_two_beads_stores_share_one_directory() {
         "must name the ignored store: {detail}"
     );
 }
+
+// ------------------------------------------------------- telemetry (pact-aw7)
+
+/// A collector that completes the TCP handshake and then never says another
+/// word: a listener nothing ever accepts from, so the kernel's backlog answers
+/// the SYN and no byte ever comes back. That is what a *wedged* collector looks
+/// like, and it is the state that decided this epic's transport — the
+/// `opentelemetry-otlp` prototype spent 1031 ms per command in it, twenty times
+/// pact's exit budget (otel-core, pact-aw7.1). A merely *closed* port fails
+/// fast and would prove nothing, which is why this is a real listener and not
+/// an unused port number.
+fn blackholed_collector() -> (std::net::TcpListener, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a blackhole");
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    // Non-blocking so the test can ask "did anything connect?" without hanging
+    // when the answer is no — which is the expected answer in a default build.
+    listener.set_nonblocking(true).unwrap();
+    (listener, url)
+}
+
+/// Run pact with telemetry either off or pointed at `endpoint`, and time it.
+///
+/// The `env_remove` list is not defensive padding. The machine this was written
+/// on exports Claude Code to a gRPC collector via `OTEL_EXPORTER_OTLP_PROTOCOL`,
+/// and `cargo test` inherits the developer's environment: leave those variables
+/// to chance and the "telemetry on" run silently exports nothing, so the test
+/// passes by measuring nothing at all.
+fn timed_pact(
+    repo: &Path,
+    agent: &str,
+    args: &[&str],
+    endpoint: Option<&str>,
+) -> (Output, std::time::Duration) {
+    let mut cmd = pact_cmd(repo, args);
+    cmd.env("PACT_AGENT", agent);
+    for key in [
+        "OTEL_SDK_DISABLED",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_TIMEOUT",
+        "OTEL_SERVICE_NAME",
+    ] {
+        cmd.env_remove(key);
+    }
+    if let Some(url) = endpoint {
+        cmd.env("OTEL_EXPORTER_OTLP_ENDPOINT", url)
+            .env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json");
+    }
+    let start = std::time::Instant::now();
+    let out = cmd.output().expect("failed to run pact binary");
+    (out, start.elapsed())
+}
+
+/// The invariant the whole telemetry epic hangs on, asked for independently by
+/// otel-core (pact-wisp-hvo), lease-metrics (pact-wisp-rcm) and msg-metrics
+/// (pact-wisp-ldu): a collector that never answers must change neither exit
+/// code, nor stdout, nor how long pact takes to get out of the way.
+///
+/// Both documented lease codes are exercised, because they fail differently: 0
+/// runs the whole happy path with an export at the end, and 2 is the one an
+/// agent's script branches on. Exit codes are API (README), so a telemetry
+/// layer that can move one is a bug in every consumer at once.
+///
+/// The test is deliberately NOT `#[cfg(feature = "otel")]`. In the default
+/// build it asserts something just as load-bearing — that the same variables
+/// are inert, and that nothing dials out of a binary built without the feature.
+#[test]
+fn a_wedged_collector_changes_neither_exit_code_nor_stdout_nor_exit_latency() {
+    let (blackhole, endpoint) = blackholed_collector();
+
+    // Two repos so the runs see identical state rather than each other's leases.
+    let quiet = init_repo();
+    let traced = init_repo();
+
+    let scenario = |repo: &Path, ep: Option<&str>| {
+        let free = timed_pact(repo, "agent-a", &["lease", "acquire", "src/x.rs"], ep);
+        let held = timed_pact(repo, "agent-b", &["lease", "acquire", "src/x.rs"], ep);
+        (free, held)
+    };
+
+    let ((q_free, q_free_t), (q_held, q_held_t)) = scenario(quiet.path(), None);
+    let ((t_free, t_free_t), (t_held, t_held_t)) = scenario(traced.path(), Some(&endpoint));
+
+    assert_ok(&q_free);
+    assert_ok(&t_free);
+    assert_eq!(q_held.status.code(), Some(2), "{}", stderr_of(&q_held));
+    assert_eq!(
+        t_held.status.code(),
+        Some(2),
+        "a wedged collector must not turn `2 = held by another agent` into \
+         anything else\nstdout: {}\nstderr: {}",
+        stdout_of(&t_held),
+        stderr_of(&t_held)
+    );
+
+    // Byte-identical stdout, not merely "looks right". stderr is excluded on
+    // purpose: the conflict message carries the lease's age, which legitimately
+    // differs between two runs.
+    assert_eq!(
+        stdout_of(&t_free),
+        stdout_of(&q_free),
+        "telemetry leaked into stdout on the success path"
+    );
+    assert_eq!(
+        stdout_of(&t_held),
+        stdout_of(&q_held),
+        "telemetry leaked into stdout on the conflict path"
+    );
+
+    // Latency is measured as a delta against the same commands with telemetry
+    // off, so a slow machine moves both sides. 500 ms of slack is ~10x the
+    // measured cost of this state (+31.7 ms, bounded by otel::EXIT_BUDGET_MS)
+    // and still an order of magnitude under the 1031 ms regression it guards.
+    let quiet_total = q_free_t + q_held_t;
+    let traced_total = t_free_t + t_held_t;
+    assert!(
+        traced_total < quiet_total + std::time::Duration::from_millis(500),
+        "a collector that never answers delayed exit: {traced_total:?} against \
+         {quiet_total:?} with telemetry off"
+    );
+
+    // Everything above would also pass if pact had simply not tried, so ask the
+    // blackhole whether anyone knocked. This is what keeps the assertions honest
+    // when someone changes how the endpoint is resolved.
+    let connected = blackhole.accept().is_ok();
+    if cfg!(feature = "otel") {
+        assert!(
+            connected,
+            "nothing reached the collector, so this test proved nothing — \
+             check how OTEL_EXPORTER_OTLP_ENDPOINT is resolved"
+        );
+    } else {
+        assert!(
+            !connected,
+            "a build without the `otel` feature must ignore OTEL_* entirely; \
+             something opened a socket"
+        );
+    }
+}
+
+/// `pact doctor` on an unhealthy repo must report and exit 1 — not exit behind
+/// main's back. It used to end in `std::process::exit(1)`, which skips every
+/// destructor: the failing doctor run, the only one anybody troubleshoots,
+/// flushed no telemetry at all (span-dev, pact-aw7.2). The fix is invisible
+/// from the outside, which is exactly why it needs a test — the next person to
+/// reach for `process::exit` here will pass every other test in this file.
+#[test]
+fn an_unhealthy_doctor_reports_on_stdout_and_exits_1_without_short_circuiting() {
+    let tmp = init_repo();
+    let out = pact(tmp.path(), "doctor-agent", &["doctor"]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a bare repo has no AGENTS.md and is not healthy\nstdout: {}\nstderr: {}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("AGENTS.md"),
+        "the report belongs on stdout: {stdout}"
+    );
+    assert!(
+        !stderr_of(&out).starts_with("error:"),
+        "an unhealthy repo is a finding, not a command failure: {}",
+        stderr_of(&out)
+    );
+}

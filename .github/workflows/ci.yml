@@ -28,6 +28,30 @@ jobs:
       - name: Test (ui feature)
         if: runner.os == 'Linux'
         run: cargo test --features ui
+      # `otel` is off by default, so nothing above compiles a line of it. The
+      # `ui` feature went unbuilt for exactly this reason until it got a job of
+      # its own; this is that job, added on the day the feature landed instead.
+      - name: Clippy (ui + otel features)
+        if: runner.os == 'Linux'
+        run: cargo clippy --all-targets --features ui,otel -- -D warnings
+      - name: Test (ui + otel features)
+        if: runner.os == 'Linux'
+        run: cargo test --features ui,otel
+      # The promise that decided the transport: the exporter is hand-rolled
+      # OTLP/HTTP+JSON over std::net precisely because every opentelemetry-otlp
+      # combination pulls tonic and tokio into a synchronous CLI. Enforced here
+      # rather than remembered — the trees must be character-for-character equal.
+      #
+      # normal,build,dev, not normal: `--edges normal` prints neither
+      # [build-dependencies] nor [dev-dependencies], so the guard let a build-dep
+      # or dev-dep added by the feature through without a word. pact already has
+      # a build-dependency (chrono, via build.rs).
+      - name: The otel feature costs no dependency
+        if: runner.os == 'Linux'
+        run: |
+          test "$(cargo tree --edges normal,build,dev)" = "$(cargo tree --edges normal,build,dev --features otel)" \
+            || { echo 'the otel feature changed the dependency tree:'; \
+                 cargo tree --edges normal,build,dev --features otel; exit 1; }
       # Linux-only: the check walks `pact --help`, which is platform-independent,
       # and it needs the ui feature built — which only this job does. It shells
       # out to `pact doctor`, so it must run after checkout in a real git repo;
