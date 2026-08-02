@@ -67,6 +67,23 @@ use crate::{attrs, otel};
 /// Label prefix marking "this agent has read this message".
 const READ_BY: &str = "read-by-";
 
+/// Label marking a message as being ABOUT a path, so delivery can follow the
+/// file instead of stopping at the name the path resolved to.
+///
+/// `--to-owner-of` addressed a file and then resolved it to an agent, and
+/// delivery stopped there. Measured over one fleet run: 30 of 44 agent-to-agent
+/// messages went to agents who had already exited, and none of those were ever
+/// read, while every message to a live agent was read. Addressing was never the
+/// failure — deliverability was. Every one of the 30 was about a file, sent to
+/// the agent who had just released it (pact-4tj).
+const ABOUT: &str = "about-";
+
+/// A path as a label-safe token: `/` to `__`, the same encoding lease lock
+/// files already use, so one path has one spelling across the whole tool.
+fn encode_path(path: &str) -> String {
+    path.replace('/', "__")
+}
+
 /// How far [`walk_to_root`] follows `parent` links before giving up. pact only
 /// ever creates depth-1 threads; the cap exists so hand-edited or cyclic parent
 /// data cannot spin forever, not because deep threads are expected.
@@ -195,15 +212,33 @@ impl BdIssue {
 /// error. Not atomic — bd has no transaction across N creates — so a failure
 /// part-way through leaves the earlier recipients' messages sent; the error
 /// says which, and `sent()` lists them, so nobody has to re-send blind.
+/// Everything about a message except who it goes to.
+///
+/// A struct rather than four more parameters: `send` was already at the limit,
+/// and "the message" is a real thing with parts, not an argument list.
+pub struct Draft<'a> {
+    /// Reply within an existing thread; `None` starts a new one.
+    pub thread: Option<&'a str>,
+    pub subject: Option<&'a str>,
+    pub body: &'a str,
+    /// Paths this message is ABOUT, from `--to-owner-of`. Recorded as labels so
+    /// delivery can follow the file after the agent it resolved to has exited.
+    pub about: &'a [String],
+}
+
 pub fn send(
     cli: &BeadsCli,
     repo_root: &Path,
     agent: &str,
     to: &[String],
-    thread: Option<&str>,
-    subject: Option<&str>,
-    body: &str,
+    draft: Draft<'_>,
 ) -> Result<Vec<Message>> {
+    let Draft {
+        thread,
+        subject,
+        body,
+        about,
+    } = draft;
     if to.is_empty() {
         anyhow::bail!("no recipients — `msg send` needs at least one --to");
     }
@@ -227,6 +262,7 @@ pub fn send(
         None => None,
     };
     let mut messages: Vec<Message> = Vec::with_capacity(to.len());
+    let mut ids: Vec<String> = Vec::with_capacity(to.len());
     // Read once, not per recipient: it is a property of the command line, and
     // every bead this send creates was addressed the same way.
     let addressing = addressing_mode();
@@ -256,6 +292,7 @@ pub fn send(
         })?;
         let id = issue.id;
         let thread = thread_id.get_or_insert_with(|| id.clone()).clone();
+        ids.push(id.clone());
         messages.push(Message {
             id,
             thread,
@@ -281,7 +318,51 @@ pub fn send(
             ],
         );
     }
+
+    // Tag every bead with the paths it is ABOUT, so `lease acquire` can deliver
+    // it to whoever picks the file up next. Best-effort on purpose: the message
+    // has already been sent and the sender has already been told so, and this
+    // module's whole reason for putting read state in bd is that a send whose
+    // bookkeeping failed must not look like a send that did not happen.
+    if !about.is_empty() && !ids.is_empty() {
+        let labels: Vec<String> = about
+            .iter()
+            .map(|p| format!("{ABOUT}{}", encode_path(p)))
+            .collect();
+        let mut args: Vec<&str> = vec!["label", "add"];
+        args.extend(ids.iter().map(String::as_str));
+        args.extend(labels.iter().map(String::as_str));
+        if let Err(e) = cli.run(repo_root, &args) {
+            crate::output::warn(&format!(
+                "warning: sent, but could not tag it with the path it is about \
+                 ({e:#}) — it will not be surfaced to whoever leases that path next"
+            ));
+        }
+    }
     Ok(messages)
+}
+
+/// Unread messages tagged as being about `path`, for any recipient.
+///
+/// This is what makes `--to-owner-of` a delivery mechanism rather than an
+/// address-book lookup. It deliberately ignores who a message was addressed to:
+/// the point is that a message about `src/otel.rs` reaches whoever picks up
+/// `src/otel.rs`, even — especially — when the agent it was addressed to has
+/// exited. Reading it is the recipient's job; noticing it is the file's.
+pub fn about_path(cli: &BeadsCli, repo_root: &Path, path: &str) -> Result<Vec<Message>> {
+    let label = format!("{ABOUT}{}", encode_path(path));
+    let issues = list_issues(cli, repo_root, None)?;
+    let matching: Vec<BdIssue> = issues
+        .into_iter()
+        .filter(|i| {
+            i.labels
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|l| l == &label)
+        })
+        .collect();
+    Ok(to_messages(matching, None))
 }
 
 /// `create` args for one message bead. Owned Strings because they are all
@@ -557,6 +638,16 @@ fn read_label(agent: &str) -> String {
 
 /// `bd label add <id>... read-by-<agent>` — one call for the whole thread, and
 /// idempotent, so re-reading a thread is a no-op rather than a duplicate.
+/// Mark one message read by id, for a caller that has the id but not the bead.
+///
+/// `pact ui` needs this: the dashboard is the human's inbox, and until it could
+/// record a read the sender's `pact msg sent` said "unread" forever (pact-4tj).
+pub fn mark_read_by_id(cli: &BeadsCli, repo_root: &Path, agent: &str, id: &str) -> Result<()> {
+    let label = read_label(agent);
+    cli.run(repo_root, &["label", "add", id, &label])
+        .map(|_| ())
+}
+
 fn mark_read(cli: &BeadsCli, repo_root: &Path, agent: &str, issues: &[BdIssue]) -> Result<()> {
     let label = read_label(agent);
     let mut args = vec!["label", "add"];
@@ -1237,9 +1328,12 @@ mod tests {
             Path::new("/nonexistent"),
             "msg-fix",
             &[],
-            None,
-            None,
-            "body",
+            Draft {
+                thread: None,
+                subject: None,
+                body: "body",
+                about: &[],
+            },
         )
         .expect_err("empty --to must not be accepted");
         assert!(err.to_string().contains("no recipients"), "{err}");

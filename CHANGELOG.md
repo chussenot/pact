@@ -183,6 +183,21 @@ cog's.
   being about editing, so leasing a directory before probing a CLI never
   occurred to it.
 
+### Changed — messages are delivered to files, not just addressed to names
+
+- **A message sent with `--to-owner-of <path>` is tagged with that path**, and
+  `pact lease acquire` surfaces any unread message about a path you take. In one
+  fleet run, 30 of 44 agent-to-agent messages went to agents who had already
+  exited and none were read, while every message to a live agent was — so
+  addressing was never the failure, deliverability was. All 30 were about a
+  file, sent to the agent who had just released it.
+- **`msg send` reports who a path resolved to and how long since they acted.** A
+  resolved name reads like a delivered message and is not.
+- **`pact ui` marks a message read when you select it.** 41 of 85 messages went
+  to `human`, who never runs `pact msg read`, so `pact msg sent` reported them
+  unread forever and the protocol's "confirm, don't re-send" always answered no
+  for the most important recipient.
+
 ### Changed — exit code
 
 - **Usage errors now exit `5`, not `2`.** A breaking change to a documented

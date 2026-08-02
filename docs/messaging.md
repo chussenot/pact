@@ -381,3 +381,56 @@ agent identity — `--agent <name>` or `PACT_AGENT` (see the
 
 Messages also show up in `pact log`, merged with lease events into one
 chronological feed.
+
+
+## Delivery follows the file, not the name
+
+`--to-owner-of <path>` resolves a path to the agent who last worked on it. That
+is *addressing*, and addressing was never the problem.
+
+Measured across one nine-agent fleet run, after `--to-owner-of` had shipped:
+
+```
+recipient acted again after the message was sent:  14/44  → read 14  (100%)
+recipient never acted again (had exited):          30/44  → read  0    (0%)
+```
+
+Every message to a live agent was read. Every message to an exited one was not.
+The read rate barely moved from the run before (86% unread → 84%) because a
+better address does not help when nobody is home. Eleven of thirteen agents used
+`--to-owner-of` or `agents --for`, and every one reported it routing correctly
+on the first try to a name they did not know — it worked exactly as designed,
+and the designed thing was the wrong thing.
+
+So a message sent with `--to-owner-of` is now **tagged with the path**, as an
+`about-<path>` label on the message bead, and `pact lease acquire` surfaces any
+unread message about a path you are taking:
+
+```
+$ pact lease acquire src/otel.rs
+acquired lease on src/otel.rs for third-agent
+note: 1 unread message(s) about src/otel.rs, oldest from second-agent —
+"BLOCKER: flush is broken". Read it before you edit: `pact msg read bd_…-wisp-xnp`
+```
+
+The third agent was never the addressee and had read nothing. It gets the
+message because it took the file. Every one of the 30 lost messages above was
+about a file, sent to the agent who had just released it — so the moment
+somebody leases that file is exactly the moment the message becomes useful
+again.
+
+Two supporting changes:
+
+- **`msg send` says who a path resolved to, and how stale they are** — `note:
+  src/otel.rs resolved to first-owner, last seen 41m ago`. A resolved name
+  reads like a delivered message and is not. One agent worked around this by
+  hand-adding `--to human` to all three of its sends; it was the only one that
+  thought of it.
+- **`pact ui` marks a message read when you select it.** 41 of 85 messages in
+  that run went to `human`, who never runs `pact msg read`, so `pact msg sent`
+  reported them unread forever — and the protocol's "confirm, don't re-send:
+  `pact msg sent` shows whether the recipient has read it" always answered *no*
+  for the most important recipient. The dashboard is the human's inbox, so
+  looking at a message there counts as reading it. Selection, not display:
+  merely opening the tab would wipe the unread markers that make the list worth
+  having.

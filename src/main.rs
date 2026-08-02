@@ -193,6 +193,12 @@ enum MsgAction {
 /// that instruction unfollowable.
 const USAGE_ERROR: i32 = 5;
 
+/// How long a resolved recipient can have been silent before `msg send` says so.
+/// Fifteen minutes is well past a normal think-and-edit gap and well short of a
+/// session, so it flags an agent that has probably exited without nagging about
+/// one that is merely busy.
+const QUIET_AGENT_SECS: i64 = 15 * 60;
+
 /// clap's verdict, as an exit code plus the argv *shape* that stands in for a
 /// subcommand name we never got to parse.
 ///
@@ -755,6 +761,45 @@ fn run_agents(cwd: &Path, json: bool, for_path: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Unread messages about the paths being leased, surfaced to whoever is taking
+/// them over.
+///
+/// `--to-owner-of` addressed a file and then resolved it to an agent name, and
+/// delivery stopped there. Over one fleet run, 30 of 44 agent-to-agent messages
+/// went to agents who had already exited and none were ever read, while every
+/// message to a live agent WAS read: addressing was never the failure,
+/// deliverability was. Every one of the 30 was about a file, sent to the agent
+/// who had just released it — so the moment someone leases that file is exactly
+/// the moment the message becomes useful again (pact-4tj).
+///
+/// Silent when `bd` is absent: acquiring a lease must not start depending on
+/// the messaging backend, which `lease` has never needed.
+fn messages_about(root: &Path, paths: &[String], agent: &str) -> Vec<String> {
+    let Ok(cli) = beads::BeadsCli::locate() else {
+        return Vec::new();
+    };
+    paths
+        .iter()
+        .filter_map(|path| {
+            let waiting: Vec<msg::Message> = msg::about_path(&cli, root, path)
+                .ok()?
+                .into_iter()
+                // Yours already, or already read by you: not news.
+                .filter(|m| m.from != agent && !m.read_by.iter().any(|r| r == agent))
+                .collect();
+            let first = waiting.first()?;
+            Some(format!(
+                "note: {} unread message(s) about {path}, oldest from {} — \"{}\". \
+                 Read it before you edit: `pact msg read {}`",
+                waiting.len(),
+                first.from,
+                first.subject.as_deref().unwrap_or("(no subject)"),
+                first.id
+            ))
+        })
+        .collect()
+}
+
 /// Advisory lines for paths someone else worked on recently.
 ///
 /// A lease says nothing about a path once it is released, so `acquire` on a
@@ -843,6 +888,9 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
             // After the success line, never before it: what happened first,
             // then what you should know.
             for line in prior {
+                output::warn(&line);
+            }
+            for line in messages_about(&root, &paths, &agent) {
                 output::warn(&line);
             }
             Ok(())
@@ -967,6 +1015,26 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
                         ));
                     }
                     Some(owner) => {
+                        // Say who the path resolved to and how stale they are.
+                        // A resolved name looks like a delivered message, and
+                        // it is not: every message to a live agent in the last
+                        // fleet run was read, every message to an exited one
+                        // was not. One agent worked around this by hand-adding
+                        // `--to human` to all three of its sends; they were the
+                        // only one who thought of it (pact-4tj).
+                        let ago = age_of(&owner.at)
+                            .map(human_secs)
+                            .unwrap_or_else(|| "an unknown time".to_string());
+                        let stale = age_of(&owner.at).is_some_and(|s| s > QUIET_AGENT_SECS);
+                        output::warn(&format!(
+                            "note: {path} resolved to {}, last seen {ago} ago{}",
+                            owner.agent,
+                            if stale {
+                                " — they may have exited; whoever leases that path next                                  will be shown this message"
+                            } else {
+                                ""
+                            }
+                        ));
                         if !to.contains(&owner.agent) {
                             to.push(owner.agent);
                         }
@@ -990,9 +1058,12 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
                 &root,
                 &agent,
                 &to,
-                thread.as_deref(),
-                subject.as_deref(),
-                &body,
+                msg::Draft {
+                    thread: thread.as_deref(),
+                    subject: subject.as_deref(),
+                    body: &body,
+                    about: &to_owner_of,
+                },
             )?;
             output::emit(json, &sent, |sent: &Vec<msg::Message>| {
                 let root_msg = &sent[0]; // send() errors on an empty recipient list

@@ -157,6 +157,11 @@ struct App {
     bd: std::result::Result<BeadsCli, String>,
     messages: Vec<msg::Message>,
     message_list_state: ListState,
+    /// Message ids already marked read this session, so the 1-second refresh
+    /// does not shell out to the Beads CLI once per tick for the same message.
+    /// Same trap the mascot work had to avoid: a per-tick subprocess is how a
+    /// dashboard turns into 10 `bd` invocations a second.
+    marked_read: std::collections::HashSet<String>,
     /// `Some` while viewing a thread's detail pane instead of the inbox list.
     thread: Option<Vec<msg::Message>>,
 
@@ -204,6 +209,7 @@ impl App {
             bd,
             messages: Vec::new(),
             message_list_state: ListState::default(),
+            marked_read: std::collections::HashSet::new(),
             thread: None,
             doctor_report: None,
             unread: 0,
@@ -340,8 +346,50 @@ impl App {
                     None => Some(0),
                 };
                 self.message_list_state.select(selected);
+                self.mark_selected_read();
             }
             Err(e) => self.status = Some(format!("failed to fetch inbox: {e:#}")),
+        }
+    }
+
+    /// Mark the message under the cursor as read.
+    ///
+    /// The dashboard IS the human's inbox, and that was the gap: 41 of 85
+    /// messages in one fleet run were addressed to `human`, who never runs
+    /// `pact msg read`, so `pact msg sent` reported every one of them unread
+    /// forever. The protocol tells agents "confirm, don't re-send: `pact msg
+    /// sent` shows whether the recipient has read it" — and for the single most
+    /// important recipient that instruction always answered no, which is how an
+    /// inbox reaches sixty entries nobody can triage (pact-4tj).
+    ///
+    /// Selection, not display: scrolling past a line is reading it, but merely
+    /// opening the tab is not, and marking the whole list read on arrival would
+    /// destroy the unread markers that make the list worth having.
+    fn mark_selected_read(&mut self) {
+        let Some(agent) = self.agent.clone() else {
+            return;
+        };
+        let Ok(cli) = &self.bd else {
+            return;
+        };
+        let Some(m) = self
+            .message_list_state
+            .selected()
+            .and_then(|i| self.messages.get(i))
+        else {
+            return;
+        };
+        // Already read, or already done this session: no subprocess.
+        if m.read || !self.marked_read.insert(m.id.clone()) {
+            return;
+        }
+        let id = m.id.clone();
+        if let Err(e) = msg::mark_read_by_id(cli, &self.repo_root, &agent, &id) {
+            // Non-fatal and non-blocking: a dashboard that cannot update read
+            // state is still a dashboard. Retrying every tick would be the
+            // subprocess storm this guard exists to prevent, so the id stays in
+            // the set either way.
+            self.status = Some(format!("could not mark {id} read: {e:#}"));
         }
     }
 
@@ -396,6 +444,7 @@ impl App {
         let current = self.message_list_state.selected().unwrap_or(0) as isize;
         self.message_list_state
             .select(Some((current + delta).rem_euclid(len) as usize));
+        self.mark_selected_read();
     }
 
     /// Click on the leases table: select whichever row is under `y`, if any.
@@ -415,6 +464,7 @@ impl App {
         if let Some(index) = row_at(self.content_area, y, 0, self.message_list_state.offset()) {
             if index < self.messages.len() {
                 self.message_list_state.select(Some(index));
+                self.mark_selected_read();
             }
         }
     }
@@ -1106,6 +1156,7 @@ mod tests {
             bd: Err("bd (beads) not found on PATH".to_string()),
             messages: Vec::new(),
             message_list_state: ListState::default().with_selected(Some(0)),
+            marked_read: std::collections::HashSet::new(),
             thread: None,
             doctor_report: None,
             unread: 0,

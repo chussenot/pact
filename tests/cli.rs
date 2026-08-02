@@ -2210,3 +2210,108 @@ fn an_unhealthy_doctor_reports_on_stdout_and_exits_1_without_short_circuiting() 
         stderr_of(&out)
     );
 }
+
+/// The finding pact-4tj measured: `--to-owner-of` fixed ADDRESSING, and
+/// addressing was never the failure. 30 of 44 agent-to-agent messages in one
+/// fleet run went to agents who had already exited and none were ever read,
+/// while every message to a live agent WAS read. Every one of the 30 was about
+/// a file, sent to the agent who had just released it — so the moment someone
+/// leases that file is the moment the message becomes useful again.
+#[test]
+fn a_message_about_a_path_is_delivered_to_whoever_leases_it_next() {
+    let Some(tmp) = bd_repo("a_message_about_a_path_is_delivered") else {
+        return;
+    };
+    // first-owner works the file, then exits.
+    assert_ok(&pact(
+        tmp.path(),
+        "first-owner",
+        &["lease", "acquire", "src/otel.rs"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "first-owner",
+        &["lease", "release", "--all"],
+    ));
+
+    // second-agent addresses the FILE; it never learns "first-owner".
+    assert_ok(&pact(
+        tmp.path(),
+        "second-agent",
+        &[
+            "msg",
+            "send",
+            "--to-owner-of",
+            "src/otel.rs",
+            "--subject",
+            "BLOCKER: flush",
+            "spans never sent",
+        ],
+    ));
+
+    // third-agent has read nothing and is not the addressee, but takes the path.
+    let out = pact(
+        tmp.path(),
+        "third-agent",
+        &["lease", "acquire", "src/otel.rs"],
+    );
+    assert_ok(&out);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("unread message") && stderr.contains("BLOCKER: flush"),
+        "the message must follow the file to its next holder: {stderr}"
+    );
+    assert!(
+        stderr.contains("second-agent"),
+        "and name who sent it: {stderr}"
+    );
+}
+
+/// Advisory, and quiet when it has nothing to say: a path with no messages
+/// about it must not grow a line, or the signal is lost in ceremony.
+#[test]
+fn leasing_a_path_with_no_messages_about_it_says_nothing_extra() {
+    let Some(tmp) = bd_repo("leasing_a_path_with_no_messages") else {
+        return;
+    };
+    let out = pact(tmp.path(), "solo", &["lease", "acquire", "quiet.rs"]);
+    assert_ok(&out);
+    assert!(
+        !stderr_of(&out).contains("unread message"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+/// `msg send --to-owner-of` says who the path resolved to. A resolved name
+/// looks like a delivered message and is not — one agent worked around this by
+/// hand-adding `--to human` to every send, and was the only one who thought of
+/// it.
+#[test]
+fn to_owner_of_reports_who_it_resolved_to() {
+    let Some(tmp) = bd_repo("to_owner_of_reports_who") else {
+        return;
+    };
+    assert_ok(&pact(
+        tmp.path(),
+        "owner-agent",
+        &["lease", "acquire", "src/x.rs"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "owner-agent",
+        &["lease", "release", "--all"],
+    ));
+
+    let out = pact(
+        tmp.path(),
+        "sender",
+        &["msg", "send", "--to-owner-of", "src/x.rs", "body"],
+    );
+    assert_ok(&out);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("resolved to owner-agent") && stderr.contains("last seen"),
+        "must name the resolution and its age: {stderr}"
+    );
+}

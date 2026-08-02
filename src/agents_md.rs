@@ -54,6 +54,12 @@ this protocol whenever you touch shared files or hand off work to others.
   not the name: `pact msg send --to-owner-of <path> "..."`. A path outlives the
   process that held it, so a handoff sent to a path still reaches whoever picks
   it up next; one sent to an agent that has finished is a dead letter.
+- **A message about a file follows the file.** `pact msg send --to-owner-of
+  <path>` does not just look up a name — the message is tagged with the path,
+  and whoever leases that path next is told it is waiting, even if the agent it
+  resolved to has exited. So when you are handing off work, address the FILE.
+  And read what `pact lease acquire` tells you before you edit: a message
+  waiting on a path is usually the reason the last agent stopped.
 - **A path someone else holds exits 2** — branch on that, not on the message
   text. `pact lease ls` names the holder; message them and pick up something
   else, which is what announcing early bought you. `pact lease acquire --steal`
@@ -546,6 +552,7 @@ mod tests {
             "pact lease ls",
             "pact agents --for",
             "--to-owner-of",
+            "follows the file",
             "pact lease acquire",
             "acquire <path>...",
             "pact lease renew",
