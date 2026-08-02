@@ -1806,3 +1806,184 @@ fn help_and_version_exit_0_but_a_bare_invocation_does_not() {
         "bare `pact` is an incomplete invocation, not a successful one"
     );
 }
+
+// ----------------------------------------------------------------- ownership
+
+/// pact modelled who HOLDS a path and nothing else, so a released path became
+/// indistinguishable from one nobody had ever opened. In a nine-agent run that
+/// cost `src/doctor.rs` blocking two agents in sequence, and one word-fix being
+/// routed by three agents then nearly applied twice (pact-o38).
+#[test]
+fn a_released_path_still_remembers_who_worked_on_it() {
+    let tmp = init_repo();
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-one",
+        &[
+            "lease",
+            "acquire",
+            "src/doctor.rs",
+            "--note",
+            "half of the bead lives here",
+        ],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-one",
+        &["lease", "release", "--all"],
+    ));
+
+    // `lease ls` is still only about locks held right now.
+    let plain = stdout_of(&pact(tmp.path(), "agent-two", &["lease", "ls"]));
+    assert!(!plain.contains("src/doctor.rs"), "{plain}");
+
+    // `--all` is "everything pact knows about paths", which now includes this.
+    let all = stdout_of(&pact(tmp.path(), "agent-two", &["lease", "ls", "--all"]));
+    assert!(
+        all.contains("src/doctor.rs") && all.contains("agent-one"),
+        "{all}"
+    );
+
+    // The scriptable answer, and the reason it is not folded into `ls --json`:
+    // a released path has no lock, so it cannot honestly be a LeaseEntry.
+    let out = pact(
+        tmp.path(),
+        "agent-two",
+        &["agents", "--for", "src/doctor.rs", "--json"],
+    );
+    assert_ok(&out);
+    let v = json_stdout(&out);
+    assert_eq!(v["agent"], "agent-one");
+    assert_eq!(v["last"], "released");
+    assert_eq!(v["note"], "half of the bead lives here");
+}
+
+/// Advisory, never blocking: the acquire succeeds, and the note goes to stderr
+/// *after* the success line so the reader sees what happened before what they
+/// should know.
+#[test]
+fn acquiring_a_recently_released_path_warns_but_succeeds() {
+    let tmp = init_repo();
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-one",
+        &["lease", "acquire", "f.txt"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-one",
+        &["lease", "release", "--all"],
+    ));
+
+    let out = pact(tmp.path(), "agent-two", &["lease", "acquire", "f.txt"]);
+    assert_ok(&out);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("agent-one"),
+        "must name who to ask: {stderr}"
+    );
+    assert!(
+        stderr.contains("--to-owner-of"),
+        "must say how to reach them: {stderr}"
+    );
+    assert!(
+        stdout_of(&out).contains("acquired lease"),
+        "advisory must not block"
+    );
+}
+
+/// Your own history is not news. A long task that renews or re-acquires its own
+/// path would otherwise warn about itself on every call, which is how a warning
+/// becomes noise people filter out.
+#[test]
+fn re_acquiring_your_own_path_says_nothing() {
+    let tmp = init_repo();
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-one",
+        &["lease", "acquire", "f.txt"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-one",
+        &["lease", "release", "--all"],
+    ));
+
+    let again = pact(tmp.path(), "agent-one", &["lease", "acquire", "f.txt"]);
+    assert_ok(&again);
+    assert!(
+        !stderr_of(&again).contains("last"),
+        "should not warn about itself: {}",
+        stderr_of(&again)
+    );
+}
+
+#[test]
+fn agents_for_an_untouched_path_answers_rather_than_failing() {
+    let tmp = init_repo();
+    let out = pact(
+        tmp.path(),
+        "agent-one",
+        &["agents", "--for", "never/seen.rs", "--json"],
+    );
+    assert_ok(&out); // "no owner" is an answer, like whoami's missing identity
+    assert_eq!(json_stdout(&out)["agent"], serde_json::Value::Null);
+}
+
+/// The acceptance criterion: a handoff addressed to a FILE reaches whoever
+/// worked on it, after its author has exited. 51 of 59 messages in one fleet
+/// run were never read because they were addressed to processes, not to work.
+#[test]
+fn a_message_addressed_to_a_path_reaches_the_agent_who_last_held_it() {
+    let Some(tmp) = bd_repo("a_message_addressed_to_a_path") else {
+        return;
+    };
+    assert_ok(&pact(
+        tmp.path(),
+        "first-owner",
+        &["lease", "acquire", "src/api.rs"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "first-owner",
+        &["lease", "release", "--all"],
+    ));
+
+    // second-agent never learns "first-owner" — it addresses the file.
+    let sent = pact(
+        tmp.path(),
+        "second-agent",
+        &[
+            "msg",
+            "send",
+            "--to-owner-of",
+            "src/api.rs",
+            "--subject",
+            "handoff",
+            "found a bug in your change",
+        ],
+    );
+    assert_ok(&sent);
+
+    let inbox = pact(tmp.path(), "first-owner", &["msg", "inbox"]);
+    assert_ok(&inbox);
+    assert!(
+        stdout_of(&inbox).contains("handoff"),
+        "the path's owner should have received it: {}",
+        stdout_of(&inbox)
+    );
+}
+
+#[test]
+fn to_owner_of_an_untouched_path_is_an_error_not_a_silent_no_op() {
+    let Some(tmp) = bd_repo("to_owner_of_an_untouched_path") else {
+        return;
+    };
+    let out = pact(
+        tmp.path(),
+        "sender",
+        &["msg", "send", "--to-owner-of", "nobody/touched.rs", "body"],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    assert!(stderr_of(&out).contains("no owner"), "{}", stderr_of(&out));
+}

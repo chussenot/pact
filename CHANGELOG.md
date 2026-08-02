@@ -157,6 +157,16 @@ cog's.
 
 ## Notes — unreleased
 
+### Added — ownership outlives the lease
+
+- **`pact agents --for <path>`**, an advisory note from **`pact lease acquire`**,
+  released paths in **`pact lease ls --all`**, and **`pact msg send
+  --to-owner-of <path>`**. A lease said who was holding a path right now and
+  nothing else, so a released path looked exactly like one nobody had ever
+  opened. Derived from `.pact/events.jsonl` — no registry, no new state.
+  Addressing a message to a path rather than an agent is the part that matters:
+  a path outlives the process that held it, so the handoff still lands.
+
 ### Changed — exit code
 
 - **Usage errors now exit `5`, not `2`.** A breaking change to a documented

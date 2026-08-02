@@ -72,7 +72,12 @@ enum Command {
     /// Show what pact resolved: identity, paths, and the bd it will use.
     Whoami,
     /// List the agent identities seen in this repo's leases and messages.
-    Agents,
+    Agents {
+        /// Answer "whose file is this?" for one PATH instead of listing
+        /// everyone: the last agent to act on it, from the lease event log.
+        #[arg(long, value_name = "PATH")]
+        r#for: Option<String>,
+    },
     /// Advisory file leases.
     Lease {
         #[command(subcommand)]
@@ -139,8 +144,13 @@ enum MsgAction {
     Send {
         /// Recipient; repeat for several (`--to a --to b`). One send is one
         /// thread, however many recipients (pact-rnc.4).
-        #[arg(long, required = true)]
+        #[arg(long, required_unless_present = "to_owner_of")]
         to: Vec<String>,
+        /// Address the last agent to work on a PATH instead of a name you have
+        /// to already know. Repeatable, and combines with --to. A path is
+        /// stable; the process that held it is not.
+        #[arg(long, value_name = "PATH")]
+        to_owner_of: Vec<String>,
         /// Reply within an existing thread; omit to start a new one.
         #[arg(long)]
         thread: Option<String>,
@@ -216,7 +226,7 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init { print, no_commit } => run_init(&cwd, print, no_commit, cli.json),
         Command::Whoami => run_whoami(&cwd, cli.agent.as_deref(), cli.json),
-        Command::Agents => run_agents(&cwd, cli.json),
+        Command::Agents { r#for } => run_agents(&cwd, cli.json, r#for.as_deref()),
         Command::Lease { action } => run_lease(&cwd, cli.agent.as_deref(), cli.json, action),
         Command::Msg { action } => run_msg(&cwd, cli.agent.as_deref(), cli.json, action),
         Command::Log { limit } => run_log(&cwd, cli.json, limit),
@@ -510,8 +520,56 @@ fn bd_health(bd: &beads::BeadsCli, root: &Path) -> (Option<String>, Vec<String>)
     (version, problems)
 }
 
-fn run_agents(cwd: &Path, json: bool) -> Result<()> {
+fn run_agents(cwd: &Path, json: bool, for_path: Option<&str>) -> Result<()> {
     let root = repo::find_repo_root(cwd)?;
+
+    // "Whose file is this?" — the question `lease ls` could never answer once a
+    // lease was released, and the scriptable half of pact-o38. Answered from the
+    // event log, so there is no registry to keep in sync.
+    if let Some(path) = for_path {
+        #[derive(serde::Serialize)]
+        struct OwnerReport<'a> {
+            path: &'a str,
+            agent: Option<String>,
+            /// `acquired` / `released` / `renewed` / `expired` / `stolen`.
+            last: Option<String>,
+            at: Option<String>,
+            note: Option<String>,
+        }
+        let owner = events::owner_of(&root, path)?;
+        let report = OwnerReport {
+            path,
+            agent: owner.as_ref().map(|o| o.agent.clone()),
+            last: owner.as_ref().map(|o| o.kind.clone()),
+            at: owner.as_ref().map(|o| o.at.clone()),
+            note: owner.as_ref().and_then(|o| o.detail.clone()),
+        };
+        // Exits 0 with agent: null when nobody has touched it. "No owner" is an
+        // answer, not a failure — the same reason `whoami` never raises.
+        output::emit(json, &report, |r: &OwnerReport| match &r.agent {
+            None => format!("{}: no agent has acted on this path", r.path),
+            Some(agent) => {
+                let ago =
+                    r.at.as_deref()
+                        .and_then(age_of)
+                        .map(|s| format!("{} ago", human_secs(s)))
+                        .unwrap_or_else(|| "at an unknown time".to_string());
+                let note = r
+                    .note
+                    .as_deref()
+                    .filter(|n| !n.is_empty())
+                    .map(|n| format!("\n  note: {n}"))
+                    .unwrap_or_default();
+                format!(
+                    "{}: {agent} ({} {ago}){note}",
+                    r.path,
+                    r.last.as_deref().unwrap_or("acted")
+                )
+            }
+        });
+        return Ok(());
+    }
+
     // bd is optional here, exactly as it is for `pact lease`: without it we can
     // still name whoever holds a lease. `locate()` covers bd being absent;
     // `agents::list` covers bd being present but unable to answer, folding that
@@ -559,6 +617,52 @@ fn run_agents(cwd: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Advisory lines for paths someone else worked on recently.
+///
+/// A lease says nothing about a path once it is released, so `acquire` on a
+/// file another agent finished with three minutes ago printed the same
+/// four-word success line it prints for an untouched file. That is how one
+/// word-fix in a nine-agent run got routed to the same agent by three peers and
+/// was then nearly applied a second time, with worse wording, by an agent whose
+/// `acquire` told it nothing (pact-o38).
+///
+/// Advisory only: it never blocks and never changes the exit code. The point is
+/// that you find out before you edit, not that pact decides for you.
+fn prior_owners(root: &Path, paths: &[String], agent: &str) -> Vec<String> {
+    paths
+        .iter()
+        .filter_map(|p| {
+            let owner = events::owner_of(root, p).ok().flatten()?;
+            // Your own history is not news.
+            if owner.agent == agent {
+                return None;
+            }
+            let ago = age_of(&owner.at)
+                .map(|s| format!("{} ago", human_secs(s)))
+                .unwrap_or_else(|| owner.at.clone());
+            let note = owner
+                .detail
+                .as_deref()
+                .filter(|d| !d.is_empty())
+                .map(|d| format!(" — their note: {d}"))
+                .unwrap_or_default();
+            Some(format!(
+                "note: {p} was last {} by {} ({ago}){note}. `pact log` has the history; \
+                 `pact msg send --to-owner-of {p}` reaches them.",
+                owner.kind, owner.agent
+            ))
+        })
+        .collect()
+}
+
+/// Seconds since an RFC3339 stamp, or `None` if it will not parse. Timestamps
+/// are compared as parsed instants, never as strings: `bd` writes `…Z` and pact
+/// writes `…+00:00`, which sort differently as bytes than as time.
+fn age_of(at: &str) -> Option<i64> {
+    let then = chrono::DateTime::parse_from_rfc3339(at).ok()?;
+    Some((chrono::Utc::now() - then.with_timezone(&chrono::Utc)).num_seconds())
+}
+
 fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseAction) -> Result<()> {
     let root = repo::find_repo_root(cwd)?;
     match action {
@@ -569,6 +673,9 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
             note,
         } => {
             let agent = identity::resolve_agent(agent_flag)?;
+            // Look up prior owners BEFORE acquiring: the acquire appends its own
+            // event, which would make the caller the answer to its own question.
+            let prior = prior_owners(&root, &paths, &agent);
             let mut outcomes = lease::acquire_many(&root, &agent, &paths, ttl, steal, note)?;
             // One path renders and serializes exactly as it always did — a
             // script doing `lease acquire f --json | jq .lease.path` must not
@@ -594,6 +701,11 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
                             .join("\n")
                     )
                 });
+            }
+            // After the success line, never before it: what happened first,
+            // then what you should know.
+            for line in prior {
+                output::warn(&line);
             }
             Ok(())
         }
@@ -655,8 +767,28 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
         }
         LeaseAction::Ls { all } => {
             let entries = lease::list(&root, all)?;
+            // `--all` means "show me everything pact knows about paths", and
+            // until now a released path vanished completely: `src/doctor.rs`
+            // blocked two agents in sequence because nothing distinguished it
+            // from a file nobody had ever opened (pact-o38).
+            //
+            // Human output only, deliberately. `lease ls --json` is an array of
+            // LeaseEntry, a shape pact-er0 just pinned, and a released path has
+            // no lock file to describe — synthesizing a LeaseEntry with an
+            // invented ttl would be a lie in a typed field. `pact agents --for
+            // <path>` is the scriptable answer.
+            let released = if all {
+                released_paths(&root, &entries)
+            } else {
+                Vec::new()
+            };
             output::emit(json, &entries, |entries: &Vec<lease::LeaseEntry>| {
-                render_leases(entries)
+                let mut out = render_leases(entries);
+                if !released.is_empty() {
+                    out.push_str("\n\nrecently released (no lease held, last owner known):\n");
+                    out.push_str(&released.join("\n"));
+                }
+                out
             });
             Ok(())
         }
@@ -670,6 +802,7 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
     match action {
         MsgAction::Send {
             to,
+            to_owner_of,
             thread,
             subject,
             body,
@@ -681,6 +814,33 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
             };
             if body.trim().is_empty() {
                 anyhow::bail!("empty message body — nothing to send");
+            }
+            // Resolve paths to the agents who last worked on them. This is
+            // what makes a handoff survive its author: 51 of 59 messages in one
+            // fleet run were never read, because they were addressed to
+            // processes that had already exited rather than to the work itself
+            // (pact-o38). A path outlives the agent holding it.
+            let mut to = to;
+            for path in &to_owner_of {
+                match events::owner_of(&root, path)? {
+                    Some(owner) if owner.agent == agent => {
+                        output::warn(&format!(
+                            "note: you are yourself the last agent to work on {path}; not adding a recipient"
+                        ));
+                    }
+                    Some(owner) => {
+                        if !to.contains(&owner.agent) {
+                            to.push(owner.agent);
+                        }
+                    }
+                    None => anyhow::bail!(
+                        "no agent has ever leased {path}, so it has no owner to address — \
+                         `pact lease ls --all` lists every path pact knows"
+                    ),
+                }
+            }
+            if to.is_empty() {
+                anyhow::bail!("no recipients resolved — nothing to send");
             }
             for recipient in &to {
                 check_recipient(recipient)?;
@@ -924,6 +1084,21 @@ fn unknown_recipient_warning(known: &[agents::AgentInfo], to: &str) -> Option<St
 /// force-released, so it only appears when it says something actionable. The
 /// note comes along because "what is this agent doing" is the question an
 /// operator is actually asking before they reach for --force.
+/// Paths the event log remembers that have no lock on disk right now.
+fn released_paths(root: &Path, held: &[lease::LeaseEntry]) -> Vec<String> {
+    events::owners(root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(path, _)| !held.iter().any(|e| e.lease.path == *path))
+        .map(|(path, owner)| {
+            let ago = age_of(&owner.at)
+                .map(|s| format!("{} ago", human_secs(s)))
+                .unwrap_or_else(|| owner.at.clone());
+            format!("  {path}  {} by {} ({ago})", owner.kind, owner.agent)
+        })
+        .collect()
+}
+
 fn render_leases(entries: &[lease::LeaseEntry]) -> String {
     if entries.is_empty() {
         return "no active leases".to_string();

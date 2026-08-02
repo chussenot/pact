@@ -123,6 +123,85 @@ pub fn recent(repo_root: &Path, limit: usize) -> Result<Vec<Event>> {
     Ok(events[start..].to_vec())
 }
 
+/// Who last touched a path, and how their claim on it ended.
+///
+/// pact models who is HOLDING a path right now and, until this existed, nothing
+/// else. Nobody could ask "who is this file's agent", "who do I send this defect
+/// to", or "who touched it last". In one nine-agent run that cost three separate
+/// failures: `src/doctor.rs` blocked two agents in sequence because nobody held
+/// it, so `lease ls` showed it exactly like an untouched file; one word-fix was
+/// routed to the same agent by three others and then nearly applied twice; and
+/// 51 of 59 messages were never read, because they were addressed to processes
+/// that had exited rather than to the work.
+///
+/// Derived, never stored — the answer was always in `.pact/events.jsonl`, it
+/// just took hand-scanning `pact log` to get it. No registry, no new state, and
+/// nothing to keep in sync (see docs/architecture.md).
+#[derive(Debug, Clone)]
+pub struct Owner {
+    pub agent: String,
+    /// RFC3339 of the last event on this path.
+    pub at: String,
+    /// `acquired` / `released` / `renewed` / `expired` / `stolen`.
+    pub kind: String,
+    /// The lease note that came with it, when there was one.
+    pub detail: Option<String>,
+}
+
+/// The last agent to act on `path`, or `None` if pact has never seen it.
+///
+/// The log is bounded (rewritten to the newest 4000 lines past 5000), so an
+/// owner is forgettable by design: a path nobody has touched in thousands of
+/// events has no current owner, which is the honest answer.
+pub fn owner_of(repo_root: &Path, path: &str) -> Result<Option<Owner>> {
+    Ok(all(repo_root)?
+        .into_iter()
+        .rev()
+        .find(|e| e.path.as_deref() == Some(path))
+        .map(|e| Owner {
+            agent: e.agent,
+            at: e.at,
+            kind: e.kind,
+            detail: e.detail,
+        }))
+}
+
+/// Every path pact has ever seen an event for, with its last owner, most
+/// recently touched first. Backs the free-but-owned rows in `lease ls --all`.
+pub fn owners(repo_root: &Path) -> Result<Vec<(String, Owner)>> {
+    let mut seen: Vec<(String, Owner)> = Vec::new();
+    for e in all(repo_root)?.into_iter().rev() {
+        let Some(path) = e.path.clone() else { continue };
+        if seen.iter().any(|(p, _)| *p == path) {
+            continue;
+        }
+        seen.push((
+            path,
+            Owner {
+                agent: e.agent,
+                at: e.at,
+                kind: e.kind,
+                detail: e.detail,
+            },
+        ));
+    }
+    Ok(seen)
+}
+
+/// The whole log, oldest-first. `recent` is this truncated to a limit.
+fn all(repo_root: &Path) -> Result<Vec<Event>> {
+    let path = events_file_path(repo_root);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    Ok(contents
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

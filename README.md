@@ -161,6 +161,52 @@ what you asked for is the text, not a report about it. Every other `init`
 invocation honours `--json`, whose report carries `instruction_files` alongside
 `agents_md`, `claude_md` and the commit fields.
 
+### Ownership — who is this file's agent, after they've gone
+
+A lease answers "who is holding this **right now**". Nothing answered "who is
+this file's agent", "who do I send this defect to", or "who touched it last" —
+and once a lease was released, a path became indistinguishable from one nobody
+had ever opened.
+
+That gap cost three separate failures in a single nine-agent run. `src/doctor.rs`
+blocked two agents in sequence, forty minutes apart, because nobody held it so
+`lease ls` showed it like an untouched file. One word-fix was routed to the same
+agent by three different peers, then nearly applied a second time with worse
+wording by an agent whose `acquire` told it nothing. And 51 of 59 messages were
+never read, because they were addressed to processes that had already exited
+rather than to the work.
+
+Ownership is **derived from the lease event log**, not declared — no registry,
+nothing to keep in sync, and it needs no new state because the answer was always
+in `.pact/events.jsonl`. Three surfaces:
+
+```
+$ pact agents --for src/doctor.rs
+src/doctor.rs: agent-one (released 12m ago)
+  note: half of the bead lives here
+
+$ pact lease acquire src/doctor.rs
+acquired lease on src/doctor.rs for agent-two
+note: src/doctor.rs was last released by agent-one (12m ago) — their note: half
+of the bead lives here. `pact log` has the history; `pact msg send
+--to-owner-of src/doctor.rs` reaches them.
+
+$ pact msg send --to-owner-of src/doctor.rs "found a bug in your change"
+```
+
+That last one is what turns dead letters into routable mail: **a message
+addressed to a path is still deliverable to whoever picks that path up**, and a
+fleet whose every agent starts with `pact msg inbox` then actually receives its
+predecessor's handoffs.
+
+`pact lease ls --all` lists released paths with their last owner too. It stays
+out of `lease ls --json`, which is an array of leases: a released path has no
+lock, so giving it an invented TTL to fit the shape would be a lie in a typed
+field. `pact agents --for <path> --json` is the scriptable answer.
+
+The `acquire` note is advisory — it never blocks, never changes the exit code,
+and says nothing when the last agent to touch the path was you.
+
 ### Leases — claim a file before you edit it
 
 A lease is an advisory claim on a path, backed by an atomic lock file under
@@ -366,7 +412,7 @@ bd         bd  (bd version 1.1.0)
 traffic — no registry, just the traces already on disk and in Beads:
 
 ```
-$ pact agents
+$ pact agents [--for <path>]
 AGENT       LAST SEEN   LEASES  SENT  RECV
 cli-wire    7m46s ago   1       0     3
 agents-new  13m56s ago  0       3     0
@@ -479,7 +525,7 @@ pact lease renew <path>
 pact lease release <path> [--force]
 pact lease release --all
 pact lease ls [--all]
-pact msg send --to <agent> [--to <agent>...] [--thread <id>] [--subject <text>] (<body> | --body-file <path|->)
+pact msg send (--to <agent>... | --to-owner-of <path>...) [--thread <id>] [--subject <text>] (<body> | --body-file <path|->)
 pact msg inbox [--unread-only] [--full]
 pact msg sent
 pact msg read <id>

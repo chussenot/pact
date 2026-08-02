@@ -41,6 +41,13 @@ this protocol whenever you touch shared files or hand off work to others.
   not outlive its lease. `pact lease release <path>` frees one file, `pact
   lease release --all` frees everything you hold in a single call, so nothing
   gets half-forgotten. Release before you report yourself finished, not after.
+- **Ask whose file it is before you touch it, and hand it back by name**:
+  `pact agents --for <path>` names the last agent to act on a path even after
+  they released it and exited, and `pact lease acquire` tells you the same
+  thing unprompted. When you need something from that agent, address the FILE,
+  not the name: `pact msg send --to-owner-of <path> "..."`. A path outlives the
+  process that held it, so a handoff sent to a path still reaches whoever picks
+  it up next; one sent to an agent that has finished is a dead letter.
 - **A path someone else holds exits 2** — branch on that, not on the message
   text. `pact lease ls` names the holder; message them and pick up something
   else, which is what announcing early bought you. `pact lease acquire --steal`
@@ -531,6 +538,8 @@ mod tests {
             "--thread",
             "pact msg sent",
             "pact lease ls",
+            "pact agents --for",
+            "--to-owner-of",
             "pact lease acquire",
             "acquire <path>...",
             "pact lease renew",
