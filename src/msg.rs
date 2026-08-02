@@ -26,6 +26,32 @@
 //! its parent's labels unless `--no-inherit-labels` is passed, which is why
 //! every create here passes it. Without it a reply to a message you had
 //! already read would be born carrying your own `read-by-` label.
+//!
+//! # br (beads-rust)
+//!
+//! br 0.2.19 runs the same model but not the same argv, so the four places
+//! below branch on [`BeadsCli::is_br`]. Every claim here was checked by running
+//! the binary against a scratch workspace (pact-l94), not read off bd's docs:
+//!
+//! - `br create --type=message --title= --description= --assignee= --parent=
+//!   --actor= --json` all work unchanged, and return the same single JSON
+//!   object bd does.
+//! - `--no-inherit-labels` does not exist (`error: unexpected argument`) and is
+//!   not needed: a br child is born with no labels at all, so the bug that flag
+//!   exists to prevent cannot happen. It is therefore omitted, not faked.
+//! - `--include-infra` does not exist either, and is equally unnecessary: plain
+//!   `br list` already returns `issue_type: "message"` beads. br *does* have the
+//!   `--type` filter bd lacks, so the filtering happens server-side there and
+//!   client-side for bd.
+//! - `br list --json` returns an envelope, `{"issues":[…],"total":…}`, where bd
+//!   returns a bare array — hence [`parse_issues`] accepts either.
+//! - `br list --json` omits `parent`, and `br list` has no `--parent` filter, so
+//!   neither the thread column nor `read_thread`'s reply fetch can come from it.
+//!   `br show <id>… --json` *does* carry `parent`, and a root's `dependents`
+//!   name its children as `parent-child` edges. So on br every listing is
+//!   `list` (for the ids) followed by one `show` (for the records): two
+//!   subprocesses instead of one, in exchange for the same data bd gives, from
+//!   the backend itself rather than from guessing at br's `<id>.<n>` id shape.
 
 use std::cmp::Ordering;
 use std::path::Path;
@@ -86,6 +112,36 @@ struct BdIssue {
     /// rather than a `#[serde(default)] Vec` (which would fail on null).
     #[serde(default)]
     labels: Option<Vec<String>>,
+    /// br only, and only from `show`: the beads that point *at* this one. br has
+    /// no `list --parent`, so this is how a thread's replies are found there.
+    #[serde(default)]
+    dependents: Option<Vec<DepRef>>,
+}
+
+/// One edge out of br's `show --json`. bd never emits these; the field is
+/// absent and stays `None`.
+#[derive(Debug, Deserialize)]
+struct DepRef {
+    id: String,
+    #[serde(default)]
+    dependency_type: String,
+}
+
+/// `list --json` output. bd returns a bare array, br wraps it in an envelope;
+/// untagged means neither backend needs a parser of its own.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ListPayload {
+    Bare(Vec<BdIssue>),
+    Envelope { issues: Vec<BdIssue> },
+}
+
+impl ListPayload {
+    fn into_issues(self) -> Vec<BdIssue> {
+        match self {
+            ListPayload::Bare(v) | ListPayload::Envelope { issues: v } => v,
+        }
+    }
 }
 
 impl BdIssue {
@@ -211,10 +267,11 @@ pub fn send(
     Ok(messages)
 }
 
-/// `bd create` args for one message bead. Owned Strings because they are all
+/// `create` args for one message bead. Owned Strings because they are all
 /// interpolated; see the module docs for why `--no-inherit-labels` is not
-/// optional.
+/// optional on bd — and why br neither accepts nor needs it.
 fn create_args(
+    is_br: bool,
     to: &str,
     parent: Option<&str>,
     agent: &str,
@@ -225,16 +282,21 @@ fn create_args(
         "create".to_string(),
         "--type=message".to_string(),
         "--json".to_string(),
+    ];
+    if !is_br {
         // A child must not inherit the parent's read-by-* labels, or a reply
         // would be born already "read" by whoever read the message above it.
-        "--no-inherit-labels".to_string(),
+        // br rejects the flag outright and does not inherit labels anyway.
+        args.push("--no-inherit-labels".to_string());
+    }
+    args.extend([
         format!("--title={title}"),
         format!("--description={body}"),
         format!("--assignee={to}"),
-        // Records who (in pact's own identity scheme) sent this, in bd's audit
-        // trail — this is what `from` and `sent()` read back.
+        // Records who (in pact's own identity scheme) sent this, in the
+        // backend's audit trail — what `from` and `sent()` read back.
         format!("--actor={agent}"),
-    ];
+    ]);
     if let Some(p) = parent {
         args.push(format!("--parent={p}"));
     }
@@ -250,10 +312,11 @@ fn create(
     title: &str,
     body: &str,
 ) -> Result<BdIssue> {
-    let args = create_args(to, parent, agent, title, body);
+    let args = create_args(cli.is_br(), to, parent, agent, title, body);
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
     let stdout = cli.run(repo_root, &borrowed)?;
-    serde_json::from_str(&stdout).context("parsing `bd create --json` output")
+    serde_json::from_str(&stdout)
+        .with_context(|| format!("parsing `{} create --json` output", cli.binary()))
 }
 
 pub fn inbox(
@@ -262,17 +325,52 @@ pub fn inbox(
     agent: &str,
     unread_only: bool,
 ) -> Result<Vec<Message>> {
-    let assignee_arg = format!("--assignee={agent}");
-    let stdout = cli.run(
-        repo_root,
-        &["list", "--include-infra", "--json", &assignee_arg],
-    )?;
-    let mut messages = parse_messages(&stdout, Some(agent))?;
+    let issues = list_issues(cli, repo_root, Some(agent))?;
+    let mut messages = to_messages(issues, Some(agent));
 
     if unread_only {
         messages.retain(|m| !m.read);
     }
     Ok(messages)
+}
+
+/// Every message bead the backend will admit to, optionally narrowed to one
+/// assignee. The one place the two backends' listing argv differ.
+///
+/// br's `list --json` omits `parent` and it has no `--include-infra`, so there
+/// the listing is only good for ids and a second `show` fetches the records —
+/// see the module docs. Doing it in one place keeps `inbox`, `sent` and the TUI
+/// from each growing their own half-right version.
+fn list_issues(cli: &BeadsCli, repo_root: &Path, assignee: Option<&str>) -> Result<Vec<BdIssue>> {
+    let assignee_arg = assignee.map(|a| format!("--assignee={a}"));
+    let mut args: Vec<&str> = if cli.is_br() {
+        vec!["list", "--json", "--type=message"]
+    } else {
+        vec!["list", "--include-infra", "--json"]
+    };
+    if let Some(a) = &assignee_arg {
+        args.push(a);
+    }
+    let issues = parse_issues(&cli.run(repo_root, &args)?, cli)?;
+    if !cli.is_br() {
+        return Ok(issues);
+    }
+    let ids: Vec<&str> = issues.iter().map(|i| i.id.as_str()).collect();
+    if ids.is_empty() {
+        // `br show` with no ids is an error, and an empty inbox is not one.
+        return Ok(Vec::new());
+    }
+    show_many(cli, repo_root, &ids)
+}
+
+/// `show <id>… --json`, which returns an array on both backends.
+fn show_many(cli: &BeadsCli, repo_root: &Path, ids: &[&str]) -> Result<Vec<BdIssue>> {
+    let mut args = vec!["show"];
+    args.extend_from_slice(ids);
+    args.push("--json");
+    let out = cli.run(repo_root, &args)?;
+    serde_json::from_str(&out)
+        .with_context(|| format!("parsing `{} show --json` output", cli.binary()))
 }
 
 /// Messages this agent sent, newest first (pact-rnc.7). A sender that cannot
@@ -286,12 +384,9 @@ pub fn sent(cli: &BeadsCli, repo_root: &Path, agent: &str) -> Result<Vec<Message
     Ok(messages)
 }
 
-/// One `bd show <id> --json`, which returns an array even for a single id.
+/// One `show <id> --json`, which returns an array even for a single id.
 fn show(cli: &BeadsCli, repo_root: &Path, id: &str) -> Result<BdIssue> {
-    let out = cli.run(repo_root, &["show", id, "--json"])?;
-    let mut issues: Vec<BdIssue> =
-        serde_json::from_str(&out).context("parsing `bd show --json` output")?;
-    issues
+    show_many(cli, repo_root, &[id])?
         .pop()
         .ok_or_else(|| anyhow::anyhow!("message {id} not found"))
 }
@@ -345,13 +440,7 @@ pub fn read_thread(
     let root = thread_root(cli, repo_root, id)?;
     let root_id = root.id.clone();
 
-    let parent_arg = format!("--parent={root_id}");
-    let list_out = cli.run(
-        repo_root,
-        &["list", "--include-infra", "--json", &parent_arg],
-    )?;
-    let replies: Vec<BdIssue> =
-        serde_json::from_str(&list_out).context("parsing `bd list --json` output")?;
+    let replies = replies_of(cli, repo_root, &root)?;
 
     let mut all = vec![root];
     all.extend(replies.into_iter().filter(|i| i.issue_type == "message"));
@@ -395,6 +484,41 @@ pub fn read_thread(
         .collect())
 }
 
+/// The direct replies to `root`, unfiltered by type.
+///
+/// bd answers this with `list --parent=<id>`. br has no such filter, but its
+/// `show --json` already told us the answer: `dependents` names every bead
+/// hanging off this one, and `parent-child` is the edge `create --parent` makes.
+/// So br needs no extra query to find the children, only one to hydrate them.
+fn replies_of(cli: &BeadsCli, repo_root: &Path, root: &BdIssue) -> Result<Vec<BdIssue>> {
+    if !cli.is_br() {
+        let parent_arg = format!("--parent={}", root.id);
+        let out = cli.run(
+            repo_root,
+            &["list", "--include-infra", "--json", &parent_arg],
+        )?;
+        return parse_issues(&out, cli);
+    }
+    let children = child_ids(root);
+    if children.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<&str> = children.iter().map(String::as_str).collect();
+    show_many(cli, repo_root, &ids)
+}
+
+/// br's `parent-child` dependents, in the order br listed them. Any other edge
+/// type (`blocks`, `related`) is a real dependency, not a reply, and must not
+/// be dragged into a conversation.
+fn child_ids(root: &BdIssue) -> Vec<String> {
+    root.dependents
+        .iter()
+        .flatten()
+        .filter(|d| d.dependency_type == "parent-child")
+        .map(|d| d.id.clone())
+        .collect()
+}
+
 /// The one place the `read-by-` label is spelled for writing; `into_message`
 /// is the one place it is spelled for reading.
 fn read_label(agent: &str) -> String {
@@ -414,25 +538,31 @@ fn mark_read(cli: &BeadsCli, repo_root: &Path, agent: &str, issues: &[BdIssue]) 
 /// Every message bead in the repo, regardless of recipient, oldest first.
 ///
 /// `bd list` hides message beads unless `--include-infra` is passed and has no
-/// `--type` filter, so `issue_type == "message"` is filtered client-side, same
-/// as `inbox()`. There is no querying agent here, so `read` is resolved against
-/// each message's own recipient.
+/// `--type` filter, so `issue_type == "message"` is filtered client-side; br
+/// has the filter but no `--include-infra`, and the client-side pass is kept for
+/// both so one backend cannot quietly leak non-messages the other rejects.
+/// There is no querying agent here, so `read` is resolved against each
+/// message's own recipient.
 pub fn all_messages(cli: &BeadsCli, repo_root: &Path) -> Result<Vec<Message>> {
-    let stdout = cli.run(repo_root, &["list", "--include-infra", "--json"])?;
-    parse_messages(&stdout, None)
+    Ok(to_messages(list_issues(cli, repo_root, None)?, None))
 }
 
-/// `bd list --json` output -> message beads only, oldest first.
-fn parse_messages(stdout: &str, viewer: Option<&str>) -> Result<Vec<Message>> {
-    let issues: Vec<BdIssue> =
-        serde_json::from_str(stdout).context("parsing `bd list --json` output")?;
+/// `list --json` output -> issues. bd emits a bare array, br an envelope.
+fn parse_issues(stdout: &str, cli: &BeadsCli) -> Result<Vec<BdIssue>> {
+    let payload: ListPayload = serde_json::from_str(stdout)
+        .with_context(|| format!("parsing `{} list --json` output", cli.binary()))?;
+    Ok(payload.into_issues())
+}
+
+/// Issues -> message beads only, oldest first.
+fn to_messages(issues: Vec<BdIssue>, viewer: Option<&str>) -> Vec<Message> {
     let mut messages: Vec<Message> = issues
         .into_iter()
         .filter(|i| i.issue_type == "message")
         .map(|i| i.into_message(None, viewer))
         .collect();
     messages.sort_by(oldest_first);
-    Ok(messages)
+    messages
 }
 
 /// pact-rnc.20: compare parsed instants, never the raw strings. Two writers
@@ -466,6 +596,20 @@ fn default_subject(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bd() -> BeadsCli {
+        BeadsCli { binary: "bd" }
+    }
+
+    fn br() -> BeadsCli {
+        BeadsCli { binary: "br" }
+    }
+
+    /// The pre-br entry point, kept for the tests that predate the split so
+    /// they still assert the same thing about the same bytes.
+    fn parse_messages(stdout: &str, viewer: Option<&str>) -> Result<Vec<Message>> {
+        Ok(to_messages(parse_issues(stdout, &bd())?, viewer))
+    }
 
     #[test]
     fn default_subject_uses_first_line_truncated() {
@@ -621,7 +765,14 @@ mod tests {
     /// is what makes them one thread `read_thread` can return whole.
     #[test]
     fn multi_recipient_send_parents_the_rest_on_the_root() {
-        let root = create_args("mascot-dev", None, "animator", "Alarmed loops", "body");
+        let root = create_args(
+            false,
+            "mascot-dev",
+            None,
+            "animator",
+            "Alarmed loops",
+            "body",
+        );
         assert!(
             !root.iter().any(|a| a.starts_with("--parent=")),
             "a new thread's root has no parent: {root:?}"
@@ -631,6 +782,7 @@ mod tests {
 
         // Second recipient, parented on the root bead the first create returned.
         let child = create_args(
+            false,
             "tui-dev",
             Some("pact-wisp-a2u"),
             "animator",
@@ -746,6 +898,98 @@ mod tests {
         let msgs = parse_messages(&json, Some("msg-fix")).unwrap();
         assert!(msgs[0].read);
         assert_eq!(msgs[0].read_by, ["msg-fix"]);
+    }
+
+    /// pact-l94: br rejects `--no-inherit-labels` outright —
+    /// `error: unexpected argument '--no-inherit-labels' found`, exit non-zero —
+    /// so passing it would break every single send on that backend. Everything
+    /// else in the create line is identical, verified against br 0.2.19.
+    #[test]
+    fn br_creates_the_same_bead_without_bds_label_inheritance_flag() {
+        let brs = create_args(
+            true,
+            "docs-writer",
+            Some("brlab-udp"),
+            "br-dev",
+            "subj",
+            "b",
+        );
+        assert!(
+            !brs.contains(&"--no-inherit-labels".to_string()),
+            "br errors on this flag: {brs:?}"
+        );
+        // Dropping it is safe rather than a silent loss of the guarantee: a br
+        // child is born with no labels, so it cannot arrive pre-"read".
+        for expected in [
+            "create",
+            "--type=message",
+            "--json",
+            "--title=subj",
+            "--description=b",
+            "--assignee=docs-writer",
+            "--actor=br-dev",
+            "--parent=brlab-udp",
+        ] {
+            assert!(brs.contains(&expected.to_string()), "missing {expected}");
+        }
+
+        // bd keeps the flag, and every other argument is byte-identical, so the
+        // shipped backend cannot regress on the way past.
+        let bds = create_args(
+            false,
+            "docs-writer",
+            Some("brlab-udp"),
+            "br-dev",
+            "subj",
+            "b",
+        );
+        let without: Vec<&String> = bds.iter().filter(|a| *a != "--no-inherit-labels").collect();
+        assert_eq!(without, brs.iter().collect::<Vec<_>>());
+    }
+
+    /// pact-l94: `bd list --json` is a bare array, `br list --json` an envelope.
+    /// Both strings below are real output, trimmed to the fields pact reads.
+    #[test]
+    fn list_parsing_accepts_bds_bare_array_and_brs_envelope() {
+        const BR_LIST: &str = r#"{"issues":[
+          {"id":"brlab-udp","title":"hello","description":"body","status":"open",
+           "issue_type":"message","assignee":"br-dev","created_by":"sender",
+           "created_at":"2026-08-02T07:23:58.797517176Z",
+           "labels":["read-by-br-dev"],"dependency_count":0,"dependent_count":0}
+        ],"total":1,"limit":0,"offset":0,"has_more":false}"#;
+
+        let from_br = to_messages(parse_issues(BR_LIST, &br()).unwrap(), Some("br-dev"));
+        assert_eq!(from_br.len(), 1);
+        assert_eq!(from_br[0].from, "sender");
+        assert_eq!(from_br[0].to, "br-dev");
+        assert!(from_br[0].read, "read-by- labels work the same on br");
+
+        // The bd array still parses through the same function, unchanged.
+        assert_eq!(parse_issues(LIST_JSON, &bd()).unwrap().len(), 4);
+    }
+
+    /// pact-l94: br has no `list --parent`, so replies come from the root's
+    /// `dependents`. JSON copied from a real `br show <root> --json`.
+    #[test]
+    fn br_finds_thread_replies_in_the_roots_parent_child_edges() {
+        let root = issue(
+            r#"{"id":"brlab-udp","title":"hello","assignee":"br-dev",
+                "created_at":"2026-08-02T07:23:58Z","issue_type":"message",
+                "dependents":[
+                  {"id":"brlab-udp.1","title":"reply","dependency_type":"parent-child"},
+                  {"id":"brlab-udp.2","title":"r2","dependency_type":"parent-child"},
+                  {"id":"brlab-zzz","title":"a real blocker","dependency_type":"blocks"}
+                ]}"#,
+        );
+        assert_eq!(child_ids(&root), ["brlab-udp.1", "brlab-udp.2"]);
+
+        // A root with no replies, and bd's shape (no `dependents` key at all),
+        // both mean "no children" rather than a parse failure.
+        let lonely = issue(
+            r#"{"id":"brlab-lfx","title":"t2","assignee":"peer",
+                "created_at":"2026-08-02T07:25:23Z","issue_type":"message"}"#,
+        );
+        assert!(child_ids(&lonely).is_empty());
     }
 
     /// pact-rnc.4: sending to nobody is a mistake, not a silent no-op. Bails
