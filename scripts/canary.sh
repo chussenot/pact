@@ -28,6 +28,17 @@ fail() {
 }
 step() { printf '\n=== %s\n' "$1"; }
 
+# First line of a string, WITHOUT piping into `head`.
+#
+# `producer | head -1` under `set -o pipefail` is a trap: head exits after one
+# line, the producer takes SIGPIPE, the pipeline reports 141 and `set -e` kills
+# the script. It is a race, so it passes on a fast machine and fails on a CI
+# runner — which is exactly what happened on the first real run of this canary,
+# at the first pipeline, with no output at all. pact has a whole invariant about
+# this failure mode (never `println!`, see output::line); the shell version of
+# the same lesson is: don't pipe into head when you can slice a variable.
+first_line() { printf '%s' "${1%%$'\n'*}"; }
+
 need() { command -v "$1" >/dev/null 2>&1 || fail "$1 is required but not on PATH"; }
 need bd
 need jq
@@ -39,21 +50,20 @@ need git
 # thing that drifts silently from the code it claims to describe, which is the
 # whole failure mode this canary exists to catch.
 read_triplet() {
-	sed -nE "s/^const $1: \(u64, u64, u64\) = \(([0-9]+), ([0-9]+), ([0-9]+)\);/\1.\2.\3/p" \
-		src/beads.rs | head -1
+	first_line "$(sed -nE "s/^const $1: \(u64, u64, u64\) = \(([0-9]+), ([0-9]+), ([0-9]+)\);/\1.\2.\3/p" src/beads.rs)"
 }
 BD_MIN="$(read_triplet TESTED_BD_MIN)"
 BD_MAX="$(read_triplet TESTED_BD_MAX_EXCLUSIVE)"
 [ -n "$BD_MIN" ] && [ -n "$BD_MAX" ] ||
 	fail "could not read TESTED_BD_MIN/TESTED_BD_MAX_EXCLUSIVE out of src/beads.rs — has the declaration changed shape?"
 
-BD_VERSION_RAW="$(bd --version 2>&1 | head -1)"
-BD_VERSION="$(printf '%s' "$BD_VERSION_RAW" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+BD_VERSION_RAW="$(first_line "$(bd --version 2>&1)")"
+BD_VERSION="$(first_line "$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$BD_VERSION_RAW")")"
 [ -n "$BD_VERSION" ] || fail "could not parse a version out of: $BD_VERSION_RAW"
 
 # Sort-based comparison: no arithmetic on version parts, no assumptions about
 # how many components there are.
-ver_lt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }
+ver_lt() { [ "$1" != "$2" ] && [ "$(first_line "$(sort -V <<<"$1"$'\n'"$2")")" = "$1" ]; }
 IN_RANGE=yes
 if ver_lt "$BD_VERSION" "$BD_MIN" || [ "$BD_VERSION" = "$BD_MAX" ] || ! ver_lt "$BD_VERSION" "$BD_MAX"; then
 	IN_RANGE=no
@@ -75,7 +85,7 @@ step "build pact"
 cargo build --quiet
 PACT="$REPO_ROOT/target/debug/pact"
 [ -x "$PACT" ] || fail "cargo build produced no binary at $PACT"
-"$PACT" --version | head -1
+first_line "$("$PACT" --version)" && echo
 
 # ------------------------------------------------------------- scratch repo
 WORK="$(mktemp -d)"
