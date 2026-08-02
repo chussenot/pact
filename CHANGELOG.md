@@ -10,6 +10,31 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.2.1 - 2026-08-02
+#### Bug Fixes
+- **(cli)** give usage errors exit code 5 so 2 means only a held lease - (2e2f265) - Clement HUSSENOT-DESENONGES
+#### Continuous Integration
+- **(docs)** close the three drift classes check-docs.sh still missed - (9a13c06) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- **(telemetry)** state exactly what leaves the machine, and what does not - (f3e4fa8) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(doctor)** warn when two Beads stores share one .beads/ - (a766bf2) - Clement HUSSENOT-DESENONGES
+- **(msg)** deliver a message to the file it is about, not only to a name - (1bdccc1) - Clement HUSSENOT-DESENONGES
+- **(ops)** SigNoz dashboard for the fleet's coordination signals - (66f0903) - Clement HUSSENOT-DESENONGES
+- **(otel)** emit session.id so pact and Claude Code telemetry join - (cd506c8) - Clement HUSSENOT-DESENONGES
+- **(otel)** instrument leases, messages, the beads subprocess and doctor - (b0c4e2f) - Clement HUSSENOT-DESENONGES
+- **(otel)** opt-in OpenTelemetry behind a feature that costs nothing when off - (dc017fc) - Clement HUSSENOT-DESENONGES
+- **(ownership)** give a path an owner that outlives the lease - (5f84ed6) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(beads)** record the otel epic ledger - (668c2e7) - Clement HUSSENOT-DESENONGES
+- **(beads)** record the pact-nv4 close - (aa3ee4d) - Clement HUSSENOT-DESENONGES
+- Add the interactions file - (ffe4e53) - Clement HUSSENOT-DESENONGES
+- Add interactions - (1ee61af) - Clement HUSSENOT-DESENONGES
+#### Tests
+- **(otel)** cover the telemetry surface and enforce the zero-cost claim in CI - (4d71c8a) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.2.0 - 2026-08-02
 #### Bug Fixes
 - **(doctor)** warn instead of failing when protocol files are gitignored - (e2736fc) - Clement HUSSENOT-DESENONGES
