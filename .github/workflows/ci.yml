@@ -59,3 +59,35 @@ jobs:
       - name: Docs match the CLI
         if: runner.os == 'Linux'
         run: ./scripts/check-docs.sh
+
+  # Conventional-commit lint, PRs only.
+  #
+  # `cog bump` generates the changelog from commit subjects and silently drops
+  # anything it cannot parse into a type it knows: a commit landed as
+  # "chora: Add canary", cog did not recognise `chora`, and the release notes
+  # simply never mentioned the canary. No error, no warning — the changelog was
+  # just quietly incomplete. Catching it on the PR costs seconds; catching it
+  # after a tag means rewriting history.
+  #
+  # PR-only on purpose. Running it on push would fail the branch for history
+  # that is already immutable, which teaches people to ignore it.
+  commits:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # cog needs the real history to walk a range, not a shallow tip.
+          fetch-depth: 0
+      - uses: cocogitto/cocogitto-action@v4.1.0
+        with:
+          check: false
+          check-latest-tag-only: false
+      # Only the commits this PR adds. Checking all history would fail on
+      # pre-existing subjects nobody can fix now, and merge commits come from
+      # GitHub's own template rather than from an author.
+      - name: cog check
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: cog check --ignore-merge-commits "${BASE}..HEAD"

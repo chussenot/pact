@@ -1,0 +1,112 @@
+name: Release integrity
+
+# A tag is the one ref people trust without checking. This job checks it.
+#
+# 0.3.1 was first created on a commit chain that never became an ancestor of
+# master: the branch was rebuilt with new SHAs and the tag stayed behind on the
+# pre-rebase chain, unreachable from any branch. Nothing was lost that time —
+# the trees happened to be identical — but nothing said so, and the only way to
+# find out was to notice by hand that `git merge-base --is-ancestor` failed.
+#
+# Runs on the tag push, so a bad tag is red within a minute of being created
+# rather than at release time.
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integrity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The ancestry check needs real history and the master ref, neither of
+          # which a shallow single-branch checkout provides.
+          fetch-depth: 0
+
+      - name: Tag commit is an ancestor of master
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin master
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "$TAG ($GITHUB_SHA) is on master"
+            exit 0
+          fi
+          cat >&2 <<EOF
+          ::error::Tag $TAG points at $GITHUB_SHA, which is NOT an ancestor of origin/master.
+
+          This is the orphaned-tag failure mode. It happens when a branch is
+          rebased or amended after a tag was cut: the tag keeps pointing at the
+          pre-rebase commit, which is then reachable from no branch at all. The
+          tag still resolves, \`git show\` still works, and a release built from
+          it can quietly differ from what master says shipped — or be garbage
+          collected.
+
+          To fix, once you have confirmed the content really is on master
+          (\`git diff $TAG origin/master\` should be empty):
+
+              git tag -d $TAG
+              git push origin :refs/tags/$TAG
+              git tag -a $TAG <the-commit-on-master> -m "..."
+              git push origin $TAG
+
+          If the diff is NOT empty, the tag has commits master never got. Merge
+          or cherry-pick them first, then re-tag.
+          EOF
+          exit 1
+
+      - name: Cargo.toml version equals the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # First [package] version only: dependency versions also match
+          # `^version` inside their own tables, so anchor on the file's first hit.
+          out="$(grep -m1 -E '^version = "' Cargo.toml)"
+          CARGO_VERSION="${out#version = \"}"
+          CARGO_VERSION="${CARGO_VERSION%\"}"
+          if [ "$CARGO_VERSION" != "$TAG" ]; then
+            echo "::error::Cargo.toml says $CARGO_VERSION but the tag is $TAG. A tag that disagrees with the manifest ships a binary whose --version lies."
+            exit 1
+          fi
+          echo "Cargo.toml: $CARGO_VERSION"
+
+      - name: Cargo.lock agrees
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # pact's OWN entry in the lockfile, not a dependency that happens to
+          # share the version. awk finds `name = "pact"` and reads the version
+          # from the same [[package]] block.
+          LOCK_VERSION="$(awk '
+            /^name = "pact"$/ { found = 1; next }
+            found && /^version = / { gsub(/^version = "|"$/, ""); print; exit }
+          ' Cargo.lock)"
+          if [ -z "$LOCK_VERSION" ]; then
+            echo "::error::no [[package]] named pact in Cargo.lock — has the crate been renamed?"
+            exit 1
+          fi
+          if [ "$LOCK_VERSION" != "$TAG" ]; then
+            echo "::error::Cargo.lock has pact at $LOCK_VERSION but the tag is $TAG. The lockfile was not regenerated after the version bump, so a --locked build resolves the wrong version."
+            exit 1
+          fi
+          echo "Cargo.lock: $LOCK_VERSION"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Release build smoke check
+        run: cargo build --release
