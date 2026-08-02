@@ -181,6 +181,23 @@ pub struct ExportStatus {
 mod imp {
     //! The feature is on. Everything here is `std` plus `serde_json`, which
     //! pact already depends on — see the module docs for why not the SDK.
+
+    /// A canonical 8-4-4-4-12 lowercase-hex UUID, and nothing else.
+    ///
+    /// Deliberately strict rather than a length check: this value becomes part of
+    /// every metric series identity, so anything not provably one-per-session is a
+    /// cardinality bomb. Rejecting a malformed id costs one lost join; accepting
+    /// one costs the metrics backend.
+    pub(super) fn is_uuid(s: &str) -> bool {
+        let mut parts = s.split('-');
+        for len in [8, 4, 4, 4, 12] {
+            match parts.next() {
+                Some(p) if p.len() == len && p.bytes().all(|b| b.is_ascii_hexdigit()) => {}
+                _ => return false,
+            }
+        }
+        parts.next().is_none()
+    }
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
@@ -499,6 +516,27 @@ mod imp {
             // cardinality bomb `service.instance.id` was left out to avoid,
             // walking back in through the environment.
             resource.push(("pact.agent", Val::Text(agent)));
+        }
+
+        // The join to Claude Code's telemetry, which is already in the same
+        // collector. Claude Code exports CLAUDE_CODE_SESSION_ID into every
+        // subprocess it spawns — pact included — and it is byte-identical to
+        // the `session.id` on every metric and log record that session emits.
+        // Without it, "did this agent burn tokens waiting on a lease" can only
+        // be answered by eyeballing two panels on one time axis, which stops
+        // working the moment two agents run concurrently, i.e. always.
+        //
+        // Named `session.id`, not `pact.session_id`, so both services group on
+        // one key with no aliasing.
+        //
+        // The UUID filter is the `pact.agent` lesson applied a second time: a
+        // resource attribute folds into metric series identity, so an
+        // unvalidated environment variable is a cardinality bomb. A UUID is
+        // bounded by "one per Claude Code session", which is the thing being
+        // counted. Absent rather than empty when a human runs pact from a
+        // plain terminal — an empty string is a series too.
+        if let Some(id) = env("CLAUDE_CODE_SESSION_ID").filter(|s| is_uuid(s)) {
+            resource.push(("session.id", Val::Text(id)));
         }
 
         // The spec default for this is 10 s. Honour a smaller value, ignore a
@@ -1342,6 +1380,37 @@ pub use imp::{count, export_status, flush_now, gauge, init, record_ms, span, Gua
 
 #[cfg(test)]
 mod tests {
+
+    /// `session.id` joins pact's traces to Claude Code's metrics and logs in the
+    /// same collector, so it must be exactly the session's UUID or absent —
+    /// never a best-effort string. A resource attribute folds into metric series
+    /// identity, which is the `pact.agent` lesson (a 207-char value minted a new
+    /// series per invocation) applied a second time (pact-acf).
+    // Only exists in the otel build: is_uuid guards a resource attribute a
+    // default build never constructs.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn only_a_real_uuid_is_accepted_as_a_session_id() {
+        assert!(super::imp::is_uuid("18886d2a-f31f-41ce-94f9-8694ac635753"));
+        assert!(super::imp::is_uuid("00000000-0000-0000-0000-000000000000"));
+
+        for bad in [
+            "",
+            "not-a-uuid",
+            "18886d2a-f31f-41ce-94f9",                    // too few groups
+            "18886d2a-f31f-41ce-94f9-8694ac635753-extra", // too many
+            "18886d2a-f31f-41ce-94f9-8694ac63575",        // short last group
+            "18886d2az-f31f-41ce-94f9-8694ac635753",      // non-hex
+            "18886d2a f31f 41ce 94f9 8694ac635753",       // spaces, not dashes
+        ] {
+            assert!(!super::imp::is_uuid(bad), "should reject {bad:?}");
+        }
+
+        // 200 chars of hex is still not a UUID: length is the bomb, and a
+        // permissive check is how it gets shipped.
+        assert!(!super::imp::is_uuid(&"a".repeat(200)));
+    }
+
     use super::*;
 
     /// The whole point of the shim: this compiles and runs identically with

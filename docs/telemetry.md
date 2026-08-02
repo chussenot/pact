@@ -303,19 +303,34 @@ Known ceiling: pact installs no signal handler, so a `pact ui` killed with
 SIGTERM or SIGKILL loses at most the last ten seconds. A handler needs `libc`
 or a hand-declared `extern "C"`, and neither is worth a dependency for that.
 
-## Correlating with Claude Code — not wired up yet
+## Correlating with Claude Code
 
-pact and Claude Code currently share **no attribute at all**, not even a host
-name, so their telemetry cannot be joined. Time-window correlation is the only
-option today, and it breaks as soon as two agents run concurrently — which is
+pact emits `session.id` as a resource attribute on both traces and metrics,
+taken from `CLAUDE_CODE_SESSION_ID` — which Claude Code puts in the environment
+of every subprocess it spawns, pact included, and which is byte-identical to
+the `session.id` on Claude Code's own metrics and logs. Both services group on
+one key, with no aliasing, so "did this agent burn tokens waiting on a lease"
+is a query rather than two panels on one time axis. That mattered because the
+eyeball method stops working the moment two agents run concurrently, which is
 the situation pact exists for.
 
-The key exists and is one line away. `CLAUDE_CODE_SESSION_ID` is present in the
-environment of every subprocess Claude Code spawns, pact included, and is
-byte-identical to the `session.id` attribute on Claude Code's own telemetry
-(verified against a local sink). Adding it to pact's resource attributes is
-filed as **pact-acf**; it is not implemented, and pact does not emit
-`session.id` today.
+Verified off the wire, not from the source:
+
+```
+resourceSpans   -> service.name=pact, service.version=0.2.0,
+                   pact.agent=join-test, session.id=18886d2a-…-8694ac635753
+resourceMetrics -> the same four
+```
+
+**The value must be a canonical UUID or it is dropped**, and that strictness is
+deliberate. A resource attribute folds into metric series identity, so an
+unvalidated environment variable is a cardinality bomb — the same lesson
+`pact.agent` already learned when a 207-character value was measured shipping
+from a run pact itself had rejected. An empty, malformed or oversized
+`CLAUDE_CODE_SESSION_ID` yields **no attribute at all**, not an empty one: an
+empty string is a series too. Running pact from a plain terminal outside Claude
+Code is that same absent case, which is correct — there is no session to join
+to.
 
 Two related gaps, also filed and also not implemented:
 
