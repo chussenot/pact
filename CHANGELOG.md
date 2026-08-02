@@ -262,6 +262,13 @@ cog's.
   caller leasing from more than one thread could hit it — `pact ui` is one
   process.
 
+### Fixed — `pact init --print --json` emitted markdown
+
+- It early-returned before any JSON handling, so `pact init --print --json | jq`
+  failed to parse while pact exited 0. Same shape as the closed-pipe `println!`
+  the house rules exist for: the side effect looks fine and the report lies. It
+  now emits `{"block": "..."}`; the human form is unchanged.
+
 ### Changed — exit code
 
 - **Usage errors now exit `5`, not `2`.** A breaking change to a documented

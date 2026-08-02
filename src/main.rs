@@ -377,10 +377,27 @@ copilot-instructions.md, …), and the .pact/ line in .gitignore.";
 
 fn run_init(cwd: &Path, print: bool, no_commit: bool, json: bool) -> Result<()> {
     if print {
-        // Through output::line like everything else, so `init --print | head`
-        // cannot panic on a closed pipe (pact-rnc.26). trim_end because line()
-        // supplies the trailing newline the block already ends with.
-        output::line(agents_md::managed_block().trim_end());
+        // `--json` has to be honoured here too. It used to fall through and emit
+        // raw markdown at exit 0, so `pact init --print --json | jq` failed to
+        // parse while pact reported success — the same shape as the closed-pipe
+        // println! bug the house rules exist for: the side effect looks fine and
+        // the report lies (pact-3dz).
+        //
+        // Through output::line either way, so `init --print | head` cannot panic
+        // on a closed pipe (pact-rnc.26). trim_end because line() supplies the
+        // trailing newline the block already ends with.
+        let block = agents_md::managed_block();
+        #[derive(serde::Serialize)]
+        struct PrintReport<'a> {
+            block: &'a str,
+        }
+        output::emit(
+            json,
+            &PrintReport {
+                block: block.trim_end(),
+            },
+            |r: &PrintReport| r.block.to_string(),
+        );
         return Ok(());
     }
     let root = repo::find_repo_root(cwd)?;

@@ -1637,6 +1637,14 @@ fn json_shapes_of_every_command_that_needs_no_beads_backend() {
     );
     assert_object_keys("lease ls[].lease", &ls[0]["lease"], LEASE);
 
+    // pact-3dz: `--print --json` used to emit raw markdown at exit 0, so a
+    // script piping to jq failed to parse while pact reported success.
+    assert_object_keys(
+        "init --print",
+        &run(&["init", "--print", "--json"]),
+        &["block"],
+    );
+
     assert_array_of(
         "agents",
         &run(&["agents", "--json"]),
