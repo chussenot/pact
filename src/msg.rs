@@ -642,6 +642,10 @@ fn read_label(agent: &str) -> String {
 ///
 /// `pact ui` needs this: the dashboard is the human's inbox, and until it could
 /// record a read the sender's `pact msg sent` said "unread" forever (pact-4tj).
+/// `pact ui` is the only caller, so this is dead code in a default build —
+/// gated rather than `allow`ed, because an `allow` would also hide the day it
+/// stops being called at all.
+#[cfg(feature = "ui")]
 pub fn mark_read_by_id(cli: &BeadsCli, repo_root: &Path, agent: &str, id: &str) -> Result<()> {
     let label = read_label(agent);
     cli.run(repo_root, &["label", "add", id, &label])

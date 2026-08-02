@@ -10,7 +10,7 @@ shelling out to the Beads CLI (`bd`).
 ## Build & test
 
 ```bash
-mise run check    # fmt-check + clippy -D warnings + test — the CI gate
+mise run check    # fmt-check + clippy (both feature sets) + test + otel + docs — the CI gate
 mise run build    # cargo build --features ui
 mise run test     # cargo test --features ui
 mise run install  # cargo install --path . --force --features ui  (CURRENT build on PATH)

@@ -18,8 +18,15 @@ description = "Check formatting without writing changes"
 run = "cargo fmt -- --check"
 
 [tasks.lint]
-description = "Run clippy with warnings denied (with the ui feature)"
-run = "cargo clippy --all-targets --features ui -- -D warnings"
+description = "Run clippy with warnings denied, both feature-on and default"
+# Both, deliberately. Every other task builds with --features ui, and that let a
+# ui-only helper ship as dead code in the default build: `mise run check` was
+# green, CI's default-build job was red, and master was pushed broken. A local
+# gate that does not match CI is not a gate.
+run = [
+  "cargo clippy --all-targets --features ui,otel -- -D warnings",
+  "cargo clippy --all-targets -- -D warnings",
+]
 
 [tasks."check-docs"]
 description = "Fail if README/docs drift from the real CLI: missing commands or flags, dead relative links, undocumented doctor checks (pact-qbo)"
@@ -49,7 +56,7 @@ run = [
 ]
 
 [tasks.check]
-description = "Run the full CI check locally: fmt, lint, test, otel, docs. CI additionally runs clippy and test without the ui feature, so the dependency-light build stays guarded there."
+description = "Run the full CI check locally: fmt, lint (both feature sets), test, otel, docs."
 depends = ["fmt-check", "lint", "test", "otel", "check-docs"]
 
 [tasks.install]
