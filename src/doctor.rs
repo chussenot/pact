@@ -77,6 +77,33 @@ pub fn checks(root: &Path) -> DoctorReport {
         },
     });
 
+    // GEMINI.md, .github/copilot-instructions.md and friends are managed the
+    // same way CLAUDE.md is, so doctor must have the same opinion about them:
+    // an instruction file pact writes and never re-checks goes stale in silence,
+    // and a hand-edited block inside the markers reported a healthy repo.
+    let managed = agents_md::managed_instruction_files(root);
+    let stale = agents_md::stale_instruction_files(root).unwrap_or_default();
+    checks.push(DoctorCheck {
+        name: "other instruction files current",
+        ok: stale.is_empty(),
+        warn: false,
+        detail: if managed.is_empty() {
+            "none present".to_string()
+        } else if stale.is_empty() {
+            format!("{} up to date", managed.len())
+        } else {
+            format!(
+                "missing or stale — run `pact init`: {}",
+                stale
+                    .iter()
+                    .filter_map(|p| p.strip_prefix(root).ok())
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+    });
+
     // The files above can be perfectly current and still reach nobody: a
     // gitignored AGENTS.md is written, then silently refused by `git add`, and
     // the clone that was supposed to be onboarded gets nothing. pact's own repo
@@ -185,4 +212,46 @@ pub fn checks(root: &Path) -> DoctorReport {
 
     let healthy = checks.iter().all(|c| c.ok);
     DoctorReport { healthy, checks }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (ok, detail) for one check of a fresh report, by value so the caller can
+    /// keep it past the temporary.
+    fn instruction_check(root: &Path) -> (bool, String) {
+        let report = checks(root);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "other instruction files current")
+            .expect("doctor must have an opinion about instruction files");
+        (c.ok, c.detail.clone())
+    }
+
+    /// Half of pact-4zx: `pact init` managed GEMINI.md and doctor had no
+    /// opinion about it, so a hand-edited block inside the markers reported a
+    /// healthy repo. Edited *inside* the markers on purpose — deleting the
+    /// whole file is the case a "does it exist" check would already catch.
+    #[test]
+    fn a_hand_edited_instruction_file_is_reported_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert_eq!(instruction_check(root), (true, "none present".to_string()));
+
+        std::fs::write(root.join("GEMINI.md"), "# Gemini\n").unwrap();
+        agents_md::ensure_instruction_files(root).unwrap();
+        assert_eq!(instruction_check(root), (true, "1 up to date".to_string()));
+
+        let gemini = root.join("GEMINI.md");
+        let edited = std::fs::read_to_string(&gemini)
+            .unwrap()
+            .replace("Read `AGENTS.md`", "Read AGENTS.md maybe");
+        std::fs::write(&gemini, edited).unwrap();
+
+        let (ok, detail) = instruction_check(root);
+        assert!(!ok, "a corrupted managed block must not pass");
+        assert!(detail.contains("GEMINI.md"), "{detail}");
+    }
 }

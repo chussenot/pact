@@ -200,8 +200,9 @@ fn run(cli: Cli) -> Result<()> {
 /// whole history — pact must not hand anyone that problem.
 const INIT_COMMIT_MESSAGE: &str = "chore(pact): sync the coordination protocol block
 
-Written by `pact init`: the managed block in AGENTS.md, the @AGENTS.md import
-in CLAUDE.md, and the .pact/ line in .gitignore.";
+Written by `pact init`: the managed block in AGENTS.md, the pointer back to it
+in every agent-instruction file this repo already has (CLAUDE.md, GEMINI.md,
+copilot-instructions.md, …), and the .pact/ line in .gitignore.";
 
 fn run_init(cwd: &Path, print: bool, no_commit: bool, json: bool) -> Result<()> {
     if print {
@@ -217,6 +218,11 @@ fn run_init(cwd: &Path, print: bool, no_commit: bool, json: bool) -> Result<()> 
     // Claude Code never loads AGENTS.md, so writing only that file left a
     // Claude-driven fleet with no protocol at all (see `ensure_claude_md`).
     let claude = agents_md::ensure_claude_md(&root)?;
+    // Same failure, other tools: an agent reading GEMINI.md or
+    // .github/copilot-instructions.md was never told the protocol exists.
+    // Only files the repo already has are touched — pact does not conjure an
+    // instruction file for a tool nobody here uses (pact-4zx).
+    let instruction_files = agents_md::ensure_instruction_files(&root)?;
     agents_md::ensure_gitignore(&root)?;
 
     #[derive(serde::Serialize)]
@@ -225,6 +231,9 @@ fn run_init(cwd: &Path, print: bool, no_commit: bool, json: bool) -> Result<()> 
         /// `null` when `CLAUDE.md` is `AGENTS.md` under another name.
         claude_md: Option<PathBuf>,
         claude_md_status: &'static str,
+        /// Other agent-instruction files pointed at `AGENTS.md`; empty when the
+        /// repo has none, which is the common case.
+        instruction_files: Vec<PathBuf>,
         /// `null` unless a commit was actually created.
         commit: Option<String>,
         committed_files: Vec<String>,
@@ -253,11 +262,15 @@ fn run_init(cwd: &Path, print: bool, no_commit: bool, json: bool) -> Result<()> 
     let (commit, committed_files, commit_status, commit_line) = if no_commit {
         (None, vec![], "skipped (--no-commit)".to_string(), None)
     } else {
-        match repo::commit_paths(
-            &root,
-            &["AGENTS.md", "CLAUDE.md", ".gitignore"],
-            INIT_COMMIT_MESSAGE,
-        ) {
+        // The instruction files pact just rewrote have to be in the commit too,
+        // or `pact init` leaves a dirty tree it claims to have committed.
+        let mut targets = vec!["AGENTS.md", "CLAUDE.md", ".gitignore"];
+        targets.extend(
+            instruction_files
+                .iter()
+                .filter_map(|p| p.strip_prefix(&root).ok()?.to_str()),
+        );
+        match repo::commit_paths(&root, &targets, INIT_COMMIT_MESSAGE) {
             repo::CommitOutcome::Committed { sha, files } => {
                 let line = format!("committed {} file(s) ({sha})", files.len());
                 (Some(sha), files, "committed".to_string(), Some(line))
@@ -285,12 +298,16 @@ fn run_init(cwd: &Path, print: bool, no_commit: bool, json: bool) -> Result<()> 
         agents_md: path,
         claude_md,
         claude_md_status,
+        instruction_files,
         commit,
         committed_files,
         commit_status,
     };
     output::emit(json, &report, |r: &InitReport| {
         let mut out = format!("updated {}\n{claude_line}", r.agents_md.display());
+        for p in &r.instruction_files {
+            out.push_str(&format!("\nupdated {} (points at AGENTS.md)", p.display()));
+        }
         if let Some(line) = &commit_line {
             out.push('\n');
             out.push_str(line);
@@ -432,6 +449,14 @@ fn run_whoami(cwd: &Path, agent_flag: Option<&str>, json: bool) -> Result<()> {
 /// `cli.run` and not `msg::all_messages`: parsing every message in the repo to
 /// answer "can bd read this database" is far more work than the question needs,
 /// and whoami must stay a cheap read-only probe.
+///
+/// The probe is bare `list --json` and deliberately carries no filter. It used
+/// to pass `--include-infra`, which br rejects outright, so on a br workspace
+/// `pact whoami` reported "bd cannot read this repo's beads database … `pact
+/// msg` will fail" while `pact msg` worked perfectly — a diagnostic that lies
+/// about the thing you ran it to diagnose. Both backends answer the unfiltered
+/// form, and both still fail it when there is no database, which is the only
+/// property this probe needs.
 fn bd_health(bd: &beads::BeadsCli, root: &Path) -> (Option<String>, Vec<String>) {
     let mut problems = Vec::new();
     let version = match bd.version(root) {
@@ -441,7 +466,7 @@ fn bd_health(bd: &beads::BeadsCli, root: &Path) -> (Option<String>, Vec<String>)
             None
         }
     };
-    if let Err(e) = bd.run(root, &["list", "--include-infra", "--json"]) {
+    if let Err(e) = bd.run(root, &["list", "--json"]) {
         problems.push(format!(
             "bd cannot read this repo's beads database, so `pact msg` and the message \
              half of `pact agents` will fail: {e:#}"

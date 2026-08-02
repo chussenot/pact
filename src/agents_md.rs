@@ -123,7 +123,9 @@ fn splice_block(path: &Path, body: &str) -> Result<()> {
 }
 
 /// The line that pulls `AGENTS.md` into `CLAUDE.md`. Claude Code resolves a
-/// bare `@<path>` in a memory file by inlining that file's contents.
+/// bare `@<path>` in a memory file by inlining that file's contents. Gemini
+/// CLI's memory import processor and GitHub Copilot CLI spell it the same way,
+/// so [`INSTRUCTION_TARGETS`] reuses this line rather than inventing a second.
 pub const CLAUDE_IMPORT: &str = "@AGENTS.md";
 
 /// What [`ensure_claude_md`] found or did, so `init` can report it honestly
@@ -205,6 +207,121 @@ pub fn claude_md_reaches_protocol(repo_root: &Path) -> Result<bool> {
         .any(|l| l.trim() == CLAUDE_IMPORT))
 }
 
+/// Agent-instruction filenames other than `AGENTS.md` and `CLAUDE.md` that
+/// pact points back at `AGENTS.md`, paired with whether the format expands a
+/// bare `@<path>` import line. The flag is researched per tool rather than
+/// assumed, because guessing wrong costs something either way: a dangling
+/// `@AGENTS.md` in a format that ignores it reads like a broken link, and the
+/// alternative people reach for — inlining the protocol — is the copy that
+/// [`is_current`] exists to catch and can only police in one file.
+///
+/// - `GEMINI.md` — Gemini CLI's memory import processor inlines `@file.md`.
+/// - `.github/copilot-instructions.md` — Copilot CLI expands `@<relative
+///   path>`; VS Code's Copilot does not (microsoft/vscode#246877). It gets the
+///   import line *and* the prose directive, so both halves of Copilot are
+///   covered by one block.
+/// - `.cursorrules`, `.windsurfrules`, `.clinerules` — flat files with no
+///   import mechanism, so prose is all there is. That is still a reference and
+///   not a copy: these are agents with file-read tools, and "go read
+///   AGENTS.md" is an instruction they can execute.
+///
+/// Deliberately absent: `.cursor/rules/`. Managing it means *creating* a new
+/// `.mdc` rule file, which the "only manage what already exists" rule forbids,
+/// and an `.mdc` without the right frontmatter (`alwaysApply`, or a
+/// `description` for Cursor to match on) is silently never applied — a rule
+/// pact writes and Cursor ignores is worse than no rule, because it looks done.
+const INSTRUCTION_TARGETS: &[(&str, bool)] = &[
+    ("GEMINI.md", true),
+    (".github/copilot-instructions.md", true),
+    (".cursorrules", false),
+    (".windsurfrules", false),
+    (".clinerules", false),
+];
+
+/// The block spliced into a non-Claude instruction file: a reference, never a
+/// second copy of the protocol.
+fn pointer_block(expands_imports: bool) -> String {
+    let mut s = String::from(
+        "## pact coordination protocol\n\
+         \n\
+         Read `AGENTS.md` in the root of this repository and follow its \"pact\n\
+         coordination protocol\" section before you touch shared files or hand\n\
+         off work. It is referenced here, not copied, so this file has nothing\n\
+         to drift out of date with. Run `pact init` to refresh it.\n",
+    );
+    if expands_imports {
+        s.push_str(&format!("\n{CLAUDE_IMPORT}\n"));
+    }
+    s
+}
+
+/// The known instruction targets that this repo actually has. Existence *is*
+/// the configuration: pact v1 ships no config file, and creating
+/// `.windsurfrules` in a repo that has never seen Windsurf would be pact
+/// inventing a tool the team does not use. (`CLAUDE.md` is the one file pact
+/// creates when absent — see [`ensure_claude_md`] for why.)
+///
+/// `is_file`, not `exists`, because `.clinerules` is also allowed to be a
+/// *directory*; splicing a block into a directory path just errors.
+///
+/// A target that *is* `AGENTS.md` under another name is skipped for the same
+/// reason [`ensure_claude_md`] skips it — and this filter is why the check
+/// lives here rather than in one caller. `is_file()` follows symlinks, so
+/// `GEMINI.md -> AGENTS.md` looked like an ordinary target and
+/// [`ensure_instruction_files`] spliced the *pointer* block through the link,
+/// destroying the protocol block `apply` had written seconds earlier in the
+/// same `pact init`. It never converged: the pointer always wrote last, so
+/// `pact doctor` reported the block stale and prescribed the command doing the
+/// damage. Symlinking every tool's file at `AGENTS.md` is the whole agents-md
+/// convention, so this is a normal layout, not an exotic one.
+fn present_targets(repo_root: &Path) -> Vec<(PathBuf, bool)> {
+    let agents = repo_root.join("AGENTS.md").canonicalize().ok();
+    INSTRUCTION_TARGETS
+        .iter()
+        .map(|(name, expands_imports)| (repo_root.join(name), *expands_imports))
+        .filter(|(path, _)| path.is_file())
+        .filter(|(path, _)| agents.is_none() || path.canonicalize().ok() != agents)
+        .collect()
+}
+
+/// Every instruction file pact manages in this repo, current or not, so `pact
+/// doctor` can say "none present" instead of showing a green tick for nothing.
+pub fn managed_instruction_files(repo_root: &Path) -> Vec<PathBuf> {
+    present_targets(repo_root)
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect()
+}
+
+/// Point every already-present agent-instruction file at `AGENTS.md`, and
+/// return the ones touched. Idempotent, and never writes outside the markers.
+///
+/// Without this, an agent whose tool reads `GEMINI.md` or
+/// `.github/copilot-instructions.md` joined a pact fleet having never been
+/// told the protocol exists — the same failure `ensure_claude_md` fixed for
+/// Claude Code, one file at a time.
+pub fn ensure_instruction_files(repo_root: &Path) -> Result<Vec<PathBuf>> {
+    let mut managed = Vec::new();
+    for (path, expands_imports) in present_targets(repo_root) {
+        splice_block(&path, &pointer_block(expands_imports))?;
+        managed.push(path);
+    }
+    Ok(managed)
+}
+
+/// Managed instruction files whose pact block is missing or stale, so `pact
+/// doctor` has the same opinion about `GEMINI.md` it already has about
+/// `CLAUDE.md`. A file pact writes but never re-checks goes stale in silence.
+pub fn stale_instruction_files(repo_root: &Path) -> Result<Vec<PathBuf>> {
+    let mut stale = Vec::new();
+    for (path, expands_imports) in present_targets(repo_root) {
+        if !has_current_block(&path, &pointer_block(expands_imports))? {
+            stale.push(path);
+        }
+    }
+    Ok(stale)
+}
+
 /// Add a single `.pact/` line to `.gitignore`, idempotently, only if missing.
 /// Everything under `.pact/` is local runtime state — leases, message read
 /// state, and whatever else pact or an agent writes there — so the rule is the
@@ -241,13 +358,17 @@ pub fn ensure_gitignore(repo_root: &Path) -> Result<()> {
 /// Whether AGENTS.md exists, has a managed block, and that block matches the
 /// current `managed_block()` exactly (used by `pact doctor`).
 pub fn is_current(repo_root: &Path) -> Result<bool> {
-    let path = repo_root.join("AGENTS.md");
-    let existing = read_or_empty(&path)?;
+    has_current_block(&repo_root.join("AGENTS.md"), &managed_block())
+}
+
+/// Whether `path` already carries exactly the block `splice_block` would write
+/// for `body` — i.e. whether `pact init` would be a no-op for that file.
+fn has_current_block(path: &Path, body: &str) -> Result<bool> {
+    let existing = read_or_empty(path)?;
     let Some((begin, end)) = find_block_bounds(&existing) else {
         return Ok(false);
     };
-    let expected = format!("{BEGIN_MARKER}\n{}{END_MARKER}\n", managed_block());
-    Ok(existing[begin..end] == expected)
+    Ok(existing[begin..end] == format!("{BEGIN_MARKER}\n{body}{END_MARKER}\n"))
 }
 
 /// Read a file's contents, treating "does not exist" as an empty string.
@@ -442,6 +563,156 @@ mod tests {
             .replace("coordination protocol", "COORDINATION PROTOCOL (edited)");
         std::fs::write(&path, stale).unwrap();
         assert!(!is_current(tmp.path()).unwrap());
+    }
+
+    /// The rule from pact-4zx: manage what is already there, invent nothing.
+    /// A repo with no Gemini in it must not sprout a GEMINI.md.
+    #[test]
+    fn ensure_instruction_files_only_touches_files_that_already_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("GEMINI.md"), "# Gemini\n").unwrap();
+
+        let managed = ensure_instruction_files(tmp.path()).unwrap();
+
+        assert_eq!(managed, vec![tmp.path().join("GEMINI.md")]);
+        assert!(!tmp.path().join(".windsurfrules").exists());
+        assert!(!tmp.path().join(".cursorrules").exists());
+        assert!(!tmp.path().join(".github/copilot-instructions.md").exists());
+
+        let after = std::fs::read_to_string(tmp.path().join("GEMINI.md")).unwrap();
+        assert!(after.starts_with("# Gemini\n"), "prior content survives");
+        assert!(after.contains(BEGIN_MARKER) && after.contains(END_MARKER));
+    }
+
+    /// The whole reason this is not one shared loop: a format that expands
+    /// `@AGENTS.md` gets the import, one that does not gets prose — and
+    /// *neither* gets a copy of the protocol, which would be a second thing
+    /// for `is_current` to police and the drift the markers exist to prevent.
+    #[test]
+    fn instruction_blocks_reference_the_protocol_and_never_copy_it() {
+        let with_import = pointer_block(true);
+        let prose_only = pointer_block(false);
+
+        assert!(with_import.contains(CLAUDE_IMPORT));
+        assert!(!prose_only.contains(CLAUDE_IMPORT));
+        for block in [&with_import, &prose_only] {
+            assert!(block.contains("AGENTS.md"), "must name the source of truth");
+            // A distinctive sentence from the protocol itself: if it ever shows
+            // up here, someone turned the pointer into a copy.
+            assert!(!block.contains("your agent identity comes from"));
+        }
+    }
+
+    #[test]
+    fn ensure_instruction_files_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".github")).unwrap();
+        for f in [
+            "GEMINI.md",
+            ".github/copilot-instructions.md",
+            ".clinerules",
+        ] {
+            std::fs::write(tmp.path().join(f), "# existing\n").unwrap();
+        }
+
+        ensure_instruction_files(tmp.path()).unwrap();
+        let first: Vec<String> = [
+            "GEMINI.md",
+            ".github/copilot-instructions.md",
+            ".clinerules",
+        ]
+        .iter()
+        .map(|f| std::fs::read_to_string(tmp.path().join(f)).unwrap())
+        .collect();
+
+        ensure_instruction_files(tmp.path()).unwrap();
+        let second: Vec<String> = [
+            "GEMINI.md",
+            ".github/copilot-instructions.md",
+            ".clinerules",
+        ]
+        .iter()
+        .map(|f| std::fs::read_to_string(tmp.path().join(f)).unwrap())
+        .collect();
+
+        assert_eq!(first, second);
+        // Copilot CLI expands the import, VS Code's Copilot does not — that
+        // file needs both halves or half of Copilot sees nothing.
+        assert!(first[1].contains(CLAUDE_IMPORT));
+        assert!(first[1].contains("Read `AGENTS.md`"));
+        // .clinerules has no import mechanism at all: prose, no dangling link.
+        assert!(!first[2].contains(CLAUDE_IMPORT));
+    }
+
+    /// `pact init` used to destroy the protocol it had just written whenever a
+    /// target was a symlink to AGENTS.md: `is_file()` follows the link, so the
+    /// pointer block was spliced through it into AGENTS.md itself, and the
+    /// repo never recovered because every re-run repeated the sequence. The
+    /// needle is a sentence from the protocol body, not the markers — a
+    /// markers-only assertion passes while the content is gone, which is
+    /// exactly what the wiped file looked like.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_symlinked_at_agents_md_is_not_written_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        apply(tmp.path()).unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", tmp.path().join("GEMINI.md")).unwrap();
+        // A real target alongside it: the guard must skip the alias, not the loop.
+        std::fs::write(tmp.path().join(".windsurfrules"), "be nice\n").unwrap();
+
+        let managed = ensure_instruction_files(tmp.path()).unwrap();
+
+        assert_eq!(managed, vec![tmp.path().join(".windsurfrules")]);
+        let agents = std::fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+        assert!(
+            agents.contains("your agent identity comes from"),
+            "the protocol was overwritten by the pointer block:\n{agents}"
+        );
+        assert!(is_current(tmp.path()).unwrap(), "init must converge");
+        // ...and doctor must not then nag about the file it correctly skipped.
+        assert!(stale_instruction_files(tmp.path()).unwrap().is_empty());
+        assert!(
+            managed_instruction_files(tmp.path()) == vec![tmp.path().join(".windsurfrules")],
+            "an alias of AGENTS.md is not a separate managed file"
+        );
+    }
+
+    /// `.clinerules` is allowed to be a directory in newer Cline. Splicing a
+    /// block into a directory path is an error, so it must be skipped rather
+    /// than turn `pact init` into a failure for anyone using that layout.
+    #[test]
+    fn a_directory_shaped_target_is_skipped_not_a_hard_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".clinerules")).unwrap();
+
+        assert!(ensure_instruction_files(tmp.path()).unwrap().is_empty());
+        assert!(stale_instruction_files(tmp.path()).unwrap().is_empty());
+        assert!(managed_instruction_files(tmp.path()).is_empty());
+        assert!(tmp.path().join(".clinerules").is_dir());
+    }
+
+    #[test]
+    fn stale_instruction_files_reports_missing_then_goes_quiet() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(stale_instruction_files(tmp.path()).unwrap().is_empty());
+
+        std::fs::write(tmp.path().join(".windsurfrules"), "be nice\n").unwrap();
+        let path = tmp.path().join(".windsurfrules");
+        assert_eq!(
+            stale_instruction_files(tmp.path()).unwrap(),
+            vec![path.clone()]
+        );
+
+        ensure_instruction_files(tmp.path()).unwrap();
+        assert!(stale_instruction_files(tmp.path()).unwrap().is_empty());
+
+        // Edited by hand inside the markers: doctor must notice, exactly as it
+        // does for AGENTS.md.
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("Read `AGENTS.md`", "Read AGENTS.md maybe");
+        std::fs::write(&path, edited).unwrap();
+        assert_eq!(stale_instruction_files(tmp.path()).unwrap(), vec![path]);
     }
 
     #[test]
