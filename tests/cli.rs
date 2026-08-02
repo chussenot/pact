@@ -1735,3 +1735,74 @@ fn json_shapes_of_every_msg_command() {
     assert_ok(&outbox);
     assert_array_of("msg sent", &json_stdout(&outbox), MESSAGE);
 }
+
+// -------------------------------------------------------------- exit codes
+
+/// Exit 2 is documented as "lease held by another agent", and the protocol
+/// block tells agents to branch on the code rather than the message text. clap
+/// also exits 2 for any usage error, so that instruction was unfollowable: two
+/// agents hit the collision in one fleet run (an unrecognized subcommand, and a
+/// `--thread` left valueless by shell word-splitting), and a wrapper branching
+/// on 2 reads a typo as a lease conflict. Usage errors are 5 now (pact-8ou).
+#[test]
+fn usage_errors_exit_5_so_that_2_still_means_only_a_held_lease() {
+    let tmp = init_repo();
+
+    for args in [
+        vec!["nosuchcommand"],
+        vec!["lease"],                      // subcommand required
+        vec!["lease", "acquire"],           // <PATHS> required
+        vec!["msg", "send", "--to"],        // flag with no value
+        vec!["lease", "acquire", "--nope"], // unknown flag
+    ] {
+        let out = pact(tmp.path(), "usage-agent", &args);
+        assert_eq!(
+            out.status.code(),
+            Some(5),
+            "`pact {}` should be a usage error, not exit {:?}\nstderr: {}",
+            args.join(" "),
+            out.status.code(),
+            stderr_of(&out)
+        );
+    }
+
+    // The whole point: a real lease conflict keeps 2 to itself.
+    assert_ok(&pact(tmp.path(), "agent-a", &["lease", "acquire", "x.txt"]));
+    let conflict = pact(tmp.path(), "agent-b", &["lease", "acquire", "x.txt"]);
+    assert_eq!(conflict.status.code(), Some(2), "{}", stderr_of(&conflict));
+}
+
+/// `--help` and `-V` travel clap's error path but are not errors. Bare `pact`
+/// does NOT get that treatment: clap prints help there because the invocation
+/// was incomplete, and exiting 0 would let a script whose variable expanded to
+/// nothing read it as success — the very interpolation bug 5 disambiguates.
+#[test]
+fn help_and_version_exit_0_but_a_bare_invocation_does_not() {
+    let tmp = init_repo();
+
+    for args in [
+        vec!["--help"],
+        vec!["-V"],
+        vec!["--version"],
+        vec!["lease", "--help"],
+    ] {
+        let out = pact(tmp.path(), "usage-agent", &args);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "`pact {}` is a request, not an error",
+            args.join(" ")
+        );
+        assert!(
+            !stdout_of(&out).is_empty(),
+            "help/version must go to stdout"
+        );
+    }
+
+    let bare = pact(tmp.path(), "usage-agent", &[]);
+    assert_eq!(
+        bare.status.code(),
+        Some(5),
+        "bare `pact` is an incomplete invocation, not a successful one"
+    );
+}

@@ -245,10 +245,19 @@ humans, its exit codes are documented behavior, not incidental:
 | 2 | lease held by another agent (or you don't hold the lease you're releasing) |
 | 3 | Beads CLI (`bd` or `br`) not found on `PATH` |
 | 4 | not in a git repository |
+| 5 | usage error — unknown subcommand, bad or missing flag value |
 
 An agent scripting against pact can branch on these without parsing error
 text — check the exit code, and only fall back to reading stderr for the
 human-readable reason.
+
+That promise is why 5 exists. clap's own usage-error code is 2, which collided
+with "lease held by another agent", so the one code agents are most likely to
+branch on was ambiguous between "negotiate with a peer" and "you typo'd a flag".
+The protocol block tells agents to branch on the code rather than the message,
+so documenting the collision instead of removing it would have made pact's own
+instruction unfollowable. `--help` and `-V` keep exiting 0; everything else clap
+rejects is 5.
 
 That table is the whole set, which is why **a closed pipe adds nothing to it**.
 `pact … | head -1` used to panic in the middle of a write and exit 101; a caller

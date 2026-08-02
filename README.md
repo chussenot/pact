@@ -511,6 +511,17 @@ scripted caller can see whose claim a `--force` destroyed.
 | 2 | lease held by another agent (or you don't hold the lease you're releasing) |
 | 3 | Beads CLI (`bd` or `br`) not found on `PATH` |
 | 4 | not in a git repository |
+| 5 | usage error — unknown subcommand, bad or missing flag value |
+
+**5 exists so that 2 means only one thing.** clap emits 2 for any usage error,
+which collided with "lease held by another agent" — and a wrapper branching on 2
+read a typo as a lease conflict and went off to negotiate with a peer that does
+not exist. Two agents hit that in one fleet run: an unrecognized subcommand, and
+a `--thread` left valueless by shell word-splitting. The flag case is the likelier
+one in a script, because a flag value is exactly what gets interpolated from a
+variable. `pact --help` and `pact -V` still exit 0; bare `pact` is a usage error
+and exits 5, so a script whose variable expanded to nothing cannot read it as
+success.
 
 `pact doctor` exits 1 when a check **fails** (`✗`). A check can also **warn**
 (`!`) — it passed, but you should know: a Beads CLI outside its tested version range,

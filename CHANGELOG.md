@@ -155,6 +155,23 @@ cog's.
   [docs/leases.md](docs/leases.md#working-on-a-new-file-you-cant-compile-yet),
   labelled as a workaround with its costs stated.
 
+## Notes — unreleased
+
+### Changed — exit code
+
+- **Usage errors now exit `5`, not `2`.** A breaking change to a documented
+  contract, made deliberately. `2` is documented as "lease held by another
+  agent", and the `AGENTS.md` protocol block tells agents to branch on the exit
+  code rather than the message text — but clap emits `2` for any usage error
+  too, so that instruction was unfollowable. A wrapper branching on `2` read a
+  typo as a lease conflict and went off to negotiate with a peer that does not
+  exist. Two agents hit it independently in one fleet run: an unrecognized
+  subcommand, and a `--thread` left valueless by shell word-splitting.
+  `pact --help` and `pact -V` still exit `0`. Bare `pact` exits `5`, because
+  clap prints help there only because the invocation was incomplete — treating
+  that as success would let a script whose variable expanded to nothing read it
+  as having worked, which is the same interpolation bug `5` exists to catch.
+
 ## Notes — 0.1.0
 
 First tagged release. `pact` coordinates several coding agents working on one

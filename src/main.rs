@@ -167,8 +167,43 @@ enum MsgAction {
     Read { id: String },
 }
 
+/// Usage errors get their own code so exit 2 means only what the README table
+/// says it means: another agent holds the lease.
+///
+/// clap exits 2 for any usage error, which collided with that. Two agents hit
+/// it independently in one fleet run — an unrecognized subcommand, and a
+/// `--thread` left valueless by shell word-splitting — and a wrapper branching
+/// on 2 reads either as a lease conflict and goes off to negotiate with a peer
+/// that does not exist. The flag case is the likelier one in a script, because
+/// a flag value is exactly what gets interpolated from a variable.
+///
+/// The protocol block tells agents to branch on the exit code rather than the
+/// message text, so leaving the collision documented-but-real would have made
+/// that instruction unfollowable.
+const USAGE_ERROR: i32 = 5;
+
 fn main() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // --help and -V arrive here too, and are not errors. clap picks the
+            // right stream for each (help to stdout, errors to stderr); the
+            // result is dropped because a closed pipe must not turn into a
+            // panic after the work is done — same rule as output::line.
+            let _ = e.print();
+            std::process::exit(match e.kind() {
+                // Only an explicit `--help` / `-V` is a success. Deliberately
+                // NOT DisplayHelpOnMissingArgumentOrSubcommand: there, clap
+                // prints help *because the invocation was incomplete*, which is
+                // a usage error the user did not ask for. Treating it as
+                // success made bare `pact` exit 0, so a script whose variable
+                // expanded to nothing would read "worked" — the very shape of
+                // interpolation bug this code exists to disambiguate.
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => 0,
+                _ => USAGE_ERROR,
+            });
+        }
+    };
     if let Err(e) = run(cli) {
         output::warn(&format!("error: {e:#}"));
         std::process::exit(output::code_for(&e));
