@@ -57,9 +57,17 @@ BD_MAX="$(read_triplet TESTED_BD_MAX_EXCLUSIVE)"
 [ -n "$BD_MIN" ] && [ -n "$BD_MAX" ] ||
 	fail "could not read TESTED_BD_MIN/TESTED_BD_MAX_EXCLUSIVE out of src/beads.rs — has the declaration changed shape?"
 
-BD_VERSION_RAW="$(first_line "$(bd --version 2>&1)")"
-BD_VERSION="$(first_line "$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$BD_VERSION_RAW")")"
-[ -n "$BD_VERSION" ] || fail "could not parse a version out of: $BD_VERSION_RAW"
+# Parse the version from ANYWHERE in the output, not from the first line. bd
+# prefixes warnings when it finds something it does not like about the
+# environment — on a CI runner, `.beads has permissions 0755 (recommended:
+# 0700)`, because that is how checkout leaves the directory pact commits. An
+# earlier cut took the first line and reported "could not parse a version out
+# of: Warning: ...", which is a canary failing on the weather.
+BD_OUTPUT="$(bd --version 2>&1)"
+BD_VERSION="$(first_line "$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$BD_OUTPUT")")"
+[ -n "$BD_VERSION" ] || fail "could not parse a version out of: $BD_OUTPUT"
+# The line that actually carries the version, for the log.
+BD_VERSION_RAW="$(first_line "$(grep -F "$BD_VERSION" <<<"$BD_OUTPUT")")"
 
 # Sort-based comparison: no arithmetic on version parts, no assumptions about
 # how many components there are.
