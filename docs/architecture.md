@@ -131,6 +131,15 @@ than confirming it as an agent.
 places the facts already are (`.pact/events.jsonl` and `bd`) and merges them on
 parsed instants, keeping no third copy and no index.
 
+**`pact init` is the one command that writes history.** It commits the three
+files it wrote — `AGENTS.md`, `CLAUDE.md`, `.gitignore` — because the whole
+onboarding model assumes they were committed, and "remember to commit this"
+is a step that gets skipped. The commit is path-scoped (`git commit -- <paths>`
+builds from HEAD plus those paths), so unrelated staged work stays staged
+rather than being swept into a commit pact authored. `--no-commit` opts out.
+pact never passes `git add -f`: a path the repo ignores is a decision pact
+doesn't get to overrule, so that case is reported and left alone.
+
 One seam exists behind this: lease persistence goes through a `LeaseStore`
 trait, whose only implementation reads and writes the lock files described
 above. It exists so lease *logic* can be tested without a filesystem, not

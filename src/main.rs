@@ -63,6 +63,11 @@ enum Command {
         /// Print the block to stdout instead of writing it.
         #[arg(long)]
         print: bool,
+        /// Write the files but don't commit them. By default `init` commits
+        /// exactly what it wrote, because a protocol nobody committed reaches
+        /// nobody who clones.
+        #[arg(long)]
+        no_commit: bool,
     },
     /// Show what pact resolved: identity, paths, and the bd it will use.
     Whoami,
@@ -174,7 +179,7 @@ fn run(cli: Cli) -> Result<()> {
     let cwd = std::env::current_dir()?;
 
     match cli.command {
-        Command::Init { print } => run_init(&cwd, print, cli.json),
+        Command::Init { print, no_commit } => run_init(&cwd, print, no_commit, cli.json),
         Command::Whoami => run_whoami(&cwd, cli.agent.as_deref(), cli.json),
         Command::Agents => run_agents(&cwd, cli.json),
         Command::Lease { action } => run_lease(&cwd, cli.agent.as_deref(), cli.json, action),
@@ -190,7 +195,15 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn run_init(cwd: &Path, print: bool, json: bool) -> Result<()> {
+/// Conventional Commits on purpose. `bd init` writes `bd init: initialize …`,
+/// which is not a valid conventional subject and makes `cog bump` fail on the
+/// whole history — pact must not hand anyone that problem.
+const INIT_COMMIT_MESSAGE: &str = "chore(pact): sync the coordination protocol block
+
+Written by `pact init`: the managed block in AGENTS.md, the @AGENTS.md import
+in CLAUDE.md, and the .pact/ line in .gitignore.";
+
+fn run_init(cwd: &Path, print: bool, no_commit: bool, json: bool) -> Result<()> {
     if print {
         // Through output::line like everything else, so `init --print | head`
         // cannot panic on a closed pipe (pact-rnc.26). trim_end because line()
@@ -212,6 +225,10 @@ fn run_init(cwd: &Path, print: bool, json: bool) -> Result<()> {
         /// `null` when `CLAUDE.md` is `AGENTS.md` under another name.
         claude_md: Option<PathBuf>,
         claude_md_status: &'static str,
+        /// `null` unless a commit was actually created.
+        commit: Option<String>,
+        committed_files: Vec<String>,
+        commit_status: String,
     }
 
     let (claude_md, claude_md_status, claude_line) = match claude {
@@ -233,14 +250,56 @@ fn run_init(cwd: &Path, print: bool, json: bool) -> Result<()> {
         ),
     };
 
+    let (commit, committed_files, commit_status, commit_line) = if no_commit {
+        (None, vec![], "skipped (--no-commit)".to_string(), None)
+    } else {
+        match repo::commit_paths(
+            &root,
+            &["AGENTS.md", "CLAUDE.md", ".gitignore"],
+            INIT_COMMIT_MESSAGE,
+        ) {
+            repo::CommitOutcome::Committed { sha, files } => {
+                let line = format!("committed {} file(s) ({sha})", files.len());
+                (Some(sha), files, "committed".to_string(), Some(line))
+            }
+            repo::CommitOutcome::NothingToCommit => (
+                None,
+                vec![],
+                "nothing to commit".to_string(),
+                Some("nothing to commit — already up to date".to_string()),
+            ),
+            // Loud, but not fatal: the files landed, so reporting failure would
+            // repeat the broken-pipe mistake of calling a done job undone. The
+            // warning is deferred to after the report so the reader sees what
+            // *did* happen before what didn't.
+            repo::CommitOutcome::Skipped(why) => (None, vec![], format!("skipped: {why}"), None),
+        }
+    };
+
+    let deferred_warning = commit_status
+        .strip_prefix("skipped: ")
+        .filter(|_| !no_commit)
+        .map(|why| format!("warning: files written but not committed — {why}"));
+
     let report = InitReport {
         agents_md: path,
         claude_md,
         claude_md_status,
+        commit,
+        committed_files,
+        commit_status,
     };
     output::emit(json, &report, |r: &InitReport| {
-        format!("updated {}\n{claude_line}", r.agents_md.display())
+        let mut out = format!("updated {}\n{claude_line}", r.agents_md.display());
+        if let Some(line) = &commit_line {
+            out.push('\n');
+            out.push_str(line);
+        }
+        out
     });
+    if let Some(warning) = deferred_warning {
+        output::warn(&warning);
+    }
     Ok(())
 }
 

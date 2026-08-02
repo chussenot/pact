@@ -63,7 +63,20 @@ pointing any agent at it is enough; re-running `pact init` after upgrading
 pact keeps the block current without touching anything else you've written
 in `AGENTS.md`.
 
-**"Commit the result" is load-bearing, so `pact doctor` checks it.** A
+**`pact init` commits what it wrote**, so "commit the result" isn't a step
+you can forget. It stages exactly `AGENTS.md`, `CLAUDE.md` and `.gitignore` and
+commits only those — unrelated staged work stays staged, waiting for its own
+commit. Re-running finds nothing to commit rather than piling up empties, and
+`--no-commit` writes the files and stops. The message is a Conventional Commit,
+because a generated non-conventional subject is exactly what makes `cog bump`
+fail across a whole history later.
+
+If the commit *can't* be made — a gitignored `AGENTS.md`, no configured git
+identity, a rejecting hook — the files are still written, the exit status stays
+`0`, and the reason goes to stderr. An init that did its job must not report
+failure.
+
+**And because that commit is load-bearing, `pact doctor` verifies it landed.** A
 gitignored `AGENTS.md` fails in the worst possible way: `pact init` writes it,
 `git add` refuses it without a word, every other check stays green, and the
 clone that was supposed to be onboarded gets nothing. A global `~/.gitignore`
@@ -383,7 +396,7 @@ rewritten `AGENTS.md` from an old build before — this is how you catch it.
 ## Commands
 
 ```
-pact init [--print]
+pact init [--print] [--no-commit]
 pact whoami
 pact agents
 pact lease acquire <path>... [--ttl <seconds>] [--steal] [--note <text>]

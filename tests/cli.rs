@@ -1113,3 +1113,135 @@ fn doctor_does_not_warn_about_untracked_but_committable_protocol_files() {
     let check = reach_check(tmp.path());
     assert_eq!(check["ok"], true, "{check}");
 }
+
+/// Committing is on by default, and `init` must be safe to re-run: the second
+/// call finds nothing to commit rather than piling up empty commits.
+#[test]
+fn init_commits_what_it_wrote_and_a_re_run_adds_no_second_commit() {
+    let Some(tmp) = git_repo("init_commits_what_it_wrote") else {
+        return;
+    };
+    git_identity(tmp.path());
+
+    assert_ok(&pact(tmp.path(), "commit-agent", &["init"]));
+    let committed = git_out(tmp.path(), &["show", "--name-only", "--format=", "HEAD"]);
+    for f in ["AGENTS.md", "CLAUDE.md", ".gitignore"] {
+        assert!(
+            committed.contains(f),
+            "{f} missing from the commit: {committed}"
+        );
+    }
+    // Conventional Commits: `bd init`'s non-conventional subject is what broke
+    // `cog bump` over the whole history. pact must not repeat it.
+    let subject = git_out(tmp.path(), &["log", "-1", "--format=%s"]);
+    assert!(
+        subject.starts_with("chore(pact): "),
+        "subject must be a conventional commit, got {subject:?}"
+    );
+
+    assert_ok(&pact(tmp.path(), "commit-agent", &["init"]));
+    assert_eq!(
+        git_out(tmp.path(), &["rev-list", "--count", "HEAD"]).trim(),
+        "1",
+        "re-running init must not create a second commit"
+    );
+}
+
+/// The property that makes committing-by-default acceptable: `init` commits its
+/// own three files and nothing else, so a user's in-flight staged work is still
+/// staged afterwards instead of being swept into a commit pact authored.
+#[test]
+fn init_does_not_sweep_unrelated_staged_work_into_its_commit() {
+    let Some(tmp) = git_repo("init_does_not_sweep_unrelated_staged_work") else {
+        return;
+    };
+    git_identity(tmp.path());
+    std::fs::write(tmp.path().join("README"), "base\n").unwrap();
+    run_git(tmp.path(), &["add", "README"]);
+    run_git(tmp.path(), &["commit", "-qm", "chore: base"]);
+
+    std::fs::write(tmp.path().join("wip.txt"), "half-finished\n").unwrap();
+    run_git(tmp.path(), &["add", "wip.txt"]);
+
+    assert_ok(&pact(tmp.path(), "commit-agent", &["init"]));
+
+    let committed = git_out(tmp.path(), &["show", "--name-only", "--format=", "HEAD"]);
+    assert!(
+        !committed.contains("wip.txt"),
+        "pact committed someone else's staged work: {committed}"
+    );
+    assert!(
+        git_out(tmp.path(), &["diff", "--cached", "--name-only"]).contains("wip.txt"),
+        "wip.txt must still be staged, waiting for its own commit"
+    );
+}
+
+/// `--no-commit` writes the files and stops. Also the escape hatch for anyone
+/// who wants pact nowhere near their history.
+#[test]
+fn init_no_commit_writes_the_files_and_creates_no_commit() {
+    let Some(tmp) = git_repo("init_no_commit") else {
+        return;
+    };
+    git_identity(tmp.path());
+
+    assert_ok(&pact(tmp.path(), "commit-agent", &["init", "--no-commit"]));
+
+    assert!(tmp.path().join("AGENTS.md").exists());
+    assert_eq!(
+        git_out(tmp.path(), &["rev-list", "--count", "--all"]).trim(),
+        "0",
+        "--no-commit must leave the history alone"
+    );
+}
+
+/// A commit pact cannot make must never look like an init that failed: the
+/// files are on disk and correct, so the exit status stays 0 and the reason
+/// goes to stderr — the same rule the broken-pipe fix established.
+#[test]
+fn init_still_succeeds_when_the_commit_cannot_be_made() {
+    let Some(tmp) = git_repo("init_still_succeeds_when_commit_fails") else {
+        return;
+    };
+    git_identity(tmp.path());
+    std::fs::write(tmp.path().join(".gitignore"), "AGENTS.md\n").unwrap();
+
+    let out = pact(tmp.path(), "commit-agent", &["init"]);
+    assert_ok(&out);
+    assert!(
+        tmp.path().join("AGENTS.md").exists(),
+        "the file must still be written"
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("not committed") && stderr.contains(".gitignore"),
+        "stderr must say what wasn't committed and why: {stderr}"
+    );
+    assert_eq!(
+        git_out(tmp.path(), &["rev-list", "--count", "--all"]).trim(),
+        "0"
+    );
+}
+
+fn git_identity(repo: &Path) {
+    run_git(repo, &["config", "user.email", "tests@pact.invalid"]);
+    run_git(repo, &["config", "user.name", "pact tests"]);
+}
+
+fn run_git(repo: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("git");
+    assert!(out.status.success(), "git {args:?}: {}", stderr_of(&out));
+}
+
+fn git_out(repo: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("git");
+    stdout_of(&out)
+}
