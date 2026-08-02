@@ -10,6 +10,14 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.3.2 - 2026-08-02
+#### Continuous Integration
+- guard release tags and lint commit subjects on PRs - (d07e6a7) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- distinguish interactions.jsonl from the passive issues.jsonl export - (6322b12) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.3.1 - 2026-08-02
 #### Bug Fixes
 - **(canary)** report failures from one job, not once per matrix leg - (b8e3147) - Clement HUSSENOT-DESENONGES
