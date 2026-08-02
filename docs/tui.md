@@ -110,12 +110,23 @@ messages map onto Beads issues.
 
 ### Doctor
 
-The same checks as `pact doctor`, rendered live: git repo, `.pact/` presence,
-`AGENTS.md` freshness, whether `CLAUDE.md` reaches the protocol, whether the
-other instruction files pact manages (`GEMINI.md` and friends) are current,
-whether those two files would survive a clone (i.e. aren't gitignored), the
-Beads CLI (`bd` or `br`) binary and version (warning outside the tested range),
-stale-lease count, and corrupt-lock count.
+The same checks as `pact doctor`, rendered live. These are the check names
+verbatim, because `scripts/check-docs.sh` compares this table against
+`pact doctor --json` in both directions — a check missing here, or one named
+here that the CLI does not emit, fails CI:
+
+| Check | What it answers |
+|---|---|
+| `git repo` | the resolved repo root |
+| `.pact/ present` | is there any state to read |
+| `AGENTS.md block current` | does the managed block match this pact version |
+| `CLAUDE.md reaches the protocol` | Claude Code loads `CLAUDE.md`, never `AGENTS.md` |
+| `other instruction files current` | `GEMINI.md` and friends, same staleness question |
+| `protocol files reach a clone` | warns (`!`) when they are gitignored |
+| `Beads CLI` | which binary, which version, warning outside the tested range |
+| `stale leases` | how many, without collecting them |
+| `corrupt leases` | lock files pact cannot read, which only a human can clear |
+
 Lazy-loaded like Messages (only checked once you visit the tab, or press
 `r`), since it shells out to `bd --version` the same way Messages does.
 

@@ -139,11 +139,31 @@ while IFS= read -r hit; do
 	# grep -r prefixes "file:", and the link regex excludes ':' so absolute URLs
 	# never reach here — which makes the last colon the separator, always.
 	src=${hit%%:*}
-	target=${hit##*:}
-	target=${target%%#*} # file.md#anchor — the file is what can vanish
-	[ -n "$target" ] || continue
-	[ -e "$(dirname "$src")/$target" ] ||
+	link=${hit##*:}
+	target=${link%%#*}
+	frag=${link#"$target"}
+	frag=${frag#\#}
+
+	# A bare "#anchor" points into the source file itself.
+	path=${target:+$(dirname "$src")/$target}
+	path=${path:-$src}
+
+	if [ ! -e "$path" ]; then
 		problem "$src links to $target, which does not exist"
+		continue
+	fi
+	[ -n "$frag" ] || continue
+
+	# Fragments rot exactly like filenames do — this round added four deep links
+	# and none were verified. GitHub slugs a heading by lowercasing it, dropping
+	# anything that is not a word character, space or hyphen, then joining on
+	# hyphens; reproduce that rather than guessing.
+	grep -qxF "$frag" < <(
+		grep -E '^#{1,6}[[:space:]]' "$path" |
+			sed -E 's/^#+[[:space:]]*//; s/[[:space:]]+$//' |
+			tr 'A-Z' 'a-z' |
+			sed -E 's/`//g; s/[^a-z0-9 _-]//g; s/[[:space:]]+/-/g'
+	) || problem "$src links to $link, but $path has no heading anchored #$frag"
 done < <(grep -roE '\]\([^):]+\)' README.md docs/ | sed 's/](/:/; s/)$//')
 
 # ------------------------------------------------------ 3. doctor checks
@@ -153,26 +173,38 @@ done < <(grep -roE '\]\([^):]+\)' README.md docs/ | sed 's/](/:/; s/)$//')
 doctor_names=$(pact doctor --json 2>/dev/null | sed -nE 's/.*"name": "(.*)",?$/\1/p')
 [ -n "$doctor_names" ] || { problem "\`pact doctor --json\` emitted no check names"; exit 1; }
 
-# docs/tui.md describes the checks in prose ("`.pact/` presence", "the `bd`
-# binary"), not as a verbatim list, so a literal match on the check name would
-# fail on all eight today. Instead: at least one word of the name, 4+ chars,
-# has to appear in tui.md's Doctor section. Scoping to that section is what
-# gives the check teeth: "leases" appears all over that page, so a whole-file
-# match shrugs at the recorded defect (a doctor check list missing 2 of 7
-# entries) — deleting "stale-lease count, and corrupt-lock count" from the
-# Doctor section still leaves the word "leases" three tabs away.
-lower() { tr 'A-Z' 'a-z'; }
-tui_doctor=$(awk '/^###?[[:space:]]+Doctor[[:space:]]*$/ {inside=1; next} inside && /^#/ {exit} inside' docs/tui.md | lower)
+# docs/tui.md's Doctor section lists the check names VERBATIM in backticks, so
+# this is an exact set comparison in both directions.
+#
+# It used to be prose, matched by "any word of the name, 4+ chars, appears in
+# the section". That was weak both ways: docs naming a check the CLI does not
+# have passed (appending "and dolt remote reachability" was invisible), and
+# deleting a whole check's sentence passed too, because words like "files" and
+# "current" survived elsewhere in the paragraph. A verbatim list is what makes
+# the comparison exact, and it is better documentation than the prose was.
+tui_doctor=$(awk '/^###?[[:space:]]+Doctor[[:space:]]*$/ {inside=1; next} inside && /^#/ {exit} inside' docs/tui.md)
 [ -n "$tui_doctor" ] || { problem "docs/tui.md has no Doctor section to check against"; exit 1; }
+# Only the "| Check |" table — the same section carries a keybindings table
+# whose first cell is also backticked, and `r` is not a doctor check.
+documented=$(awk -F'|' '
+	/^\|[[:space:]]*Check[[:space:]]*\|/ {intable=1; next}
+	intable && !/^\|/ {exit}
+	intable && $2 ~ /`/ {gsub(/^[[:space:]]*`|`[[:space:]]*$/, "", $2); print $2}
+' <<<"$tui_doctor" | sort -u)
+[ -n "$documented" ] || { problem "docs/tui.md's Doctor section names no checks in backticks"; exit 1; }
 
 while IFS= read -r name; do
-	hit=0
-	for word in $(lower <<<"$name"); do
-		[ ${#word} -ge 4 ] || continue
-		grep -qF -- "$word" <<<"$tui_doctor" && { hit=1; break; }
-	done
-	[ $hit -eq 1 ] || problem "doctor check \"$name\" is not named in docs/tui.md's Doctor section"
+	grep -qxF -- "$name" <<<"$documented" ||
+		problem "doctor check \"$name\" is not named in docs/tui.md's Doctor section"
 done <<<"$doctor_names"
+
+# The reverse direction, which the criterion asks for and the prose version
+# never had: a check documented here that the CLI stopped emitting. Same rot as
+# a removed flag still listed in README, already guarded both ways above.
+while IFS= read -r name; do
+	grep -qxF -- "$name" <<<"$doctor_names" ||
+		problem "docs/tui.md documents doctor check \"$name\", which \`pact doctor\` does not emit"
+done <<<"$documented"
 
 # ---------------------------------------------------------------------------
 
