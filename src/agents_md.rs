@@ -20,10 +20,13 @@ this protocol whenever you touch shared files or hand off work to others.
   never guesses an identity. `pact whoami` shows the identity and paths it
   resolved.
 - **Announce intent before you research, not just before you write.** Your
-  first pact commands come *before* you read the first file: `pact msg inbox`,
-  then `pact msg send --to <peer-or-human>` saying what you are about to work
-  on, then `pact lease acquire <path> --note "<what>"` for the files you expect
-  to own. Do it even if you will only be reading for the next ten minutes. Why:
+  first pact commands come *before* you read the first file: `pact msg inbox`
+  and `pact lease ls` to see what is already claimed and by whom, then
+  `pact msg send --to <peer-or-human>` saying what you are about to work on,
+  then `pact lease acquire <path>... --note "<what>"` for the files you expect
+  to own. Several paths in one `acquire` are taken all-or-nothing, so you never
+  end up holding half of what you need while a peer holds the rest.
+  Do it even if you will only be reading for the next ten minutes. Why:
   a peer planning against the same file can renegotiate now instead of at the
   end, when both plans are sunk cost — and a fleet that has announced nothing
   looks exactly like a fleet that crashed on startup.
@@ -33,11 +36,17 @@ this protocol whenever you touch shared files or hand off work to others.
   evidence log, your own scratch dir) — nobody else writes it, so it needs no
   lease. Anything else: lease it. Leases are advisory, not enforced by the
   filesystem; respect them anyway.
-- **Keep a lease alive, then let it all go**: `pact lease renew <path>`
-  refreshes the TTL — a long task must not outlive its lease. `pact lease
-  release <path>` frees one file, `pact lease release --all` frees everything
-  you hold in a single call, so nothing gets half-forgotten. Release before
-  you report yourself finished, not after.
+- **Keep a lease alive, then let it all go**: a lease lasts `--ttl` seconds
+  (default 900) and `pact lease renew <path>` refreshes it — a long task must
+  not outlive its lease. `pact lease release <path>` frees one file, `pact
+  lease release --all` frees everything you hold in a single call, so nothing
+  gets half-forgotten. Release before you report yourself finished, not after.
+- **A path someone else holds exits 2** — branch on that, not on the message
+  text. `pact lease ls` names the holder; message them and pick up something
+  else, which is what announcing early bought you. `pact lease acquire --steal`
+  and `pact lease release --force` do override a live claim, but both warn on
+  stderr and name the agent they displaced: reach for them when you know a peer
+  is gone, not when you are impatient with one who isn't.
 - **Announce contract changes**: if you change an API, schema, CLI flag, or
   any other contract another agent depends on, message them:
   `pact msg send --to <agent> "what changed and why"`. Check the recipient
@@ -47,6 +56,11 @@ this protocol whenever you touch shared files or hand off work to others.
 - **Use a file for anything longer than a sentence**: `--body-file <path>`, or
   `--body-file -` for stdin. Quotes, backslashes and aligned tables do not
   survive a shell, and handing over an API is exactly that kind of content.
+- **Read and reply in the same thread**: `pact msg inbox` lists one line per
+  message; `pact msg read <id>` shows one in full together with its whole
+  thread. Reply with `pact msg send --to <sender> --thread <id> "..."` — a
+  reply sent without `--thread` starts a new thread, and the exchange stops
+  being readable as one conversation.
 - **Confirm, don't re-send**: `pact msg sent` shows what you sent and whether
   the recipient has read it. If you are unsure a message went out, check
   there — a blind re-send is how a peer's inbox fills with duplicates.
@@ -385,14 +399,30 @@ mod tests {
     #[test]
     fn managed_block_teaches_the_protocol_commands() {
         let block = managed_block();
+        // Every command an agent needs to *operate* under the protocol. The
+        // block drifted behind the CLI twice (pact-sri, then multi-path
+        // acquire, which that bead listed and its fix missed), so the list is
+        // asserted rather than reviewed by eye.
         for needle in [
             "before you research",
             "pact msg inbox",
+            "pact msg read",
+            "--thread",
+            "pact msg sent",
+            "pact lease ls",
             "pact lease acquire",
+            "acquire <path>...",
             "pact lease renew",
+            "--ttl",
             "release --all",
+            "--steal",
+            "--force",
+            "exits 2",
+            "pact log",
             "pact agents",
             "pact whoami",
+            "--body-file",
+            "--json",
         ] {
             assert!(block.contains(needle), "managed_block missing {needle:?}");
         }

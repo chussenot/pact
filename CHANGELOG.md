@@ -218,8 +218,14 @@ behind each one is the useful part.
 
 ### Known gaps
 
-- The `AGENTS.md` block `pact init` generates does not yet teach `pact log`,
-  `pact msg sent`, multi-recipient `--to` or multi-path `acquire` (`pact-sri`).
+- ~~The `AGENTS.md` block `pact init` generates does not yet teach `pact log`,
+  `pact msg sent`, multi-recipient `--to` or multi-path `acquire`~~
+  (`pact-sri`). Closed: the block now teaches the whole operating surface —
+  `lease ls`, multi-path `acquire`, `--ttl`, `renew`, `release --all`,
+  `--steal`/`--force` and that a held path exits 2, plus `msg read`,
+  `--thread` replies, `msg sent`, `--body-file`, `pact log`, `agents`,
+  `whoami` and `--json`. A unit test asserts each one, because this block had
+  already drifted behind the CLI twice.
 - Multi-path `acquire` lets an agent claim a new module and the line that
   registers it together, but if that line is owned by another agent, the new
   file's author still cannot build or test their own work (`pact-rnc.21`,
