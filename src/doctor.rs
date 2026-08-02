@@ -2,10 +2,11 @@
 //! surfaces show exactly the same thing instead of drifting apart.
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use serde::Serialize;
 
-use crate::{agents_md, beads, lease, repo};
+use crate::{agents_md, beads, lease, otel, repo};
 
 #[derive(Serialize)]
 pub struct DoctorCheck {
@@ -137,6 +138,22 @@ pub fn checks(root: &Path) -> DoctorReport {
         },
     });
 
+    // Built in, configured, and exporting are three different things, and the
+    // gap between the last two is silent by construction: pact speaks http/json
+    // over http:// only, so `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` (the
+    // OTel *spec default*) or an `https://` endpoint (every hosted collector)
+    // turns export off with no warning and no failure. A repo that switched the
+    // feature on in CI got a green build, a green doctor, `pact --version`
+    // saying `features: otel`, and no data. Choosing to speak one protocol is
+    // defensible; being quiet about the choice is the defect.
+    let otel_export = otel::export_status();
+    checks.push(DoctorCheck {
+        name: "otel export",
+        ok: true,
+        warn: otel_export.warn,
+        detail: otel_export.detail,
+    });
+
     // Warns rather than fails: pact still resolves correctly (Dolt first,
     // because that is where the data is), and two stores can legitimately
     // coexist mid-migration. But the correct tiebreak is what makes it
@@ -231,7 +248,64 @@ pub fn checks(root: &Path) -> DoctorReport {
     }
 
     let healthy = checks.iter().all(|c| c.ok);
+    export(&checks);
     DoctorReport { healthy, checks }
+}
+
+/// Health as one number, because a two-valued gauge would throw away exactly
+/// the distinction `warn` was added to make. Bigger is healthier, so `min()`
+/// across checks is the worst thing wrong with the repo and one chart reads
+/// without a legend. Same `(ok, warn)` match as the `✗ ! ✓` glyphs in
+/// `run_doctor`, so the number and the tick can never disagree.
+fn status_code(c: &DoctorCheck) -> i64 {
+    match (c.ok, c.warn) {
+        (false, _) => 0,
+        (true, true) => 1,
+        (true, false) => 2,
+    }
+}
+
+/// Statuses last exported by this process, so an unchanged report is not
+/// re-sent.
+static LAST_EXPORT: Mutex<Option<Vec<i64>>> = Mutex::new(None);
+
+/// True the first time, and afterwards only when a verdict actually moved.
+/// Takes the slot rather than reading the static so a test can own its own —
+/// `cargo test` runs these threads in one process, and a test that raced the
+/// global against every other test calling `checks()` would be flaky by design.
+fn is_new(slot: &Mutex<Option<Vec<i64>>>, statuses: Vec<i64>) -> bool {
+    let Ok(mut last) = slot.lock() else {
+        // A poisoned lock means some other thread panicked mid-export. Losing a
+        // gauge is not worth propagating that into a doctor run.
+        return false;
+    };
+    if last.as_ref() == Some(&statuses) {
+        return false;
+    }
+    *last = Some(statuses);
+    true
+}
+
+/// One gauge per check, keyed by check name — `pact doctor` is a point-in-time
+/// answer nobody recorded, which is how AGENTS.md sat gitignored-and-uncommitted
+/// for the project's whole life waiting for a human to notice (pact-aw7.7).
+///
+/// Edge-triggered, not level: `tui.rs` calls `checks()` once a second while the
+/// Doctor tab is open, and otel buffers every point until the process exits
+/// (pact-aw7.9), so exporting unconditionally would grow that buffer all day to
+/// say the same thing 3600 times an hour. Check names are a fixed set, so they
+/// are safe as an attribute; nothing user-supplied is exported.
+fn export(checks: &[DoctorCheck]) {
+    if !is_new(&LAST_EXPORT, checks.iter().map(status_code).collect()) {
+        return;
+    }
+    for c in checks {
+        otel::gauge(
+            "pact.doctor.check.status",
+            status_code(c),
+            &otel::attrs!["pact.doctor.check" => c.name],
+        );
+    }
 }
 
 #[cfg(test)]
@@ -273,5 +347,61 @@ mod tests {
         let (ok, detail) = instruction_check(root);
         assert!(!ok, "a corrupted managed block must not pass");
         assert!(detail.contains("GEMINI.md"), "{detail}");
+    }
+
+    /// Two contracts in one line. The check must EXIST in both builds, because
+    /// `scripts/check-docs.sh` compares doctor's names against docs/tui.md as
+    /// an exact set and only the default build is walked there. And it must
+    /// never fail: `healthy` feeds doctor's exit code, and telemetry — of all
+    /// things — does not get to change an exit code that the protocol tells
+    /// agents to branch on.
+    #[test]
+    fn the_otel_export_check_exists_in_both_builds_and_never_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report = checks(tmp.path());
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "otel export")
+            .expect("doctor must say whether telemetry is actually exporting");
+        assert!(c.ok, "an otel check must not move doctor's exit code");
+        assert!(!c.detail.is_empty());
+    }
+
+    fn check(ok: bool, warn: bool) -> DoctorCheck {
+        DoctorCheck {
+            name: "x",
+            ok,
+            warn,
+            detail: String::new(),
+        }
+    }
+
+    /// The whole point of pact-aw7.7: `warn` is a third state, so the gauge has
+    /// to have three values. A two-valued one would fold `!` into `✓` and hide
+    /// the situation the warn level was just added to surface.
+    #[test]
+    fn the_gauge_keeps_warn_apart_from_ok_and_fail() {
+        assert_eq!(status_code(&check(false, false)), 0);
+        assert_eq!(status_code(&check(true, true)), 1);
+        assert_eq!(status_code(&check(true, false)), 2);
+        // A failing check that also warns is still a failure, exactly as the
+        // glyph match in `run_doctor` renders it.
+        assert_eq!(status_code(&check(false, true)), 0);
+    }
+
+    /// Edge, not level: `pact ui` calls `checks()` once a second and otel holds
+    /// every point until the process exits, so an unchanged verdict must cost
+    /// nothing.
+    #[test]
+    fn an_unchanged_report_is_not_exported_twice() {
+        let slot = Mutex::new(None);
+        assert!(is_new(&slot, vec![2, 2, 1]), "first report always exports");
+        assert!(!is_new(&slot, vec![2, 2, 1]), "same verdicts, nothing new");
+        assert!(is_new(&slot, vec![2, 0, 1]), "a check went red");
+        assert!(
+            is_new(&slot, vec![2, 1, 1]),
+            "red to warn is still a change"
+        );
     }
 }

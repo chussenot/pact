@@ -15,9 +15,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 
+use crate::otel;
 use crate::output::exit_with;
 
 const TESTED_BD_MIN: (u64, u64, u64) = (1, 1, 0);
@@ -80,13 +82,54 @@ impl BeadsCli {
 
     /// Run `bd <args>` in `repo_root`, capturing stdout; the backend's own
     /// reason is surfaced on failure, from whichever stream it used.
+    ///
+    /// This is the only place pact spawns a Beads process, so it is also the
+    /// only place that has to be instrumented (pact-aw7.6): every message
+    /// command shells out at least once, the TUI's Messages tab once did it per
+    /// refresh tick, and not turning that into ten subprocesses a second was the
+    /// single hardest constraint in the mascot feature — measured by nothing.
     pub fn run(&self, repo_root: &Path, args: &[&str]) -> Result<String> {
+        let shape = argv_shape(args);
+        let mut sp = otel::span("pact.beads.exec");
+        // `process.executable.name` and `process.exit.code` are the registry
+        // names for exactly this. `process.command_args` is NOT used and must
+        // not be: `--title=` and `--description=` carry the message subject and
+        // body, and shipping a colleague's prose to a collector is not a thing
+        // an observability change gets to do quietly.
+        sp.set("process.executable.name", self.binary);
+        sp.set("pact.beads.argv_shape", shape.join(" "));
+        sp.set("pact.beads.subcommand", subcommand(&shape).to_string());
+        if let Some(v) = BACKEND_VERSION.get() {
+            sp.set("pact.beads.version", v.clone());
+        }
+        let started = std::time::Instant::now();
+
         let output = Command::new(self.binary)
             .args(args)
             .current_dir(repo_root)
             .output()
-            .with_context(|| format!("spawning {} {:?}", self.binary, args))?;
+            .with_context(|| format!("spawning {} {:?}", self.binary, args));
+        let output = match output {
+            Ok(o) => o,
+            Err(e) => {
+                sp.fail("spawn");
+                self.record(&shape, started, "spawn");
+                return Err(e);
+            }
+        };
+        // `.code()` is None when a signal killed it, which is not an exit code
+        // and must not be faked as one.
+        if let Some(code) = output.status.code() {
+            sp.set("process.exit.code", i64::from(code));
+        }
         if !output.status.success() {
+            let outcome = if output.status.code().is_some() {
+                "exit"
+            } else {
+                "signal"
+            };
+            sp.fail(outcome);
+            self.record(&shape, started, outcome);
             anyhow::bail!(
                 "{} {:?} failed ({}): {}",
                 self.binary,
@@ -98,8 +141,88 @@ impl BeadsCli {
                 )
             );
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        // Learn the version for free from the one call that already asks for
+        // it, rather than probing. See BACKEND_VERSION. `set` returning Ok
+        // means we are the call that learned it, and that call has to carry the
+        // attribute itself: measured on `pact doctor`, the `--version` span was
+        // the *only* beads span in the whole process, so a version attached
+        // only to later spans would never have been exported at all.
+        if args == ["--version"] && BACKEND_VERSION.set(stdout.trim().to_string()).is_ok() {
+            sp.set("pact.beads.version", stdout.trim().to_string());
+        }
+        self.record(&shape, started, "ok");
+        Ok(stdout)
     }
+
+    /// The aggregate behind the span: how much wall clock a pact command spends
+    /// waiting on Beads, and how many spawns it took. Dimensions are the
+    /// backend, the subcommand and a three-valued outcome — all bounded, none
+    /// derived from a path or an issue id, because a metric label is where
+    /// unbounded cardinality actually hurts.
+    fn record(&self, shape: &[&str], started: std::time::Instant, outcome: &'static str) {
+        let attrs = otel::attrs![
+            "process.executable.name" => self.binary,
+            "pact.beads.subcommand" => subcommand(shape).to_string(),
+            "pact.outcome" => outcome,
+        ];
+        otel::record_ms(
+            "pact.beads.duration",
+            started.elapsed().as_secs_f64() * 1000.0,
+            &attrs,
+        );
+    }
+}
+
+/// The backend's version string, learned for free the one time something asks
+/// the backend for it (`pact doctor`), and reused by every later span in the
+/// same process.
+///
+/// Deliberately never probed on demand: spawning `bd --version` to decorate a
+/// span would double the exact subprocess cost the span exists to measure, and
+/// telemetry that changes what it observes is worse than no telemetry. A trace
+/// with no `pact.beads.version` means nothing in that command needed it.
+static BACKEND_VERSION: OnceLock<String> = OnceLock::new();
+
+/// The first token of the shape: `create`, `label`, `--version`. Bounded by the
+/// call sites in `msg.rs`, which is what makes it safe as a metric dimension.
+fn subcommand<'a>(shape: &[&'a str]) -> &'a str {
+    shape.first().copied().unwrap_or("")
+}
+
+/// argv reduced to its *shape*: keep the flag names, keep the leading verbs,
+/// drop everything else.
+///
+/// The rule is deliberately paranoid rather than clever, because the thing on
+/// the other side of a mistake is a collector holding somebody's message body:
+///
+/// - `--title=<subject>` and `--description=<body>` are how `msg send` passes
+///   user prose, so a flag is truncated at its `=` and only the name survives.
+/// - a positional is dropped outright. In practice they are issue ids
+///   (`show <id>… --json`) and `read-by-<agent>` labels — not free text, but
+///   unbounded, and an id tells you nothing about the shape of the call.
+/// - the exception is the leading verb chain (`list`, `label add`), capped at
+///   two tokens of pure lowercase ASCII. An id (`pact-aw7.6`) or any prose
+///   fails that test, so the chain stops at the first thing that is not
+///   obviously a subcommand.
+fn argv_shape<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut in_verbs = true;
+    for arg in args {
+        if arg.starts_with('-') {
+            in_verbs = false;
+            out.push(arg.split('=').next().unwrap_or(arg));
+        } else if in_verbs && out.len() < 2 && is_verb(arg) {
+            out.push(arg);
+        } else {
+            in_verbs = false;
+        }
+    }
+    out
+}
+
+fn is_verb(token: &str) -> bool {
+    !token.is_empty() && token.len() <= 16 && token.bytes().all(|b| b.is_ascii_lowercase())
 }
 
 /// Why the backend said it failed. Reading stderr alone was correct only while
@@ -267,6 +390,62 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one that matters: `msg send`'s real argv carries the subject and the
+    /// body, and neither may reach a collector (pact-aw7.6). Verbatim from
+    /// `msg::create_args`.
+    #[test]
+    fn the_argv_shape_keeps_flag_names_and_drops_every_value() {
+        let args = [
+            "create",
+            "--type=message",
+            "--json",
+            "--no-inherit-labels",
+            "--title=lease handoff on src/tui.rs",
+            "--description=I am done with the refresh loop, it is yours",
+            "--assignee=integrator",
+            "--actor=beads-span",
+            "--parent=pact-aw7.6",
+        ];
+        let shape = argv_shape(&args).join(" ");
+        assert_eq!(
+            shape,
+            "create --type --json --no-inherit-labels --title --description \
+             --assignee --actor --parent"
+        );
+        for leaked in ["lease handoff", "refresh loop", "integrator", "pact-aw7.6"] {
+            assert!(!shape.contains(leaked), "{leaked:?} leaked into {shape:?}");
+        }
+    }
+
+    /// The other shapes `msg.rs` produces. Ids and `read-by-<agent>` labels are
+    /// positionals: bounded-ish, but nothing about the shape of the call, and
+    /// unbounded as a metric dimension.
+    #[test]
+    fn positionals_are_dropped_but_a_two_word_subcommand_survives() {
+        let shape = |a: &[&str]| argv_shape(a).join(" ");
+        assert_eq!(
+            shape(&["list", "--include-infra", "--json", "--assignee=alice"]),
+            "list --include-infra --json --assignee"
+        );
+        assert_eq!(
+            shape(&["show", "pact-aw7.6", "pact-l94", "--json"]),
+            "show --json"
+        );
+        assert_eq!(
+            shape(&["label", "add", "pact-aw7.6", "read-by-beads-span"]),
+            "label add"
+        );
+        assert_eq!(shape(&["--version"]), "--version");
+        assert_eq!(shape(&[]), "");
+        // A verb chain stops at the first token that is not obviously one, so a
+        // hypothetical positional title cannot ride in as a subcommand.
+        assert_eq!(
+            shape(&["create", "Fix the thing", "--json"]),
+            "create --json"
+        );
+        assert_eq!(subcommand(&argv_shape(&["label", "add"])), "label");
+    }
 
     #[test]
     fn which_finds_a_real_binary_on_path() {

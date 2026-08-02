@@ -47,6 +47,21 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// fetch there recomputes the count for free.
 const UNREAD_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How often buffered telemetry is pushed to the collector while the ui runs.
+///
+/// `pact ui` is the only long-lived pact process, and otel's only flush was on
+/// the guard at exit — so an eight-hour session exported one batch, timestamped
+/// at exit, and a session killed with Ctrl-C or `kill` exported nothing at all
+/// (pact-aw7.9). That is exactly backwards for the process a human watches all
+/// day. Hung on the 1 s wake that already exists, so it adds no event-loop
+/// wakeups; 10 s because a POST is cheaper than a `bd` subprocess but not free,
+/// and because it keeps the buffer far below otel's cap either way.
+///
+/// ponytail: this does not cover SIGKILL, and pact has no signal handler — that
+/// needs libc or a hand-declared `extern "C"`, and neither is worth a
+/// dependency for the last ten seconds of a dashboard session.
+const EXPORT_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Floor on how often the mascot may wake the event loop. The animation asks
 /// for 70–380 ms frames, so this only ever kicks in to stop a zero/near-zero
 /// `next_frame_in` from turning `event::poll` into a 100% CPU spin.
@@ -480,9 +495,17 @@ impl App {
 }
 
 fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+    let mut last_export = Instant::now();
     loop {
         app.mascot.tick(Instant::now());
         terminal.draw(|frame| draw(frame, app))?;
+
+        // See EXPORT_INTERVAL. A no-op in the default build, and a no-op in the
+        // otel build until something is actually configured.
+        if last_export.elapsed() >= EXPORT_INTERVAL {
+            last_export = Instant::now();
+            crate::otel::flush_now();
+        }
 
         // Two independent clocks share one poll: the 1 s DATA refresh and the
         // ~100 ms animation frame. Waking on the sooner of the two is what keeps
@@ -1205,6 +1228,17 @@ mod tests {
         let rendered = render_to_string(&terminal);
         assert!(rendered.contains("Messages"));
         assert!(!rendered.contains("Messages ("));
+    }
+
+    /// The ui exports on a timer, and the timer has to be readable off the two
+    /// clocks that already exist. Too short and every animation frame carries a
+    /// POST; longer than a coffee break and `pact ui` is back to what
+    /// pact-aw7.9 found — one batch at exit, nothing at all on Ctrl-C, and a
+    /// whole session's gauges collapsed onto the exit timestamp.
+    #[test]
+    fn telemetry_is_exported_on_a_clock_the_event_loop_already_wakes_for() {
+        assert!(EXPORT_INTERVAL >= REFRESH_INTERVAL);
+        assert!(EXPORT_INTERVAL <= Duration::from_secs(60));
     }
 
     #[test]

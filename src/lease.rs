@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::events;
+use crate::otel;
 use crate::output::exit_with;
 use crate::repo::pact_dir;
 
@@ -310,6 +311,196 @@ fn log_event(repo_root: &Path, agent: &str, kind: &str, path: &str, detail: Opti
     );
 }
 
+// ---------------------------------------------------------------------------
+// Telemetry (pact-aw7.3). The retro counted 19 acquires / 19 releases / 0
+// steals by hand-scanning `pact log`; these make it a query. Every one of them
+// sits next to the `log_event` for the same transition, so the feed and the
+// metric cannot disagree about what happened.
+//
+// WHERE A NAME IS AND IS NOT. Neither `pact.path` nor an agent name is on a
+// metric; both are on the SPAN. A metric attribute has to be bounded, and
+// neither of these is: a repo has thousands of files, and an agent name is
+// whatever `PACT_AGENT` was set to. `pact.lease.peer` used to dimension all
+// three metrics here, and a verifier measured what that costs — five agents
+// doing one operation each produced ten distinct series, this repo's own
+// `lease ls --all` already lists sixteen historical agents, every fleet mints
+// more, and nothing ages a series out. So: the metric tells you the *rate* of
+// each outcome, and the trace tells you *which file* and *which peer* — click
+// through, don't group by. `pact log` and `.pact/events.jsonl` still carry the
+// full who-blocked-whom edge, which is where it was before the metrics existed.
+//
+// None of this may change an exit code or write to stdout: with the `otel`
+// feature off every call below compiles to nothing, and with it on the
+// exporter is fire-and-forget (see src/otel.rs).
+// ---------------------------------------------------------------------------
+
+/// Longest agent name we write into a wait marker. An agent name arrives from
+/// `PACT_AGENT` or from a lock file another process wrote — neither is a
+/// promise about length.
+#[cfg(feature = "otel")]
+const MAX_AGENT_LEN: usize = 64;
+
+/// A conflict older than this tells you nothing about a wait: the agent went
+/// away and came back, or the marker outlived the run that left it.
+#[cfg(feature = "otel")]
+const MAX_WAIT_MS: f64 = 6.0 * 3600.0 * 1000.0;
+
+#[cfg(feature = "otel")]
+fn short_agent(agent: &str) -> String {
+    agent.chars().take(MAX_AGENT_LEN).collect()
+}
+
+/// One counter for every lease transition, dimensioned by outcome and by
+/// nothing else. See the section header for why the peer is not here.
+///
+/// `reclaimed` and `stolen` are separate outcomes here even though the event
+/// log writes both as `"stolen"`. Taking over a dead claim is not overriding a
+/// live one, and in the feed the only thing that distinguishes them is free
+/// text in `detail`, which nobody can group by.
+fn count_transition(outcome: &'static str) {
+    otel::count(
+        "pact.lease.transitions",
+        1,
+        &otel::attrs!["pact.lease.outcome" => outcome],
+    );
+}
+
+/// Milliseconds a lease had been held, or `None` when its `acquired_at` cannot
+/// be parsed. [`parse_acquired`] answers epoch-0 for a corrupt stamp on purpose
+/// — the safe answer for "is this reclaimable" — but feeding that to a
+/// histogram would record a 56-year hold and drag every percentile with it.
+fn held_ms(lease: &LeaseInfo, now: DateTime<Utc>) -> Option<f64> {
+    let acquired = DateTime::parse_from_rfc3339(&lease.acquired_at).ok()?;
+    let ms = (now - acquired.with_timezone(&Utc)).num_milliseconds();
+    (ms >= 0).then_some(ms as f64)
+}
+
+/// Record a hold that just ended. `pact.lease.overrun` is the half of
+/// pact-aw7.3 that says "a lease held past its TTL is visible as a metric
+/// rather than only in `pact log`" — true when the claim outlived the TTL its
+/// holder promised, which until now you could only see by reading the feed.
+///
+/// Caveat worth knowing before you read the percentiles: `renew` resets
+/// `acquired_at`, so a renewed lease reports time-since-last-renew, not
+/// time-since-first-claim. That is also exactly what `overrun` needs to mean —
+/// a renewed lease has not broken its promise.
+fn record_hold(lease: &LeaseInfo, outcome: &'static str) {
+    let now = Utc::now();
+    let Some(ms) = held_ms(lease, now) else {
+        return;
+    };
+    let (_, remaining) = age_and_remaining(lease, now);
+    otel::record_ms(
+        "pact.lease.hold.duration",
+        ms,
+        &otel::attrs![
+            "pact.lease.outcome" => outcome,
+            "pact.lease.overrun" => remaining < 0,
+        ],
+    );
+}
+
+/// Where a conflict leaves a breadcrumb so that a *later* acquire can say what
+/// the conflict cost. The two events are different processes — pact exits
+/// between them — so the gap cannot be measured in memory, and it is not
+/// derivable from `.pact/events.jsonl` either: a refused acquire writes no
+/// event, and adding one would make the *blocked* agent the answer to
+/// `events::owner_of`, i.e. `msg send --to-owner-of` would start routing mail
+/// to the agent that lost the file.
+///
+/// So: an empty-ish file whose mtime is the conflict and whose contents are the
+/// agent that blocked us. Invisible to everything else — `scan` and
+/// `corrupt_count` only look at `*.lock`, and this is a sibling directory.
+///
+/// Everything in this block is `#[cfg(feature = "otel")]` and has a no-op twin
+/// below, the same shape otel.rs uses for its own API. It has to be: only the
+/// terminal `otel::record_ms` compiled away, so the DEFAULT build — telemetry
+/// compiled out, no `OTEL_*` in the environment — created `.pact/waits/` on
+/// every acquire and wrote a marker on every conflict, to feed a histogram it
+/// can never emit. The section header three screens up claims "with the `otel`
+/// feature off every call below compiles to nothing"; these attributes are what
+/// make that true.
+///
+/// The leak was the default outcome of a conflict, not an edge case: a marker
+/// is only collected when the *same* agent later acquires the *same* path,
+/// which is precisely what AGENTS.md tells a blocked agent not to do ("message
+/// them and pick up something else"). Hence [`sweep_wait_markers`].
+#[cfg(feature = "otel")]
+fn wait_marker(repo_root: &Path, agent: &str, relative: &str) -> Option<PathBuf> {
+    let dir = pact_dir(repo_root).ok()?.join("waits");
+    std::fs::create_dir_all(&dir).ok()?;
+    // Same encoding, and the same collision caveat, as `encode_path`.
+    Some(dir.join(format!(
+        "{}__{}.wait",
+        encode_path(agent),
+        encode_path(relative)
+    )))
+}
+
+#[cfg(feature = "otel")]
+fn mark_conflict(repo_root: &Path, agent: &str, relative: &str, blocker: &str) {
+    if let Some(marker) = wait_marker(repo_root, agent, relative) {
+        // The blocker's name is written but never exported: it is what makes a
+        // marker readable when someone goes looking in `.pact/waits/`, and an
+        // agent name has no business being a metric dimension (section header).
+        let _ = std::fs::write(marker, short_agent(blocker));
+    }
+}
+
+/// Consume the breadcrumb from [`mark_conflict`] and record how long the agent
+/// was locked out of this path.
+#[cfg(feature = "otel")]
+fn record_wait(repo_root: &Path, agent: &str, relative: &str) {
+    let Some(marker) = wait_marker(repo_root, agent, relative) else {
+        return;
+    };
+    if std::fs::read(&marker).is_err() {
+        return; // no conflict preceded this acquire
+    }
+    let elapsed = std::fs::metadata(&marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|m| m.elapsed().ok());
+    let _ = std::fs::remove_file(&marker);
+    let Some(elapsed) = elapsed else { return };
+    let ms = elapsed.as_secs_f64() * 1000.0;
+    if ms > MAX_WAIT_MS {
+        return;
+    }
+    otel::record_ms("pact.lease.wait.duration", ms, &otel::attrs![]);
+}
+
+/// Drop every marker this agent left behind. `release --all` is the one call
+/// that means "I am done here", so it is the only place that can honestly say a
+/// pending wait will never be collected — and without it a conflict the agent
+/// never retried leaks one ~16-byte file per (agent, path) forever.
+#[cfg(feature = "otel")]
+fn sweep_wait_markers(repo_root: &Path, agent: &str) {
+    let Ok(dir) = pact_dir(repo_root).map(|d| d.join("waits")) else {
+        return;
+    };
+    let prefix = format!("{}__", encode_path(agent));
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+// The no-op twins. Identical signatures, so no call site carries a `#[cfg]`.
+#[cfg(not(feature = "otel"))]
+#[inline(always)]
+fn mark_conflict(_repo_root: &Path, _agent: &str, _relative: &str, _blocker: &str) {}
+#[cfg(not(feature = "otel"))]
+#[inline(always)]
+fn record_wait(_repo_root: &Path, _agent: &str, _relative: &str) {}
+#[cfg(not(feature = "otel"))]
+#[inline(always)]
+fn sweep_wait_markers(_repo_root: &Path, _agent: &str) {}
+
 pub fn acquire(
     repo_root: &Path,
     agent: &str,
@@ -321,7 +512,38 @@ pub fn acquire(
     current_store().acquire(repo_root, agent, path, ttl_secs, steal, note)
 }
 
+/// Telemetry wrapper around [`acquire_inner`]. Separate so the span covers the
+/// whole operation — including the post-rename verify — and so the four
+/// success branches inside do not each have to remember to close the wait
+/// histogram.
 fn acquire_fs(
+    repo_root: &Path,
+    agent: &str,
+    path: &str,
+    ttl_secs: u64,
+    steal: bool,
+    note: Option<String>,
+) -> Result<AcquireOutcome> {
+    let relative = normalize_path(repo_root, path);
+    let mut sp = otel::span("pact.lease.acquire");
+    sp.set("pact.path", relative.clone());
+    sp.set("pact.lease.ttl_secs", ttl_secs);
+
+    let outcome = acquire_inner(repo_root, agent, path, ttl_secs, steal, note);
+    match &outcome {
+        Ok(o) => {
+            sp.set("pact.lease.stolen", o.stolen);
+            record_wait(repo_root, agent, &relative);
+        }
+        // `held` and not the error text: a span status is a bounded reason
+        // code, and the message names another agent.
+        Err(e) if crate::output::code_for(e) == 2 => sp.fail("held"),
+        Err(_) => sp.fail("error"),
+    }
+    outcome
+}
+
+fn acquire_inner(
     repo_root: &Path,
     agent: &str,
     path: &str,
@@ -356,6 +578,7 @@ fn acquire_fs(
                 &relative,
                 new_lease.note.clone(),
             );
+            count_transition("acquired");
             Ok(AcquireOutcome {
                 lease: new_lease,
                 stolen: false,
@@ -397,6 +620,9 @@ fn acquire_fs(
                         existing.agent, existing.ttl_secs
                     )),
                 );
+                count_transition("expired");
+                record_hold(&existing, "expired");
+                count_transition("reclaimed");
                 Ok(AcquireOutcome {
                     lease: new_lease,
                     stolen: true,
@@ -412,6 +638,7 @@ fn acquire_fs(
                     &relative,
                     new_lease.note.clone(),
                 );
+                count_transition("renewed");
                 Ok(AcquireOutcome {
                     lease: new_lease,
                     stolen: false,
@@ -433,12 +660,19 @@ fn acquire_fs(
                         existing.agent
                     )),
                 );
+                count_transition("stolen");
+                record_hold(&existing, "stolen");
                 Ok(AcquireOutcome {
                     lease: new_lease,
                     stolen: true,
                 })
             } else {
                 let (age, remaining) = age_and_remaining(&existing, now);
+                count_transition("conflicted");
+                // Leave the breadcrumb *before* returning: the acquire that
+                // finally succeeds is a different process and this is the only
+                // record that the agent was ever locked out.
+                mark_conflict(repo_root, agent, &relative, &existing.agent);
                 Err(exit_with(
                     2,
                     format!(
@@ -528,6 +762,18 @@ fn acquire_many_fs(
                         let _ = write_lease_atomic(&lock_path, before);
                     }
                 }
+                // One per batch that actually unwound, not one per path, and
+                // not at all when there was nothing to give back. `main.rs`
+                // routes even a one-path `lease acquire` through here, so
+                // counting every failure as a rollback made an ordinary
+                // conflict — the commonest event in a fleet — report a
+                // rollback that never happened. The paths it did give back
+                // were each counted `acquired` and then `released`, so those
+                // two stay balanced; this is the counter that says the pair
+                // was churn rather than work.
+                if !newly_taken.is_empty() || !refreshed.is_empty() {
+                    count_transition("rolled_back");
+                }
                 return Err(e);
             }
         }
@@ -547,6 +793,8 @@ pub fn release(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result
 fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<Option<String>> {
     let relative = normalize_path(repo_root, path);
     let lock_path = lock_file_path(repo_root, &relative)?;
+    let mut sp = otel::span("pact.lease.release");
+    sp.set("pact.path", relative.clone());
 
     let existing = match read_lease(&lock_path) {
         Ok(lease) => lease,
@@ -559,6 +807,8 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
     } else if force {
         Some(existing.agent.clone())
     } else {
+        count_transition("conflicted");
+        sp.fail("held");
         return Err(exit_with(
             2,
             format!(
@@ -575,14 +825,22 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
     }
 
     match &displaced {
-        Some(holder) => log_event(
-            repo_root,
-            agent,
-            "force-released",
-            &relative,
-            Some(format!("destroyed live claim of {holder}")),
-        ),
-        None => log_event(repo_root, agent, "released", &relative, existing.note),
+        Some(holder) => {
+            log_event(
+                repo_root,
+                agent,
+                "force-released",
+                &relative,
+                Some(format!("destroyed live claim of {holder}")),
+            );
+            count_transition("force_released");
+            record_hold(&existing, "force_released");
+        }
+        None => {
+            record_hold(&existing, "released");
+            log_event(repo_root, agent, "released", &relative, existing.note);
+            count_transition("released");
+        }
     }
     Ok(displaced)
 }
@@ -603,6 +861,14 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
 /// unlink, so two concurrent `lease ls` runs cannot report one lapse twice.
 fn collect_expired(repo_root: &Path, lock_path: &Path, lease: &LeaseInfo) {
     if std::fs::remove_file(lock_path).is_ok() {
+        // Only the process that won the unlink counts it, for the same reason
+        // it is the only one that logs it: one lapse, one event, one increment,
+        // however many agents run `lease ls`. `pact.lease.peer` is the holder
+        // whose claim lapsed — equal to `pact.agent` when an agent sweeps its
+        // own, which is how you tell "I abandoned a file" from "someone else
+        // did". (pact-aw7.9: in `pact ui` these buffer until the TUI exits.)
+        count_transition("expired");
+        record_hold(lease, "expired");
         log_event(
             repo_root,
             &lease.agent,
@@ -662,6 +928,9 @@ fn release_all_fs(repo_root: &Path, agent: &str) -> Result<Vec<String>> {
             collect_expired(repo_root, &lock_path, lease);
         }
     }
+    // "Release everything" includes the telemetry breadcrumbs, which are the
+    // only thing in `.pact/` that nothing else ever collects.
+    sweep_wait_markers(repo_root, agent);
     Ok(held)
 }
 
@@ -682,6 +951,7 @@ fn renew_fs(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
     }
     let existing = read_lease(&lock_path)?;
     if existing.agent != agent {
+        count_transition("conflicted");
         return Err(exit_with(
             2,
             format!(
@@ -697,6 +967,7 @@ fn renew_fs(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
     };
     write_lease_atomic(&lock_path, &renewed)?;
     log_event(repo_root, agent, "renewed", &relative, renewed.note.clone());
+    count_transition("renewed");
     Ok(renewed)
 }
 
@@ -1436,6 +1707,134 @@ mod tests {
             .map(|e| e.kind)
             .collect();
         assert_eq!(kinds, ["expired", "stolen", "stolen"]);
+    }
+
+    // ---- pact-aw7.3: what the lease metrics are computed from -------------
+
+    /// A histogram must never be fed the epoch. `parse_acquired` answers
+    /// epoch-0 for a corrupt stamp deliberately (it makes the lease
+    /// reclaimable), and passing that through as a hold time would record a
+    /// 56-year lease and drag every percentile with it.
+    #[test]
+    fn held_ms_measures_a_real_hold_and_refuses_a_corrupt_one() {
+        let (lease, now) = lease_aged(900, 5);
+        let ms = held_ms(&lease, now).expect("a parseable stamp has a hold time");
+        assert!(
+            (4_000.0..=6_000.0).contains(&ms),
+            "got {ms}ms for a 5s hold"
+        );
+
+        let corrupt = LeaseInfo {
+            acquired_at: "not-a-timestamp".into(),
+            ..lease
+        };
+        assert_eq!(held_ms(&corrupt, now), None);
+    }
+
+    /// An agent name reaches a wait marker from `PACT_AGENT` or from a lock
+    /// file another process wrote. Neither is a promise about length.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn short_agent_bounds_what_reaches_a_wait_marker() {
+        assert_eq!(short_agent("lease-metrics"), "lease-metrics");
+        assert_eq!(short_agent(&"x".repeat(500)).len(), MAX_AGENT_LEN);
+    }
+
+    /// The other side of the cfg, and the reason it was added: with telemetry
+    /// compiled out, a conflict must leave NOTHING on disk. The default build
+    /// created `.pact/waits/` on every acquire and a marker on every conflict —
+    /// filesystem work whose only consumer was a histogram that build cannot
+    /// emit, and which nothing ever collected, because a marker is only read
+    /// when the same agent retries the same path and AGENTS.md tells a blocked
+    /// agent to go do something else.
+    #[cfg(not(feature = "otel"))]
+    #[test]
+    fn the_default_build_does_no_telemetry_filesystem_work() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim(root, "agent-a", "hot.rs");
+        let waits = root.join(".pact").join("waits");
+        assert!(!waits.exists(), "an uncontended acquire created {waits:?}");
+
+        assert!(acquire(root, "agent-b", "hot.rs", 900, false, None).is_err());
+        assert!(!waits.exists(), "a conflict created {waits:?}");
+    }
+
+    /// The conflict → acquire gap spans two processes, so it is measured off a
+    /// breadcrumb on disk. The invariant that matters: a conflict leaves one
+    /// naming the blocker, the acquire that finally succeeds consumes it, and
+    /// an uncontended acquire leaves nothing behind.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn a_conflict_leaves_a_wait_marker_that_the_next_acquire_consumes() {
+        let tmp = repo();
+        let root = tmp.path();
+        let marker = wait_marker(root, "agent-b", "hot.rs").unwrap();
+
+        claim(root, "agent-a", "hot.rs");
+        assert!(!marker.exists(), "no conflict yet");
+
+        // agent-b is blocked: exit 2, and the breadcrumb names who blocked it.
+        let err = acquire(root, "agent-b", "hot.rs", 900, false, None).unwrap_err();
+        assert_eq!(
+            crate::output::code_for(&err),
+            2,
+            "telemetry changed the exit code"
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "agent-a");
+
+        // …then gets the file, which closes the wait and clears the marker.
+        release(root, "agent-a", "hot.rs", false).unwrap();
+        acquire(root, "agent-b", "hot.rs", 900, false, None).unwrap();
+        assert!(!marker.exists(), "the wait was recorded but not consumed");
+
+        // An acquire nobody contended leaves no breadcrumb at all.
+        acquire(root, "agent-b", "quiet.rs", 900, false, None).unwrap();
+        assert!(!wait_marker(root, "agent-b", "quiet.rs").unwrap().exists());
+    }
+
+    /// A conflict the agent never retried used to leak its marker forever,
+    /// because the only thing that collects one is the same agent acquiring the
+    /// same path — the one move the protocol tells a blocked agent NOT to make.
+    /// `release --all` is where an agent says it is done, so it is where the
+    /// breadcrumbs go.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn release_all_sweeps_the_wait_markers_this_agent_left() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim(root, "agent-a", "hot.rs");
+        assert!(acquire(root, "agent-b", "hot.rs", 900, false, None).is_err());
+        let mine = wait_marker(root, "agent-b", "hot.rs").unwrap();
+        let theirs = wait_marker(root, "agent-c", "hot.rs").unwrap();
+        std::fs::write(&theirs, "agent-a").unwrap();
+        assert!(mine.exists() && theirs.exists());
+
+        // agent-b never retried hot.rs — it went and did something else, which
+        // is exactly what the protocol asked of it.
+        claim(root, "agent-b", "other.rs");
+        release_all(root, "agent-b").unwrap();
+
+        assert!(!mine.exists(), "release --all left {mine:?} behind");
+        assert!(theirs.exists(), "swept another agent's marker");
+    }
+
+    /// The markers live beside the locks and must stay invisible to everything
+    /// that reads them — `scan` (so `lease ls` cannot report a wait as a
+    /// lease) and `corrupt_count` (so `pact doctor` cannot call one corruption).
+    #[test]
+    fn wait_markers_are_invisible_to_the_lock_scanners() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim(root, "agent-a", "hot.rs");
+        assert!(acquire(root, "agent-b", "hot.rs", 900, false, None).is_err());
+
+        assert_eq!(peek(root, true).unwrap().len(), 1, "a wait is not a lease");
+        assert_eq!(
+            corrupt_count(root).unwrap(),
+            0,
+            "a wait is not a corrupt lock"
+        );
     }
 
     // ---- race-condition guard: verify after rename -----------------------

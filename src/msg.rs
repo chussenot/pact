@@ -62,6 +62,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::beads::BeadsCli;
 use crate::output;
+use crate::{attrs, otel};
 
 /// Label prefix marking "this agent has read this message".
 const READ_BY: &str = "read-by-";
@@ -226,6 +227,10 @@ pub fn send(
         None => None,
     };
     let mut messages: Vec<Message> = Vec::with_capacity(to.len());
+    // Read once, not per recipient: it is a property of the command line, and
+    // every bead this send creates was addressed the same way.
+    let addressing = addressing_mode();
+    let is_reply = thread.is_some();
     for recipient in to {
         let issue = create(
             cli,
@@ -263,6 +268,18 @@ pub fn send(
             read: false,
             read_by: Vec::new(),
         });
+        // One bead created, so one message sent. Counted here rather than after
+        // the loop because a partial fan-out failure returns early, and the
+        // recipients who *did* get it are exactly what a sender must not
+        // re-send to (see the with_context above).
+        otel::count(
+            "pact.msg.sent",
+            1,
+            &attrs![
+                "pact.msg.addressing" => addressing,
+                "pact.msg.reply" => is_reply,
+            ],
+        );
     }
     Ok(messages)
 }
@@ -327,6 +344,11 @@ pub fn inbox(
 ) -> Result<Vec<Message>> {
     let issues = list_issues(cli, repo_root, Some(agent))?;
     let mut messages = to_messages(issues, Some(agent));
+
+    // Before the filter, so `--unread-only` and a plain listing report the same
+    // queue depth. This is the observation pact-aw7.4 exists for: nobody can
+    // see a mailbox rotting from inside the process that is not reading it.
+    record_unread(&messages, Utc::now());
 
     if unread_only {
         messages.retain(|m| !m.read);
@@ -470,6 +492,7 @@ pub fn read_thread(
         }
     };
 
+    let now = Utc::now();
     Ok(all
         .into_iter()
         .map(|i| {
@@ -478,6 +501,13 @@ pub fn read_thread(
             if marked && !m.read {
                 m.read = true;
                 m.read_by.push(agent.to_string());
+                // This branch *is* "first read by this agent" — re-reading a
+                // thread takes the other one — so it is the event to count, and
+                // the message's age here is how long the sender waited.
+                otel::count("pact.msg.read", 1, &attrs![]);
+                if let Some(ms) = age_ms(&m.created_at, now) {
+                    otel::record_ms("pact.msg.read_latency", ms, &attrs![]);
+                }
             }
             m
         })
@@ -590,6 +620,116 @@ fn default_subject(body: &str) -> String {
         format!("{truncated}...")
     } else {
         first_line.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry (pact-aw7.4)
+//
+// 51 of 59 messages in one fleet run were never read, and it took a human
+// reading `pact log` afterwards to find that out. The one that mattered —
+// "BLOCKER: pact init deletes the protocol" — sat unread for 38 minutes in the
+// mailbox of an agent that had already exited. None of that is visible from
+// inside any single process, so it has to be counted and shipped.
+//
+// Counts and ages only, never a subject and never a body: a message body is
+// user free text and is not ours to send off this machine.
+// ---------------------------------------------------------------------------
+
+/// Age buckets for unread mail, in seconds, as an *attribute* rather than a
+/// histogram. The shared explicit bounds in `otel.rs` stop at 10 s, which is
+/// the right scale for a `bd` subprocess and cannot express "unread for 38
+/// minutes" — every real value would land in the overflow bucket. Five
+/// source-controlled labels keep the distribution and keep the dimension
+/// bounded; a message id or a path here would be unbounded.
+const UNREAD_AGE_BUCKETS: [(&str, i64); 5] = [
+    ("lt_1m", 60),
+    ("1m_5m", 300),
+    ("5m_15m", 900),
+    ("15m_1h", 3600),
+    ("gt_1h", i64::MAX),
+];
+
+/// Which flag actually addressed this send. `--to-owner-of` exists because a
+/// path outlives the process that held it (pact-o38), and whether the fleet
+/// adopted it is a number, not a feeling.
+///
+/// Taken from argv rather than plumbed down from `main`, because by the time
+/// `send` is reached the two are indistinguishable: `--to-owner-of <path>` has
+/// already been resolved to an agent name and pushed onto the same `to` vec.
+/// Argv *shape* only — the flag names, never their values.
+///
+/// Known ceiling: this is a scan, not a parse, so a *value* spelled exactly
+/// `--to` or `--to-owner-of` would be miscounted. clap rejects that spelling
+/// without a `--` separator anyway, and the cost of being wrong is one
+/// mislabelled data point. If `send` ever grows a caller that is not the CLI,
+/// pass the mode in instead of guessing at the process's arguments.
+fn addressing_from_argv(args: impl Iterator<Item = String>) -> &'static str {
+    let (mut literal, mut owner) = (false, false);
+    for arg in args {
+        // `--to=x` and `--to x` are the same flag to clap, so compare the stem.
+        match arg.split('=').next().unwrap_or_default() {
+            "--to" => literal = true,
+            "--to-owner-of" => owner = true,
+            _ => {}
+        }
+    }
+    match (literal, owner) {
+        (true, true) => "mixed",
+        (false, true) => "to-owner-of",
+        _ => "to",
+    }
+}
+
+fn addressing_mode() -> &'static str {
+    addressing_from_argv(std::env::args())
+}
+
+/// Age of a message in milliseconds. Clamped at zero: bd's clock and pact's are
+/// the same clock today, but a future-dated `created_at` (hand-edited data, a
+/// machine whose time jumped) must not become a negative duration. `None` when
+/// the stamp does not parse, same as everywhere else in this module.
+fn age_ms(created_at: &str, now: DateTime<Utc>) -> Option<f64> {
+    let created = parse_ts(created_at)?;
+    Some((now - created).num_milliseconds().max(0) as f64)
+}
+
+/// Index into [`UNREAD_AGE_BUCKETS`] for an age in seconds.
+fn bucket_index(age_secs: i64) -> usize {
+    UNREAD_AGE_BUCKETS
+        .iter()
+        .position(|(_, limit)| age_secs < *limit)
+        .unwrap_or(UNREAD_AGE_BUCKETS.len() - 1)
+}
+
+/// How many messages are sitting unread for the querying agent, per age bucket.
+fn unread_by_bucket(messages: &[Message], now: DateTime<Utc>) -> [i64; UNREAD_AGE_BUCKETS.len()] {
+    let mut counts = [0i64; UNREAD_AGE_BUCKETS.len()];
+    for m in messages.iter().filter(|m| !m.read) {
+        let secs = age_ms(&m.created_at, now).map_or(0, |ms| (ms / 1000.0) as i64);
+        counts[bucket_index(secs)] += 1;
+    }
+    counts
+}
+
+/// Report the inbox as queue depth.
+///
+/// A gauge and not a counter: `pact ui` calls `inbox` on every refresh, and a
+/// counter would multiply one rotting message by the number of times the
+/// dashboard happened to look at it. "How deep is the queue, and how stale" is
+/// a spot measurement.
+///
+/// Every bucket is emitted, empty ones included. A gauge keeps its last value,
+/// so a bucket that simply stopped being reported would read as permanently
+/// full — which is the same false alarm this metric exists to avoid raising.
+fn record_unread(messages: &[Message], now: DateTime<Utc>) {
+    let counts = unread_by_bucket(messages, now);
+    for (i, (bucket, _)) in UNREAD_AGE_BUCKETS.iter().enumerate() {
+        otel::gauge(
+            "pact.msg.unread",
+            counts[i],
+            &attrs!["pact.msg.age_bucket" => *bucket],
+        );
     }
 }
 
@@ -990,6 +1130,99 @@ mod tests {
                 "created_at":"2026-08-02T07:25:23Z","issue_type":"message"}"#,
         );
         assert!(child_ids(&lonely).is_empty());
+    }
+
+    /// pact-aw7.4: the counter that says whether the fleet adopted
+    /// `--to-owner-of` or kept addressing agents that had already exited.
+    #[test]
+    fn addressing_mode_reads_the_flag_and_not_its_value() {
+        let argv = |s: &str| {
+            addressing_from_argv(
+                s.split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            )
+        };
+        assert_eq!(argv("pact msg send --to docs-writer body"), "to");
+        assert_eq!(argv("pact msg send --to=docs-writer body"), "to");
+        assert_eq!(
+            argv("pact msg send --to-owner-of src/msg.rs body"),
+            "to-owner-of"
+        );
+        assert_eq!(
+            argv("pact msg send --to-owner-of=src/msg.rs body"),
+            "to-owner-of"
+        );
+        assert_eq!(
+            argv("pact msg send --to human --to-owner-of src/msg.rs b"),
+            "mixed"
+        );
+        // Whatever argv holds, exactly three labels ever reach the collector.
+        for line in [
+            "pact msg send --to a body",
+            "pact msg send --to-owner-of p b",
+            "pact msg send --to a --to-owner-of p b",
+            "pact msg inbox",
+        ] {
+            assert!(["to", "to-owner-of", "mixed"].contains(&argv(line)));
+        }
+    }
+
+    /// pact-aw7.4: 38 minutes is the number that mattered, and the bucket it
+    /// lands in is the whole reason this is an attribute and not the shared
+    /// 10 s-max histogram.
+    #[test]
+    fn unread_age_buckets_span_the_timescale_coordination_fails_on() {
+        let names: Vec<&str> = [0, 59, 60, 299, 300, 899, 900, 2280, 3599, 3600, 86_400]
+            .iter()
+            .map(|s| UNREAD_AGE_BUCKETS[bucket_index(*s)].0)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "lt_1m", "lt_1m", "1m_5m", "1m_5m", "5m_15m", "5m_15m", "15m_1h",
+                "15m_1h", // 2280 s = the 38-minute BLOCKER
+                "15m_1h", "gt_1h", "gt_1h",
+            ]
+        );
+    }
+
+    #[test]
+    fn unread_counting_ignores_read_mail_and_survives_a_skewed_clock() {
+        let now = parse_ts("2026-08-02T12:00:00Z").unwrap();
+        let at = |ts: &str, read: bool| Message {
+            id: "m".into(),
+            thread: "m".into(),
+            from: "peer".into(),
+            to: "msg-metrics".into(),
+            subject: None,
+            body: String::new(),
+            created_at: ts.to_string(),
+            read,
+            read_by: Vec::new(),
+        };
+        let counts = unread_by_bucket(
+            &[
+                at("2026-08-02T11:59:30Z", false), // 30 s
+                at("2026-08-02T11:22:00Z", false), // 38 min — the BLOCKER
+                at("2026-08-02T09:00:00Z", false), // 3 h
+                at("2026-08-02T09:00:00Z", true),  // read: not queue depth
+                at("2026-08-02T12:05:00Z", false), // future-dated: clamps to 0
+                at("not a timestamp", false),      // unparsable: clamps to 0
+            ],
+            now,
+        );
+        assert_eq!(
+            counts,
+            [3, 0, 0, 1, 1],
+            "lt_1m, 1m_5m, 5m_15m, 15m_1h, gt_1h"
+        );
+
+        // And the age a read would report, in the milliseconds record_ms wants.
+        assert_eq!(age_ms("2026-08-02T11:22:00Z", now), Some(2_280_000.0));
+        assert_eq!(age_ms("2026-08-02T12:05:00Z", now), Some(0.0));
+        assert_eq!(age_ms("not a timestamp", now), None);
     }
 
     /// pact-rnc.4: sending to nobody is a mistake, not a silent no-op. Bails
