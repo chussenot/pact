@@ -5,6 +5,12 @@ edition = "2021"
 
 [features]
 ui = ["dep:ratatui"]
+# OpenTelemetry export (pact-aw7). Deliberately adds NO dependency: the
+# exporter is hand-written OTLP/HTTP+JSON over std::net on top of serde_json,
+# which pact already has. See src/otel.rs for the measurements that rejected
+# opentelemetry-otlp — every feature combination of it drags in tonic and
+# tokio, and its flush-on-exit cost 1031 ms against a blackholed collector.
+otel = []
 
 [build-dependencies]
 chrono = "0.4.45"

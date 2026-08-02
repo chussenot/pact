@@ -8,6 +8,7 @@ mod lease;
 #[cfg(feature = "ui")]
 mod mascot;
 mod msg;
+mod otel;
 mod output;
 mod repo;
 #[cfg(feature = "ui")]
@@ -192,6 +193,22 @@ enum MsgAction {
 /// that instruction unfollowable.
 const USAGE_ERROR: i32 = 5;
 
+/// clap's verdict, as an exit code plus the argv *shape* that stands in for a
+/// subcommand name we never got to parse.
+///
+/// Only an explicit `--help` / `-V` is a success. Deliberately NOT
+/// DisplayHelpOnMissingArgumentOrSubcommand: there, clap prints help *because
+/// the invocation was incomplete*, which is a usage error the user did not ask
+/// for. Treating it as success made bare `pact` exit 0, so a script whose
+/// variable expanded to nothing would read "worked" — the very shape of
+/// interpolation bug this code exists to disambiguate.
+fn clap_outcome(kind: clap::error::ErrorKind) -> (i32, &'static str) {
+    match kind {
+        clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => (0, "help"),
+        _ => (USAGE_ERROR, "usage-error"),
+    }
+}
+
 fn main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -201,41 +218,144 @@ fn main() {
             // result is dropped because a closed pipe must not turn into a
             // panic after the work is done — same rule as output::line.
             let _ = e.print();
-            std::process::exit(match e.kind() {
-                // Only an explicit `--help` / `-V` is a success. Deliberately
-                // NOT DisplayHelpOnMissingArgumentOrSubcommand: there, clap
-                // prints help *because the invocation was incomplete*, which is
-                // a usage error the user did not ask for. Treating it as
-                // success made bare `pact` exit 0, so a script whose variable
-                // expanded to nothing would read "worked" — the very shape of
-                // interpolation bug this code exists to disambiguate.
-                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => 0,
-                _ => USAGE_ERROR,
-            });
+            let (code, shape) = clap_outcome(e.kind());
+            // Traced too, which it was not: `otel::init` sits below
+            // `try_parse`, so exit 5 — the one code a mis-scripted agent
+            // actually hits, and the one the protocol block tells agents to
+            // branch on — was the only documented exit code that put nothing on
+            // the wire at all. `shape` is a literal from the two arms above, so
+            // the dimension stays as bounded as `subcommand_name`'s.
+            otel::init(shape).finish(code);
+            std::process::exit(code);
         }
     };
-    if let Err(e) = run(cli) {
-        output::warn(&format!("error: {e:#}"));
-        std::process::exit(output::code_for(&e));
+    // One trace per invocation. `otel` is a no-op struct unless the off-by-
+    // default `otel` feature is on, so this line costs nothing in the build
+    // everyone actually ships (see src/otel.rs).
+    let subcommand = subcommand_name(&cli.command);
+    let mut telemetry = otel::init(subcommand);
+    // The attributes that make the trace joinable (pact-aw7.2). Set here and
+    // not inside otel.rs: identity is main's job, and the exporter has no
+    // business walking the filesystem for a repo root.
+    telemetry.set("pact.subcommand", subcommand);
+    telemetry.set("pact.json", cli.json);
+    // The *resolved* identity, so `--agent` shows up too — otel.rs can only
+    // see PACT_AGENT. An unresolvable identity is simply absent: `whoami` and
+    // `doctor` exist to be run when it is broken, and they must still trace.
+    if let Ok(agent) = identity::resolve_agent(cli.agent.as_deref()) {
+        telemetry.set("pact.agent", agent);
+    }
+    if let Some(repo) = repo_name() {
+        telemetry.set("pact.repo", repo);
+    }
+    match run(cli) {
+        // A subcommand can report a non-zero code without being an error —
+        // `doctor` on an unhealthy repo is the case (see `run`). Flush first
+        // either way.
+        Ok(code) => {
+            telemetry.finish(code);
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Err(e) => {
+            output::warn(&format!("error: {e:#}"));
+            let code = output::code_for(&e);
+            // Before the exit, not after: `std::process::exit` skips
+            // destructors, so a `Drop`-only flush would export exactly the
+            // successful runs and lose every failure worth looking at.
+            telemetry.finish(code);
+            std::process::exit(code);
+        }
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
+/// Argv *shape* for the root span and for `pact.subcommand`: one literal per
+/// subcommand-and-action, from a fixed set in this file. Never an argument
+/// value — a path, an agent name or a message body has no business in a span
+/// name, and a span name is the one attribute you cannot drop later.
+///
+/// Down to the action (`lease acquire`, not `lease`) because "which pact
+/// command is slow" has never once been answered by "lease". Thirteen
+/// literals is a bounded dimension; the argv that produced them is not.
+///
+/// No `pact.` prefix: `service.name` is already `pact`, and OTel's naming
+/// guidance is explicit that a span name should not repeat the service.
+fn subcommand_name(command: &Command) -> &'static str {
+    match command {
+        Command::Init { .. } => "init",
+        Command::Whoami => "whoami",
+        Command::Agents { .. } => "agents",
+        Command::Lease { action } => match action {
+            LeaseAction::Acquire { .. } => "lease acquire",
+            LeaseAction::Renew { .. } => "lease renew",
+            LeaseAction::Release { .. } => "lease release",
+            LeaseAction::Ls { .. } => "lease ls",
+        },
+        Command::Msg { action } => match action {
+            MsgAction::Send { .. } => "msg send",
+            MsgAction::Inbox { .. } => "msg inbox",
+            MsgAction::Sent => "msg sent",
+            MsgAction::Read { .. } => "msg read",
+        },
+        Command::Log { .. } => "log",
+        Command::Doctor => "doctor",
+        #[cfg(feature = "ui")]
+        Command::Ui => "ui",
+    }
+}
+
+/// The repository's directory *name* for `pact.repo` — never its path.
+///
+/// A path is the wrong value twice over: it is unbounded as a dimension (the
+/// rule this whole epic is under), and it ships the operator's home-directory
+/// layout to a collector for no benefit. The basename is what a human reads
+/// on a dashboard and what joins two agents working the same checkout.
+///
+/// Read-only and best-effort: `None` outside a git repo, which is exactly the
+/// case (`exit 4`) whose trace is most worth having.
+fn repo_name() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let root = repo::find_repo_root(&cwd).ok()?;
+    Some(root.file_name()?.to_string_lossy().into_owned())
+}
+
+/// Returns the process exit code, so that no subcommand has to call
+/// `std::process::exit` behind `main`'s back. `doctor` used to do exactly
+/// that, which skipped both `Guard::finish` and `Drop` — an unhealthy repo,
+/// the one run worth looking at, exported no telemetry at all (pact-aw7.2).
+///
+/// Keep it that way. A `std::process::exit` added to any subcommand does not
+/// merely lose its span: it silently drops every metric the run buffered.
+/// `pact lease acquire` on a contended path raises through `output::exit_with`
+/// and so still exports `pact.lease.transitions{outcome=conflicted}` — swap
+/// that for a `process::exit(2)` and the conflict counter goes quiet with
+/// nothing anywhere reporting a failure.
+fn run(cli: Cli) -> Result<i32> {
     let cwd = std::env::current_dir()?;
 
     match cli.command {
-        Command::Init { print, no_commit } => run_init(&cwd, print, no_commit, cli.json),
-        Command::Whoami => run_whoami(&cwd, cli.agent.as_deref(), cli.json),
-        Command::Agents { r#for } => run_agents(&cwd, cli.json, r#for.as_deref()),
-        Command::Lease { action } => run_lease(&cwd, cli.agent.as_deref(), cli.json, action),
-        Command::Msg { action } => run_msg(&cwd, cli.agent.as_deref(), cli.json, action),
-        Command::Log { limit } => run_log(&cwd, cli.json, limit),
+        // `doctor` reports failure as an exit code rather than an error,
+        // because its report *is* the output; everything else succeeds or
+        // raises, and `Ok(())` means exit 0.
         Command::Doctor => run_doctor(&cwd, cli.json),
+        Command::Init { print, no_commit } => {
+            run_init(&cwd, print, no_commit, cli.json).map(|()| 0)
+        }
+        Command::Whoami => run_whoami(&cwd, cli.agent.as_deref(), cli.json).map(|()| 0),
+        Command::Agents { r#for } => run_agents(&cwd, cli.json, r#for.as_deref()).map(|()| 0),
+        Command::Lease { action } => {
+            run_lease(&cwd, cli.agent.as_deref(), cli.json, action).map(|()| 0)
+        }
+        Command::Msg { action } => {
+            run_msg(&cwd, cli.agent.as_deref(), cli.json, action).map(|()| 0)
+        }
+        Command::Log { limit } => run_log(&cwd, cli.json, limit).map(|()| 0),
         #[cfg(feature = "ui")]
         Command::Ui => {
             let root = repo::find_repo_root(&cwd)?;
             let agent = identity::resolve_agent(cli.agent.as_deref()).ok();
-            tui::run(root, agent)
+            tui::run(root, agent).map(|()| 0)
         }
     }
 }
@@ -259,16 +379,31 @@ fn run_init(cwd: &Path, print: bool, no_commit: bool, json: bool) -> Result<()> 
     }
     let root = repo::find_repo_root(cwd)?;
     repo::pact_dir(&root)?;
-    let path = agents_md::apply(&root)?;
-    // Claude Code never loads AGENTS.md, so writing only that file left a
-    // Claude-driven fleet with no protocol at all (see `ensure_claude_md`).
-    let claude = agents_md::ensure_claude_md(&root)?;
-    // Same failure, other tools: an agent reading GEMINI.md or
-    // .github/copilot-instructions.md was never told the protocol exists.
-    // Only files the repo already has are touched — pact does not conjure an
-    // instruction file for a tool nobody here uses (pact-4zx).
-    let instruction_files = agents_md::ensure_instruction_files(&root)?;
-    agents_md::ensure_gitignore(&root)?;
+    // Child span (pact-aw7.2): `init` has two distinct costs — writing the
+    // instruction files, and the git commit below — and a single root span
+    // cannot tell you which one you waited on. The count is a number, never a
+    // filename: paths do not go into telemetry.
+    //
+    // `pact.`-prefixed where the root span is not, deliberately: the root is
+    // the argv shape (`init`) and a prefixed child is instantly a module
+    // instrument rather than another command. Settled with lease-metrics in
+    // thread pact-wisp-1ur — a bare `init.write` under a bare `init` differs
+    // by one word in a waterfall, which is no signal at all.
+    let (path, claude, instruction_files) = {
+        let mut sp = otel::span("pact.init.write");
+        let path = agents_md::apply(&root)?;
+        // Claude Code never loads AGENTS.md, so writing only that file left a
+        // Claude-driven fleet with no protocol at all (see `ensure_claude_md`).
+        let claude = agents_md::ensure_claude_md(&root)?;
+        // Same failure, other tools: an agent reading GEMINI.md or
+        // .github/copilot-instructions.md was never told the protocol exists.
+        // Only files the repo already has are touched — pact does not conjure
+        // an instruction file for a tool nobody here uses (pact-4zx).
+        let instruction_files = agents_md::ensure_instruction_files(&root)?;
+        agents_md::ensure_gitignore(&root)?;
+        sp.set("pact.instruction_files", instruction_files.len());
+        (path, claude, instruction_files)
+    };
 
     #[derive(serde::Serialize)]
     struct InitReport {
@@ -309,6 +444,9 @@ fn run_init(cwd: &Path, print: bool, no_commit: bool, json: bool) -> Result<()> 
     } else {
         // The instruction files pact just rewrote have to be in the commit too,
         // or `pact init` leaves a dirty tree it claims to have committed.
+        // The other half of the init trace: this one shells out to git, and it
+        // is the part that is actually slow.
+        let _sp = otel::span("pact.init.commit");
         let mut targets = vec!["AGENTS.md", "CLAUDE.md", ".gitignore"];
         targets.extend(
             instruction_files
@@ -973,7 +1111,7 @@ fn run_log(cwd: &Path, json: bool, limit: usize) -> Result<()> {
     Ok(())
 }
 
-fn run_doctor(cwd: &Path, json: bool) -> Result<()> {
+fn run_doctor(cwd: &Path, json: bool) -> Result<i32> {
     // Without a repo root none of the other checks mean anything, so this one
     // is a hard prerequisite rather than a soft check: propagate its exit
     // code (4) straight through instead of folding it into the report.
@@ -1006,11 +1144,11 @@ fn run_doctor(cwd: &Path, json: bool) -> Result<()> {
         lines.join("\n")
     });
 
-    if report.healthy {
-        Ok(())
-    } else {
-        std::process::exit(1);
-    }
+    // Handed back to `main` rather than exited here: `std::process::exit`
+    // skips every destructor, so the failing run — the only one anybody
+    // troubleshoots — used to export no trace at all. The code itself is
+    // unchanged; exit codes are API.
+    Ok(if report.healthy { 0 } else { 1 })
 }
 
 /// `-` means stdin, so a multi-paragraph body full of quotes and backslashes
@@ -1324,6 +1462,31 @@ fn one_line(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// Exit 5 is documented API and the protocol block tells agents to branch
+    /// on it, but it produced no telemetry at all — `otel::init` runs after
+    /// `Cli::try_parse`, so the clap-error path exported nothing: no span, no
+    /// duration, no `pact.exit_code`. Splitting the verdict out of `main` is
+    /// what makes both halves — the code and the span name that carries it —
+    /// assertable without spawning a process.
+    #[test]
+    fn a_clap_error_is_a_usage_error_with_a_shape_to_trace_it_by() {
+        use clap::error::ErrorKind::*;
+        assert_eq!(clap_outcome(DisplayHelp), (0, "help"));
+        assert_eq!(clap_outcome(DisplayVersion), (0, "help"));
+        assert_eq!(
+            clap_outcome(InvalidSubcommand),
+            (USAGE_ERROR, "usage-error")
+        );
+        assert_eq!(clap_outcome(UnknownArgument), (USAGE_ERROR, "usage-error"));
+        assert_eq!(clap_outcome(InvalidValue), (USAGE_ERROR, "usage-error"));
+        // The one that made bare `pact` exit 0 before pact-rnc: clap prints
+        // help, but nobody asked for it.
+        assert_eq!(
+            clap_outcome(DisplayHelpOnMissingArgumentOrSubcommand),
+            (USAGE_ERROR, "usage-error")
+        );
+    }
+
     fn lease_entry(
         path: &str,
         agent: &str,
@@ -1592,6 +1755,48 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("1 not read yet"), "{out}");
+    }
+
+    /// pact-aw7.2. The span name is the one attribute a backend cannot drop
+    /// later, so nothing that came from argv may reach it: a path in a span
+    /// name is unbounded cardinality in any real repo, and a lease note is
+    /// user free text we have no business exporting. This is the check that
+    /// fails the day someone reaches for `format!` here.
+    #[test]
+    fn a_span_name_never_carries_argv() {
+        let acquire = Command::Lease {
+            action: LeaseAction::Acquire {
+                paths: vec!["src/secret.rs".to_string()],
+                ttl: 900,
+                steal: false,
+                note: Some("rewriting the auth module".to_string()),
+            },
+        };
+        let send = Command::Msg {
+            action: MsgAction::Send {
+                to: vec!["cli-wire".to_string()],
+                to_owner_of: vec!["src/secret.rs".to_string()],
+                thread: None,
+                subject: Some("secret".to_string()),
+                body: Some("the body".to_string()),
+                body_file: None,
+            },
+        };
+        for command in [&acquire, &send] {
+            let name = subcommand_name(command);
+            assert!(!name.contains("secret.rs"), "{name} leaks a path");
+            assert!(!name.contains("cli-wire"), "{name} leaks an agent name");
+            assert!(!name.contains("auth"), "{name} leaks a lease note");
+            assert!(
+                name.chars().all(|c| c.is_ascii_lowercase() || c == ' '),
+                "{name} is not a bare argv shape"
+            );
+        }
+        // Down to the action, or the histogram cannot tell `lease ls` (a file
+        // read) from `lease acquire` (a write plus an event-log append).
+        assert_eq!(subcommand_name(&acquire), "lease acquire");
+        assert_eq!(subcommand_name(&send), "msg send");
+        assert_eq!(subcommand_name(&Command::Doctor), "doctor");
     }
 
     #[test]
