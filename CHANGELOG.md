@@ -10,6 +10,12 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.1.1 - 2026-08-02
+#### Features
+- **(cli)** stamp build provenance into pact --version - (5fdbe12) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.1.0 - 2026-08-02
 #### Bug Fixes
 - **(pact)** read-only commands no longer create .pact/, and teach the new CLI - (720396c) - Clement HUSSENOT-DESENONGES
