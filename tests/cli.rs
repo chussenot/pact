@@ -2315,3 +2315,30 @@ fn to_owner_of_reports_who_it_resolved_to() {
         "must name the resolution and its age: {stderr}"
     );
 }
+
+/// A refused acquire named the victim and never the holder, so the
+/// who-blocks-whom edge existed only in `pact log`. The holder belongs on the
+/// SPAN and not on a metric — an agent name is unbounded and would mint a
+/// metric series per fleet member — but "click through, don't group by" only
+/// works if the span actually carries it (pact-ebe).
+#[test]
+fn a_refused_acquire_still_reports_the_holder_and_exits_2() {
+    let tmp = init_repo();
+    assert_ok(&pact(
+        tmp.path(),
+        "holder-agent",
+        &["lease", "acquire", "src/x.rs"],
+    ));
+
+    let out = pact(
+        tmp.path(),
+        "blocked-agent",
+        &["lease", "acquire", "src/x.rs"],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("holder-agent"),
+        "the human-facing error must name the holder too: {}",
+        stderr_of(&out)
+    );
+}

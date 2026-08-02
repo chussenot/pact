@@ -537,7 +537,20 @@ fn acquire_fs(
         }
         // `held` and not the error text: a span status is a bounded reason
         // code, and the message names another agent.
-        Err(e) if crate::output::code_for(e) == 2 => sp.fail("held"),
+        Err(e) if crate::output::code_for(e) == 2 => {
+            // The holder goes on the span as its own attribute. It is
+            // deliberately NOT a metric dimension — an agent name is unbounded
+            // and would mint a series per fleet member — but the span is
+            // exactly where an unbounded value belongs, and without it
+            // "click through, don't group by" clicks through to nothing.
+            // That was pact-ebe: a refused acquire named the victim and never
+            // the holder, so who-blocks-whom lived only in `pact log`.
+            // One lock read, on a failure path only.
+            if let Ok(held) = lock_file_path(repo_root, &relative).and_then(|p| read_lease(&p)) {
+                sp.set("pact.lease.holder", held.agent);
+            }
+            sp.fail("held");
+        }
         Err(_) => sp.fail("error"),
     }
     outcome
@@ -808,6 +821,13 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
         Some(existing.agent.clone())
     } else {
         count_transition("conflicted");
+        // The holder goes on the SPAN, never on the metric. That split is the
+        // whole cardinality argument above, and it only works if the span
+        // actually carries the name — otherwise "click through, don't group by"
+        // means clicking through to nothing, which is what pact-ebe found: a
+        // refused acquire named the victim and not the holder, so the
+        // who-blocks-whom edge existed in `pact log` and nowhere else.
+        sp.set("pact.lease.holder", existing.agent.clone());
         sp.fail("held");
         return Err(exit_with(
             2,
