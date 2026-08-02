@@ -587,6 +587,46 @@ has already landed by the time anything is printed, and losing the tail of a
 report whose reader walked away is cheaper than making a completed action look
 failed.
 
+## Telemetry (optional, off by default)
+
+pact can export OpenTelemetry traces and metrics about its own runs — how long
+commands take, which leases are contended, how long messages sit unread. It is
+**off unless you build it in and configure it**:
+
+```bash
+cargo build --release --features ui,otel      # switch one: not a default feature
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces
+export OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://localhost:4318/v1/metrics
+export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/json   # switch two: pact speaks
+export OTEL_EXPORTER_OTLP_METRICS_PROTOCOL=http/json  # http/json over http://
+```
+
+Standard `OTEL_*` variables only — pact invents no `PACT_OTEL_*` names. Ask
+`pact doctor` which of the three states you are in, because "built in",
+"configured" and "actually exporting" are not the same thing:
+
+```
+✓ otel export: not built in (`cargo build --features otel`)
+✓ otel export: traces + metrics → http://127.0.0.1:4318
+! otel export: built in and configured, but NOT exporting —
+    OTEL_EXPORTER_OTLP_PROTOCOL=grpc — pact speaks http/json and nothing else
+```
+
+What is exported is argv **shape** and bounded values: the subcommand, the exit
+code, lease outcomes, message counts and ages, and the repository directory's
+basename. **Never a message body or subject, a lease note, file contents, an
+error string, or a repository path.** File paths appear as a span attribute on
+lease operations and nowhere else.
+
+The feature adds **no dependency** — `cargo tree --depth 1` is the same six
+crates either way, with no `tokio` — and it cannot change what pact does. A
+dead, missing or wedged collector leaves every exit code and every byte of
+stdout identical; the worst measured cost is +32 ms on a 9 ms command, against
+a collector that accepts connections and never answers.
+
+[docs/telemetry.md](docs/telemetry.md) has the full signal inventory, every
+`OTEL_*` variable honoured, and the measurements behind those claims.
+
 ## FAQ
 
 **Why advisory locking instead of mandatory?** Coding agents already fail in
@@ -664,6 +704,9 @@ where this list came from.
 - [docs/mascot-animations.md](docs/mascot-animations.md) — the animated mascot
   in `pact ui`: every gesture, the UI event that triggers it, and the frame
   data behind it.
+- [docs/telemetry.md](docs/telemetry.md) — the optional OpenTelemetry export:
+  exactly what leaves the machine, what deliberately doesn't, and what happens
+  when the collector is missing.
 
 ## Development
 
@@ -675,7 +718,8 @@ mise run test       # cargo test --features ui
 mise run fmt        # cargo fmt
 mise run lint       # cargo clippy --all-targets --features ui -- -D warnings
 mise run check-docs # scripts/check-docs.sh — README/docs vs the real CLI
-mise run check      # fmt-check + lint + test + check-docs, same gates as CI
+mise run otel       # clippy + test the otel feature, and prove it adds no dependency
+mise run check      # fmt-check + lint + test + otel + check-docs, same gates as CI
 mise run install    # cargo install --path . --force --features ui
 ```
 
@@ -691,6 +735,16 @@ Or run the underlying `cargo` commands directly if you don't use mise.
 Every task builds with `--features ui`, so what you test is what you install.
 CI runs clippy and test **both** ways — with and without the feature — so the
 dependency-light default stays guarded even though no local task exercises it.
+
+`otel` is guarded the same way, and for the same reason `ui` needed it: an
+off-by-default feature that nothing compiles rots. Its one load-bearing line is
+the dependency comparison, because "the exporter adds nothing" is a promise
+that has to be enforced rather than remembered:
+
+```bash
+test "$(cargo tree --edges normal,build,dev)" \
+   = "$(cargo tree --edges normal,build,dev --features otel)"
+```
 
 State lives under `.pact/` at the repo root (found by walking up to `.git`):
 `.pact/leases/*.lock` and `.pact/events.jsonl` (the bounded lease-event log

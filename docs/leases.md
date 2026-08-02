@@ -410,6 +410,65 @@ it: a lapse is noticed by whoever collects the lock, and the event belongs to th
 holder whose claim ended. Without it, the feed's last word on a dead agent was
 `acquired` — naming it as current holder of a file whose lock was already gone.
 
+## What lease telemetry measures
+
+Only in a build with `--features otel`, and only once a collector is configured
+— see [docs/telemetry.md](telemetry.md). Nothing below changes any output, any
+flag, or any exit code.
+
+| Metric | Type | Attributes |
+|---|---|---|
+| `pact.lease.transitions` | counter | `pact.lease.outcome` |
+| `pact.lease.hold.duration` | histogram, ms | `pact.lease.outcome`, `pact.lease.overrun` |
+| `pact.lease.wait.duration` | histogram, ms | *(none)* |
+
+`pact.lease.outcome` is one of `acquired`, `renewed`, `released`,
+`force_released`, `stolen`, `reclaimed`, `expired`, `conflicted`,
+`rolled_back`. Each increment sits next to the `log_event` for the same
+transition, so the feed and the metric cannot disagree about what happened.
+
+Two things the metric says that the event log cannot:
+
+- **`reclaimed` and `stolen` are separate outcomes.** The event log writes both
+  as `stolen`, and only the free-text `detail` distinguishes taking over a dead
+  claim from overriding a live one — which nobody can group by. A fleet retro
+  hand-counted "19 acquires / 19 releases / 0 steals" from exactly that
+  ambiguity.
+- **`pact.lease.overrun`** is true when a claim outlived the TTL its holder
+  promised. Note that `renew` resets `acquired_at`, so a renewed lease reports
+  time-since-last-renew — which is also exactly what `overrun` should mean, since
+  a renewed lease has not broken its promise.
+
+**Neither the path nor an agent name is a metric attribute.** `pact.path` is on
+the `pact.lease.acquire` and `pact.lease.release` spans; the peer is in
+`pact log`. A repo has thousands of files, a fleet mints agent names forever,
+and nothing ages a metric series out.
+
+### `.pact/waits/` — how a wait gets measured across two processes
+
+`pact.lease.wait.duration` is the gap between being refused a path and finally
+getting it, and pact exits in between. So a refused acquire drops a breadcrumb:
+
+```
+.pact/waits/<agent>__<path>.wait
+```
+
+Its mtime is the moment of the conflict and its contents name the agent that
+blocked you (written so the directory is readable by a human, never exported).
+The next successful acquire of the same path by the same agent consumes it.
+
+It cannot live in `.pact/events.jsonl` instead: a refused acquire writes no
+event, and adding one would make the **blocked** agent the answer to
+`events::owner_of`, so `pact msg send --to-owner-of` would start routing mail
+to the agent that *lost* the file.
+
+Both the directory and the markers are created only in an `otel` build —
+telemetry compiled out means no filesystem work at all. `release --all` sweeps
+any markers you left behind, because a conflict you never retried would
+otherwise leak one small file per `(agent, path)` forever — and not retrying is
+exactly what the protocol tells a blocked agent to do. `lease ls` and
+`pact doctor` do not see these files; they only look at `*.lock`.
+
 ## Why advisory, not mandatory
 
 See the FAQ in the [README](../README.md#faq) — the short version is that a

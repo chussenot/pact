@@ -329,6 +329,42 @@ error: cannot send to "Bad Name!": no agent can run pact under that name, so
 nobody could read it: invalid agent name "Bad Name!": must match [a-z0-9][a-z0-9-]{1,31}
 ```
 
+## What messaging telemetry measures
+
+Only in a build with `--features otel`, and only once a collector is configured
+— see [docs/telemetry.md](telemetry.md).
+
+| Metric | Type | Attributes |
+|---|---|---|
+| `pact.msg.sent` | counter | `pact.msg.addressing` (`to` \| `to-owner-of` \| `mixed`), `pact.msg.reply` (bool) |
+| `pact.msg.read` | counter | *(none)* — first read by this agent only |
+| `pact.msg.read_latency` | histogram, ms | *(none)* — how old a message was when first read |
+| `pact.msg.unread` | gauge | `pact.msg.age_bucket` (`lt_1m`, `1m_5m`, `5m_15m`, `15m_1h`, `gt_1h`) |
+
+**pact exports counts and ages. Never a subject, never a body, never a message
+id, never a recipient's name.** The one thing a Beads span records about the
+subprocess is the *shape* of its argv — flag names truncated at the `=` —
+precisely because `--title=` and `--description=` carry the message you wrote.
+
+Two details that explain the shapes chosen:
+
+- **Unread depth is a gauge, not a counter**, because `pact ui` calls `inbox`
+  on every refresh and a counter would multiply one rotting message by the
+  number of times the dashboard happened to look at it. All five buckets are
+  emitted every time, zeros included: a gauge keeps its last value, so a bucket
+  that merely stopped being reported would read as permanently full.
+- **Age is a bucketed attribute rather than a histogram** because the shared
+  histogram bounds top out at 10 s — right for a `bd` subprocess, useless for
+  coordination latency, where the failure worth catching is a message that sat
+  unread for 38 minutes.
+
+`pact.msg.addressing` is read off the process's argv, because by the time
+`msg::send` is called `--to-owner-of <path>` has already been resolved to an
+agent name and pushed onto the same list as `--to`. Known ceiling: it is a scan
+of flag names, not a parse, so a *value* spelled exactly `--to` would be
+miscounted — clap rejects that spelling anyway, and the cost is one mislabelled
+data point.
+
 ## Command reference
 
 ```

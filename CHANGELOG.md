@@ -198,6 +198,48 @@ cog's.
   that as success would let a script whose variable expanded to nothing read it
   as having worked, which is the same interpolation bug `5` exists to catch.
 
+### Added — optional OpenTelemetry export
+
+- **`--features otel` exports traces and metrics about pact's own runs**, off in
+  a default build and silent until an `OTEL_*` endpoint is configured. One root
+  span per invocation carrying the subcommand and exit code, child spans for
+  lease operations and every `bd`/`br` subprocess, and ten metrics covering
+  command latency, lease transitions and hold/wait durations, message
+  send/read/unread, doctor check status, and Beads subprocess cost.
+  [docs/telemetry.md](docs/telemetry.md) states exactly what is exported and
+  what is not.
+- **It adds no dependency.** `cargo tree` is byte-identical with and without the
+  feature — six crates, no `tokio`. The OTLP/HTTP+JSON client is hand-written
+  over `std::net::TcpStream` because every `opentelemetry-otlp` feature
+  combination at 0.27, 0.30 and 0.31 resolves `tonic` → `tokio-stream` →
+  `tokio`, putting an async runtime in a synchronous CLI. `mise run otel` and CI
+  both enforce the comparison, since a promise like that rots unguarded.
+- **Telemetry cannot change an exit code or stdout.** Measured against a
+  collector that accepts connections and never replies — the state that matters,
+  since a closed port fails fast and proves nothing: every documented exit code
+  unchanged, stdout byte-identical, +32 ms on a 9 ms command against a 50 ms
+  budget. An SDK-based prototype cost 1031 ms in the same state.
+  `tests/cli.rs` asserts the invariant, and scrubs the ambient `OTEL_*`
+  variables first — inherited, they silence pact by design and the test would
+  pass by measuring nothing.
+- **No message body, subject, id, lease note, error string or repository path
+  is ever exported.** Beads spans record argv *shape* — flag names truncated at
+  the `=` — precisely because `--title=` and `--description=` carry a
+  colleague's prose. File paths appear on lease spans only, never as a metric
+  dimension, alongside agent names: a repo has thousands of files, a fleet mints
+  agent names forever, and nothing ages a metric series out.
+- **`pact doctor` gained an 11th check, `otel export`**, present in both builds.
+  "Built in", "configured" and "actually exporting" are three different things,
+  and the gap between the last two was silent: `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`
+  — the OTel *spec* default — and any `https://` endpoint turned export off with
+  a green build, a green doctor and no data. It warns and never fails, so it
+  cannot move doctor's exit code.
+- **Fixed while instrumenting: `pact doctor` on an unhealthy repo exported
+  nothing at all.** `run_doctor` ended in `std::process::exit(1)`, which skips
+  destructors and so skipped the flush — telemetry appeared only when the repo
+  was healthy, losing the only run anyone troubleshoots. No subcommand exits
+  behind `main`'s back now.
+
 ## Notes — 0.1.0
 
 First tagged release. `pact` coordinates several coding agents working on one

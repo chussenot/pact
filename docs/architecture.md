@@ -226,8 +226,14 @@ the data is.
   argv rather than of storage.
 - **No mandatory locking.** Leases are advisory — see
   [docs/leases.md](leases.md) for why that's a feature, not a gap.
-- **No config file, no network I/O.** Everything is either a CLI flag, an
-  environment variable (`PACT_AGENT`), or a file under `.pact/`.
+- **No config file.** Everything is either a CLI flag, an environment variable
+  (`PACT_AGENT`), or a file under `.pact/`.
+- **No network I/O in the build everyone ships.** The one exception is opt-in
+  twice over: a binary built with `--features otel` *and* pointed at an OTLP
+  collector will POST traces and metrics about its own runs. It is off in a
+  plain `cargo build`, it adds no dependency, and it can never change an exit
+  code or write to stdout. [docs/telemetry.md](telemetry.md) states exactly what
+  is and is not sent.
 - **No stored state that could be derived.** Exactly one thing is stored that
   can't be — the lease event log, for the reason given above. Message read state
   went the other way: it moved *out* of a local file and into the bead it
@@ -284,3 +290,6 @@ every polite heads-up look like a failure.
   and why it reconstructs threads itself instead of using `bd show --thread`.
 - [docs/tui.md](tui.md) — `pact ui`'s tabs and keybindings, and the `ui` Cargo
   feature it lives behind.
+- [docs/telemetry.md](telemetry.md) — the optional `otel` feature: exactly what
+  is exported, what is deliberately not, and what happens when the collector is
+  missing or wedged.

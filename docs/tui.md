@@ -123,6 +123,7 @@ here that the CLI does not emit, fails CI:
 | `CLAUDE.md reaches the protocol` | Claude Code loads `CLAUDE.md`, never `AGENTS.md` |
 | `other instruction files current` | `GEMINI.md` and friends, same staleness question |
 | `protocol files reach a clone` | warns (`!`) when they are gitignored |
+| `otel export` | built in? configured? actually exporting? warns (`!`) when the answer to the last one is no |
 | `one Beads store` | warns (`!`) when `.beads/` holds two backends' stores |
 | `Beads CLI` | which binary, which version, warning outside the tested range |
 | `stale leases` | how many, without collecting them |
