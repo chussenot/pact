@@ -10,7 +10,7 @@ skip_ci = "[skip ci]"
 skip_untracked = false
 pre_bump_hooks = [
   # keep the crate version in step with the tag; Cargo.lock follows
-  "sed -i '0,/^version = /s//version = \"{{version}}\"/' Cargo.toml",
+  "sed -i '0,/^version *=/ s/^version *=.*/version = \"{{version}}\"/' Cargo.toml",
   "cargo check --quiet",
 ]
 post_bump_hooks = []
