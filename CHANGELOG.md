@@ -10,6 +10,21 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.1.3 - 2026-08-02
+#### Bug Fixes
+- **(init)** make the protocol reachable by Claude Code - (3d99935) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- correct drift across README and docs/ - (3710f5a) - Clement HUSSENOT-DESENONGES
+- replace the hand-mirrored protocol in CLAUDE.md with the @AGENTS.md import - (0ce9273) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(agents-md)** teach the full operating surface in the protocol block - (48a7d11) - Clement HUSSENOT-DESENONGES
+- **(doctor)** detect protocol files a clone will never see - (2b614ae) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- Add an AGENTS.md file - (3cebbae) - Clement HUSSENOT-DESENONGES
+- Remove the initial prompt - (305b456) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.1.2 - 2026-08-02
 #### Build system
 - **(mise)** enable the ui feature in local tasks - (34d0cdf) - Clement HUSSENOT-DESENONGES
