@@ -6,6 +6,9 @@ edition = "2021"
 [features]
 ui = ["dep:ratatui"]
 
+[build-dependencies]
+chrono = "0.4.45"
+
 [dependencies]
 anyhow = "1.0.104"
 chrono = "0.4.45"

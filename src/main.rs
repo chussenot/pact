@@ -20,10 +20,29 @@ use clap::{Parser, Subcommand};
 
 use lease::human_secs;
 
+/// Build provenance for `--version`. `-V` keeps the bare `pact <semver>` that
+/// scripts grep for; the long form answers "is the binary on PATH the one I
+/// just built?", which a version number alone cannot.
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\ncommit:   ",
+    env!("PACT_GIT_SHA"),
+    "\nbuilt:    ",
+    env!("PACT_BUILD_TIME"),
+    "\nrustc:    ",
+    env!("PACT_RUSTC"),
+    "\ntarget:   ",
+    env!("PACT_TARGET"),
+    "\nprofile:  ",
+    env!("PACT_PROFILE"),
+    "\nfeatures: ",
+    env!("PACT_FEATURES"),
+);
+
 /// pact: a dependency-light CLI that coordinates multiple coding agents
 /// working on the same repository (onboarding, messaging, leases).
 #[derive(Parser)]
-#[command(name = "pact", version, about)]
+#[command(name = "pact", version, long_version = LONG_VERSION, about)]
 struct Cli {
     /// Agent identity; falls back to PACT_AGENT if unset.
     #[arg(long, global = true)]

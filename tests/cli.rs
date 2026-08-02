@@ -911,3 +911,49 @@ fn msg_send_rejects_an_all_whitespace_body_file() {
         stdout_of(&sent)
     );
 }
+
+/// `-V` is the machine-facing form and must stay the bare `pact <semver>` line;
+/// `--version` carries the build stamp. Guarding both together is the point —
+/// the value of the stamp is answering "is the binary on PATH the one I built?",
+/// and the value of `-V` is that a script grepping it never sees the stamp.
+#[test]
+fn short_version_stays_bare_and_long_version_carries_the_build_stamp() {
+    let tmp = init_repo();
+
+    let short = pact(tmp.path(), "version-agent", &["-V"]);
+    assert_ok(&short);
+    assert_eq!(
+        stdout_of(&short).trim(),
+        format!("pact {}", env!("CARGO_PKG_VERSION")),
+        "-V must stay a single greppable line"
+    );
+
+    let long = pact(tmp.path(), "version-agent", &["--version"]);
+    assert_ok(&long);
+    let out = stdout_of(&long);
+    for field in [
+        "commit:",
+        "built:",
+        "rustc:",
+        "target:",
+        "profile:",
+        "features:",
+    ] {
+        assert!(out.contains(field), "--version missing {field}:\n{out}");
+    }
+    // Not a blanket "unknown" scan: the target triple legitimately contains it
+    // (`x86_64-unknown-linux-gnu`). The commit is the field that silently
+    // degrades, since `build.rs` falls back rather than failing a tarball build.
+    let commit = out
+        .lines()
+        .find_map(|l| l.strip_prefix("commit:"))
+        .expect("commit line")
+        .trim();
+    assert!(
+        commit
+            .trim_end_matches("-dirty")
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()),
+        "commit should be a git sha, got {commit:?}"
+    );
+}
