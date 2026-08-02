@@ -65,9 +65,16 @@ Run `pact doctor` if anything above seems out of date.
 /// (creating the file if absent). Running twice produces zero diff.
 pub fn apply(repo_root: &Path) -> Result<PathBuf> {
     let path = repo_root.join("AGENTS.md");
-    let existing = read_or_empty(&path)?;
+    splice_block(&path, &managed_block())?;
+    Ok(path)
+}
 
-    let block = format!("{BEGIN_MARKER}\n{}{END_MARKER}\n", managed_block());
+/// Idempotently splice `body` between the pact markers in `path`, creating the
+/// file if absent and leaving every byte outside the markers alone.
+fn splice_block(path: &Path, body: &str) -> Result<()> {
+    let existing = read_or_empty(path)?;
+
+    let block = format!("{BEGIN_MARKER}\n{body}{END_MARKER}\n");
 
     let new_content = match find_block_bounds(&existing) {
         // Both markers present, in order: splice the new block in between
@@ -97,8 +104,91 @@ pub fn apply(repo_root: &Path) -> Result<PathBuf> {
         }
     };
 
-    std::fs::write(&path, new_content).with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
+    std::fs::write(path, new_content).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// The line that pulls `AGENTS.md` into `CLAUDE.md`. Claude Code resolves a
+/// bare `@<path>` in a memory file by inlining that file's contents.
+pub const CLAUDE_IMPORT: &str = "@AGENTS.md";
+
+/// What [`ensure_claude_md`] found or did, so `init` can report it honestly
+/// instead of claiming to have written a file it deliberately skipped.
+pub enum ClaudeMd {
+    /// The pact-managed import block is now present in `CLAUDE.md`.
+    Managed(PathBuf),
+    /// `CLAUDE.md` already pulls in `AGENTS.md` by a line we did not write, so
+    /// adding ours would inline the same file twice.
+    AlreadyImported(PathBuf),
+    /// `CLAUDE.md` resolves to `AGENTS.md` itself (the symlink layout). The
+    /// protocol is already in what Claude Code loads, and writing
+    /// `@AGENTS.md` into `AGENTS.md` would be a self-import.
+    SameFileAsAgentsMd,
+}
+
+/// Make the protocol reachable by Claude Code, which loads `CLAUDE.md`,
+/// `.claude/CLAUDE.md`, `CLAUDE.local.md` and `.claude/rules/` — but **not**
+/// `AGENTS.md`. Without this, `pact init` in a fresh repo produced an
+/// `AGENTS.md` that Claude never read, so a Claude-driven fleet silently
+/// skipped the whole protocol: no leases, no inbox, no announcements.
+///
+/// Imports rather than copies, so there is still exactly one source of truth.
+pub fn ensure_claude_md(repo_root: &Path) -> Result<ClaudeMd> {
+    let path = repo_root.join("CLAUDE.md");
+    let agents = repo_root.join("AGENTS.md");
+
+    // canonicalize() resolves symlinks; equal targets mean one file under two
+    // names. (Hard links are not detected — a symlink is the layout people
+    // actually use, and bd's own guidance suggests it.)
+    if let (Ok(a), Ok(b)) = (path.canonicalize(), agents.canonicalize()) {
+        if a == b {
+            return Ok(ClaudeMd::SameFileAsAgentsMd);
+        }
+    }
+
+    let existing = read_or_empty(&path)?;
+    let has_import = existing.lines().any(|l| l.trim() == CLAUDE_IMPORT);
+    // An import inside our own block is ours to keep managing; one outside it
+    // is the user's, and adding a second would inline AGENTS.md twice.
+    let import_is_ours = match find_block_bounds(&existing) {
+        Some((begin, end)) => existing[begin..end].contains(CLAUDE_IMPORT),
+        None => false,
+    };
+    if has_import && !import_is_ours {
+        return Ok(ClaudeMd::AlreadyImported(path));
+    }
+
+    splice_block(&path, &claude_block())?;
+    Ok(ClaudeMd::Managed(path))
+}
+
+/// The block written into `CLAUDE.md`: a pointer, never a second copy of the
+/// protocol. Two copies would drift, and `is_current` could only police one.
+fn claude_block() -> String {
+    format!(
+        "## pact coordination protocol\n\
+         \n\
+         Claude Code loads this file, not `AGENTS.md`, so the protocol is imported\n\
+         here instead of copied — one source of truth, in the file the other agents\n\
+         already read. Run `pact init` to refresh it.\n\
+         \n\
+         {CLAUDE_IMPORT}\n"
+    )
+}
+
+/// Whether Claude Code can actually reach the protocol: either `CLAUDE.md`
+/// imports `AGENTS.md`, or the two are the same file (used by `pact doctor`).
+pub fn claude_md_reaches_protocol(repo_root: &Path) -> Result<bool> {
+    let path = repo_root.join("CLAUDE.md");
+    let agents = repo_root.join("AGENTS.md");
+    if let (Ok(a), Ok(b)) = (path.canonicalize(), agents.canonicalize()) {
+        if a == b {
+            return Ok(true);
+        }
+    }
+    Ok(read_or_empty(&path)?
+        .lines()
+        .any(|l| l.trim() == CLAUDE_IMPORT))
 }
 
 /// Add a single `.pact/` line to `.gitignore`, idempotently, only if missing.
@@ -174,6 +264,21 @@ fn find_block_bounds(content: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hand-written `@AGENTS.md` must not get a second, pact-managed one:
+    /// two imports inline the whole file twice into Claude's context.
+    #[test]
+    fn ensure_claude_md_leaves_a_hand_written_import_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "# Mine\n\n@AGENTS.md\n").unwrap();
+
+        let got = ensure_claude_md(tmp.path()).unwrap();
+        assert!(matches!(got, ClaudeMd::AlreadyImported(_)));
+
+        let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(after, "# Mine\n\n@AGENTS.md\n", "file must be untouched");
+        assert!(claude_md_reaches_protocol(tmp.path()).unwrap());
+    }
 
     #[test]
     fn apply_creates_agents_md_when_absent() {

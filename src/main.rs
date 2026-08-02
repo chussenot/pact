@@ -201,9 +201,45 @@ fn run_init(cwd: &Path, print: bool, json: bool) -> Result<()> {
     let root = repo::find_repo_root(cwd)?;
     repo::pact_dir(&root)?;
     let path = agents_md::apply(&root)?;
+    // Claude Code never loads AGENTS.md, so writing only that file left a
+    // Claude-driven fleet with no protocol at all (see `ensure_claude_md`).
+    let claude = agents_md::ensure_claude_md(&root)?;
     agents_md::ensure_gitignore(&root)?;
-    output::emit(json, &path, |p: &PathBuf| {
-        format!("updated {}", p.display())
+
+    #[derive(serde::Serialize)]
+    struct InitReport {
+        agents_md: PathBuf,
+        /// `null` when `CLAUDE.md` is `AGENTS.md` under another name.
+        claude_md: Option<PathBuf>,
+        claude_md_status: &'static str,
+    }
+
+    let (claude_md, claude_md_status, claude_line) = match claude {
+        agents_md::ClaudeMd::Managed(p) => {
+            let line = format!(
+                "updated {} (imports AGENTS.md for Claude Code)",
+                p.display()
+            );
+            (Some(p), "managed", line)
+        }
+        agents_md::ClaudeMd::AlreadyImported(p) => {
+            let line = format!("left {} alone — it already imports AGENTS.md", p.display());
+            (Some(p), "already-imported", line)
+        }
+        agents_md::ClaudeMd::SameFileAsAgentsMd => (
+            None,
+            "same-file-as-agents-md",
+            "CLAUDE.md is AGENTS.md (symlinked) — nothing to import".to_string(),
+        ),
+    };
+
+    let report = InitReport {
+        agents_md: path,
+        claude_md,
+        claude_md_status,
+    };
+    output::emit(json, &report, |r: &InitReport| {
+        format!("updated {}\n{claude_line}", r.agents_md.display())
     });
     Ok(())
 }

@@ -52,6 +52,20 @@ pub fn checks(root: &Path) -> DoctorReport {
         },
     });
 
+    // AGENTS.md being current is not enough: Claude Code loads CLAUDE.md and
+    // never AGENTS.md, so a repo can pass every other check and still run a
+    // Claude fleet that has never seen the protocol.
+    let claude_reaches = agents_md::claude_md_reaches_protocol(root).unwrap_or(false);
+    checks.push(DoctorCheck {
+        name: "CLAUDE.md reaches the protocol",
+        ok: claude_reaches,
+        detail: if claude_reaches {
+            "imports AGENTS.md".to_string()
+        } else {
+            "Claude Code loads CLAUDE.md, not AGENTS.md — run `pact init`".to_string()
+        },
+    });
+
     checks.push(match beads::BeadsCli::locate() {
         Ok(cli) => {
             let version = cli.version(root).unwrap_or_else(|e| {

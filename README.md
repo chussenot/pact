@@ -41,6 +41,22 @@ flowchart LR
 do — picks up the coordination protocol automatically, with nothing for you
 to repeat by hand.
 
+Claude Code is the exception: it loads `CLAUDE.md`, `.claude/CLAUDE.md`,
+`CLAUDE.local.md` and `.claude/rules/`, and never `AGENTS.md`. So `pact init`
+also puts a marked block in `CLAUDE.md` containing a single `@AGENTS.md`
+import line — a pointer, not a second copy, because two copies drift and only
+one of them can be checked for staleness. Three cases, all idempotent:
+
+| `CLAUDE.md` | what `init` does |
+| --- | --- |
+| absent, or without the import | writes the marked block |
+| already imports `AGENTS.md` by your own line | leaves the file untouched |
+| is a symlink to `AGENTS.md` | writes nothing — a self-import, and already reachable |
+
+`pact doctor` reports this as **CLAUDE.md reaches the protocol**. Without it,
+a Claude-driven fleet reads no protocol at all and silently skips leases and
+messaging, which looks identical to a fleet that never started.
+
 **Use case:** you set up a new repo for multi-agent work. You run
 `pact init` once and commit the result. From then on, cloning the repo and
 pointing any agent at it is enough; re-running `pact init` after upgrading

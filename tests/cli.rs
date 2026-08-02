@@ -957,3 +957,86 @@ fn short_version_stays_bare_and_long_version_carries_the_build_stamp() {
         "commit should be a git sha, got {commit:?}"
     );
 }
+
+// ------------------------------------------------------------------- init
+
+/// The bug this guards (found by bootstrapping a fresh repo): Claude Code
+/// loads CLAUDE.md, `.claude/CLAUDE.md`, CLAUDE.local.md and `.claude/rules/`
+/// — never AGENTS.md. `pact init` wrote only AGENTS.md, so a Claude-driven
+/// fleet read no protocol at all and silently skipped leases and messaging.
+#[test]
+fn init_makes_the_protocol_reachable_from_claude_md_without_touching_prior_content() {
+    let tmp = init_repo();
+    std::fs::write(
+        tmp.path().join("CLAUDE.md"),
+        "# House rules\n\nKeep it lazy.\n",
+    )
+    .unwrap();
+
+    assert_ok(&pact(tmp.path(), "init-agent", &["init"]));
+
+    let claude = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+    assert!(
+        claude.contains("@AGENTS.md"),
+        "CLAUDE.md must import AGENTS.md:\n{claude}"
+    );
+    assert!(
+        claude.starts_with("# House rules\n\nKeep it lazy.\n"),
+        "pre-existing content must survive verbatim:\n{claude}"
+    );
+    // A pointer, not a second copy — two copies would drift apart.
+    assert!(
+        !claude.contains("PACT_AGENT"),
+        "CLAUDE.md should import the protocol, not duplicate it:\n{claude}"
+    );
+
+    // Re-running must be a zero-diff no-op, like the AGENTS.md block.
+    assert_ok(&pact(tmp.path(), "init-agent", &["init"]));
+    let again = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+    assert_eq!(claude, again, "second init changed CLAUDE.md");
+
+    let doc = pact(tmp.path(), "init-agent", &["doctor", "--json"]);
+    let checks = json_stdout(&doc);
+    let check = checks["checks"]
+        .as_array()
+        .expect("doctor emits a checks array")
+        .iter()
+        .find(|c| c["name"] == "CLAUDE.md reaches the protocol")
+        .expect("doctor should report Claude reachability");
+    assert_eq!(check["ok"], true, "{check}");
+}
+
+/// The symlink layout (`CLAUDE.md -> AGENTS.md`, which bd's own guidance
+/// suggests): the protocol is already in the file Claude loads, and writing
+/// `@AGENTS.md` into AGENTS.md would make it import itself.
+#[cfg(unix)]
+#[test]
+fn init_does_not_write_a_self_import_when_claude_md_symlinks_to_agents_md() {
+    let tmp = init_repo();
+    assert_ok(&pact(tmp.path(), "init-agent", &["init"]));
+    std::fs::remove_file(tmp.path().join("CLAUDE.md")).unwrap();
+    std::os::unix::fs::symlink("AGENTS.md", tmp.path().join("CLAUDE.md")).unwrap();
+
+    let out = pact(tmp.path(), "init-agent", &["init"]);
+    assert_ok(&out);
+
+    let agents = std::fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+    assert!(
+        !agents.contains("@AGENTS.md"),
+        "AGENTS.md must never import itself:\n{agents}"
+    );
+    assert!(
+        agents.contains("PACT_AGENT"),
+        "the protocol itself must still be there:\n{agents}"
+    );
+    // Already reachable: doctor must not nag about a layout that works.
+    let doc = pact(tmp.path(), "init-agent", &["doctor", "--json"]);
+    let checks = json_stdout(&doc);
+    let check = checks["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "CLAUDE.md reaches the protocol")
+        .unwrap();
+    assert_eq!(check["ok"], true, "{check}");
+}
