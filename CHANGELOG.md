@@ -10,6 +10,22 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.2.0 - 2026-08-02
+#### Bug Fixes
+- **(doctor)** warn instead of failing when protocol files are gitignored - (e2736fc) - Clement HUSSENOT-DESENONGES
+#### Continuous Integration
+- **(docs)** check README and docs/ against the real CLI - (9375333) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- cover the instruction files, the br backend, and the uncompilable-file gap - (6f42915) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(beads)** support br (beads-rust) alongside bd - (ad9c588) - Clement HUSSENOT-DESENONGES
+- **(init)** point every agent-instruction file the repo already has at AGENTS.md - (9687b47) - Clement HUSSENOT-DESENONGES
+- **(init)** commit the protocol files it writes - (ba89e51) - Clement HUSSENOT-DESENONGES
+#### Tests
+- **(cli)** pin every --json shape, and cover the new backends end to end - (483dcea) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.1.3 - 2026-08-02
 #### Bug Fixes
 - **(init)** make the protocol reachable by Claude Code - (3d99935) - Clement HUSSENOT-DESENONGES
