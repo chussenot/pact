@@ -984,10 +984,10 @@ fn render_doctor(frame: &mut Frame, area: Rect, app: &App) {
         .checks
         .iter()
         .map(|c| {
-            let (symbol, style) = if c.ok {
-                ("✓", Style::default().fg(Color::Green))
-            } else {
-                ("✗", Style::default().fg(Color::Red))
+            let (symbol, style) = match (c.ok, c.warn) {
+                (false, _) => ("✗", Style::default().fg(Color::Red)),
+                (true, true) => ("!", Style::default().fg(Color::Yellow)),
+                (true, false) => ("✓", Style::default().fg(Color::Green)),
             };
             Line::from(Span::styled(
                 format!("{symbol} {}: {}", c.name, c.detail),
@@ -1533,6 +1533,7 @@ mod tests {
             checks: vec![doctor::DoctorCheck {
                 name: "Beads CLI",
                 ok: false,
+                warn: false,
                 detail: "bd not found on PATH".to_string(),
             }],
         });

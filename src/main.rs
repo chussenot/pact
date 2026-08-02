@@ -764,13 +764,24 @@ fn run_doctor(cwd: &Path, json: bool) -> Result<()> {
         let mut lines: Vec<String> = r
             .checks
             .iter()
-            .map(|c| format!("{} {}: {}", if c.ok { "✓" } else { "✗" }, c.name, c.detail))
+            .map(|c| {
+                let glyph = match (c.ok, c.warn) {
+                    (false, _) => "✗",
+                    (true, true) => "!",
+                    (true, false) => "✓",
+                };
+                format!("{glyph} {}: {}", c.name, c.detail)
+            })
             .collect();
+        let warnings = r.checks.iter().filter(|c| c.warn).count();
         lines.push(String::new());
-        lines.push(if r.healthy {
-            "all checks passed".to_string()
-        } else {
-            "some checks failed".to_string()
+        lines.push(match (r.healthy, warnings) {
+            (false, _) => "some checks failed".to_string(),
+            (true, 0) => "all checks passed".to_string(),
+            // Named in the summary too: a `!` scrolled off the top of a long
+            // report is a warning nobody saw.
+            (true, 1) => "all checks passed, 1 warning".to_string(),
+            (true, n) => format!("all checks passed, {n} warnings"),
         });
         lines.join("\n")
     });

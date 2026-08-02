@@ -85,13 +85,23 @@ rule did exactly that to pact's own repo for its entire history. The
 rule to go fix:
 
 ```
-✗ protocol files reach a clone: AGENTS.md (ignored by .gitignore:1:AGENTS.md) — `git add`
-  refuses these silently, so a clone gets no protocol; un-ignore them (e.g. add
-  `!AGENTS.md` to .gitignore) and commit
+! protocol files reach a clone: AGENTS.md (ignored by .gitignore:1:AGENTS.md) — `git add`
+  refuses these silently, so a clone gets no protocol; if that is not deliberate,
+  un-ignore them (e.g. add `!AGENTS.md` to .gitignore) and commit
+
+all checks passed, 1 warning
 ```
 
-Untracked-but-committable is fine and says nothing — that's every repo between
-`pact init` and its first commit.
+It **warns** (`!`, exit 0) rather than failing. Keeping the protocol local to one
+machine is a legitimate setup, and pact doesn't get to overrule a decision you
+already made — it says so out loud instead. A check left permanently red by a
+deliberate choice is one people learn to skip, which would cost exactly the
+visibility it exists for. The summary counts warnings so a `!` that scrolled off
+the top still gets reported. `bd` outside its tested version range warns the same
+way.
+
+Untracked-but-committable is fine and says nothing at all — that's every repo
+between `pact init` and its first commit.
 
 The protocol itself is short:
 
@@ -437,9 +447,13 @@ scripted caller can see whose claim a `--force` destroyed.
 | 3 | Beads CLI (`bd`) not found on `PATH` |
 | 4 | not in a git repository |
 
-`pact doctor` exits 1 when a check fails. `pact whoami` is the one command
-that always exits 0: a missing identity, a missing `bd`, or an unreadable repo
-root are reported as `!` problems, not raised.
+`pact doctor` exits 1 when a check **fails** (`✗`). A check can also **warn**
+(`!`) — it passed, but you should know: `bd` outside its tested version range,
+or protocol files a clone won't see. Warnings never change the exit code, and
+`--json` carries them as `"warn": true` alongside `"ok": true`, so a script can
+tell the two apart. `pact whoami` is the one command that always exits 0: a
+missing identity, a missing `bd`, or an unreadable repo root are reported as
+`!` problems, not raised.
 
 **A closed pipe is not one of these codes.** `pact … | head -1` used to panic
 mid-write and exit 101, which an agent reading only the status could not tell

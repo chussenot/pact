@@ -1087,16 +1087,34 @@ fn doctor_flags_a_gitignored_agents_md_that_no_clone_will_ever_see() {
     assert_ok(&pact(tmp.path(), "reach-agent", &["init"]));
 
     let check = reach_check(tmp.path());
-    assert_eq!(check["ok"], false, "{check}");
+    // Warns, does not fail (pact-1q0): ignoring AGENTS.md can be deliberate, so
+    // pact says so out loud rather than deciding the repo is broken.
+    assert_eq!(check["warn"], true, "{check}");
+    assert_eq!(
+        check["ok"], true,
+        "a warning must not fail the check: {check}"
+    );
     let detail = check["detail"].as_str().unwrap();
     assert!(detail.contains("AGENTS.md"), "{detail}");
     // The actionable half: *which* ignore rule to go fix.
     assert!(detail.contains(".gitignore"), "{detail}");
 
+    let out = pact(tmp.path(), "reach-agent", &["doctor"]);
     assert_eq!(
-        pact(tmp.path(), "reach-agent", &["doctor"]).status.code(),
-        Some(1),
-        "a failing check must exit 1"
+        out.status.code(),
+        Some(0),
+        "a warning must not change the exit code"
+    );
+    let stdout = stdout_of(&out);
+    // Visible without reading every line: a distinct glyph, and a count in the
+    // summary so a `!` scrolled off the top is still reported.
+    assert!(
+        stdout.contains("! protocol files reach a clone"),
+        "warnings render `!`, not `✓`: {stdout}"
+    );
+    assert!(
+        stdout.contains("all checks passed, 1 warning"),
+        "the summary must count warnings: {stdout}"
     );
 }
 

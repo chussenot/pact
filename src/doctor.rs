@@ -10,7 +10,14 @@ use crate::{agents_md, beads, lease, repo};
 #[derive(Serialize)]
 pub struct DoctorCheck {
     pub name: &'static str,
+    /// Does this check pass? A warning passes: `warn` is a louder `ok`, not a
+    /// softer failure, so `!ok` always implies `!warn`.
     pub ok: bool,
+    /// Passes, but you should know. Rendered `!` rather than `✓`, and never
+    /// affects `healthy` or the exit code — pact reports the situation instead
+    /// of deciding it is wrong. `bd` outside its tested range is the other one.
+    #[serde(default)]
+    pub warn: bool,
     pub detail: String,
 }
 
@@ -27,6 +34,7 @@ pub fn checks(root: &Path) -> DoctorReport {
     let mut checks = vec![DoctorCheck {
         name: "git repo",
         ok: true,
+        warn: false,
         detail: root.display().to_string(),
     }];
 
@@ -34,6 +42,7 @@ pub fn checks(root: &Path) -> DoctorReport {
     checks.push(DoctorCheck {
         name: ".pact/ present",
         ok: pact_present,
+        warn: false,
         detail: if pact_present {
             "present".to_string()
         } else {
@@ -45,6 +54,7 @@ pub fn checks(root: &Path) -> DoctorReport {
     checks.push(DoctorCheck {
         name: "AGENTS.md block current",
         ok: agents_md_current,
+        warn: false,
         detail: if agents_md_current {
             "up to date".to_string()
         } else {
@@ -59,6 +69,7 @@ pub fn checks(root: &Path) -> DoctorReport {
     checks.push(DoctorCheck {
         name: "CLAUDE.md reaches the protocol",
         ok: claude_reaches,
+        warn: false,
         detail: if claude_reaches {
             "imports AGENTS.md".to_string()
         } else {
@@ -79,14 +90,21 @@ pub fn checks(root: &Path) -> DoctorReport {
         })
         .collect();
     checks.push(DoctorCheck {
+        // Warns, never fails (pact-1q0). Ignoring AGENTS.md can be a deliberate
+        // choice — keeping the protocol local to one machine is a legitimate
+        // setup — and pact does not get to overrule it. A check that stays red
+        // on a decision the user already made is a check people learn to skip,
+        // which would cost exactly the visibility this one exists for.
         name: "protocol files reach a clone",
-        ok: unreachable.is_empty(),
+        ok: true,
+        warn: !unreachable.is_empty(),
         detail: if unreachable.is_empty() {
             "tracked or committable".to_string()
         } else {
             format!(
                 "{} — `git add` refuses these silently, so a clone gets no protocol; \
-                 un-ignore them (e.g. add `!AGENTS.md` to .gitignore) and commit",
+                 if that is not deliberate, un-ignore them (e.g. add `!AGENTS.md` to \
+                 .gitignore) and commit",
                 unreachable.join(", ")
             )
         },
@@ -98,18 +116,23 @@ pub fn checks(root: &Path) -> DoctorReport {
                 format!("found, but `{} --version` failed: {e:#}", cli.binary())
             });
             let mut detail = format!("{} ({version})", cli.binary());
-            if let Some(warning) = beads::version_compat_warning(&version) {
-                detail.push_str(&format!(" — warning: {warning}"));
+            let compat = beads::version_compat_warning(&version);
+            if let Some(warning) = &compat {
+                detail.push_str(&format!(" — {warning}"));
             }
             DoctorCheck {
                 name: "Beads CLI",
                 ok: true,
+                // An untested bd usually works; saying so with a green tick hid
+                // the caveat in the tail of the line, where nobody read it.
+                warn: compat.is_some(),
                 detail,
             }
         }
         Err(e) => DoctorCheck {
             name: "Beads CLI",
             ok: false,
+            warn: false,
             detail: format!("{e:#}"),
         },
     });
@@ -124,12 +147,14 @@ pub fn checks(root: &Path) -> DoctorReport {
             checks.push(DoctorCheck {
                 name: "stale leases",
                 ok: true,
+                warn: false,
                 detail: format!("{stale} stale (`pact lease ls` collects them)"),
             });
         }
         Err(e) => checks.push(DoctorCheck {
             name: "stale leases",
             ok: false,
+            warn: false,
             detail: format!("{e:#}"),
         }),
     }
@@ -138,11 +163,13 @@ pub fn checks(root: &Path) -> DoctorReport {
         Ok(0) => checks.push(DoctorCheck {
             name: "corrupt leases",
             ok: true,
+            warn: false,
             detail: "none".to_string(),
         }),
         Ok(n) => checks.push(DoctorCheck {
             name: "corrupt leases",
             ok: false,
+            warn: false,
             detail: format!(
                 "{n} unreadable lock file{} (remove manually from .pact/leases/)",
                 if n == 1 { "" } else { "s" }
@@ -151,6 +178,7 @@ pub fn checks(root: &Path) -> DoctorReport {
         Err(e) => checks.push(DoctorCheck {
             name: "corrupt leases",
             ok: false,
+            warn: false,
             detail: format!("{e:#}"),
         }),
     }
