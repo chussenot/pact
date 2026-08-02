@@ -596,11 +596,30 @@ fn closed_stdout_and_stderr_still_exit_0_and_the_work_still_lands() {
 /// CI may not have bd; when it doesn't they print why and pass, rather than
 /// making the whole file conditional. Everything above runs unconditionally.
 fn bd_repo(test: &str) -> Option<TempDir> {
+    beads_repo(test, "bd")
+}
+
+/// The br twin of [`bd_repo`] (pact-l94). `BeadsCli::locate()` picks the
+/// backend that can actually read the workspace, so a `br init` repo is the
+/// only thing that selects the br code paths at all — without one they are
+/// unreachable from the CLI and every br-specific divergence in `msg.rs` is
+/// covered by unit tests alone.
+///
+/// It needs no separate body: `br init` takes the same argv shape and, though
+/// it commits nothing (unlike `bd init`), the git identity is harmless. What
+/// it must NOT be handed is `--db <path>` — br ignores it and initialises in
+/// the cwd regardless, which is how a stray beads store landed in this repo
+/// once. The cwd *is* the tempdir here, so that hazard cannot fire.
+fn br_repo(test: &str) -> Option<TempDir> {
+    beads_repo(test, "br")
+}
+
+fn beads_repo(test: &str, tool: &str) -> Option<TempDir> {
     let on_path = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|d| d.join("bd").is_file()))
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(tool).is_file()))
         .unwrap_or(false);
     if !on_path {
-        eprintln!("SKIP {test}: bd not found on PATH — `pact msg` cannot be tested here");
+        eprintln!("SKIP {test}: {tool} not found on PATH — `pact msg` cannot be tested here");
         return None;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -610,7 +629,7 @@ fn bd_repo(test: &str) -> Option<TempDir> {
         &["git", "init", "-q", "."],
         &["git", "config", "user.email", "tests@pact.invalid"],
         &["git", "config", "user.name", "pact tests"],
-        &["bd", "init"],
+        &[tool, "init"],
     ];
     for cmd in setup {
         match Command::new(cmd[0])
@@ -1262,4 +1281,457 @@ fn git_out(repo: &Path, args: &[&str]) -> String {
         .output()
         .expect("git");
     stdout_of(&out)
+}
+
+// ------------------------------------------- init: other instruction files
+
+/// pact-4zx, requested by init-dev in thread pact-wisp-6m2. `pact init` points
+/// the agent-instruction files a repo ALREADY has back at AGENTS.md, and
+/// invents none.
+///
+/// Both halves are load-bearing and only a real process shows them. Creating
+/// `.cursorrules` in a repo that never used Cursor is pact writing config for a
+/// tool nobody runs; and a *copy* of the protocol in five files is five copies
+/// to drift, which `is_current()` can only police in one. So the assertion is
+/// "these two files, pointing, and nothing else on disk".
+#[test]
+fn init_points_existing_instruction_files_at_agents_md_and_creates_none() {
+    let tmp = init_repo();
+    std::fs::write(tmp.path().join("GEMINI.md"), "# Gemini\n").unwrap();
+    std::fs::create_dir(tmp.path().join(".github")).unwrap();
+    std::fs::write(
+        tmp.path().join(".github/copilot-instructions.md"),
+        "# Copilot\n",
+    )
+    .unwrap();
+
+    let out = pact(tmp.path(), "init-agent", &["init", "--no-commit", "--json"]);
+    assert_ok(&out);
+    let report = json_stdout(&out);
+    let managed = report["instruction_files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("init --json must report instruction_files: {report}"));
+    assert_eq!(
+        managed.len(),
+        2,
+        "only the files that already existed: {report}"
+    );
+    for want in ["GEMINI.md", "copilot-instructions.md"] {
+        assert!(
+            managed
+                .iter()
+                .any(|p| p.as_str().unwrap_or_default().ends_with(want)),
+            "{want} missing from instruction_files: {report}"
+        );
+    }
+
+    let gemini = std::fs::read_to_string(tmp.path().join("GEMINI.md")).unwrap();
+    assert!(
+        gemini.starts_with("# Gemini\n"),
+        "pre-existing content must survive verbatim:\n{gemini}"
+    );
+    assert!(
+        gemini.contains("<!-- pact:begin -->") && gemini.contains("@AGENTS.md"),
+        "GEMINI.md must carry a managed block importing AGENTS.md:\n{gemini}"
+    );
+    assert!(
+        !gemini.contains("PACT_AGENT"),
+        "a pointer, never a second copy of the protocol:\n{gemini}"
+    );
+
+    for invented in [".windsurfrules", ".cursorrules", ".clinerules"] {
+        assert!(
+            !tmp.path().join(invented).exists(),
+            "init created {invented} in a repo that never had one"
+        );
+    }
+
+    // Idempotent, like the AGENTS.md and CLAUDE.md blocks before it.
+    assert_ok(&pact(tmp.path(), "init-agent", &["init", "--no-commit"]));
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("GEMINI.md")).unwrap(),
+        gemini,
+        "a second init changed GEMINI.md"
+    );
+}
+
+// ------------------------------------------- msg over the br backend (pact-l94)
+
+/// pact-l94, requested by br-dev in thread pact-wisp-0ma. The plain round trip
+/// on br, which is a sharper guard than it looks: br rejects
+/// `--no-inherit-labels` with `error: unexpected argument`, so a regression in
+/// the create argv is a hard failure on EVERY send rather than a subtle one.
+/// Read state rides along because `read-by-<agent>` labels are the one part of
+/// the messaging model that needed no br-specific code — and "needed no change"
+/// is exactly the claim that rots without a test.
+#[test]
+fn br_backed_msg_round_trip_carries_read_state_the_way_bd_does() {
+    let Some(tmp) = br_repo("br_backed_msg_round_trip_carries_read_state_the_way_bd_does") else {
+        return;
+    };
+    assert_ok(&pact(
+        tmp.path(),
+        "sender-agent",
+        &[
+            "msg",
+            "send",
+            "--to",
+            "reader-agent",
+            "--subject",
+            "ack me",
+            "please ack",
+        ],
+    ));
+
+    let inbox = inbox_json(tmp.path(), "reader-agent");
+    assert_eq!(inbox.as_array().map(Vec::len), Some(1), "{inbox}");
+    assert_eq!(inbox[0]["from"], serde_json::json!("sender-agent"));
+    assert_eq!(inbox[0]["to"], serde_json::json!("reader-agent"));
+    assert_eq!(inbox[0]["read"], serde_json::json!(false));
+    assert_eq!(inbox[0]["body"], serde_json::json!("please ack"));
+    let id = inbox[0]["id"].as_str().unwrap().to_string();
+
+    let before = pact(tmp.path(), "sender-agent", &["msg", "sent"]);
+    assert_ok(&before);
+    assert!(
+        stdout_of(&before).contains("1 not read yet"),
+        "{}",
+        stdout_of(&before)
+    );
+
+    assert_ok(&pact(tmp.path(), "reader-agent", &["msg", "read", &id]));
+
+    let after = pact(
+        tmp.path(),
+        "reader-agent",
+        &["msg", "inbox", "--unread-only", "--json"],
+    );
+    assert_ok(&after);
+    assert_eq!(
+        json_stdout(&after).as_array().map(Vec::len),
+        Some(0),
+        "reading must clear the reader's unread on br too: {}",
+        stdout_of(&after)
+    );
+    let confirmed = pact(tmp.path(), "sender-agent", &["msg", "sent"]);
+    assert_ok(&confirmed);
+    assert!(
+        stdout_of(&confirmed).contains("0 not read yet"),
+        "the read must be visible to the sender: {}",
+        stdout_of(&confirmed)
+    );
+}
+
+/// The br twin of `every_recipient_of_a_fan_out_sees_one_thread_and_can_reply_into_it`,
+/// and the one br-dev asked not to skip.
+///
+/// bd answers "which messages are in this thread" with `list --parent <id>`.
+/// br has no such filter and its `list --json` omits `parent` entirely, so on br
+/// the answer is reconstructed from the ROOT's `parent-child` dependents out of
+/// `show --json`. A naive port passes every unit test and still reports each
+/// reply as its own one-message thread — the shared decision fragmenting exactly
+/// as pact-rnc.4 described, one backend later. Only a live br proves the walk.
+#[test]
+fn br_backed_fan_out_shares_one_thread_and_a_reply_reaches_the_root() {
+    let Some(tmp) = br_repo("br_backed_fan_out_shares_one_thread_and_a_reply_reaches_the_root")
+    else {
+        return;
+    };
+    assert_ok(&pact(
+        tmp.path(),
+        "alpha",
+        &[
+            "msg",
+            "send",
+            "--to",
+            "bravo",
+            "--to",
+            "charlie",
+            "--subject",
+            "fan out",
+            "friday?",
+        ],
+    ));
+
+    let bravo = inbox_json(tmp.path(), "bravo");
+    let root = bravo[0]["id"].as_str().expect("bravo got it").to_string();
+    assert_eq!(bravo[0]["thread"], serde_json::json!(root));
+
+    let charlie = inbox_json(tmp.path(), "charlie");
+    let charlie_id = charlie[0]["id"]
+        .as_str()
+        .expect("charlie got it")
+        .to_string();
+    assert_ne!(charlie_id, root, "recipient 2 has its own bead");
+    assert_eq!(
+        charlie[0]["thread"],
+        serde_json::json!(root),
+        "both recipients must report the same thread: {charlie}"
+    );
+
+    // Reading a non-root member gives the whole conversation, not a stub.
+    let read = pact(
+        tmp.path(),
+        "charlie",
+        &["msg", "read", &charlie_id, "--json"],
+    );
+    assert_ok(&read);
+    assert_eq!(
+        json_stdout(&read).as_array().map(Vec::len),
+        Some(2),
+        "{}",
+        stdout_of(&read)
+    );
+
+    assert_ok(&pact(
+        tmp.path(),
+        "charlie",
+        &[
+            "msg",
+            "send",
+            "--to",
+            "alpha",
+            "--thread",
+            &charlie_id,
+            "--subject",
+            "re: fan out",
+            "charlie acks",
+        ],
+    ));
+
+    let as_alpha = pact(tmp.path(), "alpha", &["msg", "read", &root, "--json"]);
+    assert_ok(&as_alpha);
+    let full = json_stdout(&as_alpha);
+    assert_eq!(
+        full.as_array().map(Vec::len),
+        Some(3),
+        "a reply parented on a child must still land in the root thread: {full}"
+    );
+    let bodies: Vec<&str> = full
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap_or_default())
+        .collect();
+    assert!(bodies.contains(&"charlie acks"), "{full}");
+}
+
+// ------------------------------------------------ --json shapes (pact-er0)
+
+/// pact-er0. The `--json` shapes are an API nobody wrote down, and they have
+/// already broken twice in silence: `pact init --json` emitted a bare path
+/// string, became an object with three keys, then gained three more the same
+/// day; `lease release --json` went string -> object earlier. Both were
+/// breaking for anything reading them and neither was noticed, because nothing
+/// in the tree contradicted the change.
+///
+/// The protocol block in AGENTS.md tells every agent to prefer `--json` over
+/// parsing human output, so each of these shapes is something a peer parses.
+/// Pinning the top-level keys does not make a shape *good* — several below are
+/// frankly inconsistent, see the comments — it makes changing one a deliberate
+/// act that edits this file, which is the failure mode that actually happened.
+///
+/// Adding a key breaks these tests too, on purpose: an added key is how both
+/// historical breakages arrived, and a reviewer seeing this file in the diff is
+/// the whole mechanism.
+fn assert_object_keys(what: &str, v: &serde_json::Value, expected: &[&str]) {
+    let mut got: Vec<&str> = v
+        .as_object()
+        .unwrap_or_else(|| panic!("`{what} --json` must be a JSON object, got: {v}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    got.sort_unstable();
+    let mut want = expected.to_vec();
+    want.sort_unstable();
+    assert_eq!(
+        got, want,
+        "`{what} --json` changed shape. This is an API agents parse (pact-er0): \
+         update the expectation here in the same commit, and say so in the \
+         changelog.\nfull payload: {v}"
+    );
+}
+
+/// Array-ness is asserted separately because it is invisible in a key
+/// comparison, and it is precisely what changed under `lease release --json`.
+fn assert_array_of(what: &str, v: &serde_json::Value, expected: &[&str]) {
+    let arr = v
+        .as_array()
+        .unwrap_or_else(|| panic!("`{what} --json` must be a JSON array, got: {v}"));
+    let first = arr.first().unwrap_or_else(|| {
+        panic!("`{what} --json` needs a non-empty sample here to pin its element shape")
+    });
+    assert_object_keys(&format!("{what}[]"), first, expected);
+}
+
+/// Every `--json` shape that does not need a Beads backend. One test, because
+/// the value is in the list being exhaustive: a command missing from it is a
+/// shape nobody is guarding.
+#[test]
+fn json_shapes_of_every_command_that_needs_no_beads_backend() {
+    let tmp = init_repo();
+    let repo = tmp.path();
+    let run = |args: &[&str]| {
+        let out = pact(repo, "shape-agent", args);
+        assert_ok(&out);
+        json_stdout(&out)
+    };
+
+    assert_object_keys(
+        "init",
+        &run(&["init", "--no-commit", "--json"]),
+        &[
+            "agents_md",
+            "claude_md",
+            "claude_md_status",
+            "instruction_files",
+            "commit",
+            "committed_files",
+            "commit_status",
+        ],
+    );
+
+    assert_object_keys(
+        "whoami",
+        &run(&["whoami", "--json"]),
+        &[
+            "agent",
+            "agent_source",
+            "pact_binary",
+            "repo_root",
+            "pact_dir",
+            "bd_binary",
+            "bd_version",
+            "problems",
+        ],
+    );
+
+    // A single-path acquire stays an OBJECT while a multi-path one is an ARRAY
+    // of the same element — already pinned by
+    // `acquire_single_path_json_stays_an_object`, repeated here so the two
+    // shapes sit next to each other in the contract.
+    const LEASE: &[&str] = &["path", "agent", "acquired_at", "ttl_secs", "note"];
+    let one = run(&["lease", "acquire", "a.rs", "--json"]);
+    assert_object_keys("lease acquire <one>", &one, &["lease", "stolen"]);
+    assert_object_keys("lease acquire <one>.lease", &one["lease"], LEASE);
+    assert_array_of(
+        "lease acquire <many>",
+        &run(&["lease", "acquire", "b.rs", "c.rs", "--json"]),
+        &["lease", "stolen"],
+    );
+
+    // `renew` returns the bare lease, not the `{lease, stolen}` envelope
+    // `acquire` returns. Inconsistent, and deliberately pinned as-is: this test
+    // records the contract, it does not get to quietly improve it.
+    assert_object_keys(
+        "lease renew",
+        &run(&["lease", "renew", "a.rs", "--json"]),
+        LEASE,
+    );
+
+    let ls = run(&["lease", "ls", "--json"]);
+    assert_array_of(
+        "lease ls",
+        &ls,
+        &["lease", "age_secs", "remaining_secs", "expired"],
+    );
+    assert_object_keys("lease ls[].lease", &ls[0]["lease"], LEASE);
+
+    assert_array_of(
+        "agents",
+        &run(&["agents", "--json"]),
+        &[
+            "name",
+            "last_seen",
+            "leases_held",
+            "messages_sent",
+            "messages_received",
+        ],
+    );
+
+    assert_array_of(
+        "log",
+        &run(&["log", "--json"]),
+        &["at", "kind", "agent", "target", "detail"],
+    );
+
+    assert_object_keys(
+        "lease release <one>",
+        &run(&["lease", "release", "a.rs", "--json"]),
+        &["path", "displaced"],
+    );
+
+    // `release --all` is an array of bare path STRINGS, not of the
+    // `{path, displaced}` objects the single-path form emits. Whoever fixes
+    // that will have to come here first, which is the entire point.
+    let all = run(&["lease", "release", "--all", "--json"]);
+    let paths = all
+        .as_array()
+        .unwrap_or_else(|| panic!("`lease release --all --json` must be an array: {all}"));
+    assert!(
+        paths.iter().all(serde_json::Value::is_string),
+        "`lease release --all --json` is an array of path strings: {all}"
+    );
+
+    // `doctor` is the one command whose exit code tracks its findings, so it is
+    // run without `assert_ok` — the shape must hold whether or not the repo is
+    // healthy, and a tempdir with no bd is not.
+    let doctor = json_stdout(&pact(repo, "shape-agent", &["doctor", "--json"]));
+    assert_object_keys("doctor", &doctor, &["healthy", "checks"]);
+    assert_array_of(
+        "doctor.checks",
+        &doctor["checks"],
+        &["name", "ok", "warn", "detail"],
+    );
+}
+
+/// The other half of pact-er0: everything `pact msg` emits. All four commands
+/// return an ARRAY of the same message record — including `msg send`, which
+/// returns one element per recipient, and `msg read`, which returns the thread
+/// rather than the one message you asked for.
+#[test]
+fn json_shapes_of_every_msg_command() {
+    let Some(tmp) = bd_repo("json_shapes_of_every_msg_command") else {
+        return;
+    };
+    const MESSAGE: &[&str] = &[
+        "id",
+        "thread",
+        "from",
+        "to",
+        "subject",
+        "body",
+        "created_at",
+        "read",
+        "read_by",
+    ];
+
+    let sent = pact(
+        tmp.path(),
+        "alpha",
+        &[
+            "msg",
+            "send",
+            "--to",
+            "bravo",
+            "--subject",
+            "shapes",
+            "--json",
+            "body",
+        ],
+    );
+    assert_ok(&sent);
+    assert_array_of("msg send", &json_stdout(&sent), MESSAGE);
+
+    let inbox = inbox_json(tmp.path(), "bravo");
+    assert_array_of("msg inbox", &inbox, MESSAGE);
+    let id = inbox[0]["id"].as_str().unwrap().to_string();
+
+    let read = pact(tmp.path(), "bravo", &["msg", "read", &id, "--json"]);
+    assert_ok(&read);
+    assert_array_of("msg read", &json_stdout(&read), MESSAGE);
+
+    let outbox = pact(tmp.path(), "alpha", &["msg", "sent", "--json"]);
+    assert_ok(&outbox);
+    assert_array_of("msg sent", &json_stdout(&outbox), MESSAGE);
 }
