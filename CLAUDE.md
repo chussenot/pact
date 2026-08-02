@@ -11,10 +11,16 @@ shelling out to the Beads CLI (`bd`).
 
 ```bash
 mise run check    # fmt-check + clippy -D warnings + test — the CI gate
-mise run build    # cargo build
-mise run test     # cargo test
-mise run install  # cargo install --path . --force  (puts the CURRENT build on PATH)
+mise run build    # cargo build --features ui
+mise run test     # cargo test --features ui
+mise run install  # cargo install --path . --force --features ui  (CURRENT build on PATH)
 ```
+
+Every mise task builds with `--features ui`, so `pact ui` exists in what you
+build, test and install. `ui` is **not** a default Cargo feature — a plain
+`cargo build` leaves ratatui out, and CI runs clippy and test both ways so that
+dependency-light build stays guarded. `pact --version` prints the enabled
+features, which is the fast answer to `unrecognized subcommand 'ui'`.
 
 Run a single test: `cargo test <substring>`, e.g. `cargo test lease::tests::renew`.
 

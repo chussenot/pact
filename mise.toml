@@ -2,12 +2,12 @@
 rust = "latest"
 
 [tasks.build]
-description = "Build the pact binary"
-run = "cargo build"
+description = "Build the pact binary (with the ui feature)"
+run = "cargo build --features ui"
 
 [tasks.test]
-description = "Run the pact test suite"
-run = "cargo test"
+description = "Run the pact test suite (with the ui feature)"
+run = "cargo test --features ui"
 
 [tasks.fmt]
 description = "Format the code"
@@ -18,13 +18,13 @@ description = "Check formatting without writing changes"
 run = "cargo fmt -- --check"
 
 [tasks.lint]
-description = "Run clippy with warnings denied"
-run = "cargo clippy --all-targets -- -D warnings"
+description = "Run clippy with warnings denied (with the ui feature)"
+run = "cargo clippy --all-targets --features ui -- -D warnings"
 
 [tasks.check]
-description = "Run the full CI check locally: fmt, lint, test"
+description = "Run the full CI check locally: fmt, lint, test. CI additionally runs clippy and test without the ui feature, so the dependency-light build stays guarded there."
 depends = ["fmt-check", "lint", "test"]
 
 [tasks.install]
-description = "Build and install the pact binary locally (cargo install --path .)"
-run = "cargo install --path . --force"
+description = "Build and install the pact binary locally, ui feature included"
+run = "cargo install --path . --force --features ui"
