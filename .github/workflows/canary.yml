@@ -1,0 +1,159 @@
+name: Canary
+
+# Exercise pact against a REAL bd release, so upstream CLI drift is found by a
+# machine instead of by a user.
+#
+# tests/cli.rs stubs bd, which is right for a unit suite and means nothing
+# checks pact's assumptions about somebody else's CLI: --include-infra, --parent
+# threading, whether --json hydrates labels, and the shapes those return.
+#
+# Deliberately NOT part of ci.yml and deliberately not a required check. It
+# depends on a third party's release process and on the network, so it must
+# never be able to block a PR — a canary that gates merges gets disabled the
+# first time upstream has a bad day.
+
+on:
+  schedule:
+    # Tuesday 06:17 UTC. Off the hour because scheduled runs cluster there and
+    # get queued; a weekday so a failure lands when somebody is around to read
+    # the issue it opens.
+    - cron: "17 6 * * 2"
+  workflow_dispatch:
+
+# A weekly job that overlaps itself is a job someone forgot to cancel. Manual
+# runs supersede a scheduled one already in flight.
+concurrency:
+  group: canary
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      # Both legs always run: "latest passed but pinned failed" is itself a
+      # diagnosis, and fail-fast would hide it.
+      fail-fast: false
+      matrix:
+        leg: [pinned, latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve the bd version for this leg
+        id: bd
+        env:
+          LEG: ${{ matrix.leg }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The tested range comes out of src/beads.rs. Restating it here would
+          # create a second copy that drifts from the code it describes, which
+          # is the exact failure this canary exists to catch.
+          triplet() {
+            sed -nE "s/^const $1: \(u64, u64, u64\) = \(([0-9]+), ([0-9]+), ([0-9]+)\);/\1.\2.\3/p" \
+              src/beads.rs | head -1
+          }
+          MIN="$(triplet TESTED_BD_MIN)"
+          MAX="$(triplet TESTED_BD_MAX_EXCLUSIVE)"
+          if [ -z "$MIN" ] || [ -z "$MAX" ]; then
+            echo "::error::could not read TESTED_BD_MIN/MAX out of src/beads.rs — has the declaration changed shape?"
+            exit 1
+          fi
+          echo "tested range: $MIN <= v < $MAX"
+
+          # Stable releases only: a pre-release is not what a user installs.
+          gh release list --repo gastownhall/beads --limit 100 --json tagName,isPrerelease \
+            -q '.[] | select(.isPrerelease | not) | .tagName' \
+            | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V > versions.txt
+
+          if [ "$LEG" = latest ]; then
+            VERSION="$(tail -1 versions.txt)"
+          else
+            # Newest release that is >= MIN and < MAX. sort -V does the ordering
+            # so there is no arithmetic on version components here.
+            VERSION="$(awk -v min="$MIN" -v max="$MAX" '
+              function cmp(a, b,   x, y, i) {
+                split(a, x, "."); split(b, y, ".")
+                for (i = 1; i <= 3; i++) { if (x[i] + 0 != y[i] + 0) return (x[i] + 0 < y[i] + 0) ? -1 : 1 }
+                return 0
+              }
+              cmp($0, min) >= 0 && cmp($0, max) < 0
+            ' versions.txt | tail -1)"
+          fi
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::no stable bd release found for leg=$LEG (range $MIN..$MAX). Releases seen:"
+            cat versions.txt
+            exit 1
+          fi
+          echo "leg=$LEG resolved to bd $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install bd ${{ steps.bd.outputs.version }}
+        env:
+          VERSION: ${{ steps.bd.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Release tarballs, named beads_<version>_linux_amd64.tar.gz. Verified
+          # against the real asset list rather than assumed; `go install` and a
+          # brew tap were not used because a tarball pins an exact version,
+          # which the two-leg split depends on.
+          gh release download "v${VERSION}" --repo gastownhall/beads \
+            --pattern "beads_${VERSION}_linux_amd64.tar.gz" --output bd.tar.gz
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf bd.tar.gz -C "$HOME/.local/bin" bd
+          chmod +x "$HOME/.local/bin/bd"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Confirm bd runs
+        run: |
+          set -euo pipefail
+          bd --version
+          # bd 1.1.x embeds Dolt ("no external server needed" per `bd init
+          # --help`) and needs no separate install. If a future bd changes that,
+          # `bd init` inside the canary fails with its own message, which is a
+          # clearer signal than a Dolt install we cannot justify today.
+          command -v dolt >/dev/null && dolt version || echo "no external dolt — expected, bd embeds it"
+
+      - name: Run the canary
+        env:
+          CANARY_LEG: ${{ matrix.leg }}
+        run: scripts/canary.sh
+
+      - name: Report a failure as an issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LEG: ${{ matrix.leg }}
+          VERSION: ${{ steps.bd.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # A red scheduled run nobody sees is worthless, and a new issue every
+          # week is the same thing with extra noise: find an open one first and
+          # comment on it instead.
+          BODY="$(printf '**leg:** `%s`\n**bd version:** `%s`\n**run:** %s\n\nThe canary exercises pact against a real bd release. See the run log for the failing assertion.\n' \
+            "$LEG" "${VERSION:-unresolved}" "$RUN_URL")"
+
+          EXISTING="$(gh issue list --label canary --state open --limit 1 --json number -q '.[0].number' || true)"
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+            echo "commented on existing canary issue #$EXISTING"
+          else
+            # --label can fail if the label does not exist yet; create it first,
+            # tolerating the case where a concurrent leg already did.
+            gh label create canary --description "Scheduled canary against a real bd release" --color B60205 2>/dev/null || true
+            gh issue create --title "Canary failing against bd ${VERSION:-unknown}" --label canary --body "$BODY"
+          fi
