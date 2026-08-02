@@ -137,6 +137,26 @@ pub fn checks(root: &Path) -> DoctorReport {
         },
     });
 
+    // Warns rather than fails: pact still resolves correctly (Dolt first,
+    // because that is where the data is), and two stores can legitimately
+    // coexist mid-migration. But the correct tiebreak is what makes it
+    // invisible — an empty store can shadow a full one and every command keeps
+    // answering normally, until someone runs the other backend directly and
+    // sees an empty issue list.
+    let conflict = beads::conflicting_stores(root);
+    checks.push(DoctorCheck {
+        name: "one Beads store",
+        ok: true,
+        warn: conflict.is_some(),
+        detail: match &conflict {
+            None => "no conflicting store".to_string(),
+            Some((used, ignored)) => format!(
+                "two stores in .beads/ — pact uses {used} and ignores {ignored}; \
+                 remove the one you do not want, or the backends will disagree"
+            ),
+        },
+    });
+
     checks.push(match beads::BeadsCli::locate() {
         Ok(cli) => {
             let version = cli.version(root).unwrap_or_else(|e| {

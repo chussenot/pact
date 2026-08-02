@@ -184,6 +184,32 @@ fn classify_workspace(beads_dir: &Path) -> Workspace {
     Workspace::None
 }
 
+/// Both backends' stores sitting in one `.beads/`, as `(used, ignored)`.
+///
+/// `classify_workspace` resolves this correctly — Dolt first, because that is
+/// where the data is — and that correct tiebreak is exactly what makes the
+/// situation invisible. A repo can carry an empty `beads.db` shadowing a full
+/// `embeddeddolt/` and every pact command keeps answering normally.
+///
+/// It is not hypothetical: `br --db /tmp/elsewhere.db init` ignored its own
+/// `--db` and initialised in the cwd of a live repo, at exit 0, with no
+/// warning, leaving a second database next to the real one. Nothing leases the
+/// Beads store and nothing checked it, so an agent that had correctly leased
+/// both files it edited still wrote shared state no lease covered.
+pub fn conflicting_stores(repo_root: &Path) -> Option<(String, String)> {
+    let beads = repo_root.join(".beads");
+    let dolt = beads.join("embeddeddolt").is_dir();
+    let sqlite = sqlite_db(&beads)?;
+    if !dolt {
+        return None;
+    }
+    let name = sqlite.file_name()?.to_string_lossy().into_owned();
+    Some((
+        ".beads/embeddeddolt/ (bd)".to_string(),
+        format!(".beads/{name} (br)"),
+    ))
+}
+
 fn sqlite_db(beads_dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(beads_dir)
         .ok()?

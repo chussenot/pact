@@ -1987,3 +1987,52 @@ fn to_owner_of_an_untouched_path_is_an_error_not_a_silent_no_op() {
     assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
     assert!(stderr_of(&out).contains("no owner"), "{}", stderr_of(&out));
 }
+
+/// pact leases file paths; the Beads store its own messaging lives in is shared
+/// mutable state no lease covered and no check guarded. `br --db /elsewhere.db
+/// init` ignored its own --db and initialised in the cwd of this live repo at
+/// exit 0, leaving a second database next to the real one. classify_workspace
+/// resolved it correctly — Dolt first, because that is where the data is — and
+/// that correct tiebreak is exactly what made it invisible (pact-nv4).
+#[test]
+fn doctor_warns_when_two_beads_stores_share_one_directory() {
+    let tmp = init_repo();
+    let beads = tmp.path().join(".beads");
+    std::fs::create_dir_all(beads.join("embeddeddolt")).unwrap();
+
+    let check = |repo: &Path| -> serde_json::Value {
+        json_stdout(&pact(repo, "store-agent", &["doctor", "--json"]))["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "one Beads store")
+            .cloned()
+            .unwrap()
+    };
+
+    let clean = check(tmp.path());
+    assert_eq!(clean["warn"], false, "one store is not a problem: {clean}");
+
+    // The stray br store, plus the -wal/-shm siblings it writes alongside.
+    for f in ["beads.db", "beads.db-wal", "beads.db-shm"] {
+        std::fs::write(beads.join(f), "").unwrap();
+    }
+
+    let conflicted = check(tmp.path());
+    assert_eq!(conflicted["warn"], true, "{conflicted}");
+    assert_eq!(
+        conflicted["ok"], true,
+        "warns, never fails: two stores can coexist mid-migration, and pact still \
+         resolves correctly — {conflicted}"
+    );
+    let detail = conflicted["detail"].as_str().unwrap();
+    // Naming both halves is the whole value: which one wins, which is ignored.
+    assert!(
+        detail.contains("embeddeddolt"),
+        "must name the store in use: {detail}"
+    );
+    assert!(
+        detail.contains("beads.db"),
+        "must name the ignored store: {detail}"
+    );
+}

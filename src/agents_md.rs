@@ -30,6 +30,12 @@ this protocol whenever you touch shared files or hand off work to others.
   a peer planning against the same file can renegotiate now instead of at the
   end, when both plans are sunk cost — and a fleet that has announced nothing
   looks exactly like a fleet that crashed on startup.
+- **Lease anything you WRITE, not just files you edit.** A lease is on a path,
+  so a directory of shared state is leasable too — `pact lease acquire .beads/
+  --note "probing the br CLI"` before you run a tool that might write there.
+  An agent that had correctly leased both source files it edited still
+  corrupted the shared Beads store, because it read the protocol as being about
+  editing files and a CLI wrote a second database behind it at exit 0.
 - **Ownership, and its one carve-out, stated together**: lease every file you
   edit that another agent might also touch, and release it when done. The
   single exception is a file that is yours alone by assignment (your own

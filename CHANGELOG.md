@@ -167,6 +167,22 @@ cog's.
   Addressing a message to a path rather than an agent is the part that matters:
   a path outlives the process that held it, so the handoff still lands.
 
+### Added — a check for two Beads stores
+
+- **`pact doctor` warns when `.beads/` holds both an `embeddeddolt/` and a
+  `*.db` store**, naming which one pact uses and which it ignores. `br --db
+  /elsewhere.db init` ignored its own flag and initialised in the cwd of a live
+  repo at exit 0, leaving a second database beside the real one. pact resolved
+  it correctly — Dolt first, because that is where the data is — and that
+  correct tiebreak is precisely what made an empty store shadowing a full one
+  invisible. Warns rather than fails: nothing is broken today, and both stores
+  legitimately coexist during a migration.
+- The protocol block now says leases cover **anything you write**, not just
+  files you edit, with `.beads/` named as leasable. The agent that caused this
+  had correctly leased both source files it edited; it read the protocol as
+  being about editing, so leasing a directory before probing a CLI never
+  occurred to it.
+
 ### Changed — exit code
 
 - **Usage errors now exit `5`, not `2`.** A breaking change to a documented
