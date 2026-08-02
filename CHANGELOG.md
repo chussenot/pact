@@ -10,6 +10,24 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.3.0 - 2026-08-02
+#### Bug Fixes
+- **(agents)** keep an agent on the roster after it releases its last lease - (9d8999c) - Clement HUSSENOT-DESENONGES
+- **(canary)** stop piping into head under pipefail, which SIGPIPEd on CI - (9bf02be) - Clement HUSSENOT-DESENONGES
+- **(doctor)** report the warning count when a check also fails, and stop a test encoding one machine - (566e5ec) - Clement HUSSENOT-DESENONGES
+- **(init)** honour --json on --print instead of emitting raw markdown - (8327d0d) - Clement HUSSENOT-DESENONGES
+- **(lease)** make the atomic-write temp file unique per thread, not per process - (edd0eb2) - Clement HUSSENOT-DESENONGES
+- **(msg)** gate the ui-only read helper so the default build compiles clean - (d8cc98a) - Clement HUSSENOT-DESENONGES
+#### Continuous Integration
+- **(canary)** exercise pact against a real bd release on a schedule - (d493a9d) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(protocol)** make the lease note the announcement, not a message - (107e7c4) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(beads)** close the remaining P4 decisions - (603a1b9) - Clement HUSSENOT-DESENONGES
+- Add the interactions - (5630858) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.2.2 - 2026-08-02
 #### Bug Fixes
 - **(otel)** record the lease holder on the conflict span - (8af8aef) - Clement HUSSENOT-DESENONGES
