@@ -69,56 +69,13 @@ Deeper detail lives in `docs/`: `architecture.md`, `leases.md`, `messaging.md`,
 `tui.md`.
 
 <!-- pact:begin -->
-<!-- Mirrored from AGENTS.md. `pact init` only manages AGENTS.md today, so if
-     the protocol text changes this copy must be updated by hand (see the bead
-     about `pact init` managing every agent-instruction file present). -->
 ## pact coordination protocol
 
-pact coordinates multiple coding agents working in this repository. Follow
-this protocol whenever you touch shared files or hand off work to others.
+Claude Code loads this file, not `AGENTS.md`, so the protocol is imported
+here instead of copied — one source of truth, in the file the other agents
+already read. Run `pact init` to refresh it.
 
-- **Identity**: your agent identity comes from the `PACT_AGENT` environment
-  variable (or `--agent <name>`). Set one before running pact commands; pact
-  never guesses an identity. `pact whoami` shows the identity and paths it
-  resolved.
-- **Announce intent before you research, not just before you write.** Your
-  first pact commands come *before* you read the first file: `pact msg inbox`,
-  then `pact msg send --to <peer-or-human>` saying what you are about to work
-  on, then `pact lease acquire <path> --note "<what>"` for the files you expect
-  to own. Do it even if you will only be reading for the next ten minutes. Why:
-  a peer planning against the same file can renegotiate now instead of at the
-  end, when both plans are sunk cost — and a fleet that has announced nothing
-  looks exactly like a fleet that crashed on startup.
-- **Ownership, and its one carve-out, stated together**: lease every file you
-  edit that another agent might also touch, and release it when done. The
-  single exception is a file that is yours alone by assignment (your own
-  evidence log, your own scratch dir) — nobody else writes it, so it needs no
-  lease. Anything else: lease it. Leases are advisory, not enforced by the
-  filesystem; respect them anyway.
-- **Keep a lease alive, then let it all go**: `pact lease renew <path>`
-  refreshes the TTL — a long task must not outlive its lease. `pact lease
-  release <path>` frees one file, `pact lease release --all` frees everything
-  you hold in a single call, so nothing gets half-forgotten. Release before
-  you report yourself finished, not after.
-- **Announce contract changes**: if you change an API, schema, CLI flag, or
-  any other contract another agent depends on, message them:
-  `pact msg send --to <agent> "what changed and why"`. Check the recipient
-  exists with `pact agents` first — a mistyped name sends into the void. One
-  decision that affects several agents goes out as ONE message: repeat `--to`
-  and they all land in a single thread anyone can read and reply into.
-- **Use a file for anything longer than a sentence**: `--body-file <path>`, or
-  `--body-file -` for stdin. Quotes, backslashes and aligned tables do not
-  survive a shell, and handing over an API is exactly that kind of content.
-- **Confirm, don't re-send**: `pact msg sent` shows what you sent and whether
-  the recipient has read it. If you are unsure a message went out, check
-  there — a blind re-send is how a peer's inbox fills with duplicates.
-- **Orient with `pact log`**: one chronological feed of who leased what and
-  who said what. Read it when you join, and when you need to know whether a
-  peer is still moving.
-- **Everything is scriptable**: every pact command accepts `--json` for
-  machine-readable output; prefer it over parsing human-formatted text.
-
-Run `pact doctor` if anything above seems out of date.
+@AGENTS.md
 <!-- pact:end -->
 
 
