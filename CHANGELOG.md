@@ -10,6 +10,12 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.1.2 - 2026-08-02
+#### Build system
+- **(mise)** enable the ui feature in local tasks - (34d0cdf) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.1.1 - 2026-08-02
 #### Features
 - **(cli)** stamp build provenance into pact --version - (5fdbe12) - Clement HUSSENOT-DESENONGES
