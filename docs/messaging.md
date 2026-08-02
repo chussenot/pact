@@ -57,7 +57,8 @@ bd create --type=message --title=<subject> --description=<body> \
 
 Every `bd create` pact runs passes `--no-inherit-labels`. Without it a child
 inherits its parent's labels, so a reply to a message you had already read would
-be born carrying your own `read-by-` label and arrive pre-read.
+be born carrying your own `read-by-` label and arrive pre-read. (br doesn't have
+the flag and doesn't need it — see [Two backends, two argv](#two-backends-two-argv).)
 
 ### The `from` field
 
@@ -106,6 +107,49 @@ parent-child links, which are reliable.
 assigned to you (`bd list --assignee=<agent> --include-infra --json`,
 `--include-infra` because message issues are otherwise hidden from `bd list`
 by default) and filters to `issue_type == "message"` on pact's side.
+
+## Two backends, two argv
+
+pact speaks to either Beads CLI: `bd` (Go, embedded Dolt) or `br` (beads-rust,
+SQLite). Which one it uses is decided by the store on disk, not by preference —
+see the [README](../README.md#install). The messaging *model* is identical on
+both: message-typed beads, `--parent` threads, `read-by-<agent>` labels. The
+argv is not, and the differences are the whole of `pact-l94`. Each was found by
+running `br` 0.2.19, not inferred from bd's documentation.
+
+| What pact needs | `bd` | `br` |
+|---|---|---|
+| list message beads | `list --include-infra --json` | `list --json --type=message` |
+| don't inherit read labels | `--no-inherit-labels` | flag rejected, and unnecessary |
+| shape of `list --json` | a bare array | `{"issues": […], "total": …}` |
+| a message's replies | `list --parent=<id> --include-infra --json` | the root's `parent-child` `dependents` |
+
+Two of those are worth more than a table row:
+
+- **`--no-inherit-labels` isn't missing on br, it's moot.** br rejects the flag
+  outright (`error: unexpected argument`), and the obvious response — emulate it
+  — would be wasted work: a br child is born with no labels at all, so the bug
+  the flag prevents (a reply arriving pre-read) cannot happen there. pact omits
+  it on br and keeps it on bd.
+- **`br list` omits `parent` and has no `--parent` filter**, which is the one
+  divergence that could have shipped as a quietly half-broken inbox: every reply
+  would report itself as its own thread root, and `msg read` would find no
+  replies. `br show --json` does carry `parent`, and a root's `dependents` name
+  its children as `parent-child` edges. So on br every listing is a `list` for
+  the ids plus one `show` to hydrate the records — two subprocesses, but
+  authoritative data. The alternative, deriving parents from br's `<id>.<n>` id
+  shape, would be pact guessing at another tool's id format.
+
+`--type` is the one place br is *ahead*: the filter bd lacks, so on br the
+message-bead filter happens in the backend rather than in pact.
+
+`pact doctor` names the backend it picked, so a puzzling `msg` result starts
+with a one-line answer to "which database am I even looking at":
+
+```
+✓ Beads CLI: br (br 0.2.19)
+✓ Beads CLI: bd (bd version 1.1.2 (20e493e56))
+```
 
 ## One send is one thread, however many recipients
 
@@ -294,7 +338,8 @@ pact msg sent
 pact msg read <id>
 ```
 
-All four require `bd` on `PATH` (exit code 3 if it isn't) and a resolved
+All four require a Beads CLI — `bd` or `br` — on `PATH` (exit code 3 if
+neither is, naming which one this repo's store needs) and a resolved
 agent identity — `--agent <name>` or `PACT_AGENT` (see the
 [README](../README.md) for identity resolution rules).
 

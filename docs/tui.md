@@ -89,8 +89,10 @@ claim is always an explicit, visible action, never silent. See
 
 ### Messages
 
-Your inbox (`bd list --assignee=<agent> --include-infra`, same as
-`pact msg inbox`), with unread messages marked `*`. `Enter` opens the full
+Your inbox — the same query `pact msg inbox` runs, which depends on the backend:
+`bd list --assignee=<agent> --include-infra` on a bd workspace,
+`br list --type=message --assignee=<agent>` on a br one. Unread messages are
+marked `*`. `Enter` opens the full
 thread — root message plus replies — in a detail pane and marks it read;
 `Esc` goes back to the list.
 
@@ -109,10 +111,11 @@ messages map onto Beads issues.
 ### Doctor
 
 The same checks as `pact doctor`, rendered live: git repo, `.pact/` presence,
-`AGENTS.md` freshness, whether `CLAUDE.md` reaches the protocol, whether those
-two files would survive a clone (i.e. aren't gitignored), the `bd` binary and
-version (warning outside the tested range), stale-lease count, and corrupt-lock
-count.
+`AGENTS.md` freshness, whether `CLAUDE.md` reaches the protocol, whether the
+other instruction files pact manages (`GEMINI.md` and friends) are current,
+whether those two files would survive a clone (i.e. aren't gitignored), the
+Beads CLI (`bd` or `br`) binary and version (warning outside the tested range),
+stale-lease count, and corrupt-lock count.
 Lazy-loaded like Messages (only checked once you visit the tab, or press
 `r`), since it shells out to `bd --version` the same way Messages does.
 

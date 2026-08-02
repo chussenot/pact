@@ -28,7 +28,7 @@ flowchart LR
     B[Agent B] -->|lease / msg| P
     P --> F[".pact/ (leases, event log)"]
     P --> G["AGENTS.md (protocol)"]
-    P --> D["bd (Beads)"]
+    P --> D["Beads CLI (bd or br)"]
 ```
 
 ## Core features
@@ -57,6 +57,37 @@ one of them can be checked for staleness. Three cases, all idempotent:
 a Claude-driven fleet reads no protocol at all and silently skips leases and
 messaging, which looks identical to a fleet that never started.
 
+Other tools have their own instruction file, and the same failure: an agent
+reading `GEMINI.md` joined a pact fleet having never been told the protocol
+exists. So `init` also points **any agent-instruction file the repo already
+has** back at `AGENTS.md`:
+
+| File | What `init` writes into it |
+| --- | --- |
+| `GEMINI.md` | prose + an `@AGENTS.md` import line (Gemini CLI inlines `@file.md`) |
+| `.github/copilot-instructions.md` | prose + `@AGENTS.md` (Copilot CLI expands it; VS Code's Copilot doesn't, so both halves are covered) |
+| `.cursorrules`, `.windsurfrules`, `.clinerules` | prose only — these formats have no import mechanism, and a dangling `@AGENTS.md` reads like a broken link |
+
+Three properties, each of which is the interesting part:
+
+- **It never creates one.** `CLAUDE.md` stays the only file pact writes from
+  nothing. Existence is the configuration: creating `.windsurfrules` in a repo
+  that has never seen Windsurf would be pact inventing a tool you don't use.
+  (`.clinerules` is skipped outright when it's a *directory*, which newer Cline
+  allows.)
+- **It's always a pointer, never a copy.** Only one file can be checked for
+  staleness, so a second copy of the protocol text is a second thing that drifts
+  unpoliced — see [docs/architecture.md](docs/architecture.md#one-copy-of-the-protocol-however-many-instruction-files).
+- **`pact doctor` has the same opinion about them it has about `CLAUDE.md`**, as
+  **other instruction files current**. A file pact writes and never re-checks
+  goes stale in silence, which is the failure the `AGENTS.md` check already
+  existed to prevent.
+
+`.cursor/rules/` is deliberately *not* managed: it would mean creating a new
+`.mdc` file, and an `.mdc` without the right frontmatter is silently never
+applied — a rule pact writes and Cursor ignores is worse than no rule, because
+it looks done.
+
 **Use case:** you set up a new repo for multi-agent work. You run
 `pact init` once and commit the result. From then on, cloning the repo and
 pointing any agent at it is enough; re-running `pact init` after upgrading
@@ -64,8 +95,9 @@ pact keeps the block current without touching anything else you've written
 in `AGENTS.md`.
 
 **`pact init` commits what it wrote**, so "commit the result" isn't a step
-you can forget. It stages exactly `AGENTS.md`, `CLAUDE.md` and `.gitignore` and
-commits only those — unrelated staged work stays staged, waiting for its own
+you can forget. It stages exactly `AGENTS.md`, `CLAUDE.md`, `.gitignore` and any
+instruction file it just pointed at `AGENTS.md`, and commits only those —
+unrelated staged work stays staged, waiting for its own
 commit. Re-running finds nothing to commit rather than piling up empties, and
 `--no-commit` writes the files and stops. The message is a Conventional Commit,
 because a generated non-conventional subject is exactly what makes `cog bump`
@@ -123,7 +155,11 @@ The protocol itself is short:
 - **Everything is scriptable**: every command supports `--json`.
 
 `pact init --print` writes the block to stdout instead of `AGENTS.md`, which
-is the honest way to see what your agents are actually being told.
+is the honest way to see what your agents are actually being told. It prints the
+raw markdown and nothing else: `--print --json` is still the raw block, because
+what you asked for is the text, not a report about it. Every other `init`
+invocation honours `--json`, whose report carries `instruction_files` alongside
+`agents_md`, `claude_md` and the commit fields.
 
 ### Leases — claim a file before you edit it
 
@@ -171,7 +207,12 @@ took 2 lease(s) for cli-wire:
 If any path is held by someone else, none are taken — the ones already grabbed
 in that call are rolled back and the error names the path you have to negotiate
 over. An agent that needs a module *and* the line that registers it can claim
-both or neither, instead of sitting on half a change.
+both or neither, instead of sitting on half a change. Claiming isn't the same as
+being allowed to edit, though: if that line belongs to another agent by
+assignment, your new file never gets compiled and you can't test it — a real gap,
+with a
+[documented workaround](docs/leases.md#working-on-a-new-file-you-cant-compile-yet)
+rather than a fix.
 
 `pact lease ls` leads with the
 lease's age, an `active` / `stale` / `expired` state, and the holder's
@@ -373,13 +414,37 @@ cargo build --release --features ui       # drop --features ui to skip `pact ui`
 cp target/release/pact /usr/local/bin/    # or anywhere on your PATH
 ```
 
-Requires `bd` (beads) on `PATH` for the `msg` subcommands; `init`, `lease`,
-`whoami`, and `agents`, `log` and `doctor` (partially — the lease half plus a
-warning) work without it. pact is tested against `bd` `1.1.0 <= version <
-1.2.0`; outside that range everything still runs and `pact doctor` adds a
-warning, since a `bd` that changed its output is the likeliest cause of a
-puzzling `msg` failure. `br` (beads-rust) compatibility is a deliberate later
-phase.
+Requires a **Beads CLI** on `PATH` for the `msg` subcommands; `init`, `lease`,
+`whoami`, `agents`, `log` and `doctor` (partially — the lease half plus a
+warning) work without one. Either implementation will do:
+
+| Backend | What it is | What its `.beads/` looks like |
+|---|---|---|
+| [`bd`](https://github.com/gastownhall/beads) | Go, embedded Dolt | `.beads/embeddeddolt/` |
+| [`br`](https://github.com/dicklesworthstone/beads-rust) | Rust, SQLite | `.beads/<name>.db` |
+
+**The store on disk picks the backend, not a preference.** The two don't share
+data, so pact walks up for the first `.beads/`, reads which tool made it, and
+uses that one. Only a repo with no Beads workspace yet gets a preference (`br`,
+then `bd`), and if both stores are present — what one stray `br init` inside a
+`bd` repo leaves behind — `bd` wins, because that is where the data is. The
+alternative, always preferring `br`, would open an empty SQLite database in
+every existing `bd` repo and cheerfully report an empty inbox.
+
+Exit code `3` still means "no usable Beads CLI on `PATH`", and it now names
+*which* one to install and why the other one you already have isn't a
+substitute. Tested ranges are per backend — `bd` `1.1.0 <= v < 1.2.0`, `br`
+`0.2.0 <= v < 0.3.0` — and outside them everything still runs while `pact
+doctor` adds a warning, since a Beads CLI that changed its output is the
+likeliest cause of a puzzling `msg` failure:
+
+```
+✓ Beads CLI: bd (bd version 1.1.2 (20e493e56))
+✓ Beads CLI: br (br 0.2.19)
+```
+
+`br` is younger and its CLI still moves; the differences pact has to absorb are
+listed in [docs/messaging.md](docs/messaging.md#two-backends-two-argv).
 
 ### Which binary am I running?
 
@@ -418,7 +483,7 @@ pact msg send --to <agent> [--to <agent>...] [--thread <id>] [--subject <text>] 
 pact msg inbox [--unread-only] [--full]
 pact msg sent
 pact msg read <id>
-pact log [-n <count>]
+pact log [-n | --limit <count>]
 pact doctor
 pact ui
 ```
@@ -444,11 +509,11 @@ scripted caller can see whose claim a `--force` destroyed.
 | 0 | success |
 | 1 | generic error |
 | 2 | lease held by another agent (or you don't hold the lease you're releasing) |
-| 3 | Beads CLI (`bd`) not found on `PATH` |
+| 3 | Beads CLI (`bd` or `br`) not found on `PATH` |
 | 4 | not in a git repository |
 
 `pact doctor` exits 1 when a check **fails** (`✗`). A check can also **warn**
-(`!`) — it passed, but you should know: `bd` outside its tested version range,
+(`!`) — it passed, but you should know: a Beads CLI outside its tested version range,
 or protocol files a clone won't see. Warnings never change the exit code, and
 `--json` carries them as `"warn": true` alongside `"ok": true`, so a script can
 tell the two apart. `pact whoami` is the one command that always exits 0: a
@@ -514,11 +579,16 @@ a later fleet supplied the data-model evidence the first one lacked:
 `pact-rnc.4` (one send, one thread, N recipients), `pact-rnc.7`
 (`pact msg sent`), `pact-rnc.13` (`pact log`, backed by `.pact/events.jsonl`)
 and `pact-rnc.17` (read state as shared `bd` labels, so a sender can see who
-looked). Two residues are still open and honestly so: the owner of a *new* file
-still cannot `cargo build` it when the line that registers it belongs to another
-agent (`pact-rnc.21`/`pact-v66` — multi-path `acquire` helps, but the real
-problem is ownership, not claiming), and the `AGENTS.md` block `pact init`
-generates does not yet teach the commands above (`pact-sri`).
+looked).
+
+One residue is still open and honestly so: the owner of a *new* file still cannot
+`cargo build` it when the line that registers it belongs to another agent
+(`pact-rnc.21`/`pact-v66`). Multi-path `acquire` closed the coordination half —
+you can claim the module and its `mod` line together — but the real problem is
+ownership, not claiming, and pact has not fixed it. What has changed is that the
+copy-the-crate workaround every new-file agent was rediscovering under time
+pressure is now [written down](docs/leases.md#working-on-a-new-file-you-cant-compile-yet),
+labelled as a workaround.
 
 The habit is the point: if you run agents against your own repo, ask each one
 what the tooling did to it, and require a quoted command as evidence. That is
@@ -543,13 +613,21 @@ where this list came from.
 Via [mise](https://mise.jdx.dev) tasks (`mise tasks ls` to list them):
 
 ```bash
-mise run build   # cargo build --features ui
-mise run test    # cargo test --features ui
-mise run fmt     # cargo fmt
-mise run lint    # cargo clippy --all-targets --features ui -- -D warnings
-mise run check   # fmt-check + lint + test, same gates as CI
-mise run install # cargo install --path . --force --features ui
+mise run build      # cargo build --features ui
+mise run test       # cargo test --features ui
+mise run fmt        # cargo fmt
+mise run lint       # cargo clippy --all-targets --features ui -- -D warnings
+mise run check-docs # scripts/check-docs.sh — README/docs vs the real CLI
+mise run check      # fmt-check + lint + test + check-docs, same gates as CI
+mise run install    # cargo install --path . --force --features ui
 ```
+
+`check-docs` walks the built binary's `--help` output rather than a hardcoded
+list, and fails if this README's `Commands` block is missing a subcommand or a
+long flag *or* documents one the CLI no longer has, if any relative link in
+`README.md` or `docs/` doesn't resolve, or if a `pact doctor` check isn't named
+in [docs/tui.md](docs/tui.md)'s Doctor section. It exists because a link in this
+file pointed at a doc that had been deleted, and nothing noticed.
 
 Or run the underlying `cargo` commands directly if you don't use mise.
 

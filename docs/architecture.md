@@ -2,7 +2,7 @@
 
 pact is a coordinator, not a platform: it has no server, no daemon, and no
 database of its own. Everything it does is either a file it writes under
-`.pact/` at your repo root, or a command it shells out to (`bd`, for
+`.pact/` at your repo root, or a command it shells out to (a Beads CLI, for
 messaging). This is deliberate — the moment coordination needs its own
 long-running process, it becomes one more thing that can crash, drift out of
 sync, or need babysitting. pact would rather do less and stay honest about it.
@@ -23,14 +23,17 @@ flowchart TB
     (managed block)"]
     P -->|writes| C["CLAUDE.md
     (@AGENTS.md import)"]
-    P -->|shells out to| BD[bd CLI]
+    P -->|writes| I["GEMINI.md, .cursorrules, …
+    (pointers, if already present)"]
+    P -->|shells out to| BD["Beads CLI
+    (bd or br)"]
     BD -->|reads/writes| DB[(Beads database)]
 
     style P fill:#4a5568,color:#fff
     style BD fill:#4a5568,color:#fff
 ```
 
-Every box other than "pact CLI" and "bd CLI" is a plain file or an existing
+Every box other than "pact CLI" and "Beads CLI" is a plain file or an existing
 tool. There's nothing in this diagram pact needs to keep alive between
 invocations.
 
@@ -47,6 +50,7 @@ subdirectory and it'll find the right place.
 | `.pact/events.jsonl` | append-only lease-event log behind `pact log`, bounded | no |
 | `AGENTS.md` (managed block) | the coordination protocol, for agents to read | yes |
 | `CLAUDE.md` (managed block) | one `@AGENTS.md` import line, because Claude Code loads `CLAUDE.md` and never `AGENTS.md` | yes |
+| `GEMINI.md`, `.github/copilot-instructions.md`, `.cursorrules`, `.windsurfrules`, `.clinerules` (managed block) | a pointer back at `AGENTS.md`, and **only if the file already exists** | yes |
 
 Message read state is deliberately *not* in this table: it lives in `bd`, as a
 `read-by-<agent>` label on the message bead. It used to be `.pact/read.json`, and
@@ -107,10 +111,14 @@ the `bd` it will shell out to. Three properties are deliberate:
 - **It never fails.** No identity, no `bd`, not in a git repo — each becomes a
   reported problem, and the command still exits 0. You run `whoami` *because*
   something else broke; it must not break too.
-- **It probes `bd`, not just `bd`'s existence.** `bd --version` is happy in a
-  repo with no reachable Beads database, while every `bd`-backed pact command
-  fails. So `whoami` runs the query those commands actually run and reports the
-  failure as a problem.
+- **It probes the Beads CLI, not just its existence.** `bd --version` is happy in
+  a repo with no reachable Beads database, while every Beads-backed pact command
+  fails. So `whoami` runs a listing — the query those commands actually run —
+  and reports the failure as a problem. The probe is deliberately the plainest
+  form both backends answer (`list --json`, no filters): a probe carrying a
+  bd-only flag failed on br and announced that messaging was broken while
+  `pact msg` worked perfectly, which is a diagnostic lying about the one thing
+  you ran it to diagnose.
 - **It creates nothing**, including `.pact/` — a read-only question shouldn't
   write. It says `(not created yet)` instead.
 
@@ -131,10 +139,42 @@ than confirming it as an agent.
 places the facts already are (`.pact/events.jsonl` and `bd`) and merges them on
 parsed instants, keeping no third copy and no index.
 
-**`pact init` is the one command that writes history.** It commits the three
-files it wrote — `AGENTS.md`, `CLAUDE.md`, `.gitignore` — because the whole
-onboarding model assumes they were committed, and "remember to commit this"
-is a step that gets skipped. The commit is path-scoped (`git commit -- <paths>`
+### One copy of the protocol, however many instruction files
+
+`AGENTS.md` holds the protocol text. Every other file `pact init` manages —
+`CLAUDE.md`, and `GEMINI.md`, `.github/copilot-instructions.md`, `.cursorrules`,
+`.windsurfrules`, `.clinerules` when the repo already has them — gets a
+**pointer**, never a copy: a native `@AGENTS.md` import where the format expands
+one, and prose telling the agent to go read `AGENTS.md` where it doesn't. The
+constraint that forces this is `agents_md::is_current()`, the freshness check
+behind `pact doctor`: it compares one file against the block pact would write
+today, so a second copy of the protocol is a second thing that can drift and
+only one of them is policed. Prose is a weaker mechanism than an import, but the
+readers here are agents with file-read tools — "read `AGENTS.md`" is an
+instruction they can execute, and a dangling `@AGENTS.md` in a format that
+ignores it reads like a broken link.
+
+Which files get a block is decided by **what the repo already has**. Existence is
+the configuration; pact ships no config file, and creating `.windsurfrules` in a
+repo that has never seen Windsurf would be pact inventing a tool the team
+doesn't use. `CLAUDE.md` is the single exception, created when absent, because
+Claude Code loads nothing else and the alternative is a fleet that reads no
+protocol at all.
+
+One layout is worth knowing about because it broke: symlinking every tool's
+instruction file at `AGENTS.md` is the whole point of the agents-md convention,
+and `is_file()` follows symlinks. `GEMINI.md -> AGENTS.md` therefore looked like
+an ordinary target, and the pointer block was spliced *through the link*, over
+the protocol block written seconds earlier in the same `pact init`. It never
+converged — the pointer always wrote last, so `pact doctor` reported the block
+stale and prescribed the command doing the damage. Targets that canonicalize to
+`AGENTS.md` are now skipped, and the skip lives in the one iterator that feeds
+the writer *and* both doctor readers, so they cannot disagree about it.
+
+**`pact init` is the one command that writes history.** It commits the files it
+wrote — `AGENTS.md`, `CLAUDE.md`, `.gitignore`, plus any instruction file it
+pointed at `AGENTS.md` — because the whole onboarding model assumes they were
+committed, and "remember to commit this" is a step that gets skipped. The commit is path-scoped (`git commit -- <paths>`
 builds from HEAD plus those paths), so unrelated staged work stays staged
 rather than being swept into a commit pact authored. `--no-commit` opts out.
 pact never passes `git add -f`: a path the repo ignores is a decision pact
@@ -154,6 +194,25 @@ agents`, `pact doctor` and `pact ui`'s refresh timer all pruned lock files as a
 side effect, and asking twice gave two answers. Collecting is now confined to
 `lease ls` and `acquire` — see [docs/leases.md](leases.md).
 
+## Choosing a Beads backend: the store decides, not a preference
+
+`src/beads.rs` is the only place pact shells out to Beads, and it supports two
+CLIs: `bd` (Go, embedded Dolt) and `br` (beads-rust, SQLite). They do **not**
+share a store, which is why selecting one is not `which("br").or(which("bd"))`.
+pact walks up for the first `.beads/` and reads what made it — `embeddeddolt/`
+means bd, a `*.db` file means br — and tries only that backend. Nothing to read
+yet is the only case with a genuine preference (br, then bd).
+
+An existing store is a constraint, not a taste. On a machine with both installed,
+an unconditional "prefer br" would open an empty SQLite database in every bd repo
+and report an empty inbox — and a tool that says "no messages" because it opened
+the wrong database is worse than one that is missing. So a store pins the
+backend, the candidate list is one binary long, and a missing binary is an honest
+exit 3 whose message names which one to install and why the other one already on
+your `PATH` is not a substitute. When both stores are present — which is what one
+stray `br init` inside a bd repo leaves behind — bd wins, because that is where
+the data is.
+
 ## What pact deliberately doesn't do
 
 - **No daemon or background process.** Every command is a single invocation
@@ -161,8 +220,10 @@ side effect, and asking twice gave two answers. Collecting is now confined to
 - **No MCP server.** pact is a CLI; wire it into an agent however that agent
   already runs shell commands.
 - **No direct Beads database or JSONL access.** Messaging always shells out
-  to `bd`, never reads `.beads/*.db` or `issues.jsonl` directly. If Beads
-  changes its storage format, pact doesn't need to know.
+  to the Beads CLI, never reads `.beads/*.db`, `.beads/embeddeddolt/` or
+  `issues.jsonl` directly. If Beads changes its storage format, pact doesn't
+  need to know — and this is what made supporting a second backend a matter of
+  argv rather than of storage.
 - **No mandatory locking.** Leases are advisory — see
   [docs/leases.md](leases.md) for why that's a feature, not a gap.
 - **No config file, no network I/O.** Everything is either a CLI flag, an
@@ -182,7 +243,7 @@ humans, its exit codes are documented behavior, not incidental:
 | 0 | success |
 | 1 | generic error |
 | 2 | lease held by another agent (or you don't hold the lease you're releasing) |
-| 3 | Beads CLI (`bd`) not found on `PATH` |
+| 3 | Beads CLI (`bd` or `br`) not found on `PATH` |
 | 4 | not in a git repository |
 
 An agent scripting against pact can branch on these without parsing error

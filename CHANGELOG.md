@@ -85,6 +85,60 @@ reasoning a commit subject cannot.
 - - -
 
 
+## Notes — unreleased
+
+Hand-written, and deliberately not under a version heading: none of this is
+tagged yet. When the next release is cut, rename this section to match it — do
+not move any of it into the generated `## <version>` sections above, which are
+cog's.
+
+- **A second Beads backend.** pact now speaks `br` (beads-rust, SQLite) as well
+  as `bd` (Go, embedded Dolt). The store on disk picks the backend rather than a
+  preference order, because the two don't share data and an unconditional
+  "prefer br" would open an empty database in every existing bd repo and report
+  an empty inbox. Exit code 3 now names *which* CLI to install. Tested ranges are
+  per backend (`bd` 1.1.0–1.2.0, `br` 0.2.0–0.3.0). Every flag `msg` depends on
+  was checked by running `br` 0.2.19; the four that differ, and why `br`'s
+  missing `--parent` filter needed a `list`+`show` pair rather than a guess at
+  its id shape, are in [docs/messaging.md](docs/messaging.md#two-backends-two-argv).
+- **`pact init` points other agent-instruction files at `AGENTS.md`.**
+  `GEMINI.md`, `.github/copilot-instructions.md`, `.cursorrules`,
+  `.windsurfrules` and `.clinerules` get a pointer block — a native `@AGENTS.md`
+  import where the format expands one, prose otherwise — **only if the repo
+  already has the file**. `CLAUDE.md` stays the one file pact creates from
+  nothing. `pact doctor` gained a matching check, **other instruction files
+  current**, and `pact init --json` gained `instruction_files`.
+- **Fixed: `pact init` destroyed `AGENTS.md` through a symlinked instruction
+  file.** `GEMINI.md -> AGENTS.md` is a normal agents-md layout, and `is_file()`
+  follows symlinks, so the pointer block was spliced through the link over the
+  protocol block written seconds earlier in the same command. It never
+  converged: `pact doctor` then reported the block stale and prescribed the
+  command doing the damage.
+- **Fixed: every `br` failure printed an empty reason.** `bd` writes errors to
+  stderr; `br` leaves stderr empty and puts a JSON envelope on stdout, so
+  failures arrived as `br [...] failed (exit status: 2): ` with nothing after
+  the colon — the backend's message *and* its actionable hint thrown away.
+- **Fixed: `pact whoami` on a `br` workspace announced that messaging was
+  broken** while `pact msg` worked fine. Its health probe carried a bd-only
+  flag; it now uses the plainest listing both backends answer.
+- **Added: `scripts/check-docs.sh`, wired into CI and `mise run check`.** It
+  walks the built binary's own `--help` output and fails when the README's
+  `Commands` block is missing a subcommand or long flag, when it documents one
+  the CLI no longer has, when a relative link in `README.md` or `docs/` doesn't
+  resolve, or when a `pact doctor` check isn't named in `docs/tui.md`. A README
+  link to a deleted doc had already survived a release.
+- **Added: `tests/cli.rs` pins the exact top-level `--json` key set of every
+  command**, so changing one is now an edit to the contract rather than a silent
+  break. Two shapes were pinned *as they are* and are genuinely inconsistent:
+  `lease renew --json` returns the bare lease where `lease acquire --json`
+  returns `{lease, stolen}`, and `lease release --all --json` is an array of
+  bare path strings where `lease release <path> --json` is `{path, displaced}`.
+  Recording the contract is not the same as improving it.
+- **Documented, not fixed: the new-file author who can't compile their own
+  work** (`pact-rnc.21`/`pact-v66`). The copy-the-crate workaround is now in
+  [docs/leases.md](docs/leases.md#working-on-a-new-file-you-cant-compile-yet),
+  labelled as a workaround with its costs stated.
+
 ## Notes — 0.1.0
 
 First tagged release. `pact` coordinates several coding agents working on one

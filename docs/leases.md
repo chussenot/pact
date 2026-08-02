@@ -118,11 +118,53 @@ Two deliberate details:
 The motivating case is a new module and the line that registers it (`mod
 parser;`): an agent that can't hold both atomically ends up sitting on half a
 change. Note what this does *not* fix — if the registration line belongs to
-another agent by assignment, being able to claim it doesn't mean you may edit it.
-That is still open (`pact-rnc.21`/`pact-v66`).
+another agent by assignment, being able to claim it doesn't mean you may edit it,
+and then you can't compile your own file. See
+[Working on a new file you can't compile yet](#working-on-a-new-file-you-cant-compile-yet).
 
 A single path renders and serializes exactly as it always did, including
 `--json` emitting the lease object rather than a one-element array.
+
+### A lease is on a path, not on a file
+
+`pact lease acquire src/parser.rs` succeeds when `src/parser.rs` doesn't exist
+yet. That's deliberate and it's the right move for a new module — claim it while
+you're still writing it, so a peer planning the same file finds out now rather
+than at merge time — but nothing said so out loud, and an agent that assumed
+otherwise leased the enclosing `scripts/` directory instead, which claims far
+more than it meant to.
+
+### Working on a new file you can't compile yet
+
+Claiming the new module and its `mod` line together solves the *coordination*
+half of `pact-rnc.21`. It does nothing for the *verification* half. If
+`src/main.rs` belongs to another agent by assignment, you may not add
+`mod parser;` to it — so your file isn't in the crate, `cargo build` never sees
+it, and you cannot run the tests you just wrote. The gap is real and pact does
+not close it.
+
+What the fleet keeps rediscovering, written down once so nobody has to invent it
+under time pressure: build a throwaway crate.
+
+```bash
+scratch=$(mktemp -d)
+cp -r src Cargo.toml Cargo.lock "$scratch"/
+echo 'mod parser;' >> "$scratch"/src/main.rs   # the line you may not write for real
+cd "$scratch" && cargo test parser
+```
+
+Your module compiles and its tests run in a copy nobody else is editing, the
+real tree is untouched, and the owner of `src/main.rs` still adds the real
+registration line when they get to it — tell them it's ready with
+`pact msg send`.
+
+**This is a workaround for a gap, not a feature**, and it should read like one.
+It costs a full cold rebuild; it tests your file against a *snapshot* of a tree
+your peers are actively changing, so a green result there can still be red in
+the repo; and nothing reminds you to delete the scratch dir or re-run once the
+`mod` line lands for real. The actual fix is a lease that can carry a named
+registration point for the owning agent to apply on your behalf — option (a) of
+`pact-rnc.21`, not built, tracked as `pact-v66`.
 
 ## Lifecycle: expiry and stealing
 
