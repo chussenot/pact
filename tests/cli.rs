@@ -2668,3 +2668,61 @@ fn a_lock_file_is_never_visible_before_its_contents() {
     writer.join().unwrap();
     assert_eq!(empty_seen, 0, "observed {empty_seen} zero-byte lock files");
 }
+
+/// `pact init` must never leave a user's own file truncated.
+///
+/// AGENTS.md, CLAUDE.md and .gitignore are mostly written by the human, and the
+/// module promises never to touch content outside its markers. A plain
+/// `fs::write` truncates before it writes, so a crash in between broke that
+/// promise completely rather than partially — and on a first init the file is
+/// not committed yet, so there is nothing to recover from (pact-703.2).
+///
+/// Runs init repeatedly while a reader watches AGENTS.md, and asserts the file
+/// is never observed empty or missing its own markers.
+#[test]
+fn init_never_exposes_a_truncated_agents_md() {
+    let tmp = init_repo();
+    assert_ok(&pact(tmp.path(), "setup-agent", &["init", "--no-commit"]));
+    // Content outside the markers, which is the thing at risk.
+    let agents_md = tmp.path().join("AGENTS.md");
+    let seeded = format!(
+        "# House rules\n\nkeep it lazy.\n\n{}",
+        std::fs::read_to_string(&agents_md).unwrap()
+    );
+    std::fs::write(&agents_md, &seeded).unwrap();
+
+    let root = tmp.path().to_path_buf();
+    let writer = std::thread::spawn(move || {
+        for _ in 0..40 {
+            let _ = std::process::Command::new(env!("CARGO_BIN_EXE_pact"))
+                .args(["init", "--no-commit"])
+                .current_dir(&root)
+                .env("PACT_AGENT", "writer-agent")
+                .output();
+        }
+    });
+
+    let mut bad = 0usize;
+    while !writer.is_finished() {
+        match std::fs::read_to_string(&agents_md) {
+            // Either spelling of the failure: gone, empty, or missing the
+            // user's own text that lives outside the managed block.
+            Ok(body) if body.is_empty() || !body.contains("# House rules") => bad += 1,
+            Err(_) => bad += 1,
+            Ok(_) => {}
+        }
+    }
+    writer.join().unwrap();
+    assert_eq!(
+        bad, 0,
+        "observed {bad} truncated or missing reads of AGENTS.md"
+    );
+
+    // And no litter beside the file it replaced.
+    let strays = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".pact-write"))
+        .count();
+    assert_eq!(strays, 0, "temp files left next to the user's file");
+}

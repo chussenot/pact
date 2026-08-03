@@ -146,8 +146,7 @@ fn splice_block(path: &Path, body: &str) -> Result<()> {
         }
     };
 
-    std::fs::write(path, new_content).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    write_atomic(path, &new_content)
 }
 
 /// The line that pulls `AGENTS.md` into `CLAUDE.md`. Claude Code resolves a
@@ -379,8 +378,7 @@ pub fn ensure_gitignore(repo_root: &Path) -> Result<()> {
     }
     new_content.push_str(".pact/\n");
 
-    std::fs::write(&path, new_content).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    write_atomic(&path, &new_content)
 }
 
 /// Whether AGENTS.md exists, has a managed block, and that block matches the
@@ -397,6 +395,53 @@ fn has_current_block(path: &Path, body: &str) -> Result<bool> {
         return Ok(false);
     };
     Ok(existing[begin..end] == format!("{BEGIN_MARKER}\n{body}{END_MARKER}\n"))
+}
+
+/// Replace `path`'s contents without ever leaving it truncated.
+///
+/// `std::fs::write` truncates the destination and then writes. A crash, a full
+/// disk or a kill in between leaves the file empty or half-written — and the
+/// files this module writes are not pact's own state. They are `AGENTS.md`,
+/// `CLAUDE.md`, `GEMINI.md`, `.cursorrules`, `.gitignore`: files the user mostly
+/// wrote, whose content outside the markers this module promises never to
+/// touch. A truncated write breaks that promise completely rather than
+/// partially, and on a first `pact init` the file is not committed yet, so
+/// there is no copy to recover from — which is also the run most likely to be
+/// interrupted, because it is the one doing the most work.
+///
+/// Write beside the target and rename: rename is atomic on one filesystem, so a
+/// reader sees the old file or the new one and never a half of either. The
+/// temp name comes from the same shared helper the lease and event-log writers
+/// use, so all three sites cannot drift apart.
+///
+/// Permissions are carried over deliberately. A fresh temp file is created with
+/// the process umask, so renaming it over a file the user had chmod'ed would
+/// quietly reset the mode.
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    // Follow a symlink to its target before replacing anything. `fs::write`
+    // wrote THROUGH a link; `rename` would replace the link itself with a
+    // regular file, silently disconnecting a `CLAUDE.md` that somebody had
+    // pointed at their dotfiles. Atomicity is the change being made here;
+    // which file gets written is not, so resolve first and keep the old
+    // meaning. (A link that IS `AGENTS.md` under another name never reaches
+    // this function — `ensure_instruction_files` skips those aliases.)
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = resolved.as_path();
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let tmp = dir.join(crate::events::unique_temp_name(".pact-write"));
+
+    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Do not leave litter next to a user's file if the rename fails.
+            let _ = std::fs::remove_file(&tmp);
+            Err(e).with_context(|| format!("replacing {}", path.display()))
+        }
+    }
 }
 
 /// Read a file's contents, treating "does not exist" as an empty string.
