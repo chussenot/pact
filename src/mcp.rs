@@ -55,25 +55,49 @@
 //! to add zero crates by the same `cargo tree` equality check that guards
 //! `otel`.
 //!
-//! ## Protocol revision
+//! ## Two protocol eras, both served
 //!
-//! This server speaks the **initialization-based** ("legacy", in the spec's
-//! terms) revisions: the client sends `initialize`, we answer with our
-//! capabilities, it sends `notifications/initialized`, and `tools/list` and
-//! `tools/call` follow. [`PROTOCOL_VERSION`] is what we advertise;
-//! [`KNOWN_PROTOCOL_VERSIONS`] is echoed back verbatim when the client asks for
-//! one of them, per the negotiation rule ("If the server supports the requested
-//! protocol version, it MUST respond with the same version. Otherwise, the
-//! server MUST respond with another protocol version it supports").
+//! MCP is not one wire format with growing fields. Revision `2026-07-28` deleted
+//! the handshake: instead of negotiating a version once via `initialize`, every
+//! request declares its own in `_meta`, and `server/discover` — which servers
+//! **MUST** implement — replaces the handshake's capability exchange. The spec
+//! calls the two **legacy** (`2025-11-25` and earlier) and **modern**, and a
+//! server doing both a **dual-era** server. This is one.
 //!
-//! Revision `2026-07-28` replaced that handshake with per-request `_meta`
-//! versioning and a mandatory `server/discover`. It is deliberately NOT
-//! implemented here: it is a second era rather than a newer field set, and
-//! guessing at it is how you ship a server that is wrong in both. A client that
-//! probes `server/discover` first gets a `-32601`, which is exactly the signal
-//! the spec's stdio backward-compatibility rules tell it to read as "this
-//! server is legacy, fall back to `initialize`" — so a dual-era client works
-//! today and a modern-only one fails loudly instead of subtly.
+//! | | Legacy | Modern |
+//! |---|---|---|
+//! | Version arrives in | `initialize` params, once | every request's `_meta` |
+//! | Capabilities | `initialize` result | [`Server::discover`] |
+//! | Results carry `resultType` | no | yes |
+//! | `tools/list` is cacheable | no | yes (`ttlMs`, `cacheScope`) |
+//!
+//! [`Era`] is decided **per request**, not per connection, because the modern
+//! revisions have no session for a connection-wide answer to live in. The rule
+//! is the spec's own: a request carrying modern `_meta` is served as modern, an
+//! `initialize` request selects legacy, and everything else follows whichever
+//! the current request declared.
+//!
+//! What the tools return does not change between eras — the five names, their
+//! schemas and their JSON are era-independent, so all of this is envelope.
+//!
+//! Version handling, in both directions:
+//!
+//! - `initialize` echoes the client's version when it is in
+//!   [`KNOWN_PROTOCOL_VERSIONS`] and otherwise answers [`PROTOCOL_VERSION`],
+//!   which is the negotiation rule ("If the server supports the requested
+//!   protocol version, it MUST respond with the same version. Otherwise, the
+//!   server MUST respond with another protocol version it supports").
+//! - A `_meta` version outside [`MODERN_PROTOCOL_VERSIONS`] gets
+//!   `-32022 UnsupportedProtocolVersionError` with the list to retry from. That
+//!   specific code matters: the spec's fallback rules tell a client to read a
+//!   *recognized* modern error as "modern server, wrong version — retry" and any
+//!   *other* error as "legacy server — fall back to `initialize`". Answering
+//!   `-32601` here would send a modern client back to a handshake it had no need
+//!   of.
+//! - A legacy version named inside modern `_meta` is refused rather than served,
+//!   even though the same string is perfectly valid in `initialize`. It means the
+//!   client has confused the eras, and quietly picking one is how you end up
+//!   emitting a `resultType` to something whose schema has no such field.
 //!
 //! ## Lifecycle
 //!
@@ -105,6 +129,27 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 /// rule provides for.
 const KNOWN_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 
+/// Revisions that carry their version in each request's `_meta` instead of
+/// negotiating once, newest first. `2026-07-28` is the first of them.
+const MODERN_PROTOCOL_VERSIONS: &[&str] = &["2026-07-28"];
+
+/// `_meta` keys, spelled as the schema spells them. The prefix is mandatory and
+/// the whole string is the key — not a nested object.
+const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+
+/// `UnsupportedProtocolVersionError`. Outside JSON-RPC's reserved range and
+/// defined by MCP itself, which is why it sits apart from the four above.
+const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+/// How long a client may cache `server/discover` and `tools/list`.
+///
+/// The tool table is a `const` in this file, so within one process the answer
+/// cannot change — but the process is spawned per session and an upgraded pact
+/// can have different tools. A minute stops a polling dashboard re-listing on
+/// every tick without outliving a `cargo install`.
+const CACHE_TTL_MS: u64 = 60_000;
+
 // JSON-RPC 2.0 error codes. Only the reserved ones; MCP defines no others for
 // the methods implemented here, and inventing a code in the reserved range is
 // how a client's error handling stops working.
@@ -130,8 +175,32 @@ const EVENTS_MAX: usize = 500;
 /// try, fail, and — worse — report to a human that pact refused it.
 struct Tool {
     name: &'static str,
+    /// Human-readable name for a client's UI. Top-level `title` rather than
+    /// `annotations.title`: the schema has both, and the top-level one is the
+    /// field a client displays.
+    title: &'static str,
     description: &'static str,
     schema: fn() -> Value,
+}
+
+/// `readOnlyHint` is the machine-readable form of this module's whole promise,
+/// so every tool carries it. Field names are from `ToolAnnotations` in the
+/// published `schema.ts`, not guessed — the prose spec pages describe
+/// `annotations` without enumerating it.
+///
+/// Only two of the four hints are set, on the schema's own instruction:
+/// `destructiveHint` and `idempotentHint` are documented as "meaningful only
+/// when `readOnlyHint == false`", so stating them on a read-only tool would be
+/// noise that invites a reader to wonder which one wins.
+///
+/// `openWorldHint: false` because every answer comes from this repository —
+/// files under `.pact/` and a local Beads CLI. Nothing here reaches a network,
+/// and the default for that hint is `true`, so saying so is informative.
+///
+/// A client is required to treat all of this as untrusted, which is why the
+/// same fact is also the first sentence of every description.
+fn read_only_annotations() -> Value {
+    json!({ "readOnlyHint": true, "openWorldHint": false })
 }
 
 /// `{"type": "object", "additionalProperties": false}` — the spec's recommended
@@ -143,6 +212,7 @@ fn no_args() -> Value {
 const TOOLS: &[Tool] = &[
     Tool {
         name: "pact_lease_list",
+        title: "Leases held",
         description: "Read-only. Lists the advisory file leases agents currently hold in this \
              repository: for each, the holder, the path, its age in seconds, the TTL remaining \
              (negative once the lease is past it), the holder's note explaining what they are \
@@ -167,6 +237,7 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "pact_msg_inbox",
+        title: "Agent inbox",
         description: "Read-only. Lists the messages addressed to one agent identity, newest last, \
              with sender, subject, body and an unread flag. IMPORTANT: unlike `pact msg inbox` \
              followed by `pact msg read`, this tool does NOT mark anything read — pact records \
@@ -194,6 +265,7 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "pact_msg_thread",
+        title: "Message thread",
         description: "Read-only. Returns every message in one thread, oldest first, with full \
              bodies — the conversation `pact msg read <id>` shows. IMPORTANT: `pact msg read` \
              marks the whole thread read for the reading agent by writing a `read-by-<agent>` \
@@ -220,6 +292,7 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "pact_doctor",
+        title: "Repository health",
         description: "Read-only. Runs pact's health checks on this repository and returns each \
              one's name, ok/warning status and detail, plus whether the repository is healthy \
              overall. Answers questions like whether the coordination protocol in AGENTS.md is \
@@ -229,6 +302,7 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "pact_events_tail",
+        title: "Lease event log",
         description: "Read-only. Returns the last N entries of the lease event log — every \
              acquire, renew, release, steal and expiry, with the agent, the path, the note and \
              the timestamp. This is `pact log`, and it is the cheapest way to see whether a fleet \
@@ -250,6 +324,31 @@ const TOOLS: &[Tool] = &[
         },
     },
 ];
+
+/// Which protocol era a single request is written in.
+///
+/// Per-request and not per-connection, because that is how the modern revisions
+/// work — they have no handshake and no session, so two requests on the same
+/// pipe may legitimately differ. The spec's own rule for a dual-era server: a
+/// request carrying modern `_meta` is served as modern, an `initialize` request
+/// selects legacy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Era {
+    /// `initialize` handshake; results carry no `resultType`.
+    Legacy,
+    /// Per-request `_meta`; results carry `resultType` and caching hints.
+    Modern,
+}
+
+/// The protocol version a modern request declares, if it declares one.
+///
+/// A free function, not a method: with `&self` in scope the returned `&str`'s
+/// lifetime is ambiguous between the receiver and the argument, which is what
+/// stopped the same chain compiling inside [`Server::tools_call`]. With one
+/// reference in, elision has only one answer and gets it right.
+fn declared_version(params: Option<&Value>) -> Option<&str> {
+    params?.get("_meta")?.get(META_PROTOCOL_VERSION)?.as_str()
+}
 
 /// Everything a tool call needs, resolved once at startup.
 pub struct Server {
@@ -325,16 +424,66 @@ impl Server {
             return None;
         };
 
+        // `initialize` selects legacy semantics outright — it is the request
+        // that means "I am a legacy client" — so it is matched before any
+        // `_meta` is consulted.
+        if method == "initialize" {
+            return Some(ok_response(id, self.initialize(params)));
+        }
+
+        let era = match declared_version(params) {
+            // No declared version: a legacy client, mid-session.
+            None => Era::Legacy,
+            Some(v) if MODERN_PROTOCOL_VERSIONS.contains(&v) => Era::Modern,
+            // A version we do not implement — including a legacy revision named
+            // in a modern envelope, which is a client confusing the two eras.
+            // Answering the MCP-defined error rather than a generic one is what
+            // lets the client retry with a version from the list instead of
+            // falling back to `initialize`.
+            Some(v) => return Some(unsupported_version_response(id, v)),
+        };
+
         match method {
-            "initialize" => Some(ok_response(id, self.initialize(params))),
-            "tools/list" => Some(ok_response(id, tools_list())),
-            "tools/call" => Some(self.tools_call(id, params)),
+            // The modern era's mandatory probe, and a dual-era client's way of
+            // finding out which era it is talking to. Answered whether or not
+            // `_meta` was present: a client sending it *is* asking, and telling
+            // it `supportedVersions` is more useful than insisting on
+            // metadata it will supply on the next request anyway.
+            "server/discover" => Some(ok_response(id, self.discover())),
+            "tools/list" => Some(ok_response(id, tools_list(era))),
+            "tools/call" => Some(self.tools_call(id, params, era)),
             _ => Some(error_response(
                 id,
                 METHOD_NOT_FOUND,
                 &format!("unknown method \"{method}\""),
             )),
         }
+    }
+
+    /// `DiscoverResult`: what we support, what we can do, who we are.
+    ///
+    /// Both eras' versions are listed. The spec's own example mixes them, and a
+    /// client that cannot use one will pick the other — whereas listing only the
+    /// modern ones would hide from a dual-era client that `initialize` works.
+    fn discover(&self) -> Value {
+        let supported: Vec<&str> = MODERN_PROTOCOL_VERSIONS
+            .iter()
+            .chain(KNOWN_PROTOCOL_VERSIONS.iter().rev())
+            .copied()
+            .collect();
+        json!({
+            "resultType": "complete",
+            "supportedVersions": supported,
+            "capabilities": { "tools": {} },
+            "instructions": INSTRUCTIONS,
+            // Required fields of `CacheableResult`, not decoration.
+            "ttlMs": CACHE_TTL_MS,
+            // `public`: nothing here is user-specific — five tool names and a
+            // version. The tool *results* are another matter, and they are not
+            // cacheable results.
+            "cacheScope": "public",
+            "_meta": { META_SERVER_INFO: server_info() },
+        })
     }
 
     fn initialize(&self, params: Option<&Value>) -> Value {
@@ -352,22 +501,14 @@ impl Server {
             // would invite a client to wait for a notification we will never
             // send.
             "capabilities": { "tools": {} },
-            "serverInfo": {
-                "name": "pact",
-                "version": env!("CARGO_PKG_VERSION"),
-            },
+            "serverInfo": server_info(),
             // Shown to the model by most clients, so it carries the one fact
             // that changes what the model should do with these tools.
-            "instructions": "pact coordinates coding agents working on one repository. This \
-                 server is strictly read-only: it observes leases, messages, health and the event \
-                 log, and cannot acquire or release a lease, send a message, or mark a message \
-                 read. Reading a message or thread here does NOT mark it read and does not \
-                 affect delivery state. Every mutation is a `pact` CLI command run by the agent \
-                 doing the work.",
+            "instructions": INSTRUCTIONS,
         })
     }
 
-    fn tools_call(&self, id: Value, params: Option<&Value>) -> String {
+    fn tools_call(&self, id: Value, params: Option<&Value>, era: Era) -> String {
         // Bound before the field reads rather than chained through `and_then`,
         // which cannot name the lifetime the borrowed `&str` comes from.
         let Some(params) = params else {
@@ -406,7 +547,7 @@ impl Server {
         span.set("pact.mcp.tool", tool.name);
 
         match self.dispatch(tool.name, args) {
-            Ok(value) => ok_response(id, tool_result(value)),
+            Ok(value) => ok_response(id, complete(tool_result(value), era)),
             Err(e) => {
                 let code = output::code_for(&e);
                 span.fail(if code == 3 {
@@ -421,7 +562,7 @@ impl Server {
                 // (3 = no Beads CLI on PATH) and because an orchestrator that
                 // knows the CLI should branch on the same number it would have
                 // got from a shell.
-                ok_response(id, tool_error(&format!("{e:#}"), code))
+                ok_response(id, complete(tool_error(&format!("{e:#}"), code), era))
             }
         }
     }
@@ -494,14 +635,78 @@ pub fn serve(root: PathBuf) -> Result<i32> {
     Server::new(root).run(stdin.lock(), &mut stdout)
 }
 
-fn tools_list() -> Value {
+/// The one fact that changes what a model should do with these tools. Shared by
+/// `initialize` and `server/discover` so the two cannot say different things.
+const INSTRUCTIONS: &str = "pact coordinates coding agents working on one repository. This server \
+     is strictly read-only: it observes leases, messages, health and the event log, and cannot \
+     acquire or release a lease, send a message, or mark a message read. Reading a message or \
+     thread here does NOT mark it read and does not affect delivery state. Every mutation is a \
+     `pact` CLI command run by the agent doing the work.";
+
+fn server_info() -> Value {
+    json!({ "name": "pact", "version": env!("CARGO_PKG_VERSION") })
+}
+
+/// Stamp a result with `resultType: "complete"` when the request was modern.
+///
+/// Only when modern, and that asymmetry is deliberate: the field is required of
+/// a server implementing `2026-07-28`, and a legacy client is entitled to a
+/// result shaped like its own revision. The spec makes the reverse safe — a
+/// client receiving no `resultType` MUST read it as `"complete"` — so the risk
+/// runs only one way, towards a strict legacy client rejecting a field its
+/// schema does not have.
+fn complete(mut result: Value, era: Era) -> Value {
+    if era == Era::Modern {
+        if let Some(object) = result.as_object_mut() {
+            object.insert("resultType".into(), Value::from("complete"));
+        }
+    }
+    result
+}
+
+fn unsupported_version_response(id: Value, requested: &str) -> String {
+    let supported: Vec<&str> = MODERN_PROTOCOL_VERSIONS
+        .iter()
+        .chain(KNOWN_PROTOCOL_VERSIONS.iter().rev())
+        .copied()
+        .collect();
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": UNSUPPORTED_PROTOCOL_VERSION,
+            "message": "Unsupported protocol version",
+            "data": { "supported": supported, "requested": requested },
+        },
+    })
+    .to_string()
+}
+
+fn tools_list(era: Era) -> Value {
+    // `ListToolsResult` is a `CacheableResult` in the modern revisions, so the
+    // caching hints belong with the `resultType` that `complete` adds — both are
+    // required there and neither is a field the legacy shape has.
+    if era == Era::Modern {
+        let mut listing = tool_listing();
+        if let Some(object) = listing.as_object_mut() {
+            object.insert("ttlMs".into(), Value::from(CACHE_TTL_MS));
+            object.insert("cacheScope".into(), Value::from("public"));
+        }
+        return complete(listing, era);
+    }
+    tool_listing()
+}
+
+fn tool_listing() -> Value {
     json!({
         "tools": TOOLS
             .iter()
             .map(|t| json!({
                 "name": t.name,
+                "title": t.title,
                 "description": t.description,
                 "inputSchema": (t.schema)(),
+                "annotations": read_only_annotations(),
             }))
             .collect::<Vec<_>>(),
     })
@@ -646,6 +851,22 @@ mod tests {
         }
     }
 
+    /// The read-only promise, in the machine-readable form a client can act on.
+    #[test]
+    fn every_tool_is_annotated_read_only() {
+        let r = respond(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
+        for t in r["result"]["tools"].as_array().unwrap() {
+            assert_eq!(t["annotations"]["readOnlyHint"], true, "{}", t["name"]);
+            // Everything comes from this repository; nothing reaches a network.
+            assert_eq!(t["annotations"]["openWorldHint"], false, "{}", t["name"]);
+            // Meaningful only when readOnlyHint is false, so stating them would
+            // be noise — asserted so a later edit does not add them absently.
+            assert!(t["annotations"]["destructiveHint"].is_null());
+            assert!(t["annotations"]["idempotentHint"].is_null());
+            assert!(t["title"].as_str().is_some_and(|s| !s.is_empty()));
+        }
+    }
+
     /// The trap, as a test: both message tools must warn that looking is not
     /// reading, because that is the one way this server could mislead a caller
     /// into a decision (not re-sending) that costs something.
@@ -675,13 +896,134 @@ mod tests {
         assert!(r["result"].is_null());
     }
 
-    /// `server/discover` is the modern era's mandatory probe. Answering
-    /// method-not-found is what tells a dual-era client to fall back to
-    /// `initialize`, so this is load-bearing rather than incidental.
+    /// `server/discover` is the modern era's mandatory probe: supported
+    /// versions, capabilities, identity, in one request.
     #[test]
-    fn server_discover_is_rejected_so_clients_fall_back() {
+    fn server_discover_reports_both_eras_versions() {
+        let r = respond(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"server/discover","params":{{"_meta":{{"{META_PROTOCOL_VERSION}":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{{}}}}}}}}"#
+        ));
+        let result = &r["result"];
+        assert_eq!(result["resultType"], "complete");
+        let supported: Vec<&str> = result["supportedVersions"]
+            .as_array()
+            .expect("supportedVersions")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // Newest first, and both eras present: a dual-era client must be able to
+        // see from this one answer that `initialize` would also have worked.
+        assert_eq!(supported[0], "2026-07-28");
+        for legacy in KNOWN_PROTOCOL_VERSIONS {
+            assert!(
+                supported.contains(legacy),
+                "{legacy} missing from {supported:?}"
+            );
+        }
+        assert!(result["capabilities"]["tools"].is_object());
+        assert_eq!(result["_meta"][META_SERVER_INFO]["name"], "pact");
+        assert_eq!(
+            result["_meta"][META_SERVER_INFO]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        // Required fields of CacheableResult.
+        assert_eq!(result["ttlMs"], CACHE_TTL_MS);
+        assert_eq!(result["cacheScope"], "public");
+        // The same text `initialize` gives, so the two eras cannot disagree.
+        assert_eq!(result["instructions"], INSTRUCTIONS);
+    }
+
+    /// The probe is answered even with no `_meta`: a client sending
+    /// `server/discover` is asking which era this is, and the answer is more
+    /// useful than a complaint about metadata.
+    #[test]
+    fn server_discover_answers_without_meta_too() {
         let r = respond(r#"{"jsonrpc":"2.0","id":4,"method":"server/discover","params":{}}"#);
-        assert_eq!(r["error"]["code"], METHOD_NOT_FOUND);
+        assert!(r["result"]["supportedVersions"].is_array(), "{r:#?}");
+    }
+
+    /// A version we do not implement gets MCP's own error with the list to retry
+    /// from — not a generic one, because the spec's fallback rules tell a client
+    /// to read any *unrecognized* error as "this server is legacy" and stop
+    /// speaking modern to it.
+    #[test]
+    fn an_unsupported_declared_version_is_error_32022() {
+        for bad in ["1900-01-01", "2025-11-25", "2025-06-18"] {
+            let r = respond(&format!(
+                r#"{{"jsonrpc":"2.0","id":5,"method":"tools/list","params":{{"_meta":{{"{META_PROTOCOL_VERSION}":"{bad}"}}}}}}"#
+            ));
+            assert_eq!(r["error"]["code"], UNSUPPORTED_PROTOCOL_VERSION, "{bad}");
+            assert_eq!(r["error"]["data"]["requested"], bad);
+            assert!(r["error"]["data"]["supported"]
+                .as_array()
+                .is_some_and(|v| !v.is_empty()));
+        }
+    }
+
+    /// A legacy revision named in a modern envelope is the era confusion above,
+    /// and it must not be served as if the client had said nothing — the same
+    /// string is perfectly valid in `initialize`.
+    #[test]
+    fn a_legacy_version_is_fine_in_initialize_and_not_in_meta() {
+        let ok = respond(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+        );
+        assert_eq!(ok["result"]["protocolVersion"], "2025-06-18");
+        // No resultType: a legacy client gets a legacy-shaped result.
+        assert!(ok["result"]["resultType"].is_null());
+
+        let rejected = respond(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{"_meta":{{"{META_PROTOCOL_VERSION}":"2025-06-18"}}}}}}"#
+        ));
+        assert_eq!(rejected["error"]["code"], UNSUPPORTED_PROTOCOL_VERSION);
+    }
+
+    /// `initialize` selects legacy semantics outright, even if the client also
+    /// bolted modern `_meta` onto it — the spec says the request itself is the
+    /// era signal.
+    #[test]
+    fn initialize_stays_legacy_even_with_modern_meta() {
+        let r = respond(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-06-18","_meta":{{"{META_PROTOCOL_VERSION}":"2026-07-28"}}}}}}"#
+        ));
+        assert_eq!(r["result"]["protocolVersion"], "2025-06-18");
+        assert!(r["result"]["resultType"].is_null());
+    }
+
+    /// Modern results carry `resultType`, and a modern `tools/list` is a
+    /// `CacheableResult` so it carries the caching hints too. Legacy results
+    /// carry neither.
+    #[test]
+    fn result_shape_follows_the_requests_era() {
+        let modern = format!(r#""_meta":{{"{META_PROTOCOL_VERSION}":"2026-07-28"}}"#);
+
+        let listing = respond(&format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{{modern}}}}}"#
+        ));
+        assert_eq!(listing["result"]["resultType"], "complete");
+        assert_eq!(listing["result"]["ttlMs"], CACHE_TTL_MS);
+        assert_eq!(listing["result"]["cacheScope"], "public");
+        assert_eq!(listing["result"]["tools"].as_array().map(Vec::len), Some(5));
+
+        let legacy = respond(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
+        assert!(legacy["result"]["resultType"].is_null());
+        assert!(legacy["result"]["ttlMs"].is_null());
+        assert!(legacy["result"]["cacheScope"].is_null());
+
+        // A tools/call result is a plain Result, so resultType and nothing else.
+        let called = respond(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"pact_events_tail","arguments":{{}},{modern}}}}}"#
+        ));
+        assert_eq!(called["result"]["resultType"], "complete");
+        assert_eq!(called["result"]["isError"], false);
+        assert!(called["result"]["ttlMs"].is_null());
+
+        // Including a failing one — the error path must not lose the field.
+        let failed = respond(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"pact_msg_inbox","arguments":{{}},{modern}}}}}"#
+        ));
+        assert_eq!(failed["result"]["resultType"], "complete");
+        assert_eq!(failed["result"]["isError"], true);
     }
 
     #[test]

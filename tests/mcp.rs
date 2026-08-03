@@ -339,6 +339,84 @@ fn a_missing_beads_cli_is_a_tool_error_not_a_crash() {
     assert_eq!(before, coordination_state(repo), "a failed tool wrote");
 }
 
+/// The modern era end to end, through the real binary: probe with
+/// `server/discover`, then call a tool with the version in `_meta` — and still
+/// not one byte changed.
+///
+/// The unit tests cover the envelope in-process. What this adds is that the two
+/// eras share one process and one repository without either leaking into the
+/// other's results.
+#[test]
+fn a_modern_session_works_and_is_equally_read_only() {
+    let tmp = init_repo();
+    let repo = tmp.path();
+    assert!(pact(repo, "worker-c", &["lease", "acquire", "src/db.rs"])
+        .status
+        .success());
+    let before = coordination_state(repo);
+
+    let meta = serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "modern-test", "version": "0"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+    let (responses, code, _) = serve(
+        repo,
+        &[("PACT_AGENT", "observer")],
+        &[
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+                "params": {"_meta": meta},
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "pact_lease_list", "arguments": {}, "_meta": meta},
+            }),
+            // A version this server does not implement, in the same session.
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/list",
+                "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "1900-01-01"}},
+            }),
+            // And a legacy request afterwards: one process, both eras.
+            serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}),
+        ],
+    );
+    assert_eq!(code, 0);
+    let by_id = |id: u64| {
+        responses
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("no response {id}: {responses:#?}"))
+    };
+
+    let discover = &by_id(1)["result"];
+    assert_eq!(discover["resultType"], "complete");
+    assert!(discover["supportedVersions"]
+        .as_array()
+        .is_some_and(|v| v.iter().any(|s| s == "2026-07-28")));
+    assert_eq!(
+        discover["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "pact"
+    );
+
+    let called = &by_id(2)["result"];
+    assert_eq!(called["resultType"], "complete");
+    assert_eq!(called["structuredContent"][0]["lease"]["path"], "src/db.rs");
+
+    assert_eq!(by_id(3)["error"]["code"], -32022);
+    assert_eq!(by_id(3)["error"]["data"]["requested"], "1900-01-01");
+
+    // The legacy request in the same process gets the legacy shape.
+    assert!(by_id(4)["result"]["resultType"].is_null());
+    assert!(by_id(4)["result"]["tools"].is_array());
+
+    assert_eq!(
+        before,
+        coordination_state(repo),
+        "a modern session must be exactly as read-only as a legacy one"
+    );
+}
+
 /// Malformed input on a channel the client also writes to must not kill the
 /// server: the next well-formed request has to still be answered.
 #[test]

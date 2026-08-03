@@ -275,14 +275,33 @@ cog's.
   equality check, now covering `otel`, `mcp` and `mcp,otel`. MCP's stdio transport
   is newline-delimited JSON-RPC 2.0, so it is `serde_json` — which pact already
   has — plus `std::io`; an SDK would charge an async runtime for framing worth
-  fifty lines. Only the initialization-based ("legacy") revisions are implemented;
-  `2026-07-28` replaced that handshake with per-request `_meta` and a mandatory
-  `server/discover`, and answering `-32601` to that probe is precisely the signal
-  the spec tells a dual-era client to read as "fall back to `initialize`".
+  fifty lines.
+- **Both MCP eras are served.** MCP is not one wire format with growing fields:
+  revision `2026-07-28` deleted the handshake, so instead of agreeing a version
+  once through `initialize`, every request declares its own in `_meta` and a
+  mandatory `server/discover` replaces the capability exchange. The spec calls
+  these *legacy* and *modern* and a server doing both *dual-era*. pact is one.
+  The era is decided **per request**, because the modern revisions have no
+  session for a connection-wide answer to live in, and the tools themselves are
+  era-independent — the five names, their schemas and their JSON are identical,
+  so all of the difference is envelope. A version outside what pact implements
+  gets `-32022 UnsupportedProtocolVersionError` with the list to retry from, and
+  the specific code is the point: the fallback rules tell a client to read a
+  *recognized* modern error as "retry with another version" and any *other* error
+  as "legacy server, fall back to `initialize`", so answering `-32601` here would
+  send a modern client back to a handshake it never needed.
+- **Every tool is annotated `readOnlyHint: true`**, plus `openWorldHint: false`
+  since every answer comes from this repository and nothing reaches a network.
+  `destructiveHint` and `idempotentHint` are deliberately absent: the schema
+  documents them as meaningful only when `readOnlyHint` is false. The field names
+  come from `ToolAnnotations` in the published `schema.ts` — the prose spec pages
+  describe `annotations` without enumerating it, and this shipped a commit late
+  rather than shipping guessed spellings, since a client must treat annotations as
+  untrusted anyway and a misspelled hint conveys nothing.
 - The read-only claim is **tested, not asserted**: `tests/mcp.rs` drives the real
-  binary over pipes, calls every tool, and compares a byte-and-mtime snapshot of
-  `.pact/` and `.beads/` before and after. `tests/mcp_absent.rs` is gated the
-  other way and asserts a default build has no `mcp` subcommand at all.
+  binary over pipes, calls every tool in both eras, and compares a byte-and-mtime
+  snapshot of `.pact/` and `.beads/` before and after. `tests/mcp_absent.rs` is
+  gated the other way and asserts a default build has no `mcp` subcommand at all.
 
 ### Added — ownership outlives the lease
 

@@ -79,7 +79,28 @@ polling every few seconds must not be quietly reclaiming other agents' paths.
 
 ## The five tools
 
-All five are read-only, and each says so in its own description.
+All five are read-only, and each says so twice: in the first words of its
+description, and as machine-readable [tool
+annotations](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)
+a client can filter on without reading prose.
+
+```json
+{
+  "name": "pact_doctor",
+  "title": "Repository health",
+  "description": "Read-only. Runs pact's health checks on this repository …",
+  "inputSchema": { "type": "object", "additionalProperties": false },
+  "annotations": { "readOnlyHint": true, "openWorldHint": false }
+}
+```
+
+`openWorldHint: false` because every answer comes from this repository — files
+under `.pact/` and a local Beads CLI; nothing reaches a network.
+`destructiveHint` and `idempotentHint` are deliberately absent: the schema
+documents them as meaningful only when `readOnlyHint` is false, so stating them
+here would invite a reader to wonder which one wins. Clients are required to
+treat annotations as untrusted, which is exactly why the same fact leads every
+description.
 
 | Tool | Answers | CLI equivalent |
 |---|---|---|
@@ -221,12 +242,58 @@ number either way:
 - **exit 4** — not spawned inside a git repository. This one fails at startup,
   before any tool call.
 
-A malformed line gets a `-32700` parse error and the session continues. An
-unknown method or unknown tool gets `-32601`; that is also what a client probing
-`server/discover` receives, which is the signal the spec's stdio
-backward-compatibility rules tell it to read as "this server speaks the
-`initialize` handshake" — see `src/mcp.rs` for which
-protocol revisions are implemented and why.
+A malformed line gets `-32700` and the session continues. An unknown method or
+unknown tool gets `-32601`. A request declaring a protocol version this server
+does not implement gets `-32022` with the list to retry from — see
+[Protocol versions](#protocol-versions).
+
+## Protocol versions
+
+MCP has two eras, and pact serves both. Revision `2026-07-28` removed the
+handshake: rather than agreeing a version once via `initialize`, every request
+declares its own in `_meta`, and `server/discover` replaces the capability
+exchange. The spec calls these **legacy** (`2025-11-25` and earlier) and
+**modern**, and a server doing both **dual-era**.
+
+| | Legacy | Modern |
+|---|---|---|
+| Opens with | `initialize` | any request, or `server/discover` |
+| Version declared in | `initialize` params, once | every request's `_meta` |
+| Results carry `resultType` | no | yes |
+| `tools/list` cacheable | no | yes (`ttlMs`, `cacheScope`) |
+
+The era is decided **per request**, because the modern revisions have no session
+for a connection-wide answer to live in. The five tools, their arguments and
+their JSON are identical either way — all of the difference is envelope, so
+nothing you build against one era needs rewriting for the other.
+
+You do not have to care which your client speaks. If it sends `initialize`, that
+works. If it probes `server/discover` first, that works:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "complete",
+    "supportedVersions": ["2026-07-28", "2025-06-18", "2025-03-26", "2024-11-05"],
+    "capabilities": { "tools": {} },
+    "instructions": "pact coordinates coding agents working on one repository. This server is strictly read-only: …",
+    "ttlMs": 60000,
+    "cacheScope": "public",
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": { "name": "pact", "version": "0.3.3" }
+    }
+  }
+}
+```
+
+A version outside that list gets `-32022 UnsupportedProtocolVersionError` naming
+what is supported, which is the error a modern client is told to retry from
+rather than fall back on. `2025-11-25` is deliberately not in the list: it is
+initialization-based and would very likely work, but pact advertises only the
+revisions whose shapes were checked field by field, so a client asking for it is
+answered `2025-06-18` and downgrades — which the negotiation rule provides for.
 
 ## Verifying the read-only claim yourself
 
