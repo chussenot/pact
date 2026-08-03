@@ -187,7 +187,65 @@ pub fn human_secs(secs: i64) -> String {
 /// Collision caveat: a path containing literal `__` can collide with a
 /// different path whose separators encode to the same string. Acceptable in v1.
 pub fn encode_path(relative_path: &str) -> String {
-    relative_path.replace('/', "__")
+    let encoded = relative_path.replace('/', "__");
+    // Case-fold the lock NAME, and only where the filesystem folds case too.
+    //
+    // pact-r2s.1 made one file resolve to one lock however the agent spelled
+    // the path — but only for the directory dimension. On a case-insensitive
+    // filesystem, which is macOS's default and what pact's own CI runs,
+    // `src/foo.rs` and `src/Foo.rs` are ONE file and still produced two locks,
+    // so two agents each held it and both were told they did.
+    //
+    // Unconditional lowercasing would be wrong, not merely conservative: on
+    // Linux those really are two files, and collapsing them manufactures the
+    // false conflict that the other half of pact-r2s.1 exists to prevent. So
+    // the answer has to come from the filesystem.
+    //
+    // Only the lock FILENAME is folded. `LeaseInfo.path` keeps the spelling the
+    // holder used, so `pact lease ls` still shows what they typed and the error
+    // still names the path they asked for.
+    encode_with_folding(&encoded, case_insensitive_fs())
+}
+
+/// The folding decision, separated from where the answer comes from, so both
+/// branches are testable on any platform. Only one of them can ever be
+/// exercised end-to-end on a given machine, which is exactly why the other one
+/// needs a test that does not depend on the machine.
+fn encode_with_folding(encoded: &str, fold: bool) -> String {
+    if fold {
+        encoded.to_lowercase()
+    } else {
+        encoded.to_string()
+    }
+}
+
+/// Does this filesystem treat `A` and `a` as the same name?
+///
+/// Probed, not read from `core.ignorecase`: that value is written by git at
+/// clone time and describes the filesystem git saw then, which is not
+/// necessarily the one pact is looking at now — a repo cloned on macOS and
+/// opened over a shared volume from Linux carries the wrong answer. The probe
+/// asks the only authority that matters.
+///
+/// Once per process, in the temp directory rather than in the repo, so a probe
+/// never appears in anyone's `git status`. Unknown answers to "sensitive",
+/// which preserves the behaviour every existing platform already had.
+fn case_insensitive_fs() -> bool {
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| {
+        let dir = std::env::temp_dir();
+        let lower = dir.join(format!(
+            ".pact-case-{}",
+            crate::events::unique_temp_name("p")
+        ));
+        let upper = PathBuf::from(lower.to_string_lossy().to_uppercase());
+        if lower == upper || std::fs::write(&lower, b"").is_err() {
+            return false;
+        }
+        let folded = upper.exists();
+        let _ = std::fs::remove_file(&lower);
+        folded
+    })
 }
 
 /// A path as the lock filename sees it: repo-root-relative, one spelling per
@@ -1193,6 +1251,46 @@ pub fn corrupt_count(repo_root: &Path) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    /// One file must be one lock however it is spelled — pact-r2s.1 covered the
+    /// directory dimension, this covers case. Both branches are asserted here
+    /// because only one of them can run on any given machine: this suite runs on
+    /// Linux (case-sensitive) and macOS (case-insensitive by default), and the
+    /// wrong branch on either is a real bug — two agents holding one file, or a
+    /// conflict over two files that merely share a name (pact-703.3).
+    #[test]
+    fn case_folding_follows_the_filesystem_and_not_the_platform() {
+        // Case-insensitive: two spellings collapse to one lock name.
+        assert_eq!(
+            encode_with_folding("src__Foo.rs", true),
+            encode_with_folding("src__foo.rs", true)
+        );
+        // Case-sensitive: they must stay distinct, or leasing src/foo.rs would
+        // falsely conflict with src/Foo.rs, which is a different file here.
+        assert_ne!(
+            encode_with_folding("src__Foo.rs", false),
+            encode_with_folding("src__foo.rs", false)
+        );
+        // Folding never touches the separator encoding.
+        assert_eq!(encode_with_folding("a__B.rs", true), "a__b.rs");
+    }
+
+    /// The probe must agree with the filesystem the test is actually running
+    /// on, and must not leave anything behind.
+    #[test]
+    fn the_case_probe_matches_this_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Probe"), b"").unwrap();
+        let folds_here = dir.path().join("probe").exists();
+        assert_eq!(
+            case_insensitive_fs(),
+            folds_here,
+            "the probe disagrees with a direct test of this filesystem"
+        );
+        // Repeated calls are cached, not re-probed, and still agree.
+        assert_eq!(case_insensitive_fs(), folds_here);
+    }
+
     use super::*;
     use chrono::Duration;
 
