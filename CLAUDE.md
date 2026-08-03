@@ -65,8 +65,20 @@ Invariants worth knowing, because each was broken at least once:
   loop's poll timeout is `min(data-refresh remaining, next animation frame)` —
   shortening it naively spawns a `bd` subprocess ~10×/second.
 
-Deeper detail lives in `docs/`: `architecture.md`, `leases.md`, `messaging.md`,
-`tui.md`.
+## Documentation
+
+`README.md` carries only *why* — the problem, why each primitive is shaped as it
+is, the non-goals, provenance. Every *how* lives in `docs/`: `install.md`,
+`cli.md` (the command/exit-code contract), `onboarding.md`, `leases.md`,
+`messaging.md`, `architecture.md`, `tui.md`, `telemetry.md`, `development.md`,
+`mascot-animations.md`.
+
+Keep it that way. `scripts/check-docs.sh` (part of `mise run check`) compares
+`docs/cli.md`'s `Commands` block against the built binary in both directions,
+resolves every relative link and `#anchor`, and requires every `pact doctor`
+check name to appear in `docs/tui.md`. After a user-visible change, use the
+`docs-curator` agent in `.claude/agents/` rather than editing docs ad hoc — it
+holds the placement rules and the reasons behind them.
 
 <!-- pact:begin -->
 ## pact coordination protocol

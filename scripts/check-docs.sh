@@ -6,10 +6,10 @@
 # produces a binary with no `pact ui` at all; two links pointed at
 # docs/pact-scaffolding-prompt.md, deleted in 305b456. Every one was mechanical.
 # The managed AGENTS.md block already has a unit test asserting its command
-# needles; this is the same guard for README.md and docs/.
+# needles; this is the same guard for the README and docs/.
 #
 # Three checks, in the bead's order of value per line:
-#   1. every subcommand and flag the real CLI exposes is in README's Commands block
+#   1. every subcommand and flag the real CLI exposes is in docs/cli.md's Commands block
 #      (and, in reverse, nothing in that block has stopped existing)
 #   2. every relative markdown link in README.md and docs/ resolves to a real file
 #   3. every `pact doctor` check name is named in docs/tui.md's Doctor section
@@ -31,7 +31,7 @@ problem() {
 }
 
 # --features ui matters: without it `pact ui` is not in the command tree at all,
-# so a default build would silently under-report what README has to cover.
+# so a default build would silently under-report what cli.md has to cover.
 if [ -n "${PACT_BIN:-}" ]; then
 	pact() { "$PACT_BIN" "$@"; }
 else
@@ -41,7 +41,7 @@ fi
 
 # ---------------------------------------------------------------- CLI inventory
 
-# Global flags live in every single --help; README documents them once in prose
+# Global flags live in every single --help; cli.md documents them once in prose
 # under the Commands block, not per-command, so listing them per-command would
 # be noise.
 is_global() { case "$1" in --agent | --json | --help | --version) return 0 ;; *) return 1 ;; esac; }
@@ -89,46 +89,50 @@ walk ""
 
 [ ${#commands[@]} -gt 0 ] || { problem "walked the CLI and found no subcommands — parser broken"; exit 1; }
 
-# ------------------------------------------------- 1. README Commands block
+# ------------------------------------------------ 1. cli.md Commands block
 
-# The fenced block right after the "## Commands" heading.
+# The fenced block right after the "## Commands" heading, which lives in
+# docs/cli.md. It used to be in README.md; when the README was reduced to
+# reasoning and the reference moved out, this guard was the first thing to
+# break — which is the correct outcome, because a checker that silently stops
+# finding what it checks is worse than one that fails loudly.
 block=$(awk '
 	/^## Commands$/      { want=1; next }
 	want && /^```/       { infence = !infence; if (!infence) exit; next }
 	infence              { print }
-' README.md)
+' docs/cli.md)
 
-[ -n "$block" ] || { problem "README.md has no fenced code block under '## Commands'"; exit 1; }
+[ -n "$block" ] || { problem "docs/cli.md has no fenced code block under '## Commands'"; exit 1; }
 
 for i in "${!flags[@]}"; do
 	f=${flags[$i]}
 	s=${shortflags[$i]}
 	# Either spelling counts: clap treats -n and --limit as one flag, so a reader
-	# who finds `-n <count>` in README has found the flag.
+	# who finds `-n <count>` in cli.md has found the flag.
 	grep -qF -- "$f" <<<"$block" && continue
 	[ -n "$s" ] && grep -qE -- "(^|[^[:alnum:]-])$s([^[:alnum:]-]|$)" <<<"$block" && continue
-	problem "flag $f exists in the CLI but is not in README's Commands block"
+	problem "flag $f exists in the CLI but is not in docs/cli.md's Commands block"
 done
 
 for c in "${commands[@]}"; do
 	grep -qE "^pact $c([[:space:]]|$)" <<<"$block" ||
-		problem "\`pact $c\` exists but is not in README's Commands block"
+		problem "\`pact $c\` exists but is not in docs/cli.md's Commands block"
 done
 
-# Reverse direction — the acceptance criterion is that CI fails when README
-# *references* something that does not exist, which is how a removed flag rots.
+# Reverse direction — CI must fail when the docs *reference* something that does
+# not exist, which is how a removed flag rots.
 while IFS= read -r line; do
 	[ -n "$line" ] || continue
 	invocation=$(sed -E 's/^pact //; s/[[:space:]]*[-<[(].*$//; s/[[:space:]]+$//' <<<"$line")
 	[ -n "$invocation" ] || continue
 	printf '%s\n' "${commands[@]}" | grep -qxF "$invocation" ||
-		problem "README's Commands block documents \`pact $invocation\`, which the CLI does not have"
+		problem "docs/cli.md's Commands block documents \`pact $invocation\`, which the CLI does not have"
 done < <(grep '^pact ' <<<"$block")
 
 for f in $(grep -oE -- '--[a-z][a-z0-9-]*' <<<"$block" | sort -u); do
 	is_global "$f" && continue
 	seen_flag "$f" ||
-		problem "README's Commands block documents $f, which the CLI does not have"
+		problem "docs/cli.md's Commands block documents $f, which the CLI does not have"
 done
 
 # ----------------------------------------------------- 2. relative md links

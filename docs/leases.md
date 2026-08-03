@@ -26,11 +26,51 @@ A lease is one JSON file: `.pact/leases/<encoded-path>.lock`, containing
 principle collide with a different path — a deliberate v1 simplification, not
 an oversight.
 
+### One file is one lease, however you spell the path
+
+The lock name has to be a *canonical* answer to "which file is this", because
+two names for one file means two leases on it, and two agents each told they
+hold it. That is the single failure the whole surface exists to prevent, so the
+spelling is normalised before anything else happens:
+
+| You type | From | pact leases |
+|---|---|---|
+| `src/auth.rs` | repo root | `src/auth.rs` |
+| `auth.rs` | `src/` | `src/auth.rs` |
+| `../src/auth.rs` | `tests/` | `src/auth.rs` |
+| `/abs/repo/src/auth.rs` | anywhere | `src/auth.rs` |
+
+A relative path is resolved against your working directory, then `.` and `..`
+are folded **lexically** — never with `canonicalize()`, because leasing a file
+that does not exist yet is a documented workflow (see below) and `canonicalize`
+fails on a missing path.
+
+Case is folded only where the filesystem folds it. On macOS's default APFS,
+`src/auth.rs` and `src/Auth.rs` are one file and take one lease; on Linux they
+are two files and take two. Lowercasing unconditionally would be a bug rather
+than caution — it would manufacture a conflict between genuinely different
+files. pact probes the filesystem rather than trusting git's `core.ignorecase`,
+which records what git saw at clone time and can describe a different machine.
+
+Only the lock *filename* is folded. `pact lease ls` and every error message show
+the spelling you used.
+
 ### How much atomicity you actually get
 
-Claiming a **free** path is atomic: the lock file is created with `O_EXCL`
-semantics (`create_new`), so two agents racing for the same unheld lease can't
-both win — one gets it, the other gets a conflict (exit 2).
+Claiming a **free** path is atomic in both senses that matter. The lease is
+written to a staging file first, then `hard_link`ed into place: the link is
+atomic and fails if the destination exists, so only one of two racing agents
+wins (the other gets exit 2) *and* the lock's name never appears before its
+contents do.
+
+That second half was learned the hard way. An earlier version used `O_EXCL`
+(`create_new`) and then wrote the body, which gives exclusivity but not atomic
+content: the file existed and was empty in between. A concurrent reader got
+`EOF while parsing a value`, and `pact doctor` called it "1 unreadable lock file
+(remove manually from `.pact/leases/`)" — advice that, followed during the
+window, deletes a live agent's lock. Measured with a tight poller: 203
+zero-byte observations in 300 acquire cycles under the old scheme, 0 under this
+one.
 
 **Taking over** an already-existing lock is a weaker guarantee, and worth
 knowing before you rely on it. The three takeover paths — reclaiming an expired
@@ -481,6 +521,6 @@ exactly what the protocol tells a blocked agent to do. `lease ls` and
 
 ## Why advisory, not mandatory
 
-See the FAQ in the [README](../README.md#faq) — the short version is that a
+See the FAQ in the [README](architecture.md#what-pact-deliberately-doesnt-do) — the short version is that a
 mandatory lock just moves the failure mode from "two agents edited the same
 file" to "a crashed agent left a lock nobody can clear," which is worse.

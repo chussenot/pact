@@ -112,7 +112,7 @@ by default) and filters to `issue_type == "message"` on pact's side.
 
 pact speaks to either Beads CLI: `bd` (Go, embedded Dolt) or `br` (beads-rust,
 SQLite). Which one it uses is decided by the store on disk, not by preference —
-see the [README](../README.md#install). The messaging *model* is identical on
+see [install.md](install.md). The messaging *model* is identical on
 both: message-typed beads, `--parent` threads, `read-by-<agent>` labels. The
 argv is not, and the differences are the whole of `pact-l94`. Each was found by
 running `br` 0.2.19, not inferred from bd's documentation.
@@ -182,6 +182,26 @@ way through, the error names who already received it, so nobody re-sends blind.
 
 A single `--to` behaves and prints exactly as before:
 `sent <id> to <who> (thread <id>)`.
+
+### One recipient, however many times you name them
+
+`--to a --to a` is one recipient. Duplicates are collapsed first-seen, so the
+same agent never gets two copies of one announcement in one thread, and the
+collapse is reported rather than swallowed:
+
+```
+$ pact msg send --to reviewer --to reviewer "ready for review"
+note: 1 duplicate recipient(s) collapsed — sending one message per distinct agent
+sent pact-wisp-7ll to reviewer (thread pact-wisp-7ll)
+```
+
+The realistic caller is not somebody typing the flag twice. The protocol tells
+agents to repeat `--to` for a decision that affects several peers, so a list
+built from `pact agents --json`, from a template, or by an orchestrator can
+repeat a name without anyone noticing — and `pact msg sent` exists precisely
+because an earlier fleet produced duplicate messages, so a single command that
+manufactures them would work against the tool's own advice. It is said out loud
+because a caller that repeated a name probably built the list wrongly.
 
 ## Read state: shared labels, not a local file
 
