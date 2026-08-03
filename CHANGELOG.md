@@ -10,6 +10,26 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.3.3 - 2026-08-03
+#### Bug Fixes
+- **(agents)** stop offering a long-dead agent as a spelling correction - (6067947) - Clement HUSSENOT-DESENONGES
+- **(init)** replace instruction files atomically instead of truncating them - (e3bf274) - Clement HUSSENOT-DESENONGES
+- **(lease)** fold lock names by case where the filesystem does - (be32679) - Clement HUSSENOT-DESENONGES
+- **(lease,events)** claim a lock by link, and give the event log a thread-unique temp - (07bb9b0) - Clement HUSSENOT-DESENONGES
+- **(lease,msg)** one file is one lease; one recipient is one message - (a646c5c) - Clement HUSSENOT-DESENONGES
+- **(otel)** refuse a control character in the endpoint host or path - (52555de) - Clement HUSSENOT-DESENONGES
+#### Continuous Integration
+- pin third-party actions to SHAs and add Dependabot - (e669f20) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- split reference out of the README and add a curator agent - (3891b8d) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(beads)** close the second hardening pass - (fd31d0a) - Clement HUSSENOT-DESENONGES
+- **(beads)** close the Agent Mail hardening review - (7299c58) - Clement HUSSENOT-DESENONGES
+- Add interactions - (f8ff487) - Clement HUSSENOT-DESENONGES
+- Add a tmp folder - (7a68b6e) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.3.2 - 2026-08-02
 #### Continuous Integration
 - guard release tags and lint commit subjects on PRs - (d07e6a7) - Clement HUSSENOT-DESENONGES
