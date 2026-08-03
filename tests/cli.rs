@@ -2615,3 +2615,56 @@ fn deduping_preserves_the_order_of_distinct_recipients() {
     let b = stdout.find("beta-two").expect("beta-two listed");
     assert!(a < b, "first-seen order must survive the dedupe: {stdout}");
 }
+
+/// A lock file's name must never exist before its contents do.
+///
+/// Acquiring a free path used to be create_new() then write_all(): the file
+/// existed and was empty in between. A reader in that window got
+/// `EOF while parsing a value`, and `pact doctor` reported "1 unreadable lock
+/// file (remove manually from .pact/leases/)" — advice that, followed during
+/// the window, deletes a live agent's lock. The claim is a hard_link now, which
+/// is atomic AND fails if the destination exists, so the name and the bytes
+/// appear together (pact-r2s.3).
+///
+/// Hammers acquire/release while a reader polls, and asserts the reader never
+/// observes a lock file that exists but does not parse.
+#[test]
+fn a_lock_file_is_never_visible_before_its_contents() {
+    let tmp = init_repo();
+    let leases = tmp.path().join(".pact/leases");
+    let root = tmp.path().to_path_buf();
+
+    let writer = std::thread::spawn(move || {
+        for _ in 0..300 {
+            let _ = std::process::Command::new(env!("CARGO_BIN_EXE_pact"))
+                .args(["lease", "acquire", "hot.rs"])
+                .current_dir(&root)
+                .env("PACT_AGENT", "writer-agent")
+                .output();
+            let _ = std::process::Command::new(env!("CARGO_BIN_EXE_pact"))
+                .args(["lease", "release", "--all"])
+                .current_dir(&root)
+                .env("PACT_AGENT", "writer-agent")
+                .output();
+        }
+    });
+
+    let mut empty_seen = 0usize;
+    while !writer.is_finished() {
+        if let Ok(entries) = std::fs::read_dir(&leases) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x == "lock") {
+                    // A lock that exists must parse. Zero bytes is the failure.
+                    if let Ok(body) = std::fs::read_to_string(&p) {
+                        if body.trim().is_empty() {
+                            empty_seen += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    writer.join().unwrap();
+    assert_eq!(empty_seen, 0, "observed {empty_seen} zero-byte lock files");
+}

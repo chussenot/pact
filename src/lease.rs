@@ -1,10 +1,7 @@
 //! Advisory file leases: atomic lock files under `.pact/leases/`, with TTL,
 //! steal, and re-entrant-refresh semantics. See docs/pact-scaffolding-prompt.md.
 
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -299,27 +296,18 @@ fn write_lease_atomic(lock_path: &Path, lease: &LeaseInfo) -> Result<()> {
     let dir = lock_path
         .parent()
         .context("lock path unexpectedly has no parent")?;
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    // Thread id as well as pid. Two threads in ONE process share a pid, so when
-    // the nanosecond clock repeats — which it does under load on a coarse
-    // clock — both wrote the SAME temp file: one renamed it into place and the
-    // other's rename hit ENOENT, reporting failure for a lease that had in fact
-    // been written. That surfaced as an intermittently red concurrency test
-    // (pact-sjg), but the bug is here, not in the test: any caller that leases
-    // from more than one thread can hit it, and `pact ui` is one process.
-    let tmp_path = dir.join(format!(
-        "tmp-{}-{:?}-{nanos}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
+    let tmp_path = dir.join(crate::events::unique_temp_name("tmp"));
     let json = serde_json::to_string_pretty(lease)?;
     std::fs::write(&tmp_path, json).with_context(|| format!("writing {}", tmp_path.display()))?;
     std::fs::rename(&tmp_path, lock_path)
         .with_context(|| format!("renaming into {}", lock_path.display()))?;
     Ok(())
+}
+
+/// A staging file beside `lock_path`, unique per process AND per thread.
+fn temp_sibling(lock_path: &Path) -> PathBuf {
+    let dir = lock_path.parent().unwrap_or(Path::new("."));
+    dir.join(crate::events::unique_temp_name("staging"))
 }
 
 fn read_lease(lock_path: &Path) -> Result<LeaseInfo> {
@@ -642,15 +630,34 @@ fn acquire_inner(
         note,
     };
 
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-    {
-        Ok(mut f) => {
-            let json = serde_json::to_string_pretty(&new_lease)?;
-            f.write_all(json.as_bytes())
-                .with_context(|| format!("writing {}", lock_path.display()))?;
+    // Claim the path with a LINK, not with create_new + write.
+    //
+    // create_new() gave exclusivity and nothing else: the file existed, empty,
+    // between the open and the write. Every other write path in this module
+    // goes through write_lease_atomic; this one did not, because O_EXCL already
+    // guarantees only one winner — but exclusivity is not atomicity of content.
+    // A reader landing in that window got `EOF while parsing a value`, and
+    // `pact doctor` called it "1 unreadable lock file (remove manually from
+    // .pact/leases/)" — advice that, followed during the window, deletes a live
+    // agent's lock. Agent Mail met the same thing: "concurrent agents could read
+    // partially-written lease JSON" (d8d1cc7), and in the same commit stopped
+    // treating absent metadata as proof the owner was dead, because there is a
+    // window between claiming a lock and describing it.
+    //
+    // hard_link is the primitive that does both jobs: it is atomic, and it fails
+    // with AlreadyExists if the destination is taken. So the name appears only
+    // once the bytes behind it are complete, and only one caller can create it.
+    // Both files live in .pact/leases/, so they are always on one filesystem.
+    let json = serde_json::to_string_pretty(&new_lease)?;
+    let staged = temp_sibling(&lock_path);
+    std::fs::write(&staged, &json).with_context(|| format!("writing {}", staged.display()))?;
+    let claimed = std::fs::hard_link(&staged, &lock_path);
+    // The staging file has served its purpose either way; the lock now has its
+    // own link to the same inode.
+    let _ = std::fs::remove_file(&staged);
+
+    match claimed {
+        Ok(()) => {
             log_event(
                 repo_root,
                 agent,

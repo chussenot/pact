@@ -64,6 +64,37 @@ fn events_file_path(repo_root: &Path) -> PathBuf {
     crate::repo::pact_dir_path(repo_root).join("events.jsonl")
 }
 
+/// A temp filename no other writer will pick: pid AND thread id AND a
+/// nanosecond stamp.
+///
+/// The thread id is the part that was missing and the part that matters. Two
+/// threads in ONE process share a pid, so `tmp-{pid}` collides whenever the
+/// clock repeats — which it does under load on a coarse clock. In `lease.rs`
+/// that produced an intermittently red concurrency test: both threads wrote one
+/// temp file, one renamed it into place, the other's rename hit ENOENT and
+/// reported failure for a lease that had in fact been written (fixed in
+/// edd0eb2). `events.rs` carried the identical `tmp-{pid}` form and was simply
+/// not audited at the same time — reachable from the same place, because the
+/// lease tests spawn threads that call `acquire` -> `log_event` -> `append`.
+///
+/// It matters more here than for a lock file: releasing a lease deletes the
+/// only record of it, so this log is the sole history, and `pact agents --for`
+/// and `msg send --to-owner-of` now read from it. A truncated log loses
+/// ownership silently.
+///
+/// One function so the two atomic-write sites cannot drift apart again.
+pub fn unique_temp_name(prefix: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "{prefix}-{}-{:?}-{nanos}",
+        std::process::id(),
+        std::thread::current().id()
+    )
+}
+
 /// Append one event to `.pact/events.jsonl`.
 ///
 /// Infallible by signature: I/O errors are swallowed, because a logging
@@ -97,7 +128,7 @@ fn append_bounded(repo_root: &Path, ev: &Event, max_lines: usize, keep_lines: us
         // Rewrite via temp + rename so a reader never sees a half-trimmed file.
         // ponytail: an append racing the rename is lost with the old inode.
         // Acceptable for an advisory feed; needs a lock file if it ever isn't.
-        let tmp = path.with_extension(format!("jsonl.tmp-{}", std::process::id()));
+        let tmp = path.with_file_name(unique_temp_name("events.jsonl.tmp"));
         std::fs::write(&tmp, kept.join("\n") + "\n")?;
         std::fs::rename(&tmp, &path)?;
     }
