@@ -2444,3 +2444,174 @@ fn a_name_nobody_ever_used_is_still_reported_as_unknown() {
         stderr_of(&real)
     );
 }
+
+/// A path used to mean whatever the CWD made it mean. Two agents each took a
+/// lease on the SAME physical file — one from the repo root, one from the
+/// subdirectory it lives in — and both were told they held it, which is the one
+/// outcome the lease surface exists to prevent (pact-r2s.1).
+#[test]
+fn one_file_is_one_lease_however_the_agent_spells_the_path() {
+    let tmp = init_repo();
+    std::fs::create_dir_all(tmp.path().join("src/deep")).unwrap();
+    std::fs::write(tmp.path().join("src/deep/foo.rs"), "x").unwrap();
+
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-a",
+        &["lease", "acquire", "src/deep/foo.rs"],
+    ));
+
+    // Same file, named from inside its own directory.
+    let out = pact_cmd(
+        &tmp.path().join("src/deep"),
+        &["lease", "acquire", "foo.rs"],
+    )
+    .env("PACT_AGENT", "agent-b")
+    .output()
+    .expect("pact");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a second spelling of one file must conflict, not mint a second lease: {}",
+        stderr_of(&out)
+    );
+
+    let locks = std::fs::read_dir(tmp.path().join(".pact/leases"))
+        .unwrap()
+        .count();
+    assert_eq!(locks, 1, "one file, one lock file");
+}
+
+/// The inverse, which must keep working: two genuinely different files that
+/// happen to share a basename used to collapse into one lock, so an agent was
+/// told to negotiate over a file nobody shared.
+#[test]
+fn two_different_files_sharing_a_basename_are_two_leases() {
+    let tmp = init_repo();
+    std::fs::create_dir_all(tmp.path().join("src/deep")).unwrap();
+    std::fs::write(tmp.path().join("src/deep/foo.rs"), "x").unwrap();
+    std::fs::write(tmp.path().join("foo.rs"), "y").unwrap();
+
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-a",
+        &["lease", "acquire", "src/deep/foo.rs"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-c",
+        &["lease", "acquire", "foo.rs"],
+    ));
+
+    let locks = std::fs::read_dir(tmp.path().join(".pact/leases"))
+        .unwrap()
+        .count();
+    assert_eq!(locks, 2, "different files must not share a lock");
+}
+
+/// `..` is folded lexically, never by `canonicalize()` — leasing a file that
+/// does not exist yet is a documented workflow (docs/leases.md), and
+/// canonicalize fails on a missing path.
+#[test]
+fn a_dot_dot_path_and_a_lease_on_a_file_that_does_not_exist_both_resolve() {
+    let tmp = init_repo();
+    std::fs::create_dir_all(tmp.path().join("src/deep")).unwrap();
+    std::fs::write(tmp.path().join("foo.rs"), "y").unwrap();
+
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-c",
+        &["lease", "acquire", "foo.rs"],
+    ));
+    let out = pact_cmd(
+        &tmp.path().join("src/deep"),
+        &["lease", "acquire", "../../foo.rs"],
+    )
+    .env("PACT_AGENT", "agent-d")
+    .output()
+    .expect("pact");
+    assert_eq!(out.status.code(), Some(2), "`..` must reach the same lock");
+
+    // The new-file case the lexical fold exists to protect.
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-e",
+        &["lease", "acquire", "src/deep/not_yet.rs"],
+    ));
+}
+
+/// `--to a --to a` used to create two beads in one thread and deliver the same
+/// message to one inbox twice. pact has no uniqueness constraint to trip over,
+/// so it succeeded silently — Agent Mail hit the same case and got a
+/// composite-PK IntegrityError instead (c66e54f #190). The realistic caller is
+/// a recipient list built from `pact agents --json` or a template, not a human
+/// typing the flag twice (pact-r2s.2).
+#[test]
+fn a_repeated_recipient_is_delivered_once() {
+    let Some(tmp) = bd_repo("a_repeated_recipient_is_delivered_once") else {
+        return;
+    };
+    let out = pact(
+        tmp.path(),
+        "sender",
+        &[
+            "msg",
+            "send",
+            "--to",
+            "dupe-target",
+            "--to",
+            "dupe-target",
+            "--subject",
+            "once",
+            "body",
+        ],
+    );
+    assert_ok(&out);
+    assert!(
+        stderr_of(&out).contains("duplicate recipient"),
+        "the collapse must be reported, not silent: {}",
+        stderr_of(&out)
+    );
+
+    let inbox = pact(tmp.path(), "dupe-target", &["msg", "inbox", "--json"]);
+    assert_ok(&inbox);
+    assert_eq!(
+        json_stdout(&inbox).as_array().map(Vec::len),
+        Some(1),
+        "one message, not two: {}",
+        stdout_of(&inbox)
+    );
+}
+
+/// Deduping must not reorder a genuine fan-out: the thread root is the first
+/// distinct recipient, and dropping a later duplicate must not move it.
+#[test]
+fn deduping_preserves_the_order_of_distinct_recipients() {
+    let Some(tmp) = bd_repo("deduping_preserves_the_order") else {
+        return;
+    };
+    let out = pact(
+        tmp.path(),
+        "sender",
+        &[
+            "msg",
+            "send",
+            "--to",
+            "alpha-one",
+            "--to",
+            "beta-two",
+            "--to",
+            "alpha-one",
+            "body",
+        ],
+    );
+    assert_ok(&out);
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("2 message(s)"),
+        "two distinct recipients: {stdout}"
+    );
+    let a = stdout.find("alpha-one").expect("alpha-one listed");
+    let b = stdout.find("beta-two").expect("beta-two listed");
+    assert!(a < b, "first-seen order must survive the dedupe: {stdout}");
+}

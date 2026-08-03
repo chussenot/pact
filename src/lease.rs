@@ -193,18 +193,74 @@ pub fn encode_path(relative_path: &str) -> String {
     relative_path.replace('/', "__")
 }
 
-/// Normalize `path` relative to `repo_root`: if absolute and under `repo_root`,
-/// strip the prefix; otherwise assume it's already given relative to the repo
-/// root. Deliberately simple — a lease can be acquired on a path that doesn't
-/// exist yet, so we don't canonicalize against the filesystem.
+/// A path as the lock filename sees it: repo-root-relative, one spelling per
+/// file, whatever directory the agent ran from.
+///
+/// A relative path used to be taken verbatim, which meant the CWD silently
+/// decided which lock you got. Both directions were wrong and both were
+/// reproducible: `pact lease acquire foo.rs` from `src/deep/` and
+/// `pact lease acquire src/deep/foo.rs` from the root took TWO locks on ONE
+/// file — two agents each told they held it, neither warned, which is the one
+/// thing the lease surface exists to prevent. And `foo.rs` at the root vs
+/// `foo.rs` inside `src/deep/` — two different files — collapsed into one lock
+/// and produced a conflict over a file nobody shared.
+///
+/// Agent Mail met the same class twice in one commit (c66e54f): #204 resolved
+/// `git_common_dir` against the repo root because the process CWD gave an
+/// unstable id, and #205 collapsed two divergent normalizers that had been
+/// splitting one mailbox in two.
+///
+/// Lexical, never `canonicalize()`. A lease on a file that does not exist yet
+/// is a documented workflow — see docs/leases.md, "Working on a new file you
+/// can't compile yet" — and `canonicalize` fails on a missing path, so it would
+/// break the case the feature was built for. `..` is folded here rather than by
+/// the filesystem, so a symlinked directory resolves by name; that is the same
+/// bargain the rest of the module already makes by keying locks on paths.
 fn normalize_path(repo_root: &Path, path: &str) -> String {
     let p = Path::new(path);
-    let rel = if p.is_absolute() {
-        p.strip_prefix(repo_root).unwrap_or(p)
-    } else {
-        p
+    // A relative path is resolved against the CWD — but only when the CWD is
+    // actually inside this repo. Every production caller derives `repo_root` by
+    // walking up from the CWD (`repo::find_repo_root(&cwd)` in main.rs), so the
+    // two always agree there. A caller that passes some other root — the unit
+    // tests, and any future embedder of `LeaseStore` — means "relative to the
+    // root I gave you", and joining an unrelated CWD would silently produce a
+    // path outside the repo. Checking the relationship instead of assuming it
+    // keeps both callers honest.
+    let cwd_in_repo = std::env::current_dir()
+        .ok()
+        .filter(|cwd| cwd.starts_with(repo_root));
+    let absolute = match (p.is_absolute(), cwd_in_repo) {
+        (true, _) => p.to_path_buf(),
+        (false, Some(cwd)) => cwd.join(p),
+        // No usable CWD: treat the input as already repo-root-relative, which
+        // is what it was before this function learned about the CWD at all.
+        (false, None) => return fold(p).to_string_lossy().into_owned(),
     };
-    rel.to_string_lossy().into_owned()
+    let folded = fold(&absolute);
+    folded
+        .strip_prefix(repo_root)
+        .unwrap_or(&folded)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Fold `.` and `..` textually. No filesystem access, so it works on a path
+/// that does not exist yet. A leading `..` that escapes the root is kept, so
+/// the caller still sees an out-of-repo path rather than a silently rebased one.
+fn fold(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn lock_file_path(repo_root: &Path, relative: &str) -> Result<PathBuf> {

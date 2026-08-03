@@ -242,6 +242,33 @@ pub fn send(
     if to.is_empty() {
         anyhow::bail!("no recipients — `msg send` needs at least one --to");
     }
+    // One recipient named twice is one recipient. Without this, `--to a --to a`
+    // created two beads in one thread and delivered the same message to the
+    // same inbox twice — reproducible, and silent, because pact has no
+    // uniqueness constraint to trip over. Agent Mail hit the same case hard
+    // enough to get a composite-primary-key IntegrityError and fixed it by
+    // deduping before building the recipient rows (c66e54f, #190).
+    //
+    // The realistic caller is not a human typing the flag twice: the protocol
+    // block tells agents to repeat `--to` for a multi-recipient decision, so a
+    // list built from `pact agents --json` or an orchestrator template can
+    // repeat a name. And `pact msg sent` exists precisely because a previous
+    // fleet produced duplicate messages, so a command that manufactures them
+    // works against the tool's own advice.
+    //
+    // First-seen order is preserved: the printed thread root must not move
+    // because a later duplicate was dropped.
+    let mut seen = std::collections::HashSet::new();
+    let deduped: Vec<String> = to.iter().filter(|r| seen.insert(*r)).cloned().collect();
+    let dropped = to.len() - deduped.len();
+    if dropped > 0 {
+        // Said out loud, not swallowed: a caller that repeated a name probably
+        // built the list wrongly and should find out now.
+        output::warn(&format!(
+            "note: {dropped} duplicate recipient(s) collapsed — sending one message per distinct agent"
+        ));
+    }
+    let to: &[String] = &deduped;
     let title = subject
         .map(str::to_string)
         .unwrap_or_else(|| default_subject(body));
