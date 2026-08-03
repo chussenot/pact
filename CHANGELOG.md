@@ -10,6 +10,18 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.4.0 - 2026-08-03
+#### Documentation
+- **(mcp)** replace the "no MCP endpoint" claim with what is actually true - (ac3e03e) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(mcp)** serve the 2026-07-28 era too, and annotate every tool read-only - (3921881) - Clement HUSSENOT-DESENONGES
+- **(mcp)** serve pact's observation surface read-only over MCP - (03ca133) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(beads)** close the MCP follow-ups - (e6823c5) - Clement HUSSENOT-DESENONGES
+- **(beads)** record the MCP server epic and its two follow-ups - (eb06fc7) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.3.3 - 2026-08-03
 #### Bug Fixes
 - **(agents)** stop offering a long-dead agent as a spelling correction - (6067947) - Clement HUSSENOT-DESENONGES
