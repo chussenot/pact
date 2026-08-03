@@ -199,6 +199,12 @@ const USAGE_ERROR: i32 = 5;
 /// one that is merely busy.
 const QUIET_AGENT_SECS: i64 = 15 * 60;
 
+/// Past this, a suggested correction says how old it is. Below it, the name
+/// alone — an age on a peer that acted seconds ago is noise, and the whole
+/// point of the annotation is that a borderline suggestion can be judged.
+/// Names older than `agents`' suggestion horizon are not offered at all.
+const ANNOTATE_SUGGESTION_AGE_SECS: i64 = 15 * 60;
+
 /// clap's verdict, as an exit code plus the argv *shape* that stands in for a
 /// subcommand name we never got to parse.
 ///
@@ -1299,7 +1305,28 @@ fn unknown_recipient_warning(known: &[agents::AgentInfo], to: &str) -> Option<St
     if agents::is_known(known, to) {
         return None;
     }
-    let hits = agents::suggest(known, to);
+    // Each suggestion carries how long since that agent last did anything.
+    // A correction is a claim about what you meant to type, and "alice-prime,
+    // last seen 3h ago" is a claim the reader can judge where a bare name is
+    // not. Names older than the suggestion horizon are not offered at all —
+    // see agents::is_stale_for_suggestion.
+    let hits: Vec<String> = agents::suggest(known, to)
+        .into_iter()
+        .map(|name| {
+            // Only annotate an age worth judging. "tui-dev (last seen 0s ago)"
+            // is noise on the common case — a peer that is working right now —
+            // and noise is what stops the useful case being read.
+            let stale = known
+                .iter()
+                .find(|a| a.name == name)
+                .and_then(|a| age_of(&a.last_seen))
+                .filter(|secs| *secs >= ANNOTATE_SUGGESTION_AGE_SECS);
+            match stale {
+                Some(secs) => format!("{name} (last seen {} ago)", human_secs(secs)),
+                None => name,
+            }
+        })
+        .collect();
     let did_you_mean = if hits.is_empty() {
         String::new()
     } else {
@@ -1692,7 +1719,10 @@ mod tests {
     fn agent_info(name: &str, leases: usize, sent: usize, received: usize) -> agents::AgentInfo {
         agents::AgentInfo {
             name: name.to_string(),
-            last_seen: "2026-07-31T09:00:00Z".to_string(),
+            // Now, not a fixed date: this fixture means "an agent that
+            // exists", and a hardcoded stamp silently ages past the
+            // suggestion horizon and changes what the test is asserting.
+            last_seen: chrono::Utc::now().to_rfc3339(),
             leases_held: leases,
             lease_events: 0,
             messages_sent: sent,

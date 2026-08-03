@@ -48,6 +48,37 @@ impl AgentInfo {
             || self.messages_sent > 0
             || self.name == HUMAN
     }
+
+    /// Too long gone to be what somebody meant to type.
+    ///
+    /// This is deliberately NOT part of [`answers`]. `answers` asks "is this a
+    /// real identity", and `is_known` uses it to decide whether to warn about a
+    /// recipient — an agent that finished its work and exited is still real, and
+    /// warning about it is the bug pact-6sx fixed. Staleness only narrows what
+    /// is offered as a CORRECTION, which is a different question: not "does
+    /// this name exist" but "is this plausibly the name you meant".
+    ///
+    /// The distinction matters because the two failures pull in opposite
+    /// directions. Suggesting a ghost is how a typo spreads — one bad send
+    /// registers a misspelling that then gets recommended to the next agent —
+    /// and pact-4tj measured the cost of following such a suggestion: of 30
+    /// messages sent to agents that had already exited, 0 were ever read.
+    ///
+    /// An unparsable timestamp is NOT treated as stale. The roster is derived
+    /// from stamps pact wrote itself, so a stamp that will not parse is more
+    /// likely clock skew on a live machine than a genuinely ancient agent, and
+    /// hiding a live peer is the worse of the two mistakes.
+    fn is_stale_for_suggestion(&self, now: DateTime<Utc>) -> bool {
+        // `human` is a mailbox, not a process; it never "acts" and must never
+        // age out of the suggestions.
+        if self.name == HUMAN {
+            return false;
+        }
+        match parse_ts(&self.last_seen) {
+            Some(seen) => (now - seen).num_seconds() > SUGGESTION_HORIZON_SECS,
+            None => false,
+        }
+    }
 }
 
 /// Identities seen holding leases or in message traffic, most-recent first.
@@ -128,6 +159,19 @@ pub fn is_known(agents: &[AgentInfo], name: &str) -> bool {
 /// typo spreads — the incident had pact answer a send to the *correct* `alice`
 /// with "did you mean alic?", the typo from the previous send.
 pub fn suggest(agents: &[AgentInfo], name: &str) -> Vec<String> {
+    suggest_at(agents, name, Utc::now())
+}
+
+/// How long ago an agent can have acted and still be offered as a correction.
+///
+/// A day: long enough to span a working session and any fleet run pact has
+/// seen, short enough that a name from last month is not presented as the
+/// thing you meant to type.
+const SUGGESTION_HORIZON_SECS: i64 = 24 * 3600;
+
+/// The body of [`suggest`] with the clock injected, so a test can age an agent
+/// without sleeping.
+fn suggest_at(agents: &[AgentInfo], name: &str, now: DateTime<Utc>) -> Vec<String> {
     let needle = name.to_lowercase();
     let mut out: Vec<String> = Vec::new();
 
@@ -140,7 +184,10 @@ pub fn suggest(agents: &[AgentInfo], name: &str) -> Vec<String> {
     ];
 
     for matches in tiers {
-        for agent in agents.iter().filter(|a| a.answers()) {
+        for agent in agents
+            .iter()
+            .filter(|a| a.answers() && !a.is_stale_for_suggestion(now))
+        {
             if agent.name == name || out.contains(&agent.name) {
                 continue; // never suggest the queried name itself
             }
@@ -231,6 +278,14 @@ mod tests {
     use super::*;
 
     /// An agent that has acted — the only kind `is_known`/`suggest` count.
+    /// The clock these fixtures live at. Pinned, not `Utc::now()`: the
+    /// fixtures carry explicit `last_seen` dates, so the test asserts what
+    /// `suggest` does relative to them rather than drifting stale as the real
+    /// clock moves past the suggestion horizon.
+    fn fixture_now() -> DateTime<Utc> {
+        "2026-07-30T13:00:00Z".parse().expect("fixture clock")
+    }
+
     fn agent(name: &str, last_seen: &str) -> AgentInfo {
         AgentInfo {
             name: name.into(),
@@ -342,6 +397,44 @@ mod tests {
         assert_eq!(agents.len(), 4);
     }
 
+    /// The horizon itself: a name that has not acted in a day is not what you
+    /// meant to type, even though it is a real agent that really did work here.
+    ///
+    /// `is_known` must NOT change with it — an exited agent is still a real
+    /// recipient, and warning about one is the bug pact-6sx fixed. The two
+    /// questions are different: "does this name exist" and "is this plausibly
+    /// the name you meant".
+    #[test]
+    fn an_agent_gone_a_long_time_is_not_offered_but_is_still_known() {
+        let agents = vec![agent("alice-prime", "2026-01-01T09:00:00Z")];
+        let now = fixture_now();
+
+        assert!(
+            suggest_at(&agents, "alice-prim", now).is_empty(),
+            "six months gone is not a correction"
+        );
+        assert!(
+            is_known(&agents, "alice-prime"),
+            "but it is still a real agent, and msg send must not warn about it"
+        );
+
+        // Just inside the horizon, the same name is offered again.
+        let recent = vec![agent("alice-prime", "2026-07-30T09:00:00Z")];
+        assert_eq!(suggest_at(&recent, "alice-prim", now), ["alice-prime"]);
+    }
+
+    /// A stamp that will not parse must not hide a live peer: the roster is
+    /// derived from stamps pact wrote itself, so garbage is likelier to be clock
+    /// skew than genuine age.
+    #[test]
+    fn an_unparsable_last_seen_is_not_treated_as_stale() {
+        let agents = vec![agent("alice-prime", "not-a-timestamp")];
+        assert_eq!(
+            suggest_at(&agents, "alice-prim", fixture_now()),
+            ["alice-prime"]
+        );
+    }
+
     /// Offering the previous send's typo as the correction for the right name is
     /// how the typo spreads, so a ghost is never a suggestion.
     #[test]
@@ -350,8 +443,11 @@ mod tests {
             ghost("alic", "2026-07-30T09:00:00Z"),
             agent("bob", "2026-07-30T09:00:00Z"),
         ];
-        assert!(suggest(&agents, "alice").is_empty(), "alic is a ghost");
-        assert_eq!(suggest(&agents, "bo"), ["bob"]);
+        assert!(
+            suggest_at(&agents, "alice", fixture_now()).is_empty(),
+            "alic is a ghost"
+        );
+        assert_eq!(suggest_at(&agents, "bo", fixture_now()), ["bob"]);
     }
 
     #[test]
@@ -375,11 +471,11 @@ mod tests {
             agent("human", "2026-07-30T09:00:00Z"),
         ];
         // The real incident: one deleted character, message sent into the void.
-        assert_eq!(suggest(&agents, "tuidev"), ["tui-dev"]);
-        assert_eq!(suggest(&agents, "TUI-DEV"), ["tui-dev"]);
-        assert_eq!(suggest(&agents, "tui"), ["tui-dev"]);
+        assert_eq!(suggest_at(&agents, "tuidev", fixture_now()), ["tui-dev"]);
+        assert_eq!(suggest_at(&agents, "TUI-DEV", fixture_now()), ["tui-dev"]);
+        assert_eq!(suggest_at(&agents, "tui", fixture_now()), ["tui-dev"]);
         // "reviewer" resembles nobody who has ever run a pact command here.
-        assert!(suggest(&agents, "reviewer").is_empty());
+        assert!(suggest_at(&agents, "reviewer", fixture_now()).is_empty());
     }
 
     #[test]
@@ -390,7 +486,7 @@ mod tests {
             agent("dev-b", "2026-07-30T09:00:00Z"),
             agent("dev-c", "2026-07-30T09:00:00Z"),
         ];
-        let out = suggest(&agents, "dev");
+        let out = suggest_at(&agents, "dev", fixture_now());
         assert_eq!(out.len(), 3);
         assert!(!out.contains(&"dev".to_string()));
     }
