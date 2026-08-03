@@ -7,6 +7,8 @@ mod identity;
 mod lease;
 #[cfg(feature = "ui")]
 mod mascot;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod msg;
 mod otel;
 mod output;
@@ -100,6 +102,27 @@ enum Command {
     /// Interactive terminal dashboard over leases, messages, and doctor status.
     #[cfg(feature = "ui")]
     Ui,
+    /// Serve pact's read-only observation surface over MCP on stdio.
+    #[cfg(feature = "mcp")]
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
+}
+
+/// `serve` is the only action, and it is still spelled out rather than folded
+/// into `pact mcp`, because the noun alone gives a later read-write mode or a
+/// `pact mcp tools` inspector somewhere to go that does not change this one's
+/// spelling. A client config that says `pact mcp serve` should keep working.
+#[derive(Subcommand)]
+#[cfg(feature = "mcp")]
+enum McpAction {
+    /// Read JSON-RPC from stdin and answer on stdout until stdin closes.
+    ///
+    /// Strictly read-only: it observes leases, messages, doctor checks and the
+    /// event log, and can neither claim a lease nor send a message nor mark a
+    /// message read. Spawned by an MCP client, never run by hand.
+    Serve,
 }
 
 #[derive(Subcommand)]
@@ -314,6 +337,10 @@ fn subcommand_name(command: &Command) -> &'static str {
         Command::Doctor => "doctor",
         #[cfg(feature = "ui")]
         Command::Ui => "ui",
+        #[cfg(feature = "mcp")]
+        Command::Mcp { action } => match action {
+            McpAction::Serve => "mcp serve",
+        },
     }
 }
 
@@ -369,6 +396,13 @@ fn run(cli: Cli) -> Result<i32> {
             let agent = identity::resolve_agent(cli.agent.as_deref()).ok();
             tui::run(root, agent).map(|()| 0)
         }
+        // No identity resolved and none needed: an observer holds nothing and
+        // sends nothing, so there is no agent for it to be. The tools that need
+        // one take it as a parameter, because an observer may watch several.
+        #[cfg(feature = "mcp")]
+        Command::Mcp { action } => match action {
+            McpAction::Serve => mcp::serve(repo::find_repo_root(&cwd)?),
+        },
     }
 }
 

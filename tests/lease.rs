@@ -1,7 +1,7 @@
 //! Integration tests for `pact lease`, driven through the compiled binary
 //! (this is a binary-only crate with no lib target, so these shell out to
 //! `env!("CARGO_BIN_EXE_pact")` rather than reaching into `src::lease`
-//! directly — see docs/pact-scaffolding-prompt.md).
+//! directly).
 
 use std::path::Path;
 use std::process::{Command, Output};

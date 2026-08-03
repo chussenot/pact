@@ -48,10 +48,18 @@ description = "Clippy + test the opt-in `otel` feature, and prove it still costs
 run = [
   "cargo clippy --all-targets --features ui,otel -- -D warnings",
   "cargo test --features ui,otel",
+  # `mcp` is the second off-by-default feature and makes the same promise. Its
+  # own leg because the *default* build is where `pact mcp serve` must not
+  # exist, and tests/mcp_absent.rs asserts exactly that.
+  "cargo clippy --all-targets --features mcp,otel -- -D warnings",
+  "cargo test --features mcp,otel",
   """
-  test "$(cargo tree --edges normal,build,dev)" = "$(cargo tree --edges normal,build,dev --features otel)" \
-    || { echo 'the otel feature changed the dependency tree:'; \
-         cargo tree --edges normal,build,dev --features otel; exit 1; }
+  base="$(cargo tree --edges normal,build,dev)"
+  for f in otel mcp mcp,otel; do
+    test "$base" = "$(cargo tree --edges normal,build,dev --features "$f")" \
+      || { echo "the $f feature(s) changed the dependency tree:"; \
+           cargo tree --edges normal,build,dev --features "$f"; exit 1; }
+  done
   """,
 ]
 

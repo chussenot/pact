@@ -37,6 +37,25 @@ jobs:
       - name: Test (ui + otel features)
         if: runner.os == 'Linux'
         run: cargo test --features ui,otel
+      # `mcp` is off by default for the same reason and rots the same way. Its
+      # own leg rather than a slot in `ui,otel` because the default build is the
+      # one that must NOT have the subcommand, and tests/mcp_absent.rs asserts
+      # that from the other side — a single all-features leg would compile both
+      # halves of that pair and run neither against the build it describes.
+      - name: Clippy (mcp feature)
+        if: runner.os == 'Linux'
+        run: cargo clippy --all-targets --features mcp -- -D warnings
+      - name: Test (mcp feature)
+        if: runner.os == 'Linux'
+        run: cargo test --features mcp
+      # mcp+otel together: the server's one span is `#[cfg]`-gated on otel, so
+      # this is the only combination that compiles `otel::span` inside mcp.rs.
+      - name: Clippy (mcp + otel features)
+        if: runner.os == 'Linux'
+        run: cargo clippy --all-targets --features mcp,otel -- -D warnings
+      - name: Test (mcp + otel features)
+        if: runner.os == 'Linux'
+        run: cargo test --features mcp,otel
       # The promise that decided the transport: the exporter is hand-rolled
       # OTLP/HTTP+JSON over std::net precisely because every opentelemetry-otlp
       # combination pulls tonic and tokio into a synchronous CLI. Enforced here
@@ -46,12 +65,21 @@ jobs:
       # [build-dependencies] nor [dev-dependencies], so the guard let a build-dep
       # or dev-dep added by the feature through without a word. pact already has
       # a build-dependency (chrono, via build.rs).
-      - name: The otel feature costs no dependency
+      #
+      # Every opt-in feature is checked, not just otel: `mcp` makes the same
+      # promise for the same reason (MCP is newline-delimited JSON-RPC, so it is
+      # serde_json plus std::io, and an SDK would charge an async runtime for
+      # framing worth fifty lines). A guard that named one feature would have
+      # gone quietly out of date the moment a second one arrived.
+      - name: The opt-in features cost no dependency
         if: runner.os == 'Linux'
         run: |
-          test "$(cargo tree --edges normal,build,dev)" = "$(cargo tree --edges normal,build,dev --features otel)" \
-            || { echo 'the otel feature changed the dependency tree:'; \
-                 cargo tree --edges normal,build,dev --features otel; exit 1; }
+          base="$(cargo tree --edges normal,build,dev)"
+          for f in otel mcp mcp,otel; do
+            test "$base" = "$(cargo tree --edges normal,build,dev --features "$f")" \
+              || { echo "the $f feature(s) changed the dependency tree:"; \
+                   cargo tree --edges normal,build,dev --features "$f"; exit 1; }
+          done
       # Linux-only: the check walks `pact --help`, which is platform-independent,
       # and it needs the ui feature built — which only this job does. It shells
       # out to `pact doctor`, so it must run after checkout in a real git repo;

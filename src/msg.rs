@@ -554,19 +554,18 @@ fn walk_to_root(start: BdIssue, mut fetch: impl FnMut(&str) -> Option<BdIssue>) 
     issue
 }
 
-/// The root message plus its direct replies, oldest first. Marks everything
-/// shown as read for `agent`.
+/// Every message of the thread `id` belongs to, oldest first, and the root's id.
 ///
 /// `id` may be any member of the thread, not just its root: a non-first recipient
 /// of a fan-out send only ever sees her own child id, and reading it must give
 /// her the whole conversation — and the root's id as the thread — rather than a
 /// one-message "thread" whose id produces invisible grandchild replies.
-pub fn read_thread(
-    cli: &BeadsCli,
-    repo_root: &Path,
-    agent: &str,
-    id: &str,
-) -> Result<Vec<Message>> {
+///
+/// Split out of [`read_thread`] so that [`peek_thread`] can answer with the same
+/// records and no read-marking. The two must not each grow their own half-right
+/// idea of what a thread contains: everything below the split is the *labelling*,
+/// which is the only part an observer must not do.
+fn gather_thread(cli: &BeadsCli, repo_root: &Path, id: &str) -> Result<(String, Vec<BdIssue>)> {
     let root = thread_root(cli, repo_root, id)?;
     let root_id = root.id.clone();
 
@@ -585,6 +584,51 @@ pub fn read_thread(
         }
     }
     all.sort_by_key(|i| parse_ts(&i.created_at));
+    Ok((root_id, all))
+}
+
+/// The thread `id` belongs to, **without marking anything read** — the twin of
+/// [`read_thread`], in the same spirit as [`crate::lease::peek`] beside
+/// `lease::list`.
+///
+/// This exists for the read-only MCP server (`pact mcp serve`), where answering
+/// "what is in this thread" must not change delivery state. `read_thread` writes
+/// a `read-by-<agent>` label, and that label is what a *sender* checks with `msg
+/// sent` to decide whether a decision landed — so an observer who marked threads
+/// read while looking at them would silently tell every sender their message had
+/// been received by an agent that never saw it.
+///
+/// `viewer` only decides whose `read` flag is reported; passing `None` reports
+/// the recipient's own.
+///
+/// Gated on the feature that uses it, or the default build warns it dead. That
+/// is not a formality — `mark_read_by_id` shipped ungated, went red in CI on the
+/// default build only, and was missed locally because `mise run check` was
+/// running with `--features ui` and nothing else. `lint` compiles every feature
+/// set now, which is what caught this one before it left the machine.
+#[cfg(feature = "mcp")]
+pub fn peek_thread(
+    cli: &BeadsCli,
+    repo_root: &Path,
+    viewer: Option<&str>,
+    id: &str,
+) -> Result<Vec<Message>> {
+    let (root_id, all) = gather_thread(cli, repo_root, id)?;
+    Ok(all
+        .into_iter()
+        .map(|i| i.into_message(Some(&root_id), viewer))
+        .collect())
+}
+
+/// The root message plus its direct replies, oldest first. Marks everything
+/// shown as read for `agent`.
+pub fn read_thread(
+    cli: &BeadsCli,
+    repo_root: &Path,
+    agent: &str,
+    id: &str,
+) -> Result<Vec<Message>> {
+    let (root_id, all) = gather_thread(cli, repo_root, id)?;
 
     // Bookkeeping must not destroy the thread the caller came for: if the
     // label write loses a race with another agent's bd write, warn and show the

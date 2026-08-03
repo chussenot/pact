@@ -1,5 +1,5 @@
 //! Advisory file leases: atomic lock files under `.pact/leases/`, with TTL,
-//! steal, and re-entrant-refresh semantics. See docs/pact-scaffolding-prompt.md.
+//! steal, and re-entrant-refresh semantics. See docs/leases.md.
 
 use std::path::{Path, PathBuf};
 

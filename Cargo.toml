@@ -11,6 +11,15 @@ ui = ["dep:ratatui"]
 # opentelemetry-otlp — every feature combination of it drags in tonic and
 # tokio, and its flush-on-exit cost 1031 ms against a blackholed collector.
 otel = []
+# Read-only MCP server (`pact mcp serve`). Adds NO dependency for the same
+# reason `otel` does not: MCP is JSON-RPC 2.0 over newline-delimited stdio, so
+# it is serde_json — which pact already has — plus std::io. An SDK would buy
+# framing pact can write in fifty lines and charge an async runtime for it.
+#
+# Off by default because the *cost* of the feature is not the code, it is the
+# promise: a build with `mcp` in it can be spawned by anything that can spawn a
+# subprocess. See src/mcp.rs for why that surface is read-only and stays so.
+mcp = []
 
 [build-dependencies]
 chrono = "0.4.45"
