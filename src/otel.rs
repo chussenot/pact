@@ -349,7 +349,7 @@ mod imp {
     ///
     /// Splitting only. Resolution is [`resolve`], so a test can check the parse
     /// without touching the network.
-    fn parse_endpoint(url: &str, default_path: &str) -> Option<(String, u16, String)> {
+    pub(super) fn parse_endpoint(url: &str, default_path: &str) -> Option<(String, u16, String)> {
         let rest = url.trim().strip_prefix("http://")?;
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], rest[i..].to_string()),
@@ -360,6 +360,24 @@ mod imp {
             None => (authority.to_string(), 80u16),
         };
         if host.is_empty() {
+            return None;
+        }
+        // Both go verbatim into a hand-written request — `POST {path} HTTP/1.1`
+        // and `Host: {host}:{port}` — so a control character here is request
+        // splitting. `parse_headers` already refuses one in a header name or
+        // value for exactly this reason; the path was the half nobody checked,
+        // and it was injectable: an endpoint of
+        // `http://127.0.0.1:4318/v1/traces\r\nX-Injected: pwned` put that line
+        // on the wire, verified against a raw socket.
+        //
+        // `host` was guarded only by accident, because `to_socket_addrs` will
+        // not resolve a name containing CRLF. Accidental guards stop being
+        // guards when the code around them changes, so it is checked here too.
+        //
+        // Refused rather than stripped, the same way `https://` is: a caller who
+        // asked for something pact cannot honestly serve gets no export and a
+        // `pact doctor` line saying so, not a quietly rewritten request.
+        if host.chars().any(char::is_control) || path.chars().any(char::is_control) {
             return None;
         }
         Some((host, port, path))
@@ -1380,6 +1398,36 @@ pub use imp::{count, export_status, flush_now, gauge, init, record_ms, span, Gua
 
 #[cfg(test)]
 mod tests {
+
+    /// A control character in the endpoint is request splitting: `path` goes
+    /// verbatim into `POST {path} HTTP/1.1` and `host` into `Host:`. Verified
+    /// against a raw socket before the guard existed — an endpoint of
+    /// `http://127.0.0.1:4318/v1/traces\r\nX-Injected: pwned` put
+    /// `X-Injected: pwned HTTP/1.1` on the wire as its own line.
+    ///
+    /// `parse_headers` already refused this in a header name or value; the path
+    /// was the half nobody checked. `host` was guarded only incidentally, by
+    /// `to_socket_addrs` failing to resolve a name with CRLF in it, and an
+    /// accidental guard is one that disappears when the code around it moves.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn an_endpoint_carrying_a_control_character_is_refused_not_sanitised() {
+        let ok = super::imp::parse_endpoint("http://127.0.0.1:4318/v1/traces", "/v1/traces");
+        assert!(ok.is_some(), "a normal endpoint must still parse");
+
+        for bad in [
+            "http://127.0.0.1:4318/v1/traces\r\nX-Injected: pwned",
+            "http://127.0.0.1:4318/v1/traces\nX-Injected: pwned",
+            "http://127.0.0.1:4318/v1/tra\tces",
+            "http://127.0.0.1\r\nX: y:4318/v1/traces",
+        ] {
+            assert!(
+                super::imp::parse_endpoint(bad, "/v1/traces").is_none(),
+                "must refuse {bad:?} outright — sanitising would silently rewrite \
+                 an endpoint the operator asked for"
+            );
+        }
+    }
 
     /// `session.id` joins pact's traces to Claude Code's metrics and logs in the
     /// same collector, so it must be exactly the session's UUID or absent —

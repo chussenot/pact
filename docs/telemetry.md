@@ -303,6 +303,33 @@ Known ceiling: pact installs no signal handler, so a `pact ui` killed with
 SIGTERM or SIGKILL loses at most the last ten seconds. A handler needs `libc`
 or a hand-declared `extern "C"`, and neither is worth a dependency for that.
 
+## What a malicious `OTEL_*` value can and cannot do
+
+The request is written by hand, so the values that reach it are checked
+rather than trusted. `OTEL_EXPORTER_OTLP_HEADERS` drops any pair whose name or
+value carries a control character, or whose name carries a colon. The endpoint's
+host and path are refused the same way, because both go verbatim into
+`POST {path} HTTP/1.1` and `Host: {host}:{port}`.
+
+The path check was added after the fact, and it is worth saying why: headers
+were guarded from the start and the path was not, so
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://host:4318/v1/traces\r\nX-Injected: pwned`
+put `X-Injected: pwned HTTP/1.1` on the wire as its own line, confirmed against
+a raw socket. The host had never been injectable, but only by accident —
+`to_socket_addrs` will not resolve a name containing CRLF — and an accidental
+guard stops being one as soon as the code around it moves.
+
+A bad value **disables the signal** rather than being stripped, the same
+treatment `https://` gets. Silently rewriting an endpoint somebody asked for is
+worse than not exporting: `pact doctor` can say the export is off, and cannot
+say "we sent your telemetry somewhere adjacent to where you pointed it".
+
+This is a low-severity boundary — anyone who sets pact's environment can
+already run commands as you — but pact is run by orchestrators that build these
+values from templates and config, and one such template produced the literal
+string `undefined` for every agent in a fleet here. Values assembled by a
+program deserve the same scepticism as values typed by a stranger.
+
 ## Correlating with Claude Code
 
 pact emits `session.id` as a resource attribute on both traces and metrics,
