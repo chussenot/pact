@@ -1,13 +1,38 @@
 [tools]
 rust = "latest"
 
+[env]
+# Every feature this repo can build, in one place so the tasks cannot disagree
+# about what "all of them" means. Local development builds with all of it: what
+# you run is then what you tested, and an off-by-default feature that nothing
+# compiles rots — `ui` proved that by breaking while every task was green.
+#
+# Adding a feature to Cargo.toml means adding it here, and to the two-way legs in
+# `lint`, `test` and `otel` that keep the *default* build honest.
+PACT_ALL_FEATURES = "ui,otel,mcp"
+
 [tasks.build]
-description = "Build the pact binary (with the ui feature)"
-run = "cargo build --features ui"
+description = "Build the pact binary with every feature enabled"
+run = "cargo build --features $PACT_ALL_FEATURES"
 
 [tasks.test]
-description = "Run the pact test suite (with the ui feature)"
-run = "cargo test --features ui"
+description = "Run the test suite with every feature, then again with none"
+# Both, and the second is not redundant. Some tests exist ONLY in the default
+# build: `tests/mcp_absent.rs` is gated `not(feature = "mcp")` and asserts that
+# `pact mcp serve` does not exist without its feature — an all-features run
+# skips it silently, which is the one build where that assertion means anything.
+# The same shape of gap once shipped a ui-only helper as dead code in the default
+# build: local green, CI red, master broken.
+#
+# Default FIRST, all-features SECOND, and the order is load-bearing: both write
+# the same `target/debug/pact`, so whichever runs last is the binary left on
+# disk. With the default leg last, `mise run test` followed by
+# `./target/debug/pact ui` answers "unrecognized subcommand" — the stale-binary
+# confusion this repo has already been bitten by once.
+run = [
+  "cargo test",
+  "cargo test --features $PACT_ALL_FEATURES",
+]
 
 [tasks.fmt]
 description = "Format the code"
@@ -19,12 +44,12 @@ run = "cargo fmt -- --check"
 
 [tasks.lint]
 description = "Run clippy with warnings denied, both feature-on and default"
-# Both, deliberately. Every other task builds with --features ui, and that let a
-# ui-only helper ship as dead code in the default build: `mise run check` was
+# Both, deliberately. Every other task builds with the features on, and that let
+# a ui-only helper ship as dead code in the default build: `mise run check` was
 # green, CI's default-build job was red, and master was pushed broken. A local
 # gate that does not match CI is not a gate.
 run = [
-  "cargo clippy --all-targets --features ui,otel -- -D warnings",
+  "cargo clippy --all-targets --features $PACT_ALL_FEATURES -- -D warnings",
   "cargo clippy --all-targets -- -D warnings",
 ]
 
@@ -45,6 +70,12 @@ description = "Clippy + test the opt-in `otel` feature, and prove it still costs
 # added by the feature passed this guard silently. pact already HAS a
 # build-dependency (chrono, via build.rs), and a codegen build-dep is the most
 # likely next thing a hand-rolled JSON encoder reaches for.
+#
+# Deliberately NOT $PACT_ALL_FEATURES — do not "simplify" these into one leg.
+# These are PAIRS, and the pairs are the point: a `#[cfg(feature = "mcp")]` item
+# that only compiles when `ui` is also on is invisible to an all-features build
+# and breaks for the user who asked for `mcp` alone. `mise run build` wants every
+# feature; this task wants the combinations, which is the opposite job.
 run = [
   "cargo clippy --all-targets --features ui,otel -- -D warnings",
   "cargo test --features ui,otel",
@@ -64,9 +95,30 @@ run = [
 ]
 
 [tasks.check]
-description = "Run the full CI check locally: fmt, lint (both feature sets), test, otel, docs."
-depends = ["fmt-check", "lint", "test", "otel", "check-docs"]
+description = "Run the full CI check locally: fmt, lint, test, otel, docs — serially, as CI does."
+# Sequential, and this is not a preference. `depends` runs tasks in PARALLEL, and
+# these legs invoke cargo with different feature sets — while every one of them
+# reaches the binary through `target/debug/pact`, a single path that the last
+# build to finish owns. In parallel, one leg overwrites the artifact another
+# leg's integration tests are in the middle of spawning: `mise run check` failed
+# three times out of three with tests/mcp_absent.rs seeing a binary that had the
+# `mcp` subcommand, because the all-features `test` leg had just replaced it.
+#
+# CI is serial within a job, so serial here is also what makes local match CI —
+# the rule the `lint` task above already exists to enforce.
+run = [
+  "mise run fmt-check",
+  "mise run lint",
+  "mise run test",
+  "mise run otel",
+  "mise run check-docs",
+]
 
 [tasks.install]
-description = "Build and install the pact binary locally, ui feature included"
-run = "cargo install --path . --force --features ui"
+description = "Build and install the pact binary locally with every feature enabled"
+# All features on purpose: this is the binary that ends up on PATH and gets used
+# against this repo, so it should be the one with the most surface to exercise.
+# Neither opt-in feature costs anything unasked — `otel` exports only when the
+# standard OTEL_* variables are set (+0 ms unconfigured, measured), and `mcp`
+# does nothing until a client spawns `pact mcp serve`.
+run = "cargo install --path . --force --features $PACT_ALL_FEATURES"

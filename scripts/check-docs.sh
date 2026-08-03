@@ -35,13 +35,17 @@ problem() {
 # in the command tree at all, so a default build would silently under-report what
 # cli.md has to cover — and the reverse check would then call both of them
 # documented-but-nonexistent. Every optional subcommand has to be compiled in
-# here for the two directions to mean anything.
+# here for the two directions to mean anything. `otel` adds no subcommand and is
+# in the list only so that the artifact this leaves in target/debug matches what
+# `mise run build` produces: this script runs last in `mise run check`, and a
+# developer whose binary silently lost a feature to the final gate has no way to
+# guess why.
 if [ -n "${PACT_BIN:-}" ]; then
 	# Must itself have been built --features ui,mcp, or the reverse check below
 	# reports every optional subcommand as documented-but-missing.
 	pact() { "$PACT_BIN" "$@"; }
 else
-	cargo build --quiet --features ui,mcp || exit 1
+	cargo build --quiet --features ui,otel,mcp || exit 1
 	pact() { ./target/debug/pact "$@"; }
 fi
 

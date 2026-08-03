@@ -9,14 +9,14 @@ forgotten is a check someone deletes.
 Via [mise](https://mise.jdx.dev) tasks (`mise tasks ls` to list them):
 
 ```bash
-mise run build      # cargo build --features ui
-mise run test       # cargo test --features ui
+mise run build      # cargo build with every feature
+mise run test       # cargo test with no features, then with every feature
 mise run fmt        # cargo fmt
-mise run lint       # cargo clippy --all-targets --features ui -- -D warnings
+mise run lint       # clippy -D warnings, every feature and then none
 mise run check-docs # scripts/check-docs.sh — README/docs vs the real CLI
-mise run otel       # clippy + test the otel feature, and prove it adds no dependency
+mise run otel       # clippy + test the opt-in features in pairs, and prove they add no dependency
 mise run check      # fmt-check + lint + test + otel + check-docs, same gates as CI
-mise run install    # cargo install --path . --force --features ui
+mise run install    # cargo install with every feature (the binary that ends up on PATH)
 ```
 
 `check-docs` walks the built binary's `--help` output rather than a hardcoded
@@ -27,9 +27,46 @@ nothing noticed.
 
 Or run the underlying `cargo` commands directly if you don't use mise.
 
-Every task builds with `--features ui`, so what you test is what you install.
-CI runs clippy and test **both** ways — with and without the feature — so the
-dependency-light default stays guarded even though no local task exercises it.
+**Local development builds every feature**, from one list — `PACT_ALL_FEATURES`
+in `mise.toml` — so no two tasks can disagree about what "all of them" means. Add
+a feature to `Cargo.toml` and it goes there too. What you test is then what you
+install, and an opt-in feature nobody compiles rots: `ui` proved that by breaking
+while every task was green.
+
+Neither opt-in feature costs anything unasked, which is what makes installing
+them all safe: `otel` exports only when the standard `OTEL_*` variables are set
+(+0 ms unconfigured, measured), and `mcp` does nothing until a client spawns
+`pact mcp serve`.
+
+The **default** build is still gated locally, not only in CI, because some checks
+exist only there. `lint` runs clippy with every feature and then with none;
+`test` runs the suite both ways. `tests/mcp_absent.rs` is gated
+`not(feature = "mcp")` and asserts `pact mcp serve` does not exist without its
+feature — an all-features run skips it silently, and it is the one build where
+that assertion means anything. The default leg runs *first* on purpose: both legs
+write the same `target/debug/pact`, so the last one wins, and a featureless
+binary left there is how `./target/debug/pact ui` starts answering "unrecognized
+subcommand" for no visible reason.
+
+`mise run otel` deliberately uses feature *pairs* (`ui,otel`, `mcp,otel`) rather
+than the full set. That is the opposite job: a `#[cfg]` item that only compiles
+when two features are on is invisible to an all-features build and breaks for
+whoever enabled just one.
+
+`mise run check` runs its legs **serially**, which is slower and deliberate.
+`depends` would run them in parallel, and every leg reaches the binary through
+`target/debug/pact` — one path, owned by whichever build finished last. In
+parallel, one leg overwrites the artifact another leg's integration tests are
+mid-spawn on: `check` failed three times out of three with
+`tests/mcp_absent.rs` seeing a binary that *had* the `mcp` subcommand, because
+the all-features `test` leg had just replaced it. Serial is also what makes local
+match CI, which is serial within a job.
+
+That sharp edge is worth knowing before writing an integration test:
+`CARGO_BIN_EXE_pact` is a shared path, not a per-feature-set artifact. Tests that
+assert behaviour are immune; one that asserts a feature is *absent* is not, so
+`mcp_absent` checks the `features:` line of `pact --version` before trusting what
+it spawned and skips loudly if another build got there first.
 
 `otel` is guarded the same way, and for the same reason `ui` needed it: an
 off-by-default feature that nothing compiles rots. Its one load-bearing line is

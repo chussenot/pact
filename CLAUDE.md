@@ -11,16 +11,24 @@ shelling out to the Beads CLI (`bd`).
 
 ```bash
 mise run check    # fmt-check + clippy (both feature sets) + test + otel + docs — the CI gate
-mise run build    # cargo build --features ui
-mise run test     # cargo test --features ui
-mise run install  # cargo install --path . --force --features ui  (CURRENT build on PATH)
+mise run build    # cargo build with every feature
+mise run test     # cargo test with no features, then with every feature
+mise run install  # cargo install with every feature  (CURRENT build on PATH)
 ```
 
-Every mise task builds with `--features ui`, so `pact ui` exists in what you
-build, test and install. `ui` is **not** a default Cargo feature — a plain
-`cargo build` leaves ratatui out, and CI runs clippy and test both ways so that
-dependency-light build stays guarded. `pact --version` prints the enabled
-features, which is the fast answer to `unrecognized subcommand 'ui'`.
+Local tasks build **every** feature, from `PACT_ALL_FEATURES` in `mise.toml` —
+one list, so no two tasks disagree. None of `ui`, `otel`, `mcp` is a default Cargo
+feature: a plain `cargo build` leaves ratatui out and has neither `pact ui` nor
+`pact mcp serve`. `pact --version` prints the features compiled in, which is the
+fast answer to `unrecognized subcommand`.
+
+`lint` and `test` each run the default build too, because some checks exist only
+there (`tests/mcp_absent.rs` is gated `not(feature = "mcp")`). In `test` the
+default leg runs **first**: both legs write `target/debug/pact` and the last one
+wins, so a featureless binary left behind would make `./target/debug/pact ui`
+fail for no visible reason. `mise run otel` uses feature *pairs* on purpose — an
+all-features build cannot catch a `#[cfg]` item that needs two features at
+once.
 
 Run a single test: `cargo test <substring>`, e.g. `cargo test lease::tests::renew`.
 

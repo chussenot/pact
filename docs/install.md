@@ -8,7 +8,7 @@ would have to maintain.
 ## Install
 
 ```bash
-mise run install   # cargo install --path . --force --features ui
+mise run install   # cargo install --path . --force with every feature
 ```
 
 Or manually:
