@@ -81,10 +81,18 @@ belong to processes that exit while the work stays.
 
 ## What pact deliberately is not
 
-**No daemon, no server, no MCP endpoint.** Every command reads state, maybe
-changes it, and exits. A daemon is one more thing that crashes, drifts out of
-sync, or has to be restarted before anyone can work — and pact would then be
-part of the problem it exists to solve.
+**No daemon.** Every command reads state, maybe changes it, and exits. A daemon
+is one more thing that crashes, drifts out of sync, or has to be restarted before
+anyone can work — and pact would then be part of the problem it exists to solve.
+
+**No MCP *write* path**, though there is a read-only MCP server. Build it with
+`--features mcp` and an observer that cannot run shell commands — an
+orchestrator, a status pane — can ask who holds what, what is unread, and whether
+the fleet is still moving. It cannot acquire a lease or send a message, and that
+is not a gap to close: a lease is a promise made *by a named agent doing the
+work*, so a claim no process stands behind is worse than no claim at all. The
+no-daemon line above still holds — the client spawns it on stdio and ends it by
+closing stdin. See [docs/mcp.md](docs/mcp.md).
 
 **No mandatory locking.** See above: advisory degrades safely, mandatory
 deadlocks at 2am with nothing to ask why.
@@ -136,6 +144,7 @@ what the tooling did to it, and require a quoted command as evidence.
 | [leases.md](docs/leases.md) | the lease lifecycle: TTL, grace period, steal vs. expiry, path identity |
 | [messaging.md](docs/messaging.md) | how messages map onto Beads issues, threading, read state, addressing a path |
 | [architecture.md](docs/architecture.md) | how pact, agents and Beads fit together, and the non-goals in full |
+| [mcp.md](docs/mcp.md) | the optional read-only MCP server: the five tools, and why it cannot write |
 | [tui.md](docs/tui.md) | `pact ui` — tabs, keybindings, and the `ui` build feature |
 | [telemetry.md](docs/telemetry.md) | the optional OpenTelemetry export: what leaves the machine and what never does |
 | [development.md](docs/development.md) | build, test, the CI gates and why each exists, the upstream canary |

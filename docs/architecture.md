@@ -250,8 +250,15 @@ tidy-up that mistakes it for the export.
 
 - **No daemon or background process.** Every command is a single invocation
   that reads state, maybe changes it, and exits.
-- **No MCP server.** pact is a CLI; wire it into an agent however that agent
-  already runs shell commands.
+- **No MCP *write* path.** There is an optional read-only MCP server
+  (`pact mcp serve`, behind the `mcp` feature — see [mcp.md](mcp.md)) so that an
+  observer with no shell can still ask who holds what. It cannot acquire a
+  lease, send a message or mark one read, and that is permanent: a lease is a
+  promise made by a named agent doing the work, and a claim no process stands
+  behind is worse than no claim, because the next agent negotiates against a
+  peer that does not exist. Mutations stay on the CLI.
+  This does not soften the line above — the server is a subprocess the client
+  spawns, owns, and ends by closing stdin. No port, no daemon, no state.
 - **No direct Beads database or JSONL access.** Messaging always shells out
   to the Beads CLI, never reads `.beads/*.db`, `.beads/embeddeddolt/` or
   `issues.jsonl` directly. If Beads changes its storage format, pact doesn't

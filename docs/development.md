@@ -48,6 +48,32 @@ behind `pact log`). Message read state is not there — it lives in `bd`, as one
 with a single `.pact/` line, so anything else an agent writes there is covered
 without a new rule.
 
+## Opt-in features
+
+Two features are off by default, and both are asserted to add **zero**
+dependencies — `mise run otel` and CI compare `cargo tree --edges
+normal,build,dev` with and without each of `otel`, `mcp` and `mcp,otel`, and
+require the trees to be character-for-character equal.
+
+| Feature | Adds | Built by |
+|---|---|---|
+| `ui` | `pact ui`, the ratatui dashboard (this one *does* add ratatui) | every mise task |
+| `otel` | OpenTelemetry export, hand-rolled OTLP/HTTP+JSON over `std::net` | `mise run otel`, CI |
+| `mcp` | `pact mcp serve`, hand-rolled JSON-RPC over stdio | `mise run otel`, CI |
+
+The zero-dependency rule is why both are hand-written rather than built on an
+SDK: `opentelemetry-otlp` pulls tonic and tokio in every feature combination
+(measured — see `src/otel.rs`), and an MCP SDK would charge an async runtime for
+newline-delimited JSON-RPC framing that fits in fifty lines of `serde_json` and
+`std::io`.
+
+Each needs its own CI leg because a feature nobody compiles rots: `ui` went
+unbuilt long enough to break, which is the reason these legs exist at all. `mcp`
+additionally needs the *default* build tested, because the thing to prove there
+is an absence — `tests/mcp_absent.rs` asserts `pact mcp serve` does not exist
+without the feature, and it is gated `not(feature = "mcp")` so it runs in exactly
+the build it describes.
+
 ## Canary: pact against a real Beads CLI
 
 `tests/cli.rs` stubs `bd`. That is right for a unit suite, and it means nothing

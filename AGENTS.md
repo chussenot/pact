@@ -47,6 +47,18 @@ cp -rf source dest          # NOT: cp -r source dest
 - `apt-get` - use `-y` flag
 - `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
+## pact over MCP (read-only)
+
+If you cannot run shell commands but you do have MCP, this repository can serve
+pact's observation surface: a build with `--features mcp` exposes `pact mcp
+serve`, whose five tools report leases, an agent's inbox, one message thread,
+doctor checks and the event log. Reading a message or thread through MCP does
+**not** mark it read, so the recipient still owes it a look and the sender will
+still see it as undelivered. Every mutation — acquiring or releasing a lease,
+sending a message, marking one read — goes through the pact CLI protocol below,
+because a claim no working agent stands behind is worse than no claim. See
+`docs/mcp.md`.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:6cd5cc61 -->
 ## Beads Issue Tracker
 

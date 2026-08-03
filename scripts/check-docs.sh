@@ -10,6 +10,7 @@
 #
 # Three checks, in the bead's order of value per line:
 #   1. every subcommand and flag the real CLI exposes is in docs/cli.md's Commands block
+#      (built with every optional feature on, so `ui` and `mcp` count)
 #      (and, in reverse, nothing in that block has stopped existing)
 #   2. every relative markdown link in README.md and docs/ resolves to a real file
 #   3. every `pact doctor` check name is named in docs/tui.md's Doctor section
@@ -30,12 +31,17 @@ problem() {
 	fail=1
 }
 
-# --features ui matters: without it `pact ui` is not in the command tree at all,
-# so a default build would silently under-report what cli.md has to cover.
+# --features ui,mcp matters: without them `pact ui` and `pact mcp serve` are not
+# in the command tree at all, so a default build would silently under-report what
+# cli.md has to cover — and the reverse check would then call both of them
+# documented-but-nonexistent. Every optional subcommand has to be compiled in
+# here for the two directions to mean anything.
 if [ -n "${PACT_BIN:-}" ]; then
+	# Must itself have been built --features ui,mcp, or the reverse check below
+	# reports every optional subcommand as documented-but-missing.
 	pact() { "$PACT_BIN" "$@"; }
 else
-	cargo build --quiet --features ui || exit 1
+	cargo build --quiet --features ui,mcp || exit 1
 	pact() { ./target/debug/pact "$@"; }
 fi
 

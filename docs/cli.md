@@ -28,10 +28,18 @@ pact msg read <id>
 pact log [-n | --limit <count>]
 pact doctor
 pact ui
+pact mcp serve
 ```
 
 Plus `pact -V` (bare version) and `pact --version` (version plus build stamp —
 see [install.md](install.md#which-binary-am-i-running)).
+
+Two of those exist only in a build that asked for them: `pact ui` needs the `ui`
+feature and `pact mcp serve` needs `mcp`. In a build without one, the subcommand
+is absent from `--help` entirely and invoking it is a usage error (exit 5, not
+2 — see below). `pact --version` lists the features compiled in, which is the
+fast answer to `unrecognized subcommand`. `pact mcp serve` is documented in
+[mcp.md](mcp.md); it is read-only and speaks MCP on stdio.
 
 Every subcommand accepts a global `--agent <name>` (or `PACT_AGENT` env var)
 and `--json` flag. `--all` on `release` is mutually exclusive with both

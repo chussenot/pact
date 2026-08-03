@@ -70,8 +70,8 @@ Invariants worth knowing, because each was broken at least once:
 `README.md` carries only *why* — the problem, why each primitive is shaped as it
 is, the non-goals, provenance. Every *how* lives in `docs/`: `install.md`,
 `cli.md` (the command/exit-code contract), `onboarding.md`, `leases.md`,
-`messaging.md`, `architecture.md`, `tui.md`, `telemetry.md`, `development.md`,
-`mascot-animations.md`.
+`messaging.md`, `architecture.md`, `mcp.md`, `tui.md`, `telemetry.md`,
+`development.md`, `mascot-animations.md`.
 
 Keep it that way. `scripts/check-docs.sh` (part of `mise run check`) compares
 `docs/cli.md`'s `Commands` block against the built binary in both directions,

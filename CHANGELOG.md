@@ -243,6 +243,47 @@ cog's.
 
 ## Notes — unreleased
 
+### Added — a read-only MCP server, and why it stays read-only
+
+- **`pact mcp serve`**, behind the off-by-default `mcp` feature, answers five
+  questions over MCP on stdio: leases held, one agent's inbox, one message
+  thread, doctor checks, and the tail of the event log. It exists because every
+  pact command until now assumed the asker could run a shell command, and an
+  orchestrator or status pane whose only tool surface is MCP had to ask a human
+  "is the fleet still moving?" — the same relay `pact msg` exists to remove one
+  level down.
+- **It cannot write, and that is permanent rather than unfinished.** A lease is a
+  promise made *by a named agent that is doing the work*; `pact log` is the record
+  of who said they would do what. An observer holds no files and cannot honour a
+  claim, so a lease acquired on its behalf puts a claim in the log that no process
+  stands behind — and the next agent then renegotiates against a peer that does
+  not exist, which is strictly worse than seeing the path unclaimed. Messages are
+  the same argument one step sharper: a message from an observer is one nobody can
+  reply to. Mutations stay on the CLI.
+- **Two read paths in pact are not read-only, and both were traps.** `pact msg
+  read` writes a `read-by-<agent>` label, which is exactly what a *sender* checks
+  to decide whether to re-send — so the obvious implementation would have told
+  every sender their message had landed with an agent that never saw it, and
+  suppressed the re-send that should have happened. `pact lease ls`
+  garbage-collects expired lock files, which is its documented job, so a
+  dashboard polling it would have been quietly reclaiming other agents' paths.
+  The tools use `msg::peek_thread` (new, split from `read_thread` so the two
+  cannot drift) and `lease::peek` instead, and both message tool descriptions say
+  so in the text the client shows the model — a caller who gets this wrong makes a
+  wrong decision rather than getting an error.
+- **Zero new dependencies**, like `otel` and enforced by the same `cargo tree`
+  equality check, now covering `otel`, `mcp` and `mcp,otel`. MCP's stdio transport
+  is newline-delimited JSON-RPC 2.0, so it is `serde_json` — which pact already
+  has — plus `std::io`; an SDK would charge an async runtime for framing worth
+  fifty lines. Only the initialization-based ("legacy") revisions are implemented;
+  `2026-07-28` replaced that handshake with per-request `_meta` and a mandatory
+  `server/discover`, and answering `-32601` to that probe is precisely the signal
+  the spec tells a dual-era client to read as "fall back to `initialize`".
+- The read-only claim is **tested, not asserted**: `tests/mcp.rs` drives the real
+  binary over pipes, calls every tool, and compares a byte-and-mtime snapshot of
+  `.pact/` and `.beads/` before and after. `tests/mcp_absent.rs` is gated the
+  other way and asserts a default build has no `mcp` subcommand at all.
+
 ### Added — ownership outlives the lease
 
 - **`pact agents --for <path>`**, an advisory note from **`pact lease acquire`**,
