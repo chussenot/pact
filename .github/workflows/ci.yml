@@ -15,7 +15,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch tip — pins the ACTION, not the toolchain; Rust stays current because the action installs whatever stable is at run time
         with:
           components: rustfmt, clippy
@@ -104,14 +104,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # cog needs the real history to walk a range, not a shallow tip.
           fetch-depth: 0
-      - uses: cocogitto/cocogitto-action@9a9fe03b31c47444290c0d7f9b1ee1b44ee13f20 # v4.1.0
+      # `install-only`, and it has to be this input specifically. The action is
+      # used here only to put `cog` on the PATH — the actual check runs in the
+      # next step, because it needs a commit range this action cannot express.
+      #
+      # It used to say `check: false`, which quietly did nothing: those inputs
+      # belong to an older major of the action and no longer exist, so `command`
+      # was simply empty. Harmless until cocogitto 6.5.0 started exiting 1 on a
+      # bare invocation ("Error: No command specified"), at which point this step
+      # failed before the check it exists to install for ever ran — and every PR
+      # went red for a reason that had nothing to do with its commits. An unknown
+      # input is not an error in Actions, which is what let it rot silently.
+      #
+      # v4.2.0 is the first release with `install-only`; on 4.1.0 `command` is
+      # `required: true` and there is no way to ask for install alone.
+      - uses: cocogitto/cocogitto-action@52d0023b4396897f1815648e553db2ab8d782f3a # v4.2.0
         with:
-          check: false
-          check-latest-tag-only: false
+          install-only: true
       # Only the commits this PR adds. Checking all history would fail on
       # pre-existing subjects nobody can fix now, and merge commits come from
       # GitHub's own template rather than from an author.
