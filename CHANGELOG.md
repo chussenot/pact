@@ -266,6 +266,51 @@ cog's.
 
 ## Notes — unreleased
 
+### Added — worktrees share one coordination space, because advisory locks must
+
+- **Every `git worktree` of a repository now shares a single `.pact/`**: leases,
+  the event log, the agents registry and messages all cross between checkouts.
+  Nothing to configure, and nothing changes for a repository that does not use
+  worktrees — `.git` being a directory is the identity path, and the whole
+  pre-existing test suite passes unmodified as the proof.
+- **Why shared is the only correct default.** A lease is *advisory*. It enforces
+  nothing; its entire value is that a peer can see it. Give two worktrees their
+  own `.pact/` and both agents "acquire" `src/api.ts`, both are told they
+  succeeded, and neither learns the other exists — an advisory lock that advises
+  nobody, which is strictly worse than no lock at all, because it *reports
+  success*. Isolation would have been a defensible default for a mandatory lock,
+  where the cost of a false claim is a stuck file; for an advisory one the cost is
+  two agents editing the same file while both believe they were granted it. So
+  `PACT_WORKTREE_SCOPE=local` exists for the rare case where two worktrees really
+  are unrelated projects, and `pact doctor` warns whenever it is in effect
+  somewhere it could hide a peer.
+- **Resolution is two file reads, no `git` subprocess.** A linked worktree's
+  `.git` is a *file* containing `gitdir:`, which points at
+  `<common>/worktrees/<name>`, which holds a `commondir` pointing back at the
+  common `.git`. A common dir named `.git` sits inside the main worktree, so state
+  goes there; anything else (`repo.git`) is a bare repository with no checkout to
+  sit beside, so state is anchored at `<common>/pact/` instead. Anything
+  unparseable falls back to per-worktree state with a warning `pact doctor`
+  prints — a broken `.git` file is a reason to coordinate less, never a reason for
+  `lease acquire` to abort in the middle of a fleet.
+- **Leases now say where their holder is.** `branch` and `worktree` are added to
+  the payload and to the exit-2 message: "held by agent-a on branch feat/auth in
+  worktree wt-auth". Cross-worktree contention is confusing in a way
+  same-directory contention is not — the holder is editing a copy the loser
+  cannot see changing, so "held by agent-a" alone invites them to check their own
+  working copy, find it untouched, and conclude the lease is stale. Both fields
+  are **absent**, not null, in a repository without worktrees, and `lease ls`
+  grows its `WHERE` column only when there is something to put in it, so that
+  output and those lock files stay byte-identical.
+- **One trade-off, stated rather than hidden.** The Beads store lives in the main
+  worktree, so the backend subprocess runs there — otherwise `msg send` from one
+  worktree would be invisible to `msg inbox` in another, or `bd` would initialise
+  a second empty store in the worktree and cheerfully report an empty inbox. The
+  consequence is that **Beads commits land on the main worktree's branch**,
+  whatever it happens to be. In the bare-repository topology there is no main
+  worktree at all, so `pact msg` refuses with exit 3 and says why, rather than
+  creating a store nobody will find again; leases and `pact log` keep working.
+
 ### Added — prebuilt binaries, in two profiles
 
 - **Every version tag now publishes tarballs** for four unix targets, each in two

@@ -44,6 +44,11 @@ by walking up from your current directory looking for `.git` — the same way
 `git` itself finds its repo root. That means you can run `pact` from any
 subdirectory and it'll find the right place.
 
+In a **linked worktree** the state directory is not under your feet: it belongs
+to the repository, not the checkout. See
+[the resolution chain](#one-coordination-space-per-repository-not-per-checkout)
+below.
+
 | Path | What | Committed? |
 |------|------|------------|
 | `.pact/leases/*.lock` | one JSON file per active lease | no |
@@ -68,6 +73,66 @@ them would just create merge conflicts between agents that have nothing to do
 with each other. The `AGENTS.md` block is the opposite: it's the one artifact
 meant to travel with the repo, so every agent that clones it learns the protocol
 on its own.
+
+### One coordination space per repository, not per checkout
+
+Several `git worktree`s of one repository are one repository being edited from
+several directories. pact treats them that way: all of them share a single
+`.pact/`, so a lease taken in one is visible in the others.
+
+That is not a convenience, it is the only correct semantic. A lease is
+**advisory** — its entire value is that a peer can see it. Give each worktree its
+own `.pact/` and two agents both "acquire" `src/api.ts`, both are told they
+succeeded, and neither learns the other exists: an advisory lock that advises
+nobody, which is strictly worse than no lock at all, because it reports success.
+
+Resolution is two file reads, no `git` subprocess (`reach` and `commit_paths` are
+the only places pact shells out to git, because gitignore semantics are not worth
+reimplementing):
+
+1. **`<root>/.git` is a directory** → an ordinary checkout. State is
+   `<root>/.pact/`. This is the identity path and is byte-for-byte what pact did
+   before it understood worktrees.
+2. **`<root>/.git` is a file** → a linked worktree. It contains
+   `gitdir: <path>`, pointing at `<common>/worktrees/<name>`. Read the
+   `commondir` file in there and resolve it (usually relative) to get the common
+   `.git`.
+   - The common dir is named **`.git`** → it sits inside the main worktree, so
+     state is `<main>/.pact/` and `<name>` becomes the worktree label.
+   - Anything else (`repo.git`) → a **bare** repository with worktrees. There is
+     no checkout to sit beside, so state is anchored at `<common>/pact/` —
+     `pact`, not `.pact`, since nothing there is hidden beside a working tree.
+3. **Anything unparseable** — no `gitdir:` line, a pointer to nowhere, a missing
+   `commondir` — falls back to per-worktree state with a warning that `pact
+   doctor` prints. A broken `.git` file is a reason to coordinate less, never a
+   reason for `pact lease acquire` to abort in the middle of a fleet.
+
+Every one of those decisions is reported by `pact doctor` (`worktree`,
+`coordination scope`, `state placement`, `state dir writable`), because a
+surprising answer should be explainable without reading `.git` files by hand.
+
+Lock keys were already repo-root-relative, so `src/api.ts` from either checkout
+is the same lock file with no encoding change. Leases additionally carry
+`branch` and `worktree`, and the exit-2 conflict message names both — a peer in
+another worktree is editing a copy the loser cannot see changing, so "held by
+agent-a" alone invites them to check their own working copy, find it untouched,
+and conclude the lease is stale. Both fields are **absent**, not null, in a
+repository with no worktrees, so its lock files stay byte-identical.
+
+**Messages follow the same rule, with one visible consequence.** The Beads store
+lives in the main worktree, so the backend subprocess runs there — otherwise
+`msg send` from one worktree would be invisible to `msg inbox` in another, or
+`bd` would initialise a second empty store in the worktree and report an empty
+inbox. The trade-off, stated rather than hidden: **Beads commits land on the main
+worktree's branch**, whichever branch that happens to be. In the bare-repository
+case there is no main worktree at all, so `pact msg` refuses with exit 3 rather
+than creating a store somewhere nobody will find again; leases and `pact log`
+keep working.
+
+`PACT_WORKTREE_SCOPE=local` restores per-worktree isolation. It exists for the
+rare case where two worktrees are deliberately unrelated projects, and `pact
+doctor` warns whenever it is in effect in a repository that has worktrees,
+because the leases it produces advise nobody.
 
 ### `.pact/events.jsonl`: the one thing pact stores that it can't derive
 

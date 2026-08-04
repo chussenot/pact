@@ -136,3 +136,48 @@ what you asked for is the text, not a report about it. Every other `init`
 invocation honours `--json`, whose report carries `instruction_files` alongside
 `agents_md`, `claude_md` and the commit fields.
 
+
+## Recipe: one agent per `git worktree`
+
+A worktree per agent is the natural fleet layout — each gets its own branch and
+its own checkout, and none of them trip over a colleague's half-finished edit.
+pact needs nothing configured for it: all worktrees of one repository share a
+single `.pact/`, so leases and messages already cross between them
+([why](architecture.md#one-coordination-space-per-repository-not-per-checkout)).
+
+The one thing worth setting per worktree is the identity, because pact never
+guesses one:
+
+```bash
+git worktree add -b feat/auth ../wt-auth
+echo 'export PACT_AGENT=agent-auth' > ../wt-auth/.envrc   # direnv
+direnv allow ../wt-auth
+```
+
+Any mechanism works — `.envrc`, the agent's own launcher, `--agent` on each
+command. What matters is that the name differs per worktree: two agents sharing
+one `PACT_AGENT` are one agent as far as leases are concerned, so each will
+happily "re-acquire" what the other holds, which is a re-entrant refresh and not
+a conflict.
+
+Run `pact init` once, in the main worktree. It writes `AGENTS.md` and friends,
+which are tracked files — every worktree on a branch that has them is already
+onboarded, and committing the block from two worktrees at once is the one
+avoidable merge conflict here.
+
+Check it with `pact doctor` from inside a worktree:
+
+```
+✓ worktree: linked worktree wt-auth of /home/you/code/pact
+✓ coordination scope: shared (default) — state at /home/you/code/pact/.pact
+✓ state placement: main-worktree — the main worktree at /home/you/code/pact
+✓ state dir writable: /home/you/code/pact/.pact is writable
+```
+
+If `worktree` says `not a worktree` from inside one, or `coordination scope`
+reports `local`, your agents are not sharing anything — see
+[the resolution chain](architecture.md#one-coordination-space-per-repository-not-per-checkout).
+
+One trade-off to know: because the Beads store lives in the main worktree, the
+commits `pact msg` produces land on **whatever branch the main worktree has
+checked out**, not on the branch of the worktree that sent the message.

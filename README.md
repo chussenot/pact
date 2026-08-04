@@ -111,6 +111,13 @@ point, so releases ship four unix targets — statically linked on Linux, becaus
 coordination tool that needs a matching glibc is one more thing to get right
 before anyone can work.
 
+**No cross-machine coordination.** Everything is files on one filesystem, so
+two agents coordinate when they can see each other's `.pact/`. Several
+`git worktree`s of one repository *do* share it — they are one repository being
+edited from several directories, and isolating their leases would produce
+advisory locks that advise nobody. Two clones on two machines do not, and closing
+that gap needs a consensus story pact has no business inventing.
+
 **No database of its own.** Leases are files, history is an append-only log,
 messages are Beads issues, and identities are derived from all three rather than
 registered. Nothing to migrate, and nothing that can be out of date with itself.

@@ -26,6 +26,37 @@ A lease is one JSON file: `.pact/leases/<encoded-path>.lock`, containing
 principle collide with a different path — a deliberate v1 simplification, not
 an oversight.
 
+In a repository that uses `git worktree`, two more keys appear:
+
+```json
+{
+  "agent": "agent-a",
+  "path": "src/auth.rs",
+  "acquired_at": "2026-07-30T09:12:03Z",
+  "ttl_secs": 900,
+  "note": "refactoring session handling",
+  "branch": "feat/auth",
+  "worktree": "wt-auth"
+}
+```
+
+Both are informational — nothing branches on either — and both are **absent**
+rather than null in a repository with no worktrees, so those lock files stay
+byte-identical to the block above. They exist because all worktrees of one
+repository share a single `.pact/`, so the holder may be editing a checkout the
+reader cannot see; `lease ls` grows a `WHERE` column and the exit-2 conflict
+message becomes:
+
+```
+error: lease on src/api.ts is held by agent-a on branch main in worktree main
+(0s old, 900s remaining); use --steal to override
+```
+
+Without the location, a reader inspects their own working copy, finds it
+untouched, and concludes the lease is stale. See
+[architecture.md](architecture.md#one-coordination-space-per-repository-not-per-checkout)
+for how the shared directory is resolved.
+
 ### One file is one lease, however you spell the path
 
 The lock name has to be a *canonical* answer to "which file is this", because

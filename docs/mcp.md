@@ -247,8 +247,11 @@ If your client does not support `cwd`, wrap it:
 }
 ```
 
-One server per repository. pact has nothing global to serve — leases, messages
-and the event log all belong to one checkout.
+One server per repository — and per repository is exactly right, because that is
+the scope of the state: several `git worktree`s share one `.pact/`, so a server
+spawned in any of them reports the same leases, messages and events. pact has
+nothing *global* to serve. See
+[architecture.md](architecture.md#one-coordination-space-per-repository-not-per-checkout).
 
 ## Failures
 
