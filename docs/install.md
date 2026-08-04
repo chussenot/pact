@@ -98,6 +98,71 @@ cargo build --release --features ui,otel,mcp
 cp target/release/pact /usr/local/bin/    # or anywhere on your PATH
 ```
 
+## With mise
+
+`mise plugin add pact https://github.com/chussenot/pact.git` looks like the right
+command and is not one. pact ships no asdf/vfox plugin, so mise clones this
+repository, finds none of the `bin/list-all` and `bin/install` scripts a plugin is
+made of, and reports success:
+
+```
+mise plugin:pact   ✓ https://github.com/chussenot/pact.git#cc18dcc
+```
+
+The failure arrives one command later, which is what makes it worth writing down
+— `mise use pact` then answers `pact not found in mise tool registry`, naming
+neither the clone nor the reason.
+
+What works is mise's **cargo backend**, pointed at a git tag. Features are a tool
+option rather than part of the version, so the `full` profile needs the table
+form:
+
+```toml
+# mise.toml — or ~/.config/mise/config.toml to have it everywhere
+[tools]
+"cargo:https://github.com/chussenot/pact" = { version = "tag:0.4.0", features = ["ui", "otel", "mcp"] }
+```
+
+```bash
+mise install
+pact --version    # features: mcp,otel,ui
+```
+
+Two pieces of syntax that fail in ways that don't point at themselves:
+
+- **`tag:0.4.0`, not `0.4.0`.** A bare version means a crates.io release and pact
+  is not published there, so mise stops at `Invalid cargo git version: 0.4.0`.
+- **Bracket options are not read on the command line here.** `mise use
+  "cargo:…@tag:0.4.0[features=ui,otel,mcp]"` hands the brackets to cargo as part
+  of the ref, and the error is about a refspec rather than about features. The
+  one-liner is only good for the `lean` profile:
+  `mise use "cargo:https://github.com/chussenot/pact@tag:0.4.0"`.
+
+`locked` defaults to true in this backend, so the build uses the `Cargo.lock` the
+tag carries — the same lockfile the release workflow checks against the tag, so a
+mise install and a release tarball resolve the same dependency versions.
+
+### A mise-managed pact and MCP clients
+
+mise installs into its own directory and reaches your shell through shims or
+`mise activate`. An MCP client started outside that shell — a desktop app, or
+anything launched by a session manager — has neither, so `command: "pact"`
+resolves to nothing. Ask mise where the binary actually is and register that
+path:
+
+```bash
+mise which pact
+# /home/you/.local/share/mise/installs/cargo-https-github-com-chussenot-pact/tag-0.4.0/bin/pact
+```
+
+Per-client configuration — Claude Code, Claude Desktop, Codex — is in
+[mcp.md](mcp.md#registering-it). Whichever client you use, `pact mcp serve` exists
+only in a build with the `mcp` feature, so check `pact --version` first: an MCP
+server that answers `unrecognized subcommand` is a `lean` binary, not a broken
+config.
+
+## The Beads CLI
+
 Requires a **Beads CLI** on `PATH` for the `msg` subcommands; `init`, `lease`,
 `whoami`, `agents`, `log` and `doctor` (partially — the lease half plus a
 warning) work without one. Either implementation will do:

@@ -193,6 +193,28 @@ with the project directory as the working directory, so nothing else is needed:
 }
 ```
 
+`claude mcp add pact --scope project -- pact mcp serve` writes exactly that.
+
+### Codex CLI
+
+`[mcp_servers.<name>]` in TOML rather than JSON. Either `.codex/config.toml` in
+the repository — read once the project is trusted, which is the scope that
+matches one-server-per-repository — or `~/.codex/config.toml` for every repo you
+open:
+
+```toml
+[mcp_servers.pact]
+command = "pact"
+args = ["mcp", "serve"]
+cwd = "/home/you/code/your-repo"
+```
+
+`cwd` is set even though `codex` is normally launched from the repository and the
+server would inherit that directory: what Codex guarantees about a stdio server's
+working directory is not written down, and the failure if it differs is exit 4 at
+startup with no tool call to attach the error to. One line makes the question not
+arise. Add `enabled = false` to park the server without deleting the block.
+
 ### Claude Desktop
 
 `claude_desktop_config.json` — `~/Library/Application Support/Claude/` on macOS,
