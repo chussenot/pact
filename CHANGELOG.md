@@ -10,6 +10,17 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.5.1 - 2026-08-04
+#### Bug Fixes
+- **(mcp)** structuredContent must be an object, not a bare array - (6fbf32b) - Clement HUSSENOT-DESENONGES
+- **(repo)** classify submodules by gitdir path instead of misreading them as broken worktrees - (9362dd9) - Clement HUSSENOT-DESENONGES
+#### Continuous Integration
+- **(deps)** bump checkout to v7.0.1, cocogitto-action to v4.2.0, and fix the commits gate - (2ba5bd9) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(beads)** record the submodule fix and the bd staging-scope experiment - (937d721) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.5.0 - 2026-08-04
 #### Documentation
 - **(worktree)** document the shared coordination space and its one trade-off - (f854c0f) - Clement HUSSENOT-DESENONGES
