@@ -122,8 +122,19 @@ trusted from then on.
 So a scheduled workflow installs a real `bd` release and runs
 [`scripts/canary.sh`](../scripts/canary.sh) against it: `bd init`, `pact init`,
 `pact doctor`, a two-identity message round-trip (send → inbox → read →
-`--unread-only` is empty → the sender can see it was read), and a lease
-acquire/list/release. Weekly, plus `workflow_dispatch`. It is **not** in `ci.yml`
+`--unread-only` is empty → the sender can see it was read), a lease
+acquire/list/release, and one assertion about what `bd` must *not* do: that it
+performs no git operations in the main worktree. Weekly, plus
+`workflow_dispatch`.
+
+That last one guards a decision rather than a behaviour. pact runs the Beads
+backend in the main worktree so every linked worktree shares one store, which
+means a sibling worktree causes `bd` to run in a checkout someone else may be
+working in. Measured, `bd` neither commits nor touches the index there, so pact
+ships no mitigation — and the canary stages decoy work, sends a message from a
+real linked worktree, and fails if `HEAD` moved, if staging changed, or if an
+index lock was left behind. See
+[architecture.md](architecture.md#what-that-routing-does-not-do-and-why-it-is-checked-weekly). It is **not** in `ci.yml`
 and **not** a required check — it depends on a third party's release process and
 the network, and a canary that can block a merge gets disabled the first time
 upstream has a bad day.

@@ -186,6 +186,35 @@ case there is no main worktree at all, so `pact msg` refuses with exit 3 rather
 than creating a store somewhere nobody will find again; leases and `pact log`
 keep working.
 
+#### What that routing does *not* do — and why it is checked weekly
+
+Running the backend in the main worktree means an agent in worktree B causes `bd`
+to run inside a checkout where another agent may be mid-task. Two hazards follow
+naturally from that, and it would be reasonable to assume both:
+
+- **index-lock contention** — `bd` racing that agent's own `git add`/`git commit`
+- **staging bleed** — `bd`'s commit sweeping whatever the agent had staged
+
+Measured against `bd` 1.1.2, **neither happens**: `bd` performs no git operations
+at all for the only mutating subcommands pact issues, `create` and `label add`.
+End to end — a sibling worktree sending a message while the main worktree held a
+staged new file and a staged modification — `HEAD` did not move, the staged work
+was neither committed nor altered, and no `.git/index.lock` was left behind.
+
+So pact ships **no mitigation**, deliberately. A `doctor` check recommending a
+no-git-ops mode would warn about a hazard that does not exist, and wrapping
+pact's `bd` calls in an internal lease would serialise operations that never
+conflict — paying a lock on every message for a measurement that says zero.
+
+That reasoning rests entirely on somebody else's behaviour, so it is asserted
+rather than remembered: `scripts/canary.sh` stages decoy work, sends a message
+from a real linked worktree, and fails if `HEAD` moved, if staging changed, or if
+an index lock was left behind. The failure message names the two mitigations to
+reach for. The guard was verified in both directions — green against real `bd`,
+and red against a deliberately committing `bd` shim, whose diagnostic correctly
+listed the agent's swept files. If `bd` changes its mind, the canary says so
+before a user does.
+
 `PACT_WORKTREE_SCOPE=local` restores per-worktree isolation. It exists for the
 rare case where two worktrees are deliberately unrelated projects, and `pact
 doctor` warns whenever it is in effect in a repository that has worktrees,

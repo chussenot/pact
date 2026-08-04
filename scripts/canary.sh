@@ -97,7 +97,10 @@ first_line "$("$PACT" --version)" && echo
 
 # ------------------------------------------------------------- scratch repo
 WORK="$(mktemp -d)"
-cleanup() { rm -rf "$WORK"; }
+# Scratch space that must NOT live inside the repo under test; see the sibling
+# worktree section at the end.
+OUTSIDE="$(mktemp -d)"
+cleanup() { rm -rf "$WORK" "$OUTSIDE"; }
 trap cleanup EXIT
 
 step "bd init in a scratch repo"
@@ -196,5 +199,96 @@ PACT_AGENT=canary-a "$PACT" lease release --all >/dev/null || fail "lease releas
 PACT_AGENT=canary-a "$PACT" lease ls --json >"$LS" || fail "lease ls after release failed"
 jq -e 'length == 0' "$LS" >/dev/null || fail "leases remain after release --all: $(cat "$LS")"
 printf '  acquire, list and release round-tripped\n'
+
+# ------------------------------------------- bd must not touch git, still
+#
+# pact routes every bd invocation through the MAIN worktree (see `beads_root` in
+# src/beads.rs), so that all linked worktrees of one repository share one Beads
+# store. That is correct for messaging and it has a consequence: an agent in
+# worktree B causes bd to run inside a checkout where another agent may be
+# actively working.
+#
+# Two hazards were hypothesised (pact-zid): bd racing the main-worktree agent on
+# `.git/index.lock`, and bd's auto-commit sweeping whatever that agent had
+# staged. Measured against bd 1.1.2, neither can happen — bd performs NO git
+# operations for the only mutating subcommands pact issues (`create` and `label
+# add`). So pact deliberately ships no mitigation: a doctor check would warn
+# about a hazard that does not exist, and wrapping bd calls in an internal lease
+# would serialise operations that never conflict.
+#
+# That decision rests entirely on somebody else's behaviour, which is precisely
+# what this canary is for. If a future bd starts committing, the reasoning behind
+# "no mitigation needed" evaporates silently — a sibling worktree would begin
+# rewriting history in a checkout it does not own, and nothing else here would
+# notice.
+step "bd does not touch git in the main worktree"
+
+# The scratch repo has no commit yet (`pact init --no-commit`, above, on purpose).
+# HEAD and `git worktree add` both need one, and this is the only section that
+# cares about git at all, so the commit is made here rather than earlier.
+printf 'tracked before the agent touches it\n' >README-canary.txt
+git add -A >/dev/null 2>&1 || true
+git commit -q -m "canary: baseline" >/dev/null 2>&1 || true
+git rev-parse HEAD >/dev/null 2>&1 || fail "could not create a baseline commit in the scratch repo"
+
+# What a main-worktree agent looks like mid-task: one staged NEW file and one
+# staged MODIFICATION to a tracked one. Both shapes, because a broad `git add`
+# and a `git commit -a` sweep different things — the second only picks up
+# modifications to files git already knows.
+printf 'work in progress\n' >agent-wip.txt
+printf 'edited by the agent\n' >>README-canary.txt
+git add agent-wip.txt README-canary.txt
+HEAD_BEFORE="$(git rev-parse HEAD)"
+STAGED_BEFORE="$(git diff --cached --name-only | sort)"
+[ -n "$STAGED_BEFORE" ] || fail "could not stage the decoy changes"
+
+# Outside the repository, both of them. `$WORK` *is* the scratch repo, so a
+# worktree or a log file placed under it would be untracked content inside the
+# tree being inspected — and a bd that ran `git add -A` would then sweep an
+# entire second checkout into its commit. Found the hard way while proving this
+# guard fails: the diagnostic listed `sibling-wt` and `wt.err` among the swept
+# paths, which is noise the reader has to discount.
+SIBLING="$OUTSIDE/sibling-wt"
+if git worktree add -q -b canary-sibling "$SIBLING" HEAD 2>"$OUTSIDE/wt.err"; then
+	# The end-to-end case: a message SENT FROM the sibling runs bd here.
+	(cd "$SIBLING" && PACT_AGENT=canary-sib "$PACT" msg send --to canary-a "from the sibling" >/dev/null) ||
+		fail "msg send from a linked worktree failed — sibling routing is broken"
+	printf '  sibling worktree sent a message through the main checkout\n'
+else
+	# Not fatal: the point of the section is bd's git behaviour, and the local
+	# calls below exercise it either way.
+	printf '  note: git worktree add failed, testing local bd calls only (%s)\n' \
+		"$(first_line "$(cat "$OUTSIDE/wt.err")")"
+fi
+
+# And the two mutating calls directly, so the assertion holds even if the
+# worktree could not be created.
+PACT_AGENT=canary-a "$PACT" msg send --to canary-b "second" >/dev/null || fail "msg send failed"
+SECOND_ID="$(PACT_AGENT=canary-b "$PACT" msg inbox --json | jq -r '.[-1].id')"
+PACT_AGENT=canary-b "$PACT" msg read "$SECOND_ID" >/dev/null || fail "msg read failed"
+
+HEAD_AFTER="$(git rev-parse HEAD)"
+STAGED_AFTER="$(git diff --cached --name-only | sort)"
+
+if [ "$HEAD_BEFORE" != "$HEAD_AFTER" ]; then
+	printf '\ncommits bd made:\n' >&2
+	git log --oneline --stat "$HEAD_BEFORE..$HEAD_AFTER" >&2
+	fail "bd moved HEAD ($HEAD_BEFORE -> $HEAD_AFTER). bd now performs git operations, so
+pact's routing of bd through the main worktree lets a SIBLING worktree rewrite
+history in a checkout it does not own. Re-open pact-zid: the mitigation options
+are a doctor check recommending bd's no-git-ops mode when has_worktrees, or
+wrapping pact's mutating bd calls in an internal lease on a reserved key."
+fi
+
+if [ "$STAGED_BEFORE" != "$STAGED_AFTER" ]; then
+	printf '\nstaged before:\n%s\nstaged after:\n%s\n' "$STAGED_BEFORE" "$STAGED_AFTER" >&2
+	fail "bd changed what was staged in the main worktree. Even without committing, that
+loses or adds to another agent's in-progress work. See pact-zid."
+fi
+
+[ ! -e .git/index.lock ] || fail "bd left .git/index.lock behind in the main worktree — it is
+now taking the git index lock, which races the main-worktree agent's own commits (pact-zid)."
+
+printf '  HEAD unmoved, staging untouched, no index.lock left behind\n'
 
 printf '\nCANARY PASSED (leg=%s, bd=%s)\n' "$LEG" "$BD_VERSION"
