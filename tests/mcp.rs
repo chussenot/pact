@@ -211,7 +211,7 @@ fn every_tool_call_leaves_the_repository_byte_identical() {
     assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 5);
 
     // The lease we planted, seen through MCP: holder, path and note.
-    let leases = &by_id(3)["result"]["structuredContent"];
+    let leases = &by_id(3)["result"]["structuredContent"]["leases"];
     assert_eq!(leases.as_array().map(Vec::len), Some(1), "{leases:#?}");
     assert_eq!(leases[0]["lease"]["agent"], "worker-a");
     assert_eq!(leases[0]["lease"]["path"], "src/api.rs");
@@ -223,7 +223,7 @@ fn every_tool_call_leaves_the_repository_byte_identical() {
     assert!(by_id(5)["result"]["structuredContent"]["checks"]
         .as_array()
         .is_some_and(|c| !c.is_empty()));
-    let events = &by_id(6)["result"]["structuredContent"];
+    let events = &by_id(6)["result"]["structuredContent"]["events"];
     assert!(
         events
             .as_array()
@@ -276,7 +276,7 @@ fn listing_an_expired_lease_does_not_sweep_it() {
     let leases = &responses
         .iter()
         .find(|r| r["id"] == 2)
-        .expect("tool response")["result"]["structuredContent"];
+        .expect("tool response")["result"]["structuredContent"]["leases"];
     assert_eq!(
         leases.as_array().map(Vec::len),
         Some(1),
@@ -401,7 +401,10 @@ fn a_modern_session_works_and_is_equally_read_only() {
 
     let called = &by_id(2)["result"];
     assert_eq!(called["resultType"], "complete");
-    assert_eq!(called["structuredContent"][0]["lease"]["path"], "src/db.rs");
+    assert_eq!(
+        called["structuredContent"]["leases"][0]["lease"]["path"],
+        "src/db.rs"
+    );
 
     assert_eq!(by_id(3)["error"]["code"], -32022);
     assert_eq!(by_id(3)["error"]["data"]["requested"], "1900-01-01");

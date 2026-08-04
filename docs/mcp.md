@@ -123,9 +123,25 @@ Arguments:
   are clamped rather than refused)
 
 Results carry the JSON twice: once as `structuredContent` and once serialized
-into a text block, which is what the protocol asks of a tool returning
-structured content. The shapes are the CLI's `--json` shapes, unchanged — so
-anything already parsing `pact lease ls --json` parses this.
+into a text block, which is what the protocol asks of a tool returning structured
+content.
+
+`structuredContent` is always a JSON **object**, so the four tools that answer
+with a list put it under a named key — `leases`, `messages`, `events` — while
+`pact_doctor` already had `{checks, healthy}`:
+
+```json
+{ "leases": [ { "lease": { "agent": "worker-a", … }, "age_secs": 0, … } ] }
+```
+
+The elements are the CLI's `--json` elements unchanged, so anything that parses
+`pact lease ls --json` parses `structuredContent.leases`. The wrapper is not
+cosmetic: in revision `2025-06-18`, which this server advertises,
+`structuredContent` is typed `{ [key: string]: unknown }`. Only `2026-07-28`
+widened it to any JSON value, and a bare array — which is what pact returned at
+first — is rejected outright by a client validating against the revision it
+negotiated. An object satisfies both revisions, which is why every tool returns
+one regardless of era.
 
 ## What a session looks like
 

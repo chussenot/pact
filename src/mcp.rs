@@ -582,16 +582,13 @@ impl Server {
             // command rather than of this question (pact-rnc.19).
             "pact_lease_list" => {
                 let include_expired = flag(args, "include_expired");
-                Ok(serde_json::to_value(lease::peek(
-                    &self.root,
-                    include_expired,
-                )?)?)
+                Ok(wrap("leases", lease::peek(&self.root, include_expired)?)?)
             }
             "pact_msg_inbox" => {
                 let agent = required_str(args, "agent")?;
                 let cli = beads::BeadsCli::locate()?;
                 let messages = msg::inbox(&cli, &self.root, agent, flag(args, "unread_only"))?;
-                Ok(serde_json::to_value(messages)?)
+                Ok(wrap("messages", messages)?)
             }
             // `peek_thread`, NOT `read_thread`: the latter writes a
             // `read-by-<agent>` label. See the module docs.
@@ -599,9 +596,10 @@ impl Server {
                 let id = required_str(args, "id")?;
                 let viewer = args.get("agent").and_then(Value::as_str);
                 let cli = beads::BeadsCli::locate()?;
-                Ok(serde_json::to_value(msg::peek_thread(
-                    &cli, &self.root, viewer, id,
-                )?)?)
+                Ok(wrap(
+                    "messages",
+                    msg::peek_thread(&cli, &self.root, viewer, id)?,
+                )?)
             }
             "pact_doctor" => Ok(serde_json::to_value(doctor::checks(&self.root))?),
             "pact_events_tail" => {
@@ -612,7 +610,7 @@ impl Server {
                     .get("limit")
                     .and_then(Value::as_u64)
                     .map_or(EVENTS_DEFAULT, |n| (n as usize).clamp(1, EVENTS_MAX));
-                Ok(serde_json::to_value(events::recent(&self.root, limit)?)?)
+                Ok(wrap("events", events::recent(&self.root, limit)?)?)
             }
             // Unreachable: `tools_call` checked the name against TOOLS.
             other => Err(anyhow::anyhow!("unknown tool \"{other}\"")),
@@ -710,6 +708,31 @@ fn tool_listing() -> Value {
             }))
             .collect::<Vec<_>>(),
     })
+}
+
+/// Put a list under a named key, because `structuredContent` must be a JSON
+/// **object**.
+///
+/// Found by a real client, not by these tests. Claude Code rejected
+/// `pact_lease_list` outright — "expected record, received array" — while
+/// `pact_doctor` worked, because a `DoctorReport` is already an object and the
+/// other four tools returned bare arrays.
+///
+/// The schema is unambiguous once read at the right revision. In `2025-06-18`,
+/// which is what [`PROTOCOL_VERSION`] advertises, the field is
+/// `structuredContent?: { [key: string]: unknown }` — an object. Only
+/// `2026-07-28` widened it to `unknown` ("any JSON value: object, array, string,
+/// number, boolean, or null"). So a bare array was wrong for the very revision
+/// this server negotiates, and an object is valid in BOTH — which is why every
+/// tool now returns one regardless of the era the request came in.
+///
+/// The reason the integration tests missed it is worth keeping: they asserted
+/// `structuredContent[0]["lease"]["path"]`, so they were written against this
+/// implementation rather than against the schema, and they enshrined the bug they
+/// existed to catch. `every_tool_returns_an_object_as_structured_content` now
+/// asserts the property the client actually enforces.
+fn wrap<T: serde::Serialize>(key: &str, list: T) -> Result<Value> {
+    Ok(json!({ key: serde_json::to_value(list)? }))
 }
 
 /// A successful tool result: the JSON both as text and as `structuredContent`.
@@ -1114,6 +1137,64 @@ mod tests {
             .contains("agent"));
     }
 
+    /// The invariant a real client enforces, asserted for every tool at once.
+    ///
+    /// This test exists because the integration tests did NOT catch the bug it
+    /// guards: they asserted `structuredContent[0][...]`, which is an assertion
+    /// about this implementation rather than about the schema, so they passed
+    /// happily while Claude Code rejected four of the five tools with "expected
+    /// record, received array".
+    ///
+    /// In `2025-06-18` — the revision `initialize` advertises — the field is
+    /// typed `{ [key: string]: unknown }`. A bare array is not that.
+    #[test]
+    fn every_tool_returns_an_object_as_structured_content() {
+        // Arguments good enough to reach the dispatch for each tool. The two
+        // Beads-backed ones fail without `bd`, and a tool ERROR carries no
+        // structuredContent at all, so they are checked for the shape only when
+        // they succeed — the point is that nothing ever answers with an array.
+        let calls = [
+            ("pact_lease_list", json!({})),
+            ("pact_doctor", json!({})),
+            ("pact_events_tail", json!({})),
+            ("pact_msg_inbox", json!({"agent": "someone"})),
+            ("pact_msg_thread", json!({"id": "pact-1"})),
+        ];
+        for (name, args) in calls {
+            let r = respond(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#
+            ));
+            let result = &r["result"];
+            assert!(result["error"].is_null(), "{name}: {r:#?}");
+            if result["isError"] == true {
+                continue; // no bd on this machine; nothing to shape-check
+            }
+            assert!(
+                result["structuredContent"].is_object(),
+                "{name} must answer with a JSON object, not {}",
+                result["structuredContent"]
+            );
+        }
+    }
+
+    /// The list tools name their collection, so the object has one obvious key.
+    #[test]
+    fn list_tools_put_their_collection_under_a_named_key() {
+        for (name, key) in [
+            ("pact_lease_list", "leases"),
+            ("pact_events_tail", "events"),
+        ] {
+            let r = respond(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{{}}}}}}"#
+            ));
+            assert!(
+                r["result"]["structuredContent"][key].is_array(),
+                "{name} should carry an array under `{key}`: {:#?}",
+                r["result"]["structuredContent"]
+            );
+        }
+    }
+
     #[test]
     fn events_limit_is_clamped_not_refused() {
         // The repo path does not exist, so `recent` returns an empty list rather
@@ -1123,7 +1204,7 @@ mod tests {
                 r#"{{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{{"name":"pact_events_tail","arguments":{{"limit":{limit}}}}}}}"#
             ));
             assert_eq!(r["result"]["isError"], false, "limit {limit}");
-            assert!(r["result"]["structuredContent"].is_array());
+            assert!(r["result"]["structuredContent"]["events"].is_array());
         }
     }
 
