@@ -10,6 +10,17 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.4.1 - 2026-08-04
+#### Build system
+- **(mise)** build every feature locally, and serialise the check that broke on it - (cc18dcc) - Clement HUSSENOT-DESENONGES
+#### Continuous Integration
+- **(release)** build, checksum and publish binaries per target and profile - (1cb64d9) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- **(install)** install with mise, and register the server with Codex - (1bbde52) - Clement HUSSENOT-DESENONGES
+- **(install)** document downloading a release, and why there are two profiles - (31ca0e5) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.4.0 - 2026-08-03
 #### Documentation
 - **(mcp)** replace the "no MCP endpoint" claim with what is actually true - (ac3e03e) - Clement HUSSENOT-DESENONGES
