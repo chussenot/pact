@@ -516,3 +516,165 @@ fn an_ordinary_checkout_is_untouched_by_any_of_this() {
     let listed = stdout(&pact(root, "agent-a", &["lease", "ls"]));
     assert!(!listed.contains("WHERE"), "{listed}");
 }
+
+/// A superproject with one submodule at `vendor/lib`, both with a commit.
+/// Returns (tempdir, superproject, submodule checkout).
+fn repo_with_submodule() -> (TempDir, PathBuf, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+
+    let lib = base.join("lib-origin");
+    std::fs::create_dir(&lib).unwrap();
+    git_ok(&lib, &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::write(lib.join("lib.rs"), "pub fn x() {}\n").unwrap();
+    git_ok(&lib, &["add", "."]);
+    git_ok(&lib, &["commit", "--quiet", "-m", "initial"]);
+
+    let main = base.join("super");
+    std::fs::create_dir(&main).unwrap();
+    git_ok(&main, &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::create_dir_all(main.join("src")).unwrap();
+    // The SAME relative path as the submodule will have, which is the point of
+    // the isolation: `lib.rs` here and `lib.rs` in the submodule are different
+    // files in different repositories and must not contend.
+    std::fs::write(main.join("src/lib.rs"), "fn main() {}\n").unwrap();
+    git_ok(&main, &["add", "."]);
+    git_ok(&main, &["commit", "--quiet", "-m", "initial"]);
+
+    // `protocol.file.allow` because git refuses file:// submodules by default
+    // since the CVE-2022-39253 fix.
+    git_ok(
+        &main,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            lib.to_str().unwrap(),
+            "vendor/lib",
+        ],
+    );
+    git_ok(&main, &["commit", "--quiet", "-m", "add submodule"]);
+
+    (tmp, main.clone(), main.join("vendor/lib"))
+}
+
+/// A submodule's `.git` is a file and its gitdir has no `commondir`, because
+/// `commondir` is worktree-specific. That used to land in the broken-worktree
+/// fallback: `doctor` warned about siblings that do not exist, and every lock
+/// file in every submodule gained `branch`/`worktree` keys — breaking exactly the
+/// byte-compatibility `has_worktrees` exists to protect.
+#[test]
+fn a_submodule_writes_the_same_lock_file_as_a_plain_checkout() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+    let (_tmp, main, sub) = repo_with_submodule();
+
+    assert!(pact(&sub, "agent-a", &["lease", "acquire", "lib.rs"])
+        .status
+        .success());
+
+    // State beside the submodule, not in the superproject.
+    let lock = sub.join(".pact/leases/lib.rs.lock");
+    let raw = std::fs::read_to_string(&lock)
+        .unwrap_or_else(|e| panic!("no lock at {}: {e}", lock.display()));
+    let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let mut keys: Vec<&str> = payload
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["acquired_at", "agent", "note", "path", "ttl_secs"],
+        "a submodule must write the plain payload — no branch/worktree stamps"
+    );
+    assert!(
+        !main.join(".pact").exists(),
+        "the submodule's lease must not land in the superproject"
+    );
+
+    // And doctor calls it what it is, without warning: this is a healthy
+    // topology, and a `!` here would train people to ignore warnings.
+    let doc = stdout(&pact(&sub, "agent-a", &["doctor"]));
+    assert!(doc.contains("submodule"), "{doc}");
+    assert!(
+        !doc.contains("will NOT be shared with sibling worktrees"),
+        "the sibling-worktree warning is nonsense for a submodule: {doc}"
+    );
+    let worktree_line = doc
+        .lines()
+        .find(|l| l.contains("worktree:"))
+        .expect("a worktree line");
+    assert!(
+        worktree_line.starts_with('✓'),
+        "submodule placement must not warn: {worktree_line}"
+    );
+}
+
+/// The same relative path in the superproject and in its submodule are different
+/// files, so they must not contend — while a linked worktree of the superproject
+/// still shares with it. Both halves in one test, because it is the combination
+/// that is easy to get wrong.
+#[test]
+fn a_submodule_stays_scoped_while_superproject_worktrees_still_share() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+    let (tmp, main, sub) = repo_with_submodule();
+    let wt = tmp.path().canonicalize().unwrap().join("super-wt");
+    git_ok(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat/x",
+            wt.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+
+    // Same path string, claimed in the superproject and in the submodule.
+    assert!(pact(&main, "agent-super", &["lease", "acquire", "lib.rs"])
+        .status
+        .success());
+    let in_sub = pact(&sub, "agent-sub", &["lease", "acquire", "lib.rs"]);
+    assert!(
+        in_sub.status.success(),
+        "the submodule's lib.rs is a different file and must not contend: {}",
+        stderr(&in_sub)
+    );
+
+    // The superproject's linked worktree DOES contend with the superproject.
+    let in_wt = pact(&wt, "agent-wt", &["lease", "acquire", "lib.rs"]);
+    assert_eq!(
+        in_wt.status.code(),
+        Some(2),
+        "a superproject worktree must still share state: {}",
+        stderr(&in_wt)
+    );
+
+    // Two separate boards, with one lease each.
+    let board = |dir: &Path| -> usize {
+        let out = stdout(&pact(dir, "x", &["lease", "ls", "--json"]));
+        serde_json::from_str::<serde_json::Value>(&out)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    assert_eq!(board(&main), 1, "superproject board");
+    assert_eq!(board(&sub), 1, "submodule board");
+    assert_eq!(
+        board(&wt),
+        board(&main),
+        "the worktree sees the superproject's"
+    );
+}

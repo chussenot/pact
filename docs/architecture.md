@@ -102,10 +102,67 @@ reimplementing):
    - Anything else (`repo.git`) → a **bare** repository with worktrees. There is
      no checkout to sit beside, so state is anchored at `<common>/pact/` —
      `pact`, not `.pact`, since nothing there is hidden beside a working tree.
-3. **Anything unparseable** — no `gitdir:` line, a pointer to nowhere, a missing
-   `commondir` — falls back to per-worktree state with a warning that `pact
-   doctor` prints. A broken `.git` file is a reason to coordinate less, never a
-   reason for `pact lease acquire` to abort in the middle of a fleet.
+3. **The gitdir path says which kind of `.git` file it is**, and it has to be
+   consulted before `commondir`. A **submodule** also has a `.git` file, pointing
+   at `<super>/.git/modules/<path>` — and a submodule gitdir has no `commondir`,
+   because `commondir` is worktree-specific. Reading its absence as "broken
+   worktree" is wrong twice: it warns about sibling worktrees that do not exist,
+   and it starts stamping `branch`/`worktree` into every lock file in every
+   submodule. So the path decides, and the **last** marker component wins:
+
+   | gitdir | classified as |
+   |---|---|
+   | `<r>/.git/worktrees/wt` | linked worktree |
+   | `<r>/.git/modules/vendor/lib` | **submodule** |
+   | `<r>/.git/modules/vendor/lib/worktrees/wt` | linked worktree *of* a submodule |
+   | `<r>/.git/modules/a/modules/b` | nested submodule |
+
+   Taking the last occurrence is what makes rows three and four come out right:
+   both contain `modules`, and only the final marker describes the relationship
+   *this* checkout has to its gitdir.
+
+4. **Anything unparseable** — no `gitdir:` line, a pointer to nowhere, or a
+   missing `commondir` on a gitdir that really is under `worktrees/` — falls back
+   to per-worktree state with a warning that `pact doctor` prints. A broken
+   `.git` file is a reason to coordinate less, never a reason for `pact lease
+   acquire` to abort in the middle of a fleet.
+
+### Each submodule is its own coordination space
+
+Deliberately, and it is the opposite call from worktrees. Worktrees share because
+they are one repository edited from several directories. A submodule is a
+*different repository* that happens to live inside another one: `src/lib.rs` in
+the superproject and `src/lib.rs` in the submodule are two unrelated files, and a
+lease on one must not block the other. So a submodule gets `<submodule>/.pact/`,
+no `branch`/`worktree` stamps, and lock files byte-identical to any ordinary
+checkout's. `pact doctor` reports `state placement: submodule` as an ok — not a
+warning, because nothing is wrong.
+
+Worktrees *of* a submodule share with each other, under the submodule's gitdir.
+
+### Known limits of the resolution chain
+
+None of these is worth code; all are worth knowing.
+
+- **Mixed scope is invisible across processes.** `PACT_WORKTREE_SCOPE=local` in
+  one agent's environment silently partitions it from siblings that believe they
+  are coordinating. `pact doctor` reports the scope in effect for *its own*
+  process, and warns when `local` is set in a repository that has worktrees — but
+  nothing detects the divergence itself, because each process only ever sees its
+  own environment. If you run a mixed fleet, the symptom is two agents editing one
+  file while both hold "the" lease.
+- **A bare repository cloned into a directory named `.git`** inverts the
+  bare-detection heuristic: the common dir's *name* is what distinguishes "inside
+  a checkout" from "bare", so `…/foo/.git` as a bare repo would be read as a main
+  worktree at `…/foo`. Pathological, and not worth code to detect.
+- **A worktree literally named `modules`** (`.git/worktrees/modules`) classifies as
+  a submodule, because the marker scan is lexical. Equally pathological.
+- **A worktree of a submodule reports the bare-repository wording.** Its common
+  dir is the module directory, which is not named `.git`, so it takes the
+  `common-gitdir` branch and `doctor` says "worktree of a BARE repository". The
+  *placement* is right — all worktrees of that submodule share
+  `<module-dir>/pact/` — but the explanation names the wrong reason, and that
+  submodule's own main checkout does not join them.
 
 Every one of those decisions is reported by `pact doctor` (`worktree`,
 `coordination scope`, `state placement`, `state dir writable`), because a

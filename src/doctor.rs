@@ -294,6 +294,13 @@ fn worktree_checks(ctx: &repo::RepoContext, checks: &mut Vec<DoctorCheck>) {
                 "main worktree; this repository also has linked worktrees, which share {}",
                 ctx.state_dir.display()
             ),
+            // Named explicitly rather than folded into "ordinary checkout": a
+            // submodule IS ordinary as far as coordination goes, but a reader
+            // asking "why don't my leases reach the superproject?" needs the
+            // answer here rather than having to infer it from `state placement`.
+            (None, false) if ctx.placement == repo::Placement::Submodule => {
+                "not a worktree (submodule checkout — its own coordination space)".to_string()
+            }
             (None, false) => "not a worktree (ordinary checkout)".to_string(),
         },
     });
@@ -341,6 +348,17 @@ fn worktree_checks(ctx: &repo::RepoContext, checks: &mut Vec<DoctorCheck>) {
                 "{} — {} lives inside the common gitdir because this is a worktree of a BARE \
                  repository, so there is no main checkout to hold it. Leases and `pact log` work; \
                  `pact msg` does not, and exits 3.",
+                ctx.placement.as_str(),
+                ctx.state_dir.display()
+            ),
+            // ok and NOT a warning: this is a healthy, supported topology. It
+            // used to be reported as `local-fallback` with a warning about
+            // sibling worktrees that do not exist, because a submodule's gitdir
+            // has no `commondir` and that read as a broken worktree.
+            repo::Placement::Submodule => format!(
+                "{} — submodule checkout; coordination is scoped to this submodule, at {}. Its \
+                 files belong to a different repository than the superproject's, so a lease on the \
+                 same path in each is a lease on a different file.",
                 ctx.placement.as_str(),
                 ctx.state_dir.display()
             ),

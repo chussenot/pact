@@ -43,8 +43,60 @@ pub enum Placement {
     /// The `.git` file could not be followed. Falls back to per-worktree state
     /// rather than guessing, and says so through `doctor`.
     LocalFallback,
+    /// A submodule checkout. Its own coordination space, deliberately: a
+    /// submodule's files belong to a different repository, so `src/lib.rs` in the
+    /// submodule and `src/lib.rs` in the superproject are different files and
+    /// must not contend for one lock.
+    Submodule,
     /// `PACT_WORKTREE_SCOPE=local` asked for per-worktree isolation.
     ScopedLocal,
+}
+
+/// What a `.git` file's target says this checkout is, read from the gitdir path
+/// alone.
+///
+/// Needed because the obvious discriminator does not work. A linked worktree's
+/// gitdir has a `commondir` file and a submodule's does not — `commondir` is
+/// worktree-specific — so "no commondir" was being read as "broken worktree"
+/// when for a submodule it is simply normal. That misfired three ways at once:
+/// `doctor` warned about sibling worktrees that do not exist, `has_worktrees`
+/// went true and started stamping `branch`/`worktree` into every lock file in
+/// every submodule (breaking the byte-compatibility that flag exists to
+/// protect), and the warning fired on every invocation in a healthy repository.
+///
+/// The path is the reliable signal, and the LAST special component is the one
+/// that decides. Verified against real git layouts:
+///
+/// | gitdir | is |
+/// |---|---|
+/// | `super/.git/worktrees/wt` | linked worktree |
+/// | `super/.git/modules/vendor/lib` | submodule |
+/// | `super/.git/modules/vendor/lib/worktrees/wt` | linked worktree **of** a submodule |
+/// | `super/.git/modules/vendor/lib/modules/inner` | nested submodule |
+///
+/// Taking the last occurrence is what makes rows three and four fall out
+/// correctly: both contain `modules`, and only the final marker describes the
+/// relationship this checkout actually has to its gitdir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitDirKind {
+    LinkedWorktree,
+    Submodule,
+    /// Neither marker present — an unusual layout, or a `.git` file pointing
+    /// somewhere hand-made. Treated as a worktree so the `commondir` chain still
+    /// gets its chance, which is the pre-existing behaviour.
+    Unknown,
+}
+
+fn classify_git_dir(git_dir: &Path) -> GitDirKind {
+    git_dir
+        .components()
+        .filter_map(|c| match c.as_os_str().to_str() {
+            Some("worktrees") => Some(GitDirKind::LinkedWorktree),
+            Some("modules") => Some(GitDirKind::Submodule),
+            _ => None,
+        })
+        .next_back()
+        .unwrap_or(GitDirKind::Unknown)
 }
 
 impl Placement {
@@ -54,6 +106,7 @@ impl Placement {
             Placement::MainWorktree => "main-worktree",
             Placement::CommonGitdir => "common-gitdir",
             Placement::LocalFallback => "local-fallback",
+            Placement::Submodule => "submodule",
             Placement::ScopedLocal => "scoped-local",
         }
     }
@@ -245,8 +298,31 @@ impl RepoContext {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned());
 
+        // Classify before reading `commondir`, because for a submodule its
+        // absence is normal rather than a fault.
+        if classify_git_dir(&git_dir) == GitDirKind::Submodule {
+            // Plain-equivalent, and that is the whole point: a submodule is a
+            // separate repository that happens to live inside another one. Its
+            // state belongs beside its own checkout, it has no sibling worktrees
+            // to share with, and its lock files must look exactly like any other
+            // ordinary checkout's.
+            return RepoContext {
+                state_dir: worktree_root.join(".pact"),
+                shared_root: worktree_root.clone(),
+                git_dir,
+                worktree_root,
+                is_linked_worktree: false,
+                worktree_name: None,
+                has_worktrees: false,
+                placement: Placement::Submodule,
+                warning: None,
+            };
+        }
+
         // `commondir` is what makes a linked worktree findable from itself.
-        // Without it there is nothing to share, so this is the last fallback.
+        // Without it there is nothing to share, so this is the last fallback —
+        // and now it only catches gitdirs that really are under `worktrees/`,
+        // which is the genuinely broken case the warning was written for.
         let common_file = git_dir.join("commondir");
         let common = match std::fs::read_to_string(&common_file) {
             Ok(c) => c.lines().next().map(|l| l.trim().to_string()),
@@ -700,6 +776,79 @@ mod tests {
             assert_eq!(ctx.state_dir, wt.join(".pact"), "{label}");
             assert!(ctx.warning.is_some(), "{label} must explain itself");
         }
+    }
+
+    /// The classifier, against the four layouts real git produces. Table-driven
+    /// because the interesting cases are the two that contain BOTH markers, and
+    /// they only come out right if the last one wins.
+    #[test]
+    fn gitdir_paths_classify_by_their_last_marker() {
+        for (path, want, why) in [
+            (
+                "/r/.git/worktrees/wt",
+                GitDirKind::LinkedWorktree,
+                "plain linked worktree",
+            ),
+            (
+                "/r/.git/modules/vendor/lib",
+                GitDirKind::Submodule,
+                "submodule",
+            ),
+            (
+                "/r/.git/modules/vendor/lib/worktrees/wt",
+                GitDirKind::LinkedWorktree,
+                "a worktree OF a submodule is still a worktree",
+            ),
+            (
+                "/r/.git/modules/a/modules/b",
+                GitDirKind::Submodule,
+                "nested submodule",
+            ),
+            ("/r/.git", GitDirKind::Unknown, "no marker at all"),
+            (
+                "/r/.git/worktrees/modules",
+                GitDirKind::Submodule,
+                "a worktree literally NAMED modules — the last marker rule is \
+                 lexical, and this is the price of it; documented in the known limits",
+            ),
+        ] {
+            assert_eq!(classify_git_dir(Path::new(path)), want, "{path}: {why}");
+        }
+    }
+
+    /// The bug this classifier exists for, at the unit level: a submodule gitdir
+    /// has no `commondir`, and reading that as a broken worktree stamped
+    /// `branch`/`worktree` into every lock file in every submodule.
+    #[test]
+    fn a_submodule_is_its_own_coordination_space() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let sub = base.join("vendor/lib");
+        // No commondir, exactly as git leaves it.
+        let gitdir = base.join(".git/modules/vendor/lib");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+
+        let ctx = RepoContext::resolve(&sub);
+        assert_eq!(ctx.placement, Placement::Submodule);
+        assert_eq!(
+            ctx.state_dir,
+            sub.join(".pact"),
+            "state belongs beside the submodule"
+        );
+        assert_eq!(ctx.shared_root, sub);
+        assert!(!ctx.is_linked_worktree, "a submodule is not a worktree");
+        assert!(
+            !ctx.has_worktrees,
+            "must stay false, or every submodule lock file gains branch/worktree keys"
+        );
+        assert_eq!(ctx.worktree_name, None);
+        assert!(
+            ctx.warning.is_none(),
+            "a submodule is a healthy topology, not a fallback: {:?}",
+            ctx.warning
+        );
     }
 
     /// A gitdir that exists but has no `commondir`: there is nothing to share, so
