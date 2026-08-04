@@ -39,17 +39,24 @@ pub fn checks(root: &Path) -> DoctorReport {
         detail: root.display().to_string(),
     }];
 
-    let pact_present = root.join(".pact").join("leases").is_dir();
+    // Resolved once and reused: the worktree checks and `.pact/ present` must
+    // agree about where state is, or the report explains one repository and
+    // checks another.
+    let ctx = repo::RepoContext::resolve(root);
+
+    let pact_present = ctx.state_dir.join("leases").is_dir();
     checks.push(DoctorCheck {
         name: ".pact/ present",
         ok: pact_present,
         warn: false,
         detail: if pact_present {
-            "present".to_string()
+            format!("present at {}", ctx.state_dir.display())
         } else {
-            "missing — run `pact init`".to_string()
+            format!("missing at {} — run `pact init`", ctx.state_dir.display())
         },
     });
+
+    worktree_checks(&ctx, &mut checks);
 
     let agents_md_current = agents_md::is_current(root).unwrap_or(false);
     checks.push(DoctorCheck {
@@ -257,6 +264,148 @@ pub fn checks(root: &Path) -> DoctorReport {
 /// across checks is the worst thing wrong with the repo and one chart reads
 /// without a legend. Same `(ok, warn)` match as the `✗ ! ✓` glyphs in
 /// `run_doctor`, so the number and the tick can never disagree.
+/// Everything about where coordination state came from, so that a surprising
+/// answer can be explained from `pact doctor` alone rather than by reading
+/// `.git` files by hand.
+///
+/// Reported even in an ordinary checkout, where it says "not a worktree" — the
+/// question "is my peer even sharing my leases?" is asked exactly when something
+/// is already confusing, and a check that is absent unless it fires is a check
+/// nobody knows to look for.
+fn worktree_checks(ctx: &repo::RepoContext, checks: &mut Vec<DoctorCheck>) {
+    let scope = std::env::var("PACT_WORKTREE_SCOPE").unwrap_or_else(|_| "shared".to_string());
+    let scope_local = scope == "local";
+
+    checks.push(DoctorCheck {
+        name: "worktree",
+        ok: true,
+        // A linked worktree whose resolution FELL BACK is the one case worth a
+        // `!`: leases still work, they just do not reach the sibling worktrees
+        // the agent probably assumes they do.
+        warn: ctx.warning.is_some(),
+        detail: match (&ctx.warning, ctx.is_linked_worktree) {
+            (Some(w), _) => format!("resolution fell back to per-worktree state: {w}"),
+            (None, true) => format!(
+                "linked worktree {} of {}",
+                ctx.worktree_name.as_deref().unwrap_or("<unnamed>"),
+                ctx.shared_root.display()
+            ),
+            (None, false) if ctx.has_worktrees => format!(
+                "main worktree; this repository also has linked worktrees, which share {}",
+                ctx.state_dir.display()
+            ),
+            (None, false) => "not a worktree (ordinary checkout)".to_string(),
+        },
+    });
+
+    checks.push(DoctorCheck {
+        name: "coordination scope",
+        ok: true,
+        // `local` in a repo with worktrees means advisory locks that advise
+        // nobody. Legal, deliberate, and worth saying out loud every time.
+        warn: scope_local && ctx.has_worktrees,
+        detail: match (scope.as_str(), ctx.has_worktrees) {
+            ("local", true) => format!(
+                "PACT_WORKTREE_SCOPE=local — state is per-worktree at {}, so leases held here are \
+                 INVISIBLE to sibling worktrees of this repository",
+                ctx.state_dir.display()
+            ),
+            ("local", false) => {
+                "PACT_WORKTREE_SCOPE=local (no worktrees here, so no effect)".to_string()
+            }
+            ("shared", _) => format!("shared (default) — state at {}", ctx.state_dir.display()),
+            (other, _) => format!(
+                "PACT_WORKTREE_SCOPE={other} is not recognised; treated as shared — state at {}",
+                ctx.state_dir.display()
+            ),
+        },
+    });
+
+    checks.push(DoctorCheck {
+        name: "state placement",
+        ok: true,
+        warn: false,
+        detail: match ctx.placement {
+            repo::Placement::Plain => {
+                format!(
+                    "{} — repo root (.git is a directory)",
+                    ctx.placement.as_str()
+                )
+            }
+            repo::Placement::MainWorktree => format!(
+                "{} — the main worktree at {}",
+                ctx.placement.as_str(),
+                ctx.shared_root.display()
+            ),
+            repo::Placement::CommonGitdir => format!(
+                "{} — {} lives inside the common gitdir because this is a worktree of a BARE \
+                 repository, so there is no main checkout to hold it. Leases and `pact log` work; \
+                 `pact msg` does not, and exits 3.",
+                ctx.placement.as_str(),
+                ctx.state_dir.display()
+            ),
+            repo::Placement::LocalFallback => format!(
+                "{} — could not follow this worktree's .git; state is local at {}",
+                ctx.placement.as_str(),
+                ctx.state_dir.display()
+            ),
+            repo::Placement::ScopedLocal => format!(
+                "{} — PACT_WORKTREE_SCOPE=local put state at {}",
+                ctx.placement.as_str(),
+                ctx.state_dir.display()
+            ),
+        },
+    });
+
+    // Emitted unconditionally, like every other check here. A check that only
+    // appears in the topology it describes cannot be verified in both
+    // directions by scripts/check-docs.sh — and, worse, is a check nobody knows
+    // to look for until it fires.
+    //
+    // It matters most for a linked worktree, which depends on a directory
+    // somewhere else entirely: one that can be on a read-only mount or owned by
+    // another user, neither of which an ordinary checkout can be relative to
+    // itself.
+    let writable = state_dir_writable(&ctx.state_dir);
+    checks.push(DoctorCheck {
+        name: "state dir writable",
+        ok: writable.is_ok(),
+        warn: false,
+        detail: match writable {
+            Ok(detail) => detail,
+            Err(e) => format!("{} is NOT usable: {e}", ctx.state_dir.display()),
+        },
+    });
+}
+
+/// Can we actually create and remove a file in the state dir?
+///
+/// A `metadata` check would pass on a read-only mount and on a directory owned by
+/// another user, which are the two ways this realistically fails — so it writes
+/// a probe and removes it. The unique-temp-name helper is the event log's, so two
+/// concurrent doctors cannot collide on the probe.
+///
+/// Creates NOTHING when the directory is absent. `pact doctor` is a question, and
+/// a question must not mutate (pact-rnc.27): a `create_dir_all` here would have
+/// `doctor` quietly laying down `.pact/` in every repo it is ever run in, which
+/// is also the one thing `.pact/ present` exists to report.
+fn state_dir_writable(state_dir: &Path) -> std::result::Result<String, String> {
+    if !state_dir.is_dir() {
+        return Ok(format!(
+            "{} does not exist yet — nothing to write to until `pact init`",
+            state_dir.display()
+        ));
+    }
+    let probe = state_dir.join(crate::events::unique_temp_name("doctor-probe"));
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(format!("{} is writable", state_dir.display()))
+        }
+        Err(e) => Err(format!("cannot write in it: {e}")),
+    }
+}
+
 fn status_code(c: &DoctorCheck) -> i64 {
     match (c.ok, c.warn) {
         (false, _) => 0,

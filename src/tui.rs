@@ -1124,6 +1124,8 @@ mod tests {
                 acquired_at: "2026-01-01T00:00:00Z".to_string(),
                 ttl_secs: 900,
                 note: None,
+                branch: None,
+                worktree: None,
             },
             age_secs: 10,
             remaining_secs: 890,

@@ -23,6 +23,48 @@ pub struct LeaseInfo {
     pub acquired_at: String, // RFC3339
     pub ttl_secs: u64,
     pub note: Option<String>,
+    /// The branch the holder had checked out, and which worktree they hold it
+    /// from. Informational: nothing branches on either.
+    ///
+    /// Both are **absent** — not null — in a repository with no linked
+    /// worktrees, so its lock files stay byte-identical to what pact wrote
+    /// before it understood worktrees at all. `default` on the way in, so a lock
+    /// file written by an older pact still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+}
+
+/// The branch/worktree pair to stamp on a new lease, empty unless this
+/// repository actually has linked worktrees.
+///
+/// Keyed on `has_worktrees` rather than on "am I in a linked worktree": the
+/// holder may be sitting in the MAIN worktree while the loser is in a linked
+/// one, and a conflict message that can only name the loser's worktree explains
+/// nothing.
+fn worktree_stamp(repo_root: &Path) -> (Option<String>, Option<String>) {
+    let ctx = crate::repo::RepoContext::resolve(repo_root);
+    if !ctx.has_worktrees {
+        return (None, None);
+    }
+    (ctx.branch(), ctx.worktree_name.clone())
+}
+
+/// "held by agent-a", plus where they are holding it from when that is knowable.
+///
+/// Cross-worktree contention is confusing in a way same-directory contention is
+/// not: the loser cannot see the file changing, because the holder is editing a
+/// different checkout of it. Saying only "held by agent-a" invites the reader to
+/// go look at their own working copy, find it untouched, and conclude the lease
+/// is stale.
+fn holder_location(lease: &LeaseInfo) -> String {
+    match (&lease.branch, &lease.worktree) {
+        (Some(b), Some(w)) => format!("{} on branch {b} in worktree {w}", lease.agent),
+        (Some(b), None) => format!("{} on branch {b}", lease.agent),
+        (None, Some(w)) => format!("{} in worktree {w}", lease.agent),
+        (None, None) => lease.agent.clone(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -680,12 +722,15 @@ fn acquire_inner(
     let relative = normalize_path(repo_root, path);
     let lock_path = lock_file_path(repo_root, &relative)?;
     let now = Utc::now();
+    let (branch, worktree) = worktree_stamp(repo_root);
     let new_lease = LeaseInfo {
         agent: agent.to_string(),
         path: relative.clone(),
         acquired_at: now.to_rfc3339(),
         ttl_secs,
         note,
+        branch,
+        worktree,
     };
 
     // Claim the path with a LINK, not with create_new + write.
@@ -791,7 +836,7 @@ fn acquire_inner(
             } else if steal {
                 crate::output::warn(&format!(
                     "warning: stealing non-expired lease on {relative} held by {} (advisory override via --steal)",
-                    existing.agent
+                    holder_location(&existing)
                 ));
                 write_lease_atomic(&lock_path, &new_lease)?;
                 verify_own_lease(&lock_path, agent, &new_lease.acquired_at)?;
@@ -818,11 +863,15 @@ fn acquire_inner(
                 // finally succeeds is a different process and this is the only
                 // record that the agent was ever locked out.
                 mark_conflict(repo_root, agent, &relative, &existing.agent);
+                // The holder's LOCATION, not just their name. A peer in another
+                // worktree is editing a checkout this reader cannot see, so
+                // "held by agent-a" alone invites them to inspect their own copy,
+                // find it untouched, and conclude the lease is stale.
                 Err(exit_with(
                     2,
                     format!(
                         "lease on {relative} is held by {} ({age}s old, {remaining}s remaining); use --steal to override",
-                        existing.agent
+                        holder_location(&existing)
                     ),
                 ))
             }
@@ -1113,8 +1162,14 @@ fn renew_fs(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
         ));
     }
 
+    // Re-stamped rather than carried over: a long task can outlive a `git
+    // switch`, and a lease claiming a branch the worktree left is a lie that
+    // survives every renew.
+    let (branch, worktree) = worktree_stamp(repo_root);
     let renewed = LeaseInfo {
         acquired_at: Utc::now().to_rfc3339(),
+        branch,
+        worktree,
         ..existing
     };
     write_lease_atomic(&lock_path, &renewed)?;
@@ -1310,6 +1365,8 @@ mod tests {
                 acquired_at: acquired.to_rfc3339(),
                 ttl_secs,
                 note: None,
+                branch: None,
+                worktree: None,
             },
             now,
         )
@@ -1385,6 +1442,8 @@ mod tests {
             acquired_at: "not-a-timestamp".into(),
             ttl_secs: DEFAULT_TTL_SECS,
             note: None,
+            branch: None,
+            worktree: None,
         };
         assert!(
             is_expired(&corrupt, Utc::now()),
@@ -1538,6 +1597,8 @@ mod tests {
             acquired_at: (Utc::now() - Duration::seconds(age_secs)).to_rfc3339(),
             ttl_secs,
             note: None,
+            branch: None,
+            worktree: None,
         };
         write_lease_atomic(&lock_file_path(root, path).unwrap(), &lease).unwrap();
     }
@@ -2052,6 +2113,8 @@ mod tests {
             acquired_at: Utc::now().to_rfc3339(),
             ttl_secs: DEFAULT_TTL_SECS,
             note: None,
+            branch: None,
+            worktree: None,
         };
         write_lease_atomic(&lock_path, &other).unwrap();
 
@@ -2170,6 +2233,8 @@ mod tests {
             acquired_at: Utc::now().to_rfc3339(),
             ttl_secs: DEFAULT_TTL_SECS,
             note: None,
+            branch: None,
+            worktree: None,
         };
         write_lease_atomic(&lock_path, &thief).unwrap();
 
@@ -2198,6 +2263,8 @@ mod tests {
             acquired_at: Utc::now().to_rfc3339(),
             ttl_secs: DEFAULT_TTL_SECS,
             note: None,
+            branch: None,
+            worktree: None,
         };
         write_lease_atomic(&lock_path2, &thief2).unwrap();
 

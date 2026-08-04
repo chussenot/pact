@@ -38,6 +38,32 @@ pub struct BeadsCli {
     pub(crate) binary: &'static str,
 }
 
+/// The directory a Beads subprocess must run in: the main worktree when this is
+/// a linked one, otherwise the checkout itself.
+///
+/// Exit 3 for the bare-repository topology, reusing "backend unavailable"
+/// rather than inventing a code — there genuinely is no Beads workspace to talk
+/// to, and the alternative is letting `bd` create one in whatever directory
+/// happened to be current. A store nobody can find again is worse than a clear
+/// refusal, and the exit code an agent branches on is unchanged.
+fn beads_root(repo_root: &Path) -> Result<PathBuf> {
+    let ctx = crate::repo::RepoContext::resolve(repo_root);
+    if ctx.is_bare_topology() {
+        return Err(exit_with(
+            3,
+            format!(
+                "no Beads workspace: {} is a worktree of a BARE repository, so there is no main \
+                 checkout to hold `.beads/`. Leases and the event log work (state is under {}), \
+                 messaging does not. Add a normal worktree and run the Beads CLI there, or use a \
+                 non-bare clone for message traffic.",
+                ctx.worktree_root.display(),
+                ctx.state_dir.display()
+            ),
+        ));
+    }
+    Ok(ctx.shared_root)
+}
+
 /// Which Beads CLI an existing `.beads/` belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Workspace {
@@ -54,7 +80,17 @@ impl BeadsCli {
         // cwd, not the git root: `repo::find_repo_root` is not reachable from
         // here without changing this signature, and every caller already runs
         // inside the repo. A `.beads/` is found by walking up regardless.
-        let workspace = detect_workspace(std::env::current_dir().ok().as_deref());
+        // Detect from the store the commands will actually use, not from the
+        // cwd: in a linked worktree there is no `.beads/` to walk up to (the
+        // worktree usually sits outside the main checkout), so cwd-based
+        // detection would report `None` and fall through to a *preference* —
+        // picking `br` for a repository whose data is in `bd`'s Dolt store.
+        // Best-effort: any resolution failure keeps the old cwd behaviour.
+        let detect_from = std::env::current_dir().ok().and_then(|cwd| {
+            let root = crate::repo::find_repo_root(&cwd).ok()?;
+            beads_root(&root).ok().or(Some(cwd))
+        });
+        let workspace = detect_workspace(detect_from.as_deref());
         for binary in candidates(workspace) {
             if which(binary).is_some() {
                 return Ok(BeadsCli { binary });
@@ -89,6 +125,14 @@ impl BeadsCli {
     /// refresh tick, and not turning that into ten subprocesses a second was the
     /// single hardest constraint in the mascot feature — measured by nothing.
     pub fn run(&self, repo_root: &Path, args: &[&str]) -> Result<String> {
+        // One Beads store per repository, not per checkout. A linked worktree
+        // has no `.beads/` of its own, so running the backend in the caller's
+        // directory would make `msg send` from worktree A invisible to `msg
+        // inbox` in worktree B — or, worse, let `bd` initialise a second empty
+        // store in the worktree and report an empty inbox, which is the exact
+        // failure this module's header is about. Resolved here because this is
+        // the only place pact spawns a backend.
+        let repo_root = &beads_root(repo_root)?;
         let shape = argv_shape(args);
         let mut sp = otel::span("pact.beads.exec");
         // `process.executable.name` and `process.exit.code` are the registry

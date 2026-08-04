@@ -609,8 +609,11 @@ fn run_whoami(cwd: &Path, agent_flag: Option<&str>, json: bool) -> Result<()> {
             None
         }
     };
-    // Deliberately does not create it: whoami is a read-only question.
-    let pact_dir = root.as_ref().map(|r| r.join(".pact"));
+    // Deliberately does not create it: whoami is a read-only question. Resolved
+    // rather than joined, so a linked worktree reports the SHARED directory it
+    // will really use — "where is my state" answered with a path pact does not
+    // write to would be worse than not answering.
+    let pact_dir = root.as_ref().map(|r| repo::pact_dir_path(r));
 
     let (bd_binary, bd_version) = match beads::BeadsCli::locate() {
         Ok(bd) => {
@@ -1397,23 +1400,48 @@ fn render_leases(entries: &[lease::LeaseEntry]) -> String {
     if entries.is_empty() {
         return "no active leases".to_string();
     }
-    let mut rows = vec![vec![
+    // The WHERE column appears only when at least one lease has somewhere to
+    // report, which in practice means the repository uses worktrees. A repo that
+    // does not gets byte-identical output to before — the same reason the two
+    // fields are omitted from the lock file rather than written as null.
+    let located = entries
+        .iter()
+        .any(|e| e.lease.worktree.is_some() || e.lease.branch.is_some());
+    let mut header = vec![
         "PATH".to_string(),
         "AGENT".to_string(),
         "HELD".to_string(),
         "STATE".to_string(),
-        "NOTE".to_string(),
-    ]];
+    ];
+    if located {
+        header.push("WHERE".to_string());
+    }
+    header.push("NOTE".to_string());
+    let mut rows = vec![header];
     rows.extend(entries.iter().map(|e| {
-        vec![
+        let mut row = vec![
             e.lease.path.clone(),
             e.lease.agent.clone(),
             human_secs(e.age_secs),
             e.state_label(),
-            one_line(e.lease.note.as_deref().unwrap_or(""), 60),
-        ]
+        ];
+        if located {
+            row.push(lease_location(&e.lease));
+        }
+        row.push(one_line(e.lease.note.as_deref().unwrap_or(""), 60));
+        row
     }));
     table(&rows)
+}
+
+/// `branch @ worktree` for the WHERE column, as compactly as the pair allows.
+fn lease_location(lease: &lease::LeaseInfo) -> String {
+    match (lease.branch.as_deref(), lease.worktree.as_deref()) {
+        (Some(b), Some(w)) => format!("{b} @ {w}"),
+        (Some(b), None) => b.to_string(),
+        (None, Some(w)) => format!("@ {w}"),
+        (None, None) => String::new(),
+    }
 }
 
 /// Whether a lease was taken from a live holder or simply claimed. The single
@@ -1657,6 +1685,8 @@ mod tests {
                 acquired_at: "2026-07-31T09:00:00+00:00".to_string(),
                 ttl_secs: 900,
                 note: Some("wiring the CLI".to_string()),
+                branch: None,
+                worktree: None,
             },
             age_secs: age,
             remaining_secs: remaining,
