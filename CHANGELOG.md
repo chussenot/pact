@@ -255,6 +255,37 @@ cog's.
 
 ## Notes — unreleased
 
+### Added — prebuilt binaries, in two profiles
+
+- **Every version tag now publishes tarballs** for four unix targets, each in two
+  feature profiles, with a `SHA256SUMS` and a build-provenance attestation.
+  Installing pact used to mean having a Rust toolchain, which is a strange
+  prerequisite for a tool whose main audience is CI fleets and coding agents.
+- **Why two profiles rather than one.** The artifact name is a promise about the
+  contents, and the two audiences want different contents. An agent or a CI image
+  never opens a dashboard and never registers an MCP server, so `lean`
+  (`--no-default-features`, 1.6 MiB) is what a fleet should pull on every job;
+  `full` (`ui,otel,mcp`, 2.2 MiB) is for humans and for anything spawning `pact
+  mcp serve`. Shipping only `full` would push 0.6 MiB of unreachable code into
+  every container layer, and shipping only `lean` would mean the interactive
+  features exist solely for people who compile their own. Each leg asserts its
+  profile in **both** directions before publishing — `full` must have `ui` and
+  `mcp serve`, `lean` must have neither — because "full has ui" passing says
+  nothing about whether `lean` quietly shipped ratatui too, which is precisely
+  the case where the filename would be lying.
+- **Why musl.** Static linking means one Linux binary per architecture with no
+  glibc version to match and no base image to get right, including `FROM
+  scratch`. A coordination tool whose install step can fail on the target distro
+  is one more thing to get right before anyone can start working, which is the
+  problem pact exists to remove rather than add to. `ui` on musl was the
+  combination worth doubting and it holds: ratatui and crossterm are pure Rust
+  here, so no C toolchain is involved and the result is a `static-pie` binary.
+- Releases are gated by the existing tag-integrity checks through a `needs:`
+  chain, so an orphaned tag or a version/manifest mismatch cannot publish a
+  binary. The pipeline is hand-written rather than generated for the same reason
+  the OTLP exporter and the MCP framing are: a release pipeline is a supply
+  chain, and it must not be opaque to its own maintainer.
+
 ### Added — a read-only MCP server, and why it stays read-only
 
 - **`pact mcp serve`**, behind the off-by-default `mcp` feature, answers five

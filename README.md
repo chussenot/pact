@@ -4,7 +4,8 @@
 Claude Code, Codex, or anything else that can run shell commands — work on the
 same repository without stepping on each other.
 
-New here: [docs/install.md](docs/install.md), then run `pact init` in a repo.
+New here: download a binary or `cargo install` — [docs/install.md](docs/install.md)
+— then run `pact init` in a repo.
 Everything below is *why* pact is built the way it is; the reference material
 lives in [docs/](#documentation).
 
@@ -101,6 +102,15 @@ deadlocks at 2am with nothing to ask why.
 under `.pact/`. Configuration is a second description of your intent that can
 disagree with the first.
 
+**No Windows build.** The coordination model assumes unix semantics rather than
+merely running on unix: a lease claim depends on `rename` and `hard_link`
+atomicity guarantees POSIX makes and Windows does not, and the protocol pact
+writes into your instruction files points agents at sh-based commands. A Windows
+binary would compile and then be wrong in the one place correctness is the whole
+point, so releases ship four unix targets — statically linked on Linux, because a
+coordination tool that needs a matching glibc is one more thing to get right
+before anyone can work.
+
 **No database of its own.** Leases are files, history is an append-only log,
 messages are Beads issues, and identities are derived from all three rather than
 registered. Nothing to migrate, and nothing that can be out of date with itself.
@@ -138,7 +148,7 @@ what the tooling did to it, and require a quoted command as evidence.
 
 | | |
 |---|---|
-| [install.md](docs/install.md) | installing pact, choosing a Beads backend, reading the build stamp |
+| [install.md](docs/install.md) | downloading a release or building from source, the lean/full profiles, choosing a Beads backend |
 | [cli.md](docs/cli.md) | every command, flag, exit code and `--json` shape |
 | [onboarding.md](docs/onboarding.md) | what `pact init` writes, to which files, and how to check it |
 | [leases.md](docs/leases.md) | the lease lifecycle: TTL, grace period, steal vs. expiry, path identity |

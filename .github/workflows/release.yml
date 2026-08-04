@@ -279,8 +279,36 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target.triple }} ${{ matrix.profile.flags }}
 
+      # Measured on the full musl profile: 2.85 MiB -> 2.25 MiB, about 22% off,
+      # entirely debug symbols nobody can use without the matching source tree.
+      # `strip` and not `llvm-strip`: every leg is native, so the host's strip
+      # already understands its own object format.
+      #
+      # Before the verification step, not after, so that what gets asserted is
+      # the exact bytes that get packaged. That ordering is load-bearing on
+      # aarch64-apple-darwin: the linker gives every arm64 macOS binary an ad-hoc
+      # code signature, `strip` invalidates it, and an invalidated signature does
+      # not warn — the kernel refuses to exec and the process dies with
+      # `Killed: 9`. Verifying the pre-strip binary would have shipped that
+      # silently, because the copy that was tested is not the copy in the tarball.
+      - name: Strip
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target.triple }}/release/pact"
+          before="$(wc -c <"$BIN")"
+          strip "$BIN"
+          # Re-sign ad hoc on macOS, for the reason above. `-` is the ad-hoc
+          # identity, which is what the linker used; this needs no certificate
+          # and no notarisation, it only makes the binary executable again.
+          case "${{ matrix.target.triple }}" in
+          *-apple-darwin) codesign --sign - --force "$BIN" ;;
+          esac
+          after="$(wc -c <"$BIN")"
+          echo "stripped: $before -> $after bytes"
+
       # The profile promise, asserted in BOTH directions on the runner that just
-      # produced the binary. One direction is not enough: "full has the ui
+      # produced the binary — and on the stripped, re-signed binary that will
+      # actually be packaged, per the step above. One direction is not enough: "full has the ui
       # subcommand" passing tells you nothing about whether `lean` accidentally
       # has it too, and `lean` quietly shipping ratatui is the exact mistake an
       # artifact name would then be lying about.
@@ -314,13 +342,6 @@ jobs:
             has_mcp && { echo "::error::lean build has mcp serve; it was built --no-default-features"; exit 1; }
             echo "lean: neither ui nor mcp serve present, as promised"
           fi
-
-      # Measured on the full musl profile: 2.85 MiB -> 2.25 MiB, about 22% off,
-      # entirely debug symbols nobody can use without the matching source tree.
-      # `strip` and not `llvm-strip`: every leg is native, so the host's strip
-      # already understands its own object format.
-      - name: Strip
-        run: strip "target/${{ matrix.target.triple }}/release/pact"
 
       - name: Package
         id: package

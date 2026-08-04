@@ -5,16 +5,96 @@ is a Beads CLI, and only for the `msg` subcommands — the README explains why
 messaging is layered on somebody else's issue tracker instead of a store pact
 would have to maintain.
 
-## Install
+## Download a release
+
+Every version tag publishes prebuilt tarballs, so installing pact does not
+require a Rust toolchain — an odd prerequisite for a tool whose main audience is
+CI fleets and coding agents.
+
+```bash
+TAG=0.4.0
+TARGET=x86_64-unknown-linux-musl
+PROFILE=lean
+
+BASE="https://github.com/chussenot/pact/releases/download/$TAG"
+curl -fsSLO "$BASE/pact-$TAG-$TARGET-$PROFILE.tar.gz"
+curl -fsSLO "$BASE/SHA256SUMS"
+
+# Verify before extracting. `--ignore-missing` because SHA256SUMS covers every
+# tarball in the release and you downloaded one of them.
+sha256sum --ignore-missing -c SHA256SUMS
+
+tar -xzf "pact-$TAG-$TARGET-$PROFILE.tar.gz"
+install -m755 "pact-$TAG-$TARGET-$PROFILE/pact" /usr/local/bin/
+```
+
+### Two profiles
+
+Each target ships twice. The profile is in the filename because the name is a
+promise about the contents, and each release asserts that promise in both
+directions before publishing — the `full` binary must have `ui` and `mcp serve`,
+the `lean` one must have neither.
+
+| Profile | Contains | For |
+|---|---|---|
+| `lean` | no optional features: `init`, `lease`, `msg`, `log`, `doctor`, `agents`, `whoami` — 1.6 MiB | agents and CI images, which never open a dashboard |
+| `full` | `ui` + `otel` + `mcp` — the TUI, OpenTelemetry export, the read-only MCP server — 2.2 MiB | humans, and anything registering pact as an MCP server |
+
+Neither optional feature costs anything unasked, so `full` is the right default
+for a workstation: `otel` exports only when the standard `OTEL_*` variables are
+set, and `mcp` does nothing until a client spawns `pact mcp serve`. Pick `lean`
+when the 0.6 MiB matters — a container layer pulled by every job in a fleet.
+
+### Targets
+
+| Target | Runs on |
+|---|---|
+| `x86_64-unknown-linux-musl` | any x86-64 Linux, including `FROM scratch` |
+| `aarch64-unknown-linux-musl` | any arm64 Linux (Graviton, Ampere, arm64 CI) |
+| `x86_64-apple-darwin` | Intel macOS |
+| `aarch64-apple-darwin` | Apple-silicon macOS |
+
+The Linux builds are statically linked against musl, so there is no glibc
+version to match and no base image to get right. **There is no Windows build**,
+and that is a decision rather than a gap: pact's coordination model assumes unix
+semantics — lease claims rely on `rename`/`hard_link` atomicity guarantees POSIX
+makes and Windows does not, the telemetry code reads `/dev/urandom`, and `pact
+init` writes instruction files referencing sh-based hooks. It would compile and
+then be wrong in ways no test here would catch.
+
+### Verifying where a binary came from
+
+Each release carries a [build-provenance
+attestation](https://docs.github.com/en/actions/concepts/security/artifact-attestations),
+so a checksum can be checked against *what built it* rather than only against
+the file next to it:
+
+```bash
+gh attestation verify "pact-$TAG-$TARGET-$PROFILE.tar.gz" --repo chussenot/pact
+```
+
+That answers a question `SHA256SUMS` cannot: the checksum file proves the tarball
+was not altered in transit, the attestation proves which workflow, commit and run
+produced it in the first place.
+
+## Build from source
+
+Needs a Rust toolchain. This is the path to take when you are working *on* pact
+rather than with it — [development.md](development.md) covers the task list.
 
 ```bash
 mise run install   # cargo install --path . --force with every feature
 ```
 
-Or manually:
+That is the `full` profile above. Or manually:
 
 ```bash
-cargo build --release --features ui       # drop --features ui to skip `pact ui`
+cargo install --path . --force --features ui,otel,mcp   # full
+cargo install --path . --force                          # lean
+```
+
+```bash
+cargo build --release --features ui,otel,mcp
 cp target/release/pact /usr/local/bin/    # or anywhere on your PATH
 ```
 
@@ -58,14 +138,18 @@ binary on my PATH the one I just built?*
 
 ```
 $ pact --version
-pact 0.3.2
-commit:   e3bf274b82cd-dirty
-built:    2026-08-03T05:21:37Z
+pact 0.4.0
+commit:   cc18dcce39e3
+built:    2026-08-03T07:16:34Z
 rustc:    rustc 1.97.1 (8bab26f4f 2026-07-14)
 target:   x86_64-unknown-linux-gnu
 profile:  release
-features: otel,ui
+features: mcp,otel,ui
 ```
+
+`target:` is how you tell a downloaded release apart from a local build: a
+release tarball reports `x86_64-unknown-linux-musl`, a `cargo build` on the same
+machine reports `-gnu`.
 
 `profile: debug` means you're running `target/debug` rather than the installed
 release build; `features: none` explains a missing `pact ui`; `-dirty` means
