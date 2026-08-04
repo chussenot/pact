@@ -10,6 +10,16 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.5.0 - 2026-08-04
+#### Documentation
+- **(worktree)** document the shared coordination space and its one trade-off - (f854c0f) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(repo)** share one coordination space across linked worktrees - (5496534) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(beads)** close the worktree epic - (09599a9) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.4.1 - 2026-08-04
 #### Build system
 - **(mise)** build every feature locally, and serialise the check that broke on it - (cc18dcc) - Clement HUSSENOT-DESENONGES
