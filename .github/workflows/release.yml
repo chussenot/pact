@@ -1,6 +1,31 @@
-name: Release integrity
+name: Release
 
-# A tag is the one ref people trust without checking. This job checks it.
+# Two things happen here, in this order and only in this order: a tag is checked,
+# then binaries are built and published from it. The `needs:` chain is what makes
+# that an order rather than a hope.
+#
+# ## Why this is hand-written and not cargo-dist
+#
+# cargo-dist generates roughly a thousand lines of YAML that this repository
+# would then own without having written — and would have to reason about the next
+# time a target, a feature profile or a permission needs to change. That trade is
+# wrong here specifically: pact's whole convention is explicit machinery with the
+# reasoning attached (see `src/otel.rs` on why the OTLP exporter is hand-rolled,
+# and the `mcp` feature comment on why JSON-RPC is). A release pipeline is a
+# supply chain, and the one thing it must not be is opaque to its own
+# maintainer. What is below fits on two screens and every unusual line says why
+# it is there.
+#
+# ## Dry runs
+#
+# `workflow_dispatch` with a `tag` input (default: the newest tag) builds and
+# packages every matrix leg and publishes NOTHING. That exists because the
+# alternative way to test a release pipeline is to cut a tag, and a tag is not a
+# thing you get to take back — the `integrity` job below exists because of a tag
+# that had to be deleted and recreated. The publish job is skipped in that mode
+# by the needs-chain rather than by a condition of its own; see its comment.
+#
+# ## A tag is the one ref people trust without checking. This job checks it.
 #
 # 0.3.1 was first created on a commit chain that never became an ancestor of
 # master: the branch was rebuilt with new SHAs and the tag stayed behind on the
@@ -15,7 +40,16 @@ on:
   push:
     tags:
       - "[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (dry run — builds every leg, publishes nothing). Defaults to the newest tag."
+        required: false
+        type: string
 
+# Read-only by default. `publish` widens this for itself and nothing else widens
+# it at all: a build job that cannot write to the repository cannot leak a
+# release even if a step in it is wrong.
 permissions:
   contents: read
 
@@ -26,6 +60,15 @@ jobs:
   integrity:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Push-only, because every check below compares against `github.ref_name`,
+    # which is a tag on a tag push and a BRANCH on a manual dispatch — the
+    # version comparison would fail on a dry run for a reason that has nothing to
+    # do with release integrity. Nothing inside the job changed; this decides
+    # when it runs, not what it checks.
+    #
+    # Skipping it is also what makes a dry run unable to publish, since `publish`
+    # needs it and a skipped dependency skips its dependents.
+    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -110,3 +153,278 @@ jobs:
 
       - name: Release build smoke check
         run: cargo build --release
+
+  # Resolve the tag once, so nothing downstream has to know which event started
+  # the run. On a tag push that is `github.ref_name`; on a dispatch it is the
+  # input, or the newest tag when the input was left blank.
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # `git tag` needs the tags, which a shallow checkout does not fetch.
+          fetch-depth: 0
+
+      - name: Pick the tag
+        id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = push ]; then
+            TAG="$REF_NAME"
+          elif [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            # Newest by version, not by date: tags are cut in version order but
+            # a re-created tag (see `integrity`) has a newer timestamp and an
+            # older version.
+            TAG="$(git tag --sort=-v:refname | head -n1)"
+          fi
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::no such tag: $TAG"
+            exit 1
+          fi
+          echo "tag=$TAG" >>"$GITHUB_OUTPUT"
+          echo "building $TAG"
+
+  build:
+    needs: [integrity, resolve]
+    # `integrity` is skipped on a dry run and MUST have succeeded otherwise. The
+    # default `needs` semantics would skip this job along with it, so the result
+    # is named explicitly — but only `success` and `skipped` are accepted, so an
+    # integrity FAILURE still stops everything here. That distinction is the
+    # whole point: a dry run may build, a broken tag may not.
+    if: ${{ !cancelled() && (needs.integrity.result == 'success' || needs.integrity.result == 'skipped') && needs.resolve.result == 'success' }}
+    runs-on: ${{ matrix.target.os }}
+    timeout-minutes: 30
+    strategy:
+      # One broken target must not hide the state of the other seven: "musl
+      # failed but darwin was fine" is a diagnosis, and fail-fast erases it.
+      fail-fast: false
+      matrix:
+        # Native runners only, no cross-rs: GitHub has ARM runners now, so
+        # cross-compilation would add a tool to trust for no coverage — and it
+        # would cost the sanity run below, which only works because every leg can
+        # execute the binary it just produced.
+        #
+        # No Windows, and the absence is a decision rather than an omission:
+        # pact's coordination model assumes unix semantics throughout. Lease
+        # claims rely on `rename`/`hard_link` atomicity guarantees POSIX makes
+        # and Windows does not, `src/otel.rs` reads `/dev/urandom` for span ids,
+        # and the instruction files `pact init` writes reference sh-based hooks.
+        # A Windows binary would compile and then be wrong in ways no test here
+        # would catch.
+        target:
+          # musl means static: one binary that runs on any distro regardless of
+          # glibc version, and inside `FROM scratch` images. This is the artifact
+          # a CI fleet actually pulls, which is why it leads the list.
+          - triple: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            musl: true
+          - triple: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            musl: true
+          - triple: x86_64-apple-darwin
+            os: macos-13
+          - triple: aarch64-apple-darwin
+            os: macos-latest
+        # Two profiles, in the README's vocabulary. Both pin their features
+        # explicitly: `--no-default-features` is a no-op while Cargo.toml has no
+        # default feature, and it stays anyway, because the artifact NAME is a
+        # promise about the contents and a default added later must not silently
+        # rewrite what `lean` means.
+        profile:
+          - name: lean
+            flags: --no-default-features
+          - name: full
+            flags: --features ui,otel,mcp
+        # No exclusions. Every target × profile combination was built before this
+        # workflow was written, including `ui` on musl — ratatui and crossterm are
+        # pure Rust here, so musl needs no C toolchain for them and the resulting
+        # binary is `static-pie linked`. If a combination ever does break for a
+        # dependency reason, exclude it HERE with the reason, so that a missing
+        # artifact is a documented decision rather than a mystery.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch tip — pins the ACTION, not the toolchain; Rust stays current because the action installs whatever stable is at run time
+        with:
+          targets: ${{ matrix.target.triple }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Without this every leg shares one cache key and they evict each
+          # other, since the same crate is built eight ways.
+          key: ${{ matrix.target.triple }}-${{ matrix.profile.name }}
+
+      # Nothing pact depends on needs a C compiler for musl today (verified: a
+      # full `ui,otel,mcp` musl build succeeds without it). Installed anyway
+      # because the failure it prevents is a linker error deep in a dependency
+      # that is nobody's idea of a release-day surprise, and it costs seconds.
+      - name: Install musl toolchain
+        if: matrix.target.musl
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      # --locked, so the artifact matches the lockfile `integrity` just verified
+      # against the tag. Resolving dependencies at build time would untie exactly
+      # the knot that check ties.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target.triple }} ${{ matrix.profile.flags }}
+
+      # The profile promise, asserted in BOTH directions on the runner that just
+      # produced the binary. One direction is not enough: "full has the ui
+      # subcommand" passing tells you nothing about whether `lean` accidentally
+      # has it too, and `lean` quietly shipping ratatui is the exact mistake an
+      # artifact name would then be lying about.
+      - name: Verify the binary keeps its profile's promise
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          PROFILE: ${{ matrix.profile.name }}
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target.triple }}/release/pact"
+
+          VERSION="$("$BIN" --version)"
+          printf '%s\n' "$VERSION"
+          grep -qF "$TAG" <<<"$VERSION" || {
+            echo "::error::$BIN does not report $TAG"
+            exit 1
+          }
+
+          has_ui() { "$BIN" --help | grep -qE '^[[:space:]]+ui[[:space:]]'; }
+          # `mcp serve --help` and not `mcp serve`: the real thing would block on
+          # stdin waiting for JSON-RPC. --help proves the subcommand is compiled
+          # in and exits.
+          has_mcp() { "$BIN" mcp serve --help >/dev/null 2>&1; }
+
+          if [ "$PROFILE" = full ]; then
+            has_ui  || { echo "::error::full build is missing the ui subcommand"; exit 1; }
+            has_mcp || { echo "::error::full build is missing mcp serve"; exit 1; }
+            echo "full: ui and mcp serve both present"
+          else
+            has_ui  && { echo "::error::lean build has the ui subcommand; it was built --no-default-features"; exit 1; }
+            has_mcp && { echo "::error::lean build has mcp serve; it was built --no-default-features"; exit 1; }
+            echo "lean: neither ui nor mcp serve present, as promised"
+          fi
+
+      # Measured on the full musl profile: 2.85 MiB -> 2.25 MiB, about 22% off,
+      # entirely debug symbols nobody can use without the matching source tree.
+      # `strip` and not `llvm-strip`: every leg is native, so the host's strip
+      # already understands its own object format.
+      - name: Strip
+        run: strip "target/${{ matrix.target.triple }}/release/pact"
+
+      - name: Package
+        id: package
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          NAME="pact-$TAG-${{ matrix.target.triple }}-${{ matrix.profile.name }}"
+          mkdir -p "dist/$NAME"
+          cp "target/${{ matrix.target.triple }}/release/pact" "dist/$NAME/"
+          cp README.md CHANGELOG.md "dist/$NAME/"
+          # This repository has no LICENSE file yet. Copied when one appears
+          # rather than failing the release the day it does.
+          [ -f LICENSE ] && cp LICENSE "dist/$NAME/"
+          tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+          echo "name=$NAME" >>"$GITHUB_OUTPUT"
+          ls -la "dist/$NAME.tar.gz"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/${{ steps.package.outputs.name }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    # No `if:` at all, and that is deliberate. This job is gated purely by the
+    # needs-chain, which cannot be got wrong by editing a condition: `integrity`
+    # failing skips `build`, and either one not succeeding skips this. A dry run
+    # skips `integrity`, so it skips this too — the dispatch mode gets its
+    # publish-nothing behaviour from the same mechanism that stops a bad tag,
+    # rather than from a second rule that could disagree with the first.
+    needs: [integrity, build, resolve]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Widened here and nowhere else. `contents: write` creates the release;
+      # the other two sign the provenance attestation below.
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          # Eight uploads, one directory. Without this each arrives in a
+          # subdirectory named after its artifact.
+          merge-multiple: true
+
+      - name: Checksum every tarball
+        run: |
+          set -euo pipefail
+          cd dist
+          # A bare glob, which the shell already expands in sorted order, so the
+          # file is byte-identical for the same set of inputs and a human
+          # comparing two releases sees only real differences. `--` because a
+          # filename could otherwise be read as an option. Basenames only (`-C
+          # dist` when packaging, `cd` here), so `sha256sum -c SHA256SUMS` works
+          # wherever the files were downloaded to.
+          sha256sum -- *.tar.gz >SHA256SUMS
+          cat SHA256SUMS
+          # Prove the file we just wrote actually verifies, here, rather than
+          # letting the first person to try it find out.
+          sha256sum -c SHA256SUMS
+
+      - name: Release notes
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ./scripts/release-notes.sh --self-test
+          ./scripts/release-notes.sh "$TAG" >/tmp/notes.md
+          if [ ! -s /tmp/notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for $TAG. cog writes one on bump; a tag without one means the changelog was not committed with the version."
+            exit 1
+          fi
+          cat /tmp/notes.md
+
+      # Cheap SLSA: consumers can run `gh attestation verify` on a tarball and
+      # get back which workflow, which commit and which run produced it. It
+      # composes with the SHA-pinning story — pinned actions say what ran, an
+      # attestation says that it really did.
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/*.tar.gz
+
+      # `gh release create` rather than a third-party release action: it is
+      # already on the runner and already authenticated, so it is one less
+      # supply-chain edge for a step that literally publishes the supply chain.
+      #
+      # Neither a draft nor a prerelease: 0.x IS this project's release series,
+      # and a draft that needs a human to press a button is a release that
+      # sometimes does not happen.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file /tmp/notes.md \
+            --verify-tag \
+            dist/*.tar.gz dist/SHA256SUMS
