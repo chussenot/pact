@@ -462,6 +462,10 @@ fn log_event(repo_root: &Path, agent: &str, kind: &str, path: &str, detail: Opti
             kind: kind.to_string(),
             path: Some(path.to_string()),
             detail,
+            // Lease events never annotate; only a hand-written
+            // correction does. See audit::ANNOTATION_KIND.
+            covers_lines: None,
+            actor: None,
         },
     );
 }

@@ -424,6 +424,17 @@ fn worktree_checks(ctx: &repo::RepoContext, checks: &mut Vec<DoctorCheck>) {
                 ctx.placement.as_str(),
                 ctx.state_dir.display()
             ),
+            // Loud, because this is only ever set on purpose and a repository that
+            // has it set by accident is one whose history is going somewhere nobody
+            // is looking.
+            repo::Placement::StateDirOverride => format!(
+                "{} — PACT_STATE_DIR is set, so state is at {} instead of anywhere this \
+                 repository's topology would put it. Intended for tests, the fleet harness and \
+                 demos; if you did not set it, this repository is writing its history somewhere \
+                 unexpected.",
+                ctx.placement.as_str(),
+                ctx.state_dir.display()
+            ),
             repo::Placement::ScopedLocal => format!(
                 "{} — PACT_WORKTREE_SCOPE=local put state at {}",
                 ctx.placement.as_str(),

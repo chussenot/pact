@@ -50,6 +50,10 @@ pub enum Placement {
     Submodule,
     /// `PACT_WORKTREE_SCOPE=local` asked for per-worktree isolation.
     ScopedLocal,
+    /// `PACT_STATE_DIR` pointed state somewhere explicit. For tests, the fleet
+    /// harness and demos, so an experiment cannot write into a real repository's
+    /// history.
+    StateDirOverride,
 }
 
 /// What a `.git` file's target says this checkout is, read from the gitdir path
@@ -107,6 +111,7 @@ impl Placement {
             Placement::CommonGitdir => "common-gitdir",
             Placement::LocalFallback => "local-fallback",
             Placement::Submodule => "submodule",
+            Placement::StateDirOverride => "state-dir-override",
             Placement::ScopedLocal => "scoped-local",
         }
     }
@@ -206,6 +211,37 @@ impl RepoContext {
     /// panic in the middle of a fleet.
     pub fn resolve(worktree_root: &Path) -> Self {
         let mut ctx = Self::resolve_topology(worktree_root);
+
+        // `PACT_STATE_DIR` wins over every topology rule, and it exists because of
+        // an incident rather than a feature request.
+        //
+        // `.pact/events.jsonl` is committed, append-only, and the evidence base for
+        // a real decision: the guard-file bead (pact-ehi) says to build the guard
+        // file if and only if a double-win appears in this log. On 2026-07-31 six
+        // synthetic events — agents `victim`, `ghost` and `grabber` on paths
+        // `shared.rs`, `ghost.rs` and `new.rs`, which have never existed in this
+        // repository — were written into it by hand-run expiry and atomicity
+        // experiments executed from the repo root. They are still there, because an
+        // append-only log is not edited.
+        //
+        // No test or script does that today; verified by hashing the log across the
+        // full suite and a fleet run rather than by reading the code. But "verified
+        // once" is how the first contamination happened, so an experiment can now be
+        // pointed somewhere harmless and made physically unable to reach a real
+        // repository's state.
+        if let Some(dir) = std::env::var_os("PACT_STATE_DIR") {
+            let dir = PathBuf::from(dir);
+            if !dir.as_os_str().is_empty() {
+                ctx.state_dir = dir;
+                ctx.placement = Placement::StateDirOverride;
+                // Deliberately NOT also moving `shared_root`: the override is about
+                // where state lands, not about which repository this is. Beads still
+                // runs where the topology says, so a redirected experiment cannot
+                // quietly start using a different message store either.
+                return ctx;
+            }
+        }
+
         if !scope_is_local() {
             return ctx;
         }

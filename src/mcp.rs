@@ -635,7 +635,13 @@ impl Server {
                     Some(s) => Some(audit::parse_since(s)?),
                     None => None,
                 };
-                Ok(serde_json::to_value(audit::summary(&self.root, since)?)?)
+                // `false`: never include annotated events. An annotation says
+                // "these lines are not real history", and an observer asking for
+                // aggregates wants the corrected picture. The raw log stays
+                // available on the CLI via --include-annotated.
+                Ok(serde_json::to_value(audit::summary(
+                    &self.root, since, false,
+                )?)?)
             }
             "pact_events_tail" => {
                 // Clamped, not refused: a model that asks for 10_000 wants "as

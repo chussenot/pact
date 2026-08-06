@@ -117,6 +117,14 @@ enum Command {
         /// now such as `90m`, `24h`, `7d`, `2w`.
         #[arg(long)]
         since: Option<String>,
+        /// Include events an annotation marked as not-real-history.
+        ///
+        /// The log is append-only, so a wrong entry is corrected by appending an
+        /// `annotation` naming its lines rather than by editing it. Those lines
+        /// are excluded from every statistic and check by default, and the count
+        /// is always reported. Pass this to see the raw log as written.
+        #[arg(long)]
+        include_annotated: bool,
     },
     /// Interactive terminal dashboard over leases, messages, and doctor status.
     #[cfg(feature = "ui")]
@@ -417,7 +425,11 @@ fn run(cli: Cli) -> Result<i32> {
             run_msg(&cwd, cli.agent.as_deref(), cli.json, action).map(|()| 0)
         }
         Command::Log { limit } => run_log(&cwd, cli.json, limit).map(|()| 0),
-        Command::Audit { check, since } => run_audit(&cwd, cli.json, check, since),
+        Command::Audit {
+            check,
+            since,
+            include_annotated,
+        } => run_audit(&cwd, cli.json, check, since, include_annotated),
         #[cfg(feature = "ui")]
         Command::Ui => {
             let root = repo::find_repo_root(&cwd)?;
@@ -441,7 +453,13 @@ fn run(cli: Cli) -> Result<i32> {
 /// `error:` and must not be confusable with a usage failure. 1 means "the check
 /// found something", which is the documented generic-failure code reused rather
 /// than a new one invented.
-fn run_audit(cwd: &Path, json: bool, check: Option<String>, since: Option<String>) -> Result<i32> {
+fn run_audit(
+    cwd: &Path,
+    json: bool,
+    check: Option<String>,
+    since: Option<String>,
+    include_annotated: bool,
+) -> Result<i32> {
     let root = repo::find_repo_root(cwd)?;
     let since = match since {
         Some(s) => Some(audit::parse_since(&s)?),
@@ -450,13 +468,13 @@ fn run_audit(cwd: &Path, json: bool, check: Option<String>, since: Option<String
 
     match check {
         None => {
-            let summary = audit::summary(&root, since)?;
+            let summary = audit::summary(&root, since, include_annotated)?;
             output::emit(json, &summary, audit::render_summary);
             Ok(0)
         }
         Some(name) => {
             let check = audit::Check::parse(&name)?;
-            let report = audit::run_check(&root, check, since)?;
+            let report = audit::run_check(&root, check, since, include_annotated)?;
             output::emit(json, &report, audit::render_check);
             // The whole point of a named check: a machine can branch on it.
             Ok(if report.findings() == 0 { 0 } else { 1 })

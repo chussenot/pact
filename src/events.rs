@@ -52,6 +52,18 @@ pub struct Event {
     pub path: Option<String>,
     /// Free text: the lease note, the displaced holder, etc.
     pub detail: Option<String>,
+    /// `kind: "annotation"` only — the 1-based line numbers this annotation
+    /// marks as not-real-history.
+    ///
+    /// The log is append-only and wrong entries are never removed, so a
+    /// correction is a new entry that points at the old ones. See
+    /// `audit::ANNOTATION_KIND` for why that is the right shape and
+    /// docs/audit.md for the incident that produced the first one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covers_lines: Option<Vec<usize>>,
+    /// `kind: "annotation"` only — who is asserting the correction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
 }
 
 /// For appending: creates `.pact/` if needed.
@@ -291,6 +303,10 @@ mod tests {
             kind: kind.into(),
             path: Some(path.into()),
             detail: None,
+            // Lease events never annotate; only a hand-written
+            // correction does. See audit::ANNOTATION_KIND.
+            covers_lines: None,
+            actor: None,
         }
     }
 

@@ -79,6 +79,95 @@ because grouping them would need a timestamp tolerance — one `acquire` writes 
 row per path, microseconds apart — and a number that depends on an arbitrary
 tolerance is worse than no number.
 
+## Provenance: the log is append-only, corrections are annotations
+
+`.pact/events.jsonl` is committed and never rewritten. Entries are not edited or
+deleted, including wrong ones — because the file is *evidence*, and a log somebody
+can quietly tidy is not evidence. The guard-file bead (**pact-ehi**) reads it to
+decide whether a real defect exists; that only means anything if nobody can remove
+an inconvenient line.
+
+So a wrong entry is **annotated**. An `annotation` event names the lines it
+covers, says why, and attributes the claim:
+
+```json
+{"at":"2026-08-06T…","agent":"maintainer","kind":"annotation",
+ "detail":"synthetic: manual expiry experiment, agents victim/ghost/grabber",
+ "covers_lines":[40,41,42,43,44,45],"actor":"maintainer"}
+```
+
+Rules that follow from that:
+
+- Annotated lines are **excluded from every statistic and every check by
+  default**, and the count is always reported — `6 event(s) excluded by
+  annotation`. A statistic that quietly omits data is one nobody can check, which
+  is the same defect as an editable log.
+- `--include-annotated` shows the raw log as written, so an annotation can be
+  **disputed** rather than merely trusted. The lines are still there.
+- The annotation row itself is never counted as an event, in either mode.
+  Otherwise a correction would inflate the totals with a record that describes the
+  log rather than the fleet.
+- Older pact binaries need no change: `kind` is a `String`, so an annotation
+  parses as an unknown kind, opens no hold window and closes none. They just do
+  not apply the exclusion — which over-reports rather than hiding events, the safe
+  direction.
+
+**The `pact-ehi` double-win trigger counts unannotated events only.** An
+annotated overlap is not evidence, and there is a test asserting exactly that: the
+same two overlapping events fire the check unannotated and do not fire it
+annotated.
+
+### The incident (2026-07-31)
+
+Six events in this repository's log are not real coordination history:
+
+| line | agent | kind | path |
+|---|---|---|---|
+| 40 | `victim` | acquired | `shared.rs` |
+| 41 | `grabber` | acquired | `new.rs` |
+| 42 | `grabber` | released | `new.rs` |
+| 43 | `ghost` | acquired | `ghost.rs` |
+| 44 | `ghost` | expired | `ghost.rs` |
+| 45 | `victim` | expired | `shared.rs` |
+
+None of those paths has ever existed here. They came from hand-run expiry and
+all-or-nothing atomicity experiments executed **from the repository root** on
+2026-07-31 — before `PACT_STATE_DIR` existed — and they were committed along with
+the log on 2026-08-06 when `.pact/events.jsonl` was first preserved.
+
+Provenance was established by measurement rather than by reading code: the log was
+hashed before and after the full test suite and a fleet-sim run, and came back
+byte-identical both times. So no test or script writes there today. `lease.rs`,
+`cli.rs`, `mcp.rs`, `events_log.rs` and `worktree.rs` all use tempdirs;
+`mcp_absent.rs` was the one file spawning pact without a `current_dir`, and though
+neither command it runs writes state, it now uses a tempdir plus
+`PACT_STATE_DIR` — a test that *cannot* reach real state is worth more than one
+that currently happens not to.
+
+Two structural changes came out of it:
+
+- **`PACT_STATE_DIR`** overrides state resolution entirely, so tests, the fleet
+  harness and demos can be pointed somewhere harmless. `pact doctor` reports it
+  loudly, because a repository with it set by accident is one whose history is
+  going somewhere nobody is looking.
+- **`scripts/fleet-sim.sh` refuses to start** unless the state directory pact
+  resolves is inside its tempdir. Asserted rather than forced: that harness exists
+  partly to exercise the real resolution chain, including `--worktrees` and
+  `--scope-local`, so it has to let resolution happen and then check the result.
+
+What the correction changed, concretely: 153 events became 147, 23 agents became
+20, and **both** `expired` events in the whole history turned out to be
+synthetic — so no lease in pact's real history has ever actually lapsed.
+`stale-holds` went from 24 findings to 22.
+
+One embarrassment worth recording, since this page is about evidentiary hygiene:
+the first annotation appended covered only line 45, because the shell command
+building it assigned the line list to `LINES` — a variable bash owns and
+overwrites with the terminal height. It happened to be 45. That annotation was
+uncommitted and had been read by nothing, so it was replaced rather than
+corrected-in-place; the append-only discipline protects recorded history, and a
+botched write nobody has seen is not history.
+
 ## What audit deliberately cannot see
 
 **The Beads side.** Audit reads `.pact/` and nothing else — never `.beads/`, a
@@ -139,11 +228,13 @@ metric, because it looks like evidence.
 
 ## What it says about pact's own history
 
-At the time of writing, on 153 preserved events from 23 agents:
+At the time of writing, on 147 preserved events from 20 agents — six more are in
+the file and excluded by annotation, see [Provenance](#provenance-the-log-is-append-only-corrections-are-annotations):
 
 ```
 $ pact audit --check double-win
-double-win: scanned 153 event(s)
+double-win: scanned 147 event(s)
+  6 event(s) excluded by annotation — this check did not look at them
 no overlapping hold windows — no two agents ever held one path at once
 ```
 
@@ -151,7 +242,7 @@ So **pact-ehi's trigger condition has not fired**. The guard file remains
 unjustified, and now that is a measured statement rather than an absence of
 complaints.
 
-`--check stale-holds` does find 24 holds past TTL with no renew, the longest
+`--check stale-holds` does find 22 holds past TTL with no renew, the longest
 36m6s against a 15m TTL. That is a protocol-adherence finding about the agents,
 not a defect in pact: they held paths their leases no longer covered.
 

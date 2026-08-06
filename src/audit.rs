@@ -49,6 +49,27 @@ use crate::lease::DEFAULT_TTL_SECS;
 /// summary. The full data is in the log; this is the part a human reads.
 const TOP_N: usize = 10;
 
+/// The one event kind that is not history: a correction pointing at lines that
+/// are.
+///
+/// `.pact/events.jsonl` is append-only, and that is load-bearing rather than
+/// incidental — it is committed, and the guard-file bead (pact-ehi) treats it as
+/// the evidence base for a real decision. So a wrong entry is never edited or
+/// deleted; it is *annotated*, by appending a record that names the lines and says
+/// why. The original stays readable, the correction is attributable, and anyone
+/// can disagree with an annotation by reading what it covers.
+///
+/// Older pact binaries need no change to cope: `kind` is a `String`, so an
+/// annotation parses as an unknown kind, opens no hold window and closes none.
+/// They simply do not apply the exclusion — which is the safe direction, because
+/// it over-reports rather than hiding events.
+///
+/// The first one exists because on 2026-07-31 hand-run expiry and atomicity
+/// experiments in this repository's root wrote six synthetic events: agents
+/// `victim`, `ghost` and `grabber` on paths `shared.rs`, `ghost.rs` and `new.rs`,
+/// none of which have ever existed here.
+pub const ANNOTATION_KIND: &str = "annotation";
+
 /// Which named check to run. Absent means the summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Check {
@@ -134,6 +155,11 @@ pub struct HoldStats {
 #[derive(Debug, Serialize)]
 pub struct Summary {
     pub events: usize,
+    /// Events dropped because an annotation covers their line. Reported so the
+    /// exclusion is itself visible: a statistic that quietly omits data is a
+    /// statistic nobody can check.
+    pub excluded_by_annotation: usize,
+    pub annotations: Vec<Annotation>,
     /// Lines the parser could not read. A torn final line is normal for an
     /// append-only log; a large number here means something else is wrong.
     pub unparseable_lines: usize,
@@ -153,6 +179,9 @@ pub struct Summary {
 pub struct CheckReport {
     pub check: &'static str,
     pub events_scanned: usize,
+    /// Events an annotation excluded. A check that silently skipped data would be
+    /// the same defect as a statistic that did.
+    pub excluded_by_annotation: usize,
     pub unparseable_lines: usize,
     pub double_wins: Vec<DoubleWin>,
     pub stale_holds: Vec<Hold>,
@@ -331,24 +360,94 @@ fn percentile(sorted: &[i64], p: f64) -> i64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-/// Read the log, optionally narrowed to events at or after `since`.
+/// What one pass over the log produced.
+struct Loaded {
+    events: Vec<(usize, Event)>,
+    unparseable: usize,
+    /// Events dropped because an annotation covers their line.
+    excluded: usize,
+    /// The annotations themselves, so a report can say what was excluded and why
+    /// rather than only how many.
+    annotations: Vec<Annotation>,
+}
+
+/// A correction: which lines are not real history, and who says so.
+#[derive(Debug, Clone, Serialize)]
+pub struct Annotation {
+    pub line: usize,
+    pub at: String,
+    pub actor: Option<String>,
+    pub note: Option<String>,
+    pub covers_lines: Vec<usize>,
+}
+
+/// Read the log, drop annotated lines unless asked not to, and narrow by `--since`.
+///
+/// The exclusion happens BEFORE `--since`, deliberately: an annotation and the
+/// lines it covers are usually days apart, so filtering by time first would drop
+/// the correction and silently re-admit the events it corrects.
 fn load(
     repo_root: &std::path::Path,
     since: Option<DateTime<Utc>>,
-) -> Result<(Vec<(usize, Event)>, usize)> {
-    let (all, skipped) = crate::events::numbered(repo_root)?;
-    let kept = match since {
-        None => all,
-        Some(cut) => all
-            .into_iter()
-            .filter(|(_, e)| parse_at(&e.at).map(|t| t >= cut).unwrap_or(false))
-            .collect(),
-    };
-    Ok((kept, skipped))
+    include_annotated: bool,
+) -> Result<Loaded> {
+    let (all, unparseable) = crate::events::numbered(repo_root)?;
+
+    let mut annotations = Vec::new();
+    let mut covered: BTreeSet<usize> = BTreeSet::new();
+    for (line, e) in &all {
+        if e.kind != ANNOTATION_KIND {
+            continue;
+        }
+        let covers = e.covers_lines.clone().unwrap_or_default();
+        covered.extend(covers.iter().copied());
+        annotations.push(Annotation {
+            line: *line,
+            at: e.at.clone(),
+            actor: e.actor.clone(),
+            note: e.detail.clone(),
+            covers_lines: covers,
+        });
+    }
+
+    let mut excluded = 0;
+    let events: Vec<(usize, Event)> = all
+        .into_iter()
+        .filter(|(line, e)| {
+            // Annotation rows are never history themselves, whatever
+            // `--include-annotated` says: counting them as events would inflate
+            // every total with records that describe the log rather than the fleet.
+            if e.kind == ANNOTATION_KIND {
+                return false;
+            }
+            if !include_annotated && covered.contains(line) {
+                excluded += 1;
+                return false;
+            }
+            true
+        })
+        .filter(|(_, e)| match since {
+            None => true,
+            Some(cut) => parse_at(&e.at).map(|t| t >= cut).unwrap_or(false),
+        })
+        .collect();
+
+    Ok(Loaded {
+        events,
+        unparseable,
+        excluded,
+        annotations,
+    })
 }
 
-pub fn summary(repo_root: &std::path::Path, since: Option<DateTime<Utc>>) -> Result<Summary> {
-    let (events, unparseable) = load(repo_root, since)?;
+pub fn summary(
+    repo_root: &std::path::Path,
+    since: Option<DateTime<Utc>>,
+    include_annotated: bool,
+) -> Result<Summary> {
+    let loaded = load(repo_root, since, include_annotated)?;
+    let unparseable = loaded.unparseable;
+    let events = loaded.events;
     let (holds, _) = reconstruct(&events);
 
     let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
@@ -416,6 +515,8 @@ pub fn summary(repo_root: &std::path::Path, since: Option<DateTime<Utc>>) -> Res
 
     Ok(Summary {
         events: events.len(),
+        excluded_by_annotation: loaded.excluded,
+        annotations: loaded.annotations,
         unparseable_lines: unparseable,
         steals: by_kind.get("stolen").copied().unwrap_or(0),
         by_kind,
@@ -433,8 +534,11 @@ pub fn run_check(
     repo_root: &std::path::Path,
     check: Check,
     since: Option<DateTime<Utc>>,
+    include_annotated: bool,
 ) -> Result<CheckReport> {
-    let (events, unparseable) = load(repo_root, since)?;
+    let loaded = load(repo_root, since, include_annotated)?;
+    let unparseable = loaded.unparseable;
+    let events = loaded.events;
     let (holds, doubles) = reconstruct(&events);
 
     let mut report = CheckReport {
@@ -443,6 +547,7 @@ pub fn run_check(
             Check::StaleHolds => "stale-holds",
         },
         events_scanned: events.len(),
+        excluded_by_annotation: loaded.excluded,
         unparseable_lines: unparseable,
         double_wins: Vec::new(),
         stale_holds: Vec::new(),
@@ -514,6 +619,23 @@ pub fn render_summary(s: &Summary) -> String {
             s.unparseable_lines
         ));
     }
+    // Never silent. A statistic that omits data without saying so is a statistic
+    // nobody can check, and the whole reason annotations exist is that the log is
+    // evidence.
+    if s.excluded_by_annotation > 0 {
+        out.push(format!(
+            "  note   {} event(s) excluded by annotation (--include-annotated to see them)",
+            s.excluded_by_annotation
+        ));
+        for a in &s.annotations {
+            out.push(format!(
+                "         line {} by {}: {}",
+                a.line,
+                a.actor.as_deref().unwrap_or("unknown"),
+                a.note.as_deref().unwrap_or("(no note)")
+            ));
+        }
+    }
 
     let kinds: Vec<String> = s.by_kind.iter().map(|(k, n)| format!("{k} {n}")).collect();
     out.push(format!("  kinds  {}", kinds.join(", ")));
@@ -572,6 +694,12 @@ pub fn render_check(r: &CheckReport) -> String {
     )];
     if r.unparseable_lines > 0 {
         out.push(format!("  {} unreadable line(s)", r.unparseable_lines));
+    }
+    if r.excluded_by_annotation > 0 {
+        out.push(format!(
+            "  {} event(s) excluded by annotation — this check did not look at them",
+            r.excluded_by_annotation
+        ));
     }
 
     if r.findings() == 0 {
@@ -671,11 +799,11 @@ mod tests {
     #[test]
     fn an_empty_log_is_not_an_error() {
         let tmp = with_log(&[]);
-        let s = summary(tmp.path(), None).unwrap();
+        let s = summary(tmp.path(), None, false).unwrap();
         assert_eq!(s.events, 0);
         assert!(render_summary(&s).contains("no coordination history"));
 
-        let r = run_check(tmp.path(), Check::DoubleWin, None).unwrap();
+        let r = run_check(tmp.path(), Check::DoubleWin, None, false).unwrap();
         assert_eq!(r.findings(), 0, "an empty log has no findings, not one");
     }
 
@@ -685,7 +813,7 @@ mod tests {
     fn a_missing_log_reads_as_empty_and_creates_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
-        assert_eq!(summary(tmp.path(), None).unwrap().events, 0);
+        assert_eq!(summary(tmp.path(), None, false).unwrap().events, 0);
         assert!(
             !tmp.path().join(".pact").exists(),
             "auditing must not create .pact/"
@@ -700,10 +828,10 @@ mod tests {
             &ev("2026-08-01T10:06:00Z", "agent-b", "acquired", "src/a.rs"),
             &ev("2026-08-01T10:07:00Z", "agent-b", "released", "src/a.rs"),
         ]);
-        let r = run_check(tmp.path(), Check::DoubleWin, None).unwrap();
+        let r = run_check(tmp.path(), Check::DoubleWin, None, false).unwrap();
         assert_eq!(r.findings(), 0, "sequential holds are not a double-win");
 
-        let s = summary(tmp.path(), None).unwrap();
+        let s = summary(tmp.path(), None, false).unwrap();
         assert_eq!(s.events, 4);
         assert_eq!(s.agents, ["agent-a", "agent-b"]);
         assert_eq!(s.open_holds, 0);
@@ -721,7 +849,7 @@ mod tests {
             &ev("2026-08-01T10:01:00Z", "agent-b", "acquired", "src/a.rs"),
             &ev("2026-08-01T10:02:00Z", "agent-b", "released", "src/a.rs"),
         ]);
-        let r = run_check(tmp.path(), Check::DoubleWin, None).unwrap();
+        let r = run_check(tmp.path(), Check::DoubleWin, None, false).unwrap();
         assert_eq!(r.findings(), 1);
         let d = &r.double_wins[0];
         assert_eq!(d.path, "src/a.rs");
@@ -751,7 +879,7 @@ mod tests {
             &ev("2026-08-01T10:30:01Z", "agent-b", "stolen", "src/a.rs"),
             &ev("2026-08-01T10:31:00Z", "agent-b", "released", "src/a.rs"),
         ]);
-        let r = run_check(tmp.path(), Check::DoubleWin, None).unwrap();
+        let r = run_check(tmp.path(), Check::DoubleWin, None, false).unwrap();
         assert_eq!(r.findings(), 0, "expired closes the old window first");
     }
 
@@ -764,7 +892,7 @@ mod tests {
             &ev("2026-08-01T10:00:00Z", "agent-a", "acquired", "src/a.rs"),
             &ev("2026-08-01T10:00:30Z", "agent-b", "stolen", "src/a.rs"),
         ]);
-        let r = run_check(tmp.path(), Check::DoubleWin, None).unwrap();
+        let r = run_check(tmp.path(), Check::DoubleWin, None, false).unwrap();
         assert_eq!(r.findings(), 1);
         assert_eq!(r.double_wins[0].incoming_kind, "stolen");
     }
@@ -778,9 +906,9 @@ mod tests {
             &ev("2026-08-01T10:00:10Z", "agent-a", "acquired", "src/a.rs"),
             &ev("2026-08-01T10:00:20Z", "agent-a", "released", "src/a.rs"),
         ]);
-        let r = run_check(tmp.path(), Check::DoubleWin, None).unwrap();
+        let r = run_check(tmp.path(), Check::DoubleWin, None, false).unwrap();
         assert_eq!(r.findings(), 0);
-        let s = summary(tmp.path(), None).unwrap();
+        let s = summary(tmp.path(), None, false).unwrap();
         assert_eq!(
             s.hold_secs.unwrap().completed,
             1,
@@ -797,13 +925,13 @@ mod tests {
             &ev("2026-08-01T10:01:00Z", "agent-a", "released", "src/a.rs"),
             r#"{"at":"2026-08-01T10:02:00Z","agent":"agent-b","kind":"acq"#,
         ]);
-        let s = summary(tmp.path(), None).unwrap();
+        let s = summary(tmp.path(), None, false).unwrap();
         assert_eq!(s.events, 2, "the two whole events still count");
         assert_eq!(s.unparseable_lines, 1);
         assert!(render_summary(&s).contains("unreadable"));
         // And a check still runs rather than refusing on a torn tail.
         assert_eq!(
-            run_check(tmp.path(), Check::DoubleWin, None)
+            run_check(tmp.path(), Check::DoubleWin, None, false)
                 .unwrap()
                 .unparseable_lines,
             1
@@ -819,13 +947,13 @@ mod tests {
             &ev("2026-08-01T10:00:30Z", "agent-a", "teleported", "src/a.rs"),
             &ev("2026-08-01T10:01:00Z", "agent-a", "released", "src/a.rs"),
         ]);
-        let s = summary(tmp.path(), None).unwrap();
+        let s = summary(tmp.path(), None, false).unwrap();
         assert_eq!(s.by_kind.get("teleported"), Some(&1));
         assert_eq!(s.unparseable_lines, 0, "unknown is not unparseable");
         // It neither opens nor closes a window.
         assert_eq!(s.hold_secs.unwrap().completed, 1);
         assert_eq!(
-            run_check(tmp.path(), Check::DoubleWin, None)
+            run_check(tmp.path(), Check::DoubleWin, None, false)
                 .unwrap()
                 .findings(),
             0
@@ -846,7 +974,7 @@ mod tests {
             &ev("2026-08-01T10:00:00Z", "quick", "acquired", "src/quick.rs"),
             &ev("2026-08-01T10:00:30Z", "quick", "released", "src/quick.rs"),
         ]);
-        let r = run_check(tmp.path(), Check::StaleHolds, None).unwrap();
+        let r = run_check(tmp.path(), Check::StaleHolds, None, false).unwrap();
         assert_eq!(r.findings(), 1, "only the long unrenewed hold");
         assert_eq!(r.stale_holds[0].agent, "slow");
         assert_eq!(r.stale_holds[0].held_secs, Some(7200));
@@ -862,7 +990,7 @@ mod tests {
             &ev("2026-08-01T10:00:00Z", "gone", "acquired", "src/a.rs"),
             &ev("2026-08-01T10:00:05Z", "gone", "expired", "src/a.rs"),
         ]);
-        let r = run_check(tmp.path(), Check::StaleHolds, None).unwrap();
+        let r = run_check(tmp.path(), Check::StaleHolds, None, false).unwrap();
         assert_eq!(r.findings(), 1);
         assert_eq!(r.stale_holds[0].closed_by.as_deref(), Some("expired"));
     }
@@ -875,12 +1003,125 @@ mod tests {
             "acquired",
             "src/a.rs",
         )]);
-        let s = summary(tmp.path(), None).unwrap();
+        let s = summary(tmp.path(), None, false).unwrap();
         assert_eq!(s.open_holds, 1);
         assert!(
             s.hold_secs.is_none(),
             "an open hold has no duration to average"
         );
+    }
+
+    fn annotation(covers: &[usize], note: &str) -> String {
+        let lines: Vec<String> = covers.iter().map(|n| n.to_string()).collect();
+        format!(
+            r#"{{"at":"2026-08-06T12:00:00Z","agent":"maintainer","kind":"annotation","detail":"{note}","covers_lines":[{}],"actor":"maintainer"}}"#,
+            lines.join(",")
+        )
+    }
+
+    /// An annotation names lines that are not real history. They leave the
+    /// statistics, and the fact that they left is reported — an exclusion nobody
+    /// can see is indistinguishable from data that was never there.
+    #[test]
+    fn an_annotation_excludes_the_lines_it_covers_and_says_so() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "real", "acquired", "src/a.rs"),
+            &ev("2026-08-01T10:05:00Z", "real", "released", "src/a.rs"),
+            &ev("2026-08-01T11:00:00Z", "ghost", "acquired", "ghost.rs"),
+            &ev("2026-08-01T11:00:01Z", "ghost", "expired", "ghost.rs"),
+            &annotation(&[3, 4], "synthetic: manual expiry experiment, agent ghost"),
+        ]);
+
+        let s = summary(tmp.path(), None, false).unwrap();
+        assert_eq!(s.events, 2, "the two synthetic events are gone");
+        assert_eq!(s.excluded_by_annotation, 2);
+        assert_eq!(s.agents, ["real"], "ghost is not an agent of this project");
+        assert_eq!(s.annotations.len(), 1);
+        assert_eq!(s.annotations[0].covers_lines, [3, 4]);
+        assert_eq!(s.annotations[0].actor.as_deref(), Some("maintainer"));
+        let text = render_summary(&s);
+        assert!(text.contains("excluded by annotation"), "{text}");
+        assert!(text.contains("maintainer"), "{text}");
+
+        // And the raw log is still reachable, because the annotation is a claim
+        // rather than a deletion.
+        let raw = summary(tmp.path(), None, true).unwrap();
+        assert_eq!(raw.events, 4);
+        assert_eq!(raw.excluded_by_annotation, 0);
+        assert!(raw.agents.contains(&"ghost".to_string()));
+    }
+
+    /// The assertion the whole mechanism exists for: an annotated double-win must
+    /// NOT fire the check, because pact-ehi's trigger condition counts real
+    /// history only — while an unannotated one still must.
+    #[test]
+    fn an_annotated_double_win_does_not_fire_but_a_real_one_does() {
+        let overlapping = [
+            ev("2026-08-01T10:00:00Z", "agent-a", "acquired", "src/a.rs"),
+            ev("2026-08-01T10:00:30Z", "agent-b", "acquired", "src/a.rs"),
+        ];
+
+        // Unannotated: a finding, and the guard-file trigger has fired.
+        let live = with_log(&[&overlapping[0], &overlapping[1]]);
+        assert_eq!(
+            run_check(live.path(), Check::DoubleWin, None, false)
+                .unwrap()
+                .findings(),
+            1
+        );
+
+        // The same two events, annotated as synthetic: no finding.
+        let annotated = with_log(&[
+            &overlapping[0],
+            &overlapping[1],
+            &annotation(&[1, 2], "synthetic: hand-run steal experiment"),
+        ]);
+        let r = run_check(annotated.path(), Check::DoubleWin, None, false).unwrap();
+        assert_eq!(r.findings(), 0, "an annotated overlap is not evidence");
+        assert_eq!(r.excluded_by_annotation, 2);
+        assert!(
+            render_check(&r).contains("excluded by annotation"),
+            "the check must admit it skipped events: {}",
+            render_check(&r)
+        );
+
+        // ...and --include-annotated shows it again, so the annotation can be
+        // disputed rather than merely trusted.
+        assert_eq!(
+            run_check(annotated.path(), Check::DoubleWin, None, true)
+                .unwrap()
+                .findings(),
+            1
+        );
+    }
+
+    /// An annotation covering one half of an overlap still removes the overlap:
+    /// exclusion is per event, and a window needs both ends.
+    #[test]
+    fn annotating_one_side_of_an_overlap_is_enough() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "real", "acquired", "src/a.rs"),
+            &ev("2026-08-01T10:00:30Z", "ghost", "acquired", "src/a.rs"),
+            &annotation(&[2], "synthetic: only the ghost half"),
+        ]);
+        let r = run_check(tmp.path(), Check::DoubleWin, None, false).unwrap();
+        assert_eq!(r.findings(), 0);
+        assert_eq!(r.excluded_by_annotation, 1);
+    }
+
+    /// The annotation row is never counted as history itself, in either mode —
+    /// otherwise every correction would inflate the event total.
+    #[test]
+    fn the_annotation_row_is_not_itself_an_event() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "real", "acquired", "src/a.rs"),
+            &annotation(&[99], "covers a line that does not exist"),
+        ]);
+        for include in [false, true] {
+            let s = summary(tmp.path(), None, include).unwrap();
+            assert_eq!(s.events, 1, "include_annotated={include}");
+            assert_eq!(s.unparseable_lines, 0, "an annotation parses fine");
+        }
     }
 
     #[test]
@@ -899,11 +1140,11 @@ mod tests {
         ]);
         let cut = parse_since("2026-01-01T00:00:00Z").unwrap();
         assert_eq!(
-            summary(tmp.path(), Some(cut)).unwrap().events,
+            summary(tmp.path(), Some(cut), false).unwrap().events,
             0,
             "--since must exclude older events"
         );
-        assert_eq!(summary(tmp.path(), None).unwrap().events, 2);
+        assert_eq!(summary(tmp.path(), None, false).unwrap().events, 2);
     }
 
     /// Junk that is not JSON at all, in the middle rather than at the end. Still
@@ -917,7 +1158,7 @@ mod tests {
             "{}",
             &ev("2026-08-01T10:01:00Z", "agent-a", "released", "src/a.rs"),
         ]);
-        let s = summary(tmp.path(), None).unwrap();
+        let s = summary(tmp.path(), None, false).unwrap();
         assert_eq!(s.events, 2);
         // `{}` fails to deserialize (no required fields) and the blank line is
         // skipped without counting.

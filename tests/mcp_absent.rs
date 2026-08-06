@@ -8,9 +8,23 @@
 
 use std::process::Command;
 
+/// Spawn pact in a scratch directory with its state redirected, never in the
+/// repository the test is running from.
+///
+/// Neither command below writes state — `--help` prints and exits, and an unknown
+/// subcommand is a usage error — so this changes no outcome. It is here because
+/// the pattern is the hazard: this was the one test file that spawned pact
+/// without a `current_dir`, and on 2026-07-31 hand-run experiments in this repo's
+/// root put six synthetic events into `.pact/events.jsonl`, which is committed,
+/// append-only and read as evidence by the guard-file bead (pact-ehi). A test
+/// that *cannot* reach real state is worth more than one that currently happens
+/// not to.
 fn pact(args: &[&str]) -> std::process::Output {
+    let tmp = tempfile::tempdir().expect("tempdir");
     Command::new(env!("CARGO_BIN_EXE_pact"))
         .args(args)
+        .current_dir(tmp.path())
+        .env("PACT_STATE_DIR", tmp.path().join("state"))
         .output()
         .expect("failed to run pact binary")
 }

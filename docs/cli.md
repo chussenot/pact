@@ -27,7 +27,7 @@ pact msg sent
 pact msg read <id>
 pact log [-n | --limit <count>]
 pact doctor
-pact audit [--check <double-win|stale-holds>] [--since <rfc3339|duration>]
+pact audit [--check <double-win|stale-holds>] [--since <rfc3339|duration>] [--include-annotated]
 pact ui
 pact mcp serve
 ```

@@ -190,6 +190,30 @@ PACT_AGENT=sim-setup "$PACT" init --no-commit >/dev/null || die "pact init faile
 git add -A
 git commit -q -m "bd + pact init" || true
 
+# ---------------------------------------------- assert we are sandboxed
+#
+# Before a single worker runs: whatever `pact` resolves as its state directory
+# must be inside this run's tempdir. Six synthetic events reached this project's
+# real, committed `.pact/events.jsonl` on 2026-07-31 from hand-run experiments,
+# and that log is the evidence base for the guard-file decision (pact-ehi) — an
+# append-only file nobody edits, so a stray write is permanent.
+#
+# Asserted rather than forced. Setting PACT_STATE_DIR here would be simpler and
+# would defeat the point: this harness exists partly to exercise the real
+# resolution chain, including --worktrees and --scope-local, so it has to let
+# resolution happen and then check where it landed.
+STATE_DIR="$(PACT_AGENT=sim-setup "$PACT" whoami --json 2>/dev/null | jq -r '.pact_dir // ""')"
+[ -n "$STATE_DIR" ] || die "could not ask pact where its state dir is"
+case "$STATE_DIR" in
+"$RUN_DIR"/*) say "=== sandboxed: state dir is $STATE_DIR" ;;
+*) die "REFUSING TO RUN: pact resolved its state dir to
+  $STATE_DIR
+which is NOT under this run's tempdir
+  $RUN_DIR
+A simulation writing into a real repository's event log would contaminate the
+history that the guard-file decision (pact-ehi) reads as evidence." ;;
+esac
+
 # ------------------------------------------------------------- seed tasks
 #
 # Each task names 1-3 target files in its description, and the generator biases
