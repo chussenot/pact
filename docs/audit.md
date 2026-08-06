@@ -64,8 +64,20 @@ is stable for a given file and a human can go and look.
 
 ### `--check stale-holds`
 
-Holds that ran past the TTL (900s) **and never renewed**, plus any hold that
-lapsed into `expired` whatever its length.
+Holds that ran past their TTL **and never renewed**, plus any hold that lapsed
+into `expired` whatever its length.
+
+**Each hold is judged against the TTL it recorded**, from `ttl_secs` in the
+event — never against the TTL the binary happens to be compiled with. That is
+what makes the default recalibratable: when
+[`DEFAULT_TTL_SECS` moved from 900 to 2700](leases.md#lifecycle-expiry-and-stealing)
+on 2026-08-06, no historical finding changed. A hardcoded threshold would have
+silently cleared 22 of them, with nothing having changed about the holds.
+
+Events written before pact recorded a TTL fall back to **900s, the default of
+their era**, and the report marks those rows `*` and counts them. Judging old
+history against today's default is how raising a default quietly rewrites the
+past.
 
 The "never renewed" half is the point. The protocol says a long task must not
 outlive its lease and that `pact lease renew` refreshes it, so a two-hour hold
@@ -243,8 +255,12 @@ unjustified, and now that is a measured statement rather than an absence of
 complaints.
 
 `--check stale-holds` does find 22 holds past TTL with no renew, the longest
-36m6s against a 15m TTL. That is a protocol-adherence finding about the agents,
-not a defect in pact: they held paths their leases no longer covered.
+36m6s against the 15m TTL those leases recorded. That is a protocol-adherence
+finding about the agents, not a defect in pact: they held paths their leases no
+longer covered. It is also the measurement that
+[recalibrated the default to 45 minutes](leases.md#lifecycle-expiry-and-stealing) —
+and those 22 findings still stand after the bump, because each hold is judged
+against its own recorded TTL.
 
 ## Where it runs
 

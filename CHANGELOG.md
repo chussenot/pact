@@ -335,6 +335,35 @@ cog's.
   sixth read-only MCP tool covered by the same byte-identical read-only proof as
   the other five.
 
+### Changed — the default lease TTL is now measured rather than chosen
+
+- **`DEFAULT_TTL_SECS` 900 → 2700 (45 minutes)**, and the constant carries its
+  own evidence. `pact audit` over this repository's 147 preserved events —
+  20 agents, 67 completed holds — measured a median hold of 842s, a p90 of 1455s
+  and a longest of 2166s, with **one renewal in the entire history**. Against a
+  900s TTL that put the p90 agent 9 minutes past expiry and the longest 21 minutes
+  past, each of them stealable while its holder was still working. The protocol
+  asks agents to renew and the data says they do not, once, ever; so the tool
+  adapts to measured behaviour instead of demanding ceremony that is demonstrably
+  skipped. 2700 is 1.85x the measured p90 and 1.25x the longest hold recorded.
+- **One honest limit on that evidence, recorded because the same audit is what
+  found it.** There are **zero** expiry events in that history: holds did outrun
+  their TTL, but no peer ever actually reclaimed one. This closes a demonstrated
+  exposure window, not a demonstrated collision. Both `expired` events that used
+  to be in the log were synthetic and are now excluded by annotation.
+- **Events carry `ttl_secs`, which is what makes this safe.** `--check
+  stale-holds` judges every hold against the TTL **it recorded**, not the one the
+  binary was compiled with, so raising the default rewrote no history: all 22
+  findings still stand. Events written before pact recorded a TTL fall back to
+  900s, the default of *their* era, and the report marks and counts those rows.
+  Without that, this change would have silently cleared every historical finding
+  with nothing having changed about the holds — which is the failure mode a test
+  now asserts against directly.
+- **The point is smaller than the number.** `pact audit` is what turns the next
+  recalibration into a measurement instead of a guess. The interesting artefact of
+  this change is not 2700; it is that the constant now has a provenance, a way to
+  re-derive it, and a check that cannot be quietly invalidated by moving it.
+
 ### Added — worktrees share one coordination space, because advisory locks must
 
 - **Every `git worktree` of a repository now shares a single `.pact/`**: leases,

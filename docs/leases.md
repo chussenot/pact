@@ -250,9 +250,26 @@ registration point for the owning agent to apply on your behalf — option (a) o
 ## Lifecycle: expiry and stealing
 
 A lease doesn't require its holder to still be alive. Every lease carries a
-TTL (default 900 seconds) plus a fixed 30-second grace period that absorbs
-clock drift between machines — a lease is only treated as expired once
+TTL (default 2700 seconds, 45 minutes) plus a fixed 30-second grace period that
+absorbs clock drift between machines — a lease is only treated as expired once
 `now > acquired_at + ttl + 30s`.
+
+That default is **calibrated, not chosen**. It was 900s until 2026-08-06, when
+`pact audit` measured this repository's own 147 preserved events: median hold
+842s, p90 1455s, longest 2166s — and **one renewal in the whole history**. So the
+p90 agent was running 9 minutes past expiry and the longest 21 minutes past, each
+one stealable while its holder was still working. The protocol asks agents to
+renew; the data says they do not, once, ever. Rather than demand ceremony that is
+demonstrably skipped, the default now covers the work agents actually do: 1.85x
+the measured p90, 1.25x the longest hold ever recorded.
+
+One honest limit on that evidence: there are **zero** expiry events in that
+history. Holds did outrun their TTL, but no peer ever actually reclaimed one. The
+bump closes a demonstrated exposure window, not a demonstrated collision.
+
+Recalibrating is now a measurement rather than a guess, and safely so:
+[`pact audit --check stale-holds`](audit.md#--check-stale-holds) judges each hold
+against the TTL **it recorded**, so moving the default cannot rewrite the past.
 
 ```mermaid
 stateDiagram-v2
