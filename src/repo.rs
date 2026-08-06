@@ -481,9 +481,45 @@ pub fn reach(repo_root: &Path, rel: &str) -> Reach {
         Err(_) => return Reach::Unknown,
     }
 
+    // The decision comes from `ls-files --others --ignored`, NOT from
+    // `check-ignore`'s exit code, and the difference is not academic.
+    //
+    // `check-ignore` exits 0 whenever a pattern MATCHES — including a negation.
+    // In a repo whose `.gitignore` says
+    //
+    //     .pact/*
+    //     !.pact/events.jsonl
+    //
+    // asking about `events.jsonl` exits 0 and reports
+    // `.gitignore:2:!.pact/events.jsonl`, so reading the exit code alone calls a
+    // deliberately re-included file "ignored". This is the shape `pact init` now
+    // writes, and it was reported as ignored until this was fixed — but the bug
+    // predates that: any repo using `*.md` plus `!AGENTS.md` was mis-warned by
+    // the protocol-files check for the same reason.
+    //
+    // `ls-files --others --ignored --exclude-standard` lists a path only when git
+    // would actually refuse to add it, which is the question being asked.
+    // Verified against `git add` on both a negated and a genuinely ignored path.
+    let really_ignored = match git(&[
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--",
+        rel,
+    ]) {
+        Ok(o) if o.status.success() => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        Ok(_) => false,
+        Err(_) => return Reach::Unknown,
+    };
+    if !really_ignored {
+        return Reach::Untracked;
+    }
+
+    // Ignored, so name the rule responsible: `-v` prints
+    // "<source>:<line>:<pattern>\t<path>", and the source is the actionable half
+    // — knowing *which* file ignores it is the fix.
     match git(&["check-ignore", "-v", "--", rel]) {
-        // `-v` prints "<source>:<line>:<pattern>\t<path>"; the source is the
-        // actionable half — knowing *which* file ignores it is the fix.
         Ok(o) if o.status.success() => {
             let stdout = String::from_utf8_lossy(&o.stdout);
             let source = stdout
@@ -494,8 +530,12 @@ pub fn reach(repo_root: &Path, rel: &str) -> Reach {
                 .to_string();
             Reach::Ignored { source }
         }
-        Ok(o) if o.status.code() == Some(1) => Reach::Untracked,
-        _ => Reach::Unknown,
+        // Ignored by something `-v` could not attribute (a global excludesFile
+        // that has since moved, say). Still ignored, and saying so without a
+        // source beats claiming it is fine.
+        _ => Reach::Ignored {
+            source: "an exclude rule git did not attribute".to_string(),
+        },
     }
 }
 

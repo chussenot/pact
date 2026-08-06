@@ -464,6 +464,10 @@ fn run_init(cwd: &Path, print: bool, no_commit: bool, json: bool) -> Result<()> 
         // an instruction file for a tool nobody here uses (pact-4zx).
         let instruction_files = agents_md::ensure_instruction_files(&root)?;
         agents_md::ensure_gitignore(&root)?;
+        // Paired with the narrowed ignore above: `events.jsonl` is now committed,
+        // and an append-only file that git merges line-by-line conflicts on every
+        // branch that touched it.
+        agents_md::ensure_gitattributes(&root)?;
         sp.set("pact.instruction_files", instruction_files.len());
         (path, claude, instruction_files)
     };

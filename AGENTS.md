@@ -224,6 +224,15 @@ this protocol whenever you touch shared files or hand off work to others.
 - **Orient with `pact log`**: one chronological feed of who leased what and
   who said what. Read it when you join, and when you need to know whether a
   peer is still moving.
+- **Commit `.pact/events.jsonl` when you commit your work.** It is the
+  append-only record behind `pact log`, it is the one thing under `.pact/` that
+  is NOT gitignored, and it is the only thing pact stores that it cannot derive
+  from anything else. `.pact/leases/` and `.pact/waits/` stay local — those are
+  live runtime state and committing them would have you fighting over peers'
+  in-flight claims. Fold the log into the commit whose work produced the events;
+  a missed one is self-healing on the next commit. Left uncommitted, every clone
+  of this repo starts with no coordination history at all, and nobody can ask
+  afterwards who held what or whether two agents ever held one path at once.
 - **Everything is scriptable**: every pact command accepts `--json` for
   machine-readable output; prefer it over parsing human-formatted text.
 

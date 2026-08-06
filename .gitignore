@@ -8,11 +8,18 @@
 # Added by cargo
 /target
 
-# Everything under .pact/ is local runtime state (see docs/architecture.md):
-# leases, message read-state, and anything else pact or an agent writes there.
-.pact/
+# pact runtime state. NOT .pact/events.jsonl — that is the append-only
+# history behind `pact log`, and it is meant to be committed
+# (see docs/architecture.md).
+.pact/leases/
+.pact/waits/
 
 # Generated agent-workflow scripts (.claude/settings.json is tracked)
 .claude/workflows/
 
 tmp/*
+
+# Everything pact or an agent writes under .pact/ is local runtime state,
+# EXCEPT the append-only event log, which is history and belongs in git.
+.pact/*
+!.pact/events.jsonl

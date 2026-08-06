@@ -58,6 +58,50 @@ pub fn checks(root: &Path) -> DoctorReport {
 
     worktree_checks(&ctx, &mut checks);
 
+    // Warns rather than fails, and the detail carries the argument rather than
+    // just the verdict: an ignored event log is not broken, it is a repository
+    // that will lose its coordination history at the next clone — and the reader
+    // needs to know that is a choice they can reverse with `pact init`.
+    let events_reach = repo::reach(root, agents_md::EVENTS_LOG_PATH);
+    let (events_ok, events_warn, events_detail) = match events_reach {
+        repo::Reach::Tracked => (
+            true,
+            false,
+            format!("{} is tracked — history survives a clone", agents_md::EVENTS_LOG_PATH),
+        ),
+        repo::Reach::Untracked => (
+            true,
+            false,
+            format!(
+                "{} is not ignored and not yet committed — commit it and the history travels",
+                agents_md::EVENTS_LOG_PATH
+            ),
+        ),
+        repo::Reach::Ignored { ref source } => (
+            true,
+            true,
+            format!(
+                "{} is ignored by {source}, so every clone of this repo starts with NO coordination \
+                 history — nothing can be asked afterwards about who held what, or whether two \
+                 agents ever held one path at once. Leases and waits are runtime state and SHOULD \
+                 stay ignored; the event log is the one thing under .pact/ that pact cannot derive. \
+                 Re-run `pact init` to narrow the rule.",
+                agents_md::EVENTS_LOG_PATH
+            ),
+        ),
+        repo::Reach::Unknown => (
+            true,
+            false,
+            "cannot ask git whether the event log is tracked".to_string(),
+        ),
+    };
+    checks.push(DoctorCheck {
+        name: "event log survives a clone",
+        ok: events_ok,
+        warn: events_warn,
+        detail: events_detail,
+    });
+
     let agents_md_current = agents_md::is_current(root).unwrap_or(false);
     checks.push(DoctorCheck {
         name: "AGENTS.md block current",

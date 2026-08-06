@@ -52,7 +52,8 @@ below.
 | Path | What | Committed? |
 |------|------|------------|
 | `.pact/leases/*.lock` | one JSON file per active lease | no |
-| `.pact/events.jsonl` | append-only lease-event log behind `pact log`, bounded | no |
+| `.pact/waits/*` | conflict breadcrumbs, so a wait can be measured across two processes | no |
+| `.pact/events.jsonl` | append-only lease-event log behind `pact log`, bounded | **yes** |
 | `AGENTS.md` (managed block) | the coordination protocol, for agents to read | yes |
 | `CLAUDE.md` (managed block) | one `@AGENTS.md` import line, because Claude Code loads `CLAUDE.md` and never `AGENTS.md` | yes |
 | `GEMINI.md`, `.github/copilot-instructions.md`, `.cursorrules`, `.windsurfrules`, `.clinerules` (managed block) | a pointer back at `AGENTS.md`, and **only if the file already exists** | yes |
@@ -62,17 +63,83 @@ Message read state is deliberately *not* in this table: it lives in `bd`, as a
 that file is gone rather than kept alongside — see
 [docs/messaging.md](messaging.md).
 
-`pact init` gitignores the whole directory with a single `.pact/` line rather
-than one rule per file, so anything an agent writes under `.pact/` is already
-covered — including `events.jsonl`, which needed no new rule. Re-running `init`
-on a repo that has the older `.pact/leases/` + `.pact/read.json` pair recognises
-them and appends nothing.
+`pact init` writes two lines — deny everything under `.pact/`, then re-include
+the one file that is history:
 
-Leases and the event log are transient, per-machine bookkeeping — committing
-them would just create merge conflicts between agents that have nothing to do
-with each other. The `AGENTS.md` block is the opposite: it's the one artifact
-meant to travel with the repo, so every agent that clones it learns the protocol
-on its own.
+```
+.pact/*
+!.pact/events.jsonl
+```
+
+**Deny by default, and that ordering is the design.** The obvious alternative is
+an allow-list of the runtime paths (`.pact/leases/`, `.pact/waits/`), which reads
+as more precise and is much worse: it silently drops the property that a file an
+agent *invents* under `.pact/` is ignored without anyone adding a rule for it.
+That was tried first here, and staging pact's own repository with it swept in 31
+fleet evidence logs and a file containing a live API key — because they had been
+covered by the broad rule and suddenly were not. An allow-list of what to hide is
+a list somebody has to keep complete.
+
+The negation works because `.pact/*` ignores the *contents* of the directory
+rather than the directory itself, so git still descends into it and a `!` line can
+reach a file directly inside. A rule of `.pact/` would ignore the directory
+outright and nothing beneath could re-include anything.
+
+Re-running `init` on a repo that still has the older broad `.pact/` rule
+**narrows it in place**, leaving every other line alone; it is idempotent, so a
+second run writes nothing. One caveat about the migration: it replaces the rule,
+not any comment a human wrote above it, so a hand-written "everything under
+.pact/ is local" line may need deleting by hand once.
+
+Leases and waits are transient, per-machine bookkeeping — committing them would
+have agents fighting over each other's in-flight claims. Anything else an agent
+drops under `.pact/` — an evidence log, a scratch file — is local too, and stays
+local without needing a rule of its own. Fleet artefacts worth keeping belong
+outside `.pact/` entirely; this repo keeps them in `tmp/`. The `AGENTS.md` block is
+the opposite: the one artifact meant to travel with the repo, so every agent that
+clones it learns the protocol on its own. `events.jsonl` is the case worth its own
+section, below.
+
+### `.pact/events.jsonl` is committed, and it is not runtime state
+
+The same argument as [`.beads/interactions.jsonl`](#beadsinteractionsjsonl-is-committed-and-is-not-the-passive-export),
+now applied to pact's own data — and it was got wrong here first.
+
+`.pact/` used to be gitignored wholesale, on the reasoning that everything under
+it is local runtime state. That is true of a lock file: a lease is a claim on a
+path *right now*, it is meaningless in a clone, and committing one would have two
+agents contending over a claim neither of them still holds.
+
+It is false of the event log, for exactly the reason the section above this one
+gives about bd's interaction log: **it is the only thing pact stores that it
+cannot derive.** Who held what, for how long, who was blocked, whether two agents
+ever held one path at once — none of it is recoverable from anywhere else once the
+file is gone. Ignoring it meant every clone of every repository started with zero
+coordination history, so no question about how a fleet had actually behaved could
+be asked after the fact. Any retrospective on a fleet run had nothing to read.
+
+So it is committed on purpose, and `pact doctor`'s **event log survives a clone**
+check reports whether it is tracked — warning rather than failing, because an
+ignored log is not a broken repository, only one that is going to lose its history
+at the next clone.
+
+The objection to committing an append-only file is merge conflicts: two agents on
+two branches both append, git sees both sides changed the same trailing region,
+and every merge stops. `pact init` therefore also writes
+
+```
+.pact/events.jsonl merge=union
+```
+
+to `.gitattributes`, which tells git to keep **both** sides. That is the correct
+resolution for a log whose entries are independent and whose ordering between
+unrelated agents carries no meaning. Verified rather than assumed: two branches
+each appending a different event merge with no conflict, and both events survive.
+
+The cost is the same small one bd's log has — it changes whenever coordination
+happens, so it needs committing. The protocol block `pact init` writes tells
+agents to fold it into the commit whose work produced the events; a missed one is
+self-healing on the next commit.
 
 ### One coordination space per repository, not per checkout
 

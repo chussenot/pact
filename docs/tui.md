@@ -122,6 +122,7 @@ here that the CLI does not emit, fails CI:
 | `worktree` | ordinary checkout, main worktree, or linked worktree — and warns (`!`) when resolution fell back |
 | `coordination scope` | `PACT_WORKTREE_SCOPE` in effect; warns (`!`) when `local` is isolating leases from sibling worktrees |
 | `state placement` | which rule put the state directory where it is |
+| `event log survives a clone` | is `.pact/events.jsonl` tracked; warns (`!`) when it is ignored, because the history dies at the next clone |
 | `state dir writable` | can pact actually write there — the shared directory of a linked worktree may not be yours |
 | `AGENTS.md block current` | does the managed block match this pact version |
 | `CLAUDE.md reaches the protocol` | Claude Code loads `CLAUDE.md`, never `AGENTS.md` |

@@ -1,0 +1,153 @@
+{"at":"2026-07-31T11:33:39.028947152+00:00","agent":"cli-wire","kind":"acquired","path":"p1.rs","detail":"atomic probe"}
+{"at":"2026-07-31T11:33:39.029089588+00:00","agent":"cli-wire","kind":"acquired","path":"p2.rs","detail":"atomic probe"}
+{"at":"2026-07-31T11:33:39.037644031+00:00","agent":"cli-wire","kind":"renewed","path":"p2.rs","detail":"should fail"}
+{"at":"2026-07-31T11:33:39.037797538+00:00","agent":"cli-wire","kind":"acquired","path":"p3.rs","detail":"should fail"}
+{"at":"2026-07-31T11:33:39.045839982+00:00","agent":"cli-wire","kind":"acquired","path":"p4.rs","detail":null}
+{"at":"2026-07-31T11:34:26.086563455+00:00","agent":"cli-wire","kind":"released","path":"p1.rs","detail":"atomic probe"}
+{"at":"2026-07-31T11:34:26.089237296+00:00","agent":"cli-wire","kind":"released","path":"p2.rs","detail":"should fail"}
+{"at":"2026-07-31T11:34:26.091487461+00:00","agent":"cli-wire","kind":"released","path":"p3.rs","detail":"should fail"}
+{"at":"2026-07-31T11:34:26.093965675+00:00","agent":"cli-wire","kind":"released","path":"p4.rs","detail":null}
+{"at":"2026-07-31T11:34:26.096440954+00:00","agent":"probe-peer","kind":"acquired","path":"q1.rs","detail":"held by a peer, for the rollback probe"}
+{"at":"2026-07-31T11:34:26.098827120+00:00","agent":"cli-wire","kind":"acquired","path":"q2.rs","detail":"should fail"}
+{"at":"2026-07-31T11:34:26.098983552+00:00","agent":"cli-wire","kind":"released","path":"q2.rs","detail":"should fail"}
+{"at":"2026-07-31T11:35:22.713292419+00:00","agent":"cli-wire","kind":"force-released","path":"q1.rs","detail":"destroyed live claim of probe-peer"}
+{"at":"2026-07-31T11:41:49.133330507+00:00","agent":"cli-wire","kind":"released","path":"src/agents.rs","detail":"cli wiring + integration"}
+{"at":"2026-07-31T11:41:49.133574697+00:00","agent":"cli-wire","kind":"released","path":"src/doctor.rs","detail":"cli wiring + integration"}
+{"at":"2026-07-31T11:41:49.133743752+00:00","agent":"cli-wire","kind":"released","path":"src/main.rs","detail":"cli wiring + integration"}
+{"at":"2026-07-31T11:41:49.133905002+00:00","agent":"cli-wire","kind":"released","path":"src/tui.rs","detail":"cli wiring + integration"}
+{"at":"2026-07-31T11:45:32.046568663+00:00","agent":"e2e-tests","kind":"acquired","path":"tests/cli.rs","detail":"writing end-to-end CLI test suite (pact-rnc.22)"}
+{"at":"2026-07-31T11:56:16.098711160+00:00","agent":"e2e-tests","kind":"released","path":"tests/cli.rs","detail":"writing end-to-end CLI test suite (pact-rnc.22)"}
+{"at":"2026-07-31T12:18:15.788024331+00:00","agent":"fixer","kind":"acquired","path":"src/lease.rs","detail":"fixing confirmed findings rnc.13/21/4/22"}
+{"at":"2026-07-31T12:18:15.788175471+00:00","agent":"fixer","kind":"acquired","path":"src/events.rs","detail":"fixing confirmed findings rnc.13/21/4/22"}
+{"at":"2026-07-31T12:18:15.788305240+00:00","agent":"fixer","kind":"acquired","path":"src/msg.rs","detail":"fixing confirmed findings rnc.13/21/4/22"}
+{"at":"2026-07-31T12:18:15.788411504+00:00","agent":"fixer","kind":"acquired","path":"tests/cli.rs","detail":"fixing confirmed findings rnc.13/21/4/22"}
+{"at":"2026-07-31T12:36:41.209457341+00:00","agent":"fixer","kind":"released","path":"src/events.rs","detail":"fixing confirmed findings rnc.13/21/4/22"}
+{"at":"2026-07-31T12:36:41.209616076+00:00","agent":"fixer","kind":"released","path":"src/lease.rs","detail":"fixing confirmed findings rnc.13/21/4/22"}
+{"at":"2026-07-31T12:36:41.209759778+00:00","agent":"fixer","kind":"released","path":"src/msg.rs","detail":"fixing confirmed findings rnc.13/21/4/22"}
+{"at":"2026-07-31T12:36:41.209874025+00:00","agent":"fixer","kind":"released","path":"tests/cli.rs","detail":"fixing confirmed findings rnc.13/21/4/22"}
+{"at":"2026-07-31T12:39:33.806831707+00:00","agent":"docs-writer","kind":"acquired","path":"README.md","detail":"pact-rnc.23 docs sync"}
+{"at":"2026-07-31T12:39:33.806946818+00:00","agent":"docs-writer","kind":"acquired","path":"CHANGELOG.md","detail":"pact-rnc.23 docs sync"}
+{"at":"2026-07-31T12:39:33.807026591+00:00","agent":"docs-writer","kind":"acquired","path":"docs/leases.md","detail":"pact-rnc.23 docs sync"}
+{"at":"2026-07-31T12:39:33.807112398+00:00","agent":"docs-writer","kind":"acquired","path":"docs/messaging.md","detail":"pact-rnc.23 docs sync"}
+{"at":"2026-07-31T12:39:33.807189075+00:00","agent":"docs-writer","kind":"acquired","path":"docs/architecture.md","detail":"pact-rnc.23 docs sync"}
+{"at":"2026-07-31T12:47:09.394668487+00:00","agent":"probe-x","kind":"acquired","path":"/tmp/x.rs","detail":null}
+{"at":"2026-07-31T12:47:09.398037885+00:00","agent":"probe-x","kind":"released","path":"/tmp/x.rs","detail":null}
+{"at":"2026-07-31T12:53:36.552035412+00:00","agent":"docs-writer","kind":"released","path":"CHANGELOG.md","detail":"pact-rnc.23 docs sync"}
+{"at":"2026-07-31T12:53:36.552193573+00:00","agent":"docs-writer","kind":"released","path":"README.md","detail":"pact-rnc.23 docs sync"}
+{"at":"2026-07-31T12:53:36.552298599+00:00","agent":"docs-writer","kind":"released","path":"docs/architecture.md","detail":"pact-rnc.23 docs sync"}
+{"at":"2026-07-31T12:53:36.552387217+00:00","agent":"docs-writer","kind":"released","path":"docs/leases.md","detail":"pact-rnc.23 docs sync"}
+{"at":"2026-07-31T12:53:36.552479521+00:00","agent":"docs-writer","kind":"released","path":"docs/messaging.md","detail":"pact-rnc.23 docs sync"}
+{"at":"2026-07-31T12:56:45.848583836+00:00","agent":"victim","kind":"acquired","path":"shared.rs","detail":"victim's existing claim"}
+{"at":"2026-07-31T12:56:45.851858662+00:00","agent":"grabber","kind":"acquired","path":"new.rs","detail":"should fail atomically"}
+{"at":"2026-07-31T12:56:45.852075030+00:00","agent":"grabber","kind":"released","path":"new.rs","detail":"should fail atomically"}
+{"at":"2026-07-31T13:01:38.410519403+00:00","agent":"ghost","kind":"acquired","path":"ghost.rs","detail":"will expire"}
+{"at":"2026-07-31T13:01:38.731804834+00:00","agent":"ghost","kind":"expired","path":"ghost.rs","detail":"lease lapsed (ttl 1s), lock collected"}
+{"at":"2026-07-31T13:05:44.798796476+00:00","agent":"victim","kind":"expired","path":"shared.rs","detail":"lease lapsed (ttl 300s), lock collected"}
+{"at":"2026-08-02T07:16:21.324785450+00:00","agent":"br-dev","kind":"acquired","path":"src/beads.rs","detail":"pact-l94: add br (beads-rust) backend detection to BeadsCli::locate() and verify msg.rs flag mapping against br's real CLI surface"}
+{"at":"2026-08-02T07:16:21.333385704+00:00","agent":"br-dev","kind":"acquired","path":"src/msg.rs","detail":"pact-l94: add br (beads-rust) backend detection to BeadsCli::locate() and verify msg.rs flag mapping against br's real CLI surface"}
+{"at":"2026-08-02T07:16:46.163098301+00:00","agent":"ci-dev","kind":"acquired","path":"scripts/check-docs.sh","detail":"pact-qbo: docs-drift checker script + CI step + mise task"}
+{"at":"2026-08-02T07:16:46.163310321+00:00","agent":"ci-dev","kind":"acquired","path":".github/workflows/ci.yml","detail":"pact-qbo: docs-drift checker script + CI step + mise task"}
+{"at":"2026-08-02T07:16:46.163477516+00:00","agent":"ci-dev","kind":"acquired","path":"mise.toml","detail":"pact-qbo: docs-drift checker script + CI step + mise task"}
+{"at":"2026-08-02T07:18:13.364123743+00:00","agent":"init-dev","kind":"acquired","path":"src/agents_md.rs","detail":"pact-4zx: manage agent-instruction files beyond AGENTS.md/CLAUDE.md (GEMINI.md, copilot-instructions, etc) + init wiring"}
+{"at":"2026-08-02T07:18:13.364296689+00:00","agent":"init-dev","kind":"acquired","path":"src/main.rs","detail":"pact-4zx: manage agent-instruction files beyond AGENTS.md/CLAUDE.md (GEMINI.md, copilot-instructions, etc) + init wiring"}
+{"at":"2026-08-02T07:25:47.969557127+00:00","agent":"init-dev","kind":"released","path":"src/agents_md.rs","detail":"pact-4zx: manage agent-instruction files beyond AGENTS.md/CLAUDE.md (GEMINI.md, copilot-instructions, etc) + init wiring"}
+{"at":"2026-08-02T07:25:47.969723330+00:00","agent":"init-dev","kind":"released","path":"src/main.rs","detail":"pact-4zx: manage agent-instruction files beyond AGENTS.md/CLAUDE.md (GEMINI.md, copilot-instructions, etc) + init wiring"}
+{"at":"2026-08-02T07:29:53.087136568+00:00","agent":"ci-dev","kind":"released","path":".github/workflows/ci.yml","detail":"pact-qbo: docs-drift checker script + CI step + mise task"}
+{"at":"2026-08-02T07:29:53.087310386+00:00","agent":"ci-dev","kind":"released","path":"mise.toml","detail":"pact-qbo: docs-drift checker script + CI step + mise task"}
+{"at":"2026-08-02T07:29:53.087440962+00:00","agent":"ci-dev","kind":"released","path":"scripts/check-docs.sh","detail":"pact-qbo: docs-drift checker script + CI step + mise task"}
+{"at":"2026-08-02T07:40:29.025093186+00:00","agent":"br-dev","kind":"released","path":"src/beads.rs","detail":"pact-l94: add br (beads-rust) backend detection to BeadsCli::locate() and verify msg.rs flag mapping against br's real CLI surface"}
+{"at":"2026-08-02T07:40:29.025168669+00:00","agent":"br-dev","kind":"released","path":"src/msg.rs","detail":"pact-l94: add br (beads-rust) backend detection to BeadsCli::locate() and verify msg.rs flag mapping against br's real CLI surface"}
+{"at":"2026-08-02T07:43:48.377079545+00:00","agent":"integrator","kind":"acquired","path":"tests/cli.rs","detail":"pact-er0: assert every --json top-level key shape in tests/cli.rs; plus the CLI tests init-dev+br-dev requested and the one-line bd_health() br fix in main.rs"}
+{"at":"2026-08-02T07:43:48.377149346+00:00","agent":"integrator","kind":"acquired","path":"src/main.rs","detail":"pact-er0: assert every --json top-level key shape in tests/cli.rs; plus the CLI tests init-dev+br-dev requested and the one-line bd_health() br fix in main.rs"}
+{"at":"2026-08-02T07:53:54.384391746+00:00","agent":"integrator","kind":"released","path":"src/main.rs","detail":"pact-er0: assert every --json top-level key shape in tests/cli.rs; plus the CLI tests init-dev+br-dev requested and the one-line bd_health() br fix in main.rs"}
+{"at":"2026-08-02T07:53:54.384463832+00:00","agent":"integrator","kind":"released","path":"tests/cli.rs","detail":"pact-er0: assert every --json top-level key shape in tests/cli.rs; plus the CLI tests init-dev+br-dev requested and the one-line bd_health() br fix in main.rs"}
+{"at":"2026-08-02T08:08:51.660287708+00:00","agent":"fixer","kind":"acquired","path":"src/agents_md.rs","detail":"fixing confirmed verifier findings: symlink AGENTS.md wipe, br stdout error text, doctor instruction-file check, one-word docs drift that reds the CI gate"}
+{"at":"2026-08-02T08:08:51.660361888+00:00","agent":"fixer","kind":"acquired","path":"src/beads.rs","detail":"fixing confirmed verifier findings: symlink AGENTS.md wipe, br stdout error text, doctor instruction-file check, one-word docs drift that reds the CI gate"}
+{"at":"2026-08-02T08:08:51.660426189+00:00","agent":"fixer","kind":"acquired","path":"src/doctor.rs","detail":"fixing confirmed verifier findings: symlink AGENTS.md wipe, br stdout error text, doctor instruction-file check, one-word docs drift that reds the CI gate"}
+{"at":"2026-08-02T08:08:51.660489989+00:00","agent":"fixer","kind":"acquired","path":"docs/tui.md","detail":"fixing confirmed verifier findings: symlink AGENTS.md wipe, br stdout error text, doctor instruction-file check, one-word docs drift that reds the CI gate"}
+{"at":"2026-08-02T08:16:00.608212128+00:00","agent":"fixer","kind":"released","path":"docs/tui.md","detail":"fixing confirmed verifier findings: symlink AGENTS.md wipe, br stdout error text, doctor instruction-file check, one-word docs drift that reds the CI gate"}
+{"at":"2026-08-02T08:16:00.608283833+00:00","agent":"fixer","kind":"released","path":"src/agents_md.rs","detail":"fixing confirmed verifier findings: symlink AGENTS.md wipe, br stdout error text, doctor instruction-file check, one-word docs drift that reds the CI gate"}
+{"at":"2026-08-02T08:16:00.608343967+00:00","agent":"fixer","kind":"released","path":"src/beads.rs","detail":"fixing confirmed verifier findings: symlink AGENTS.md wipe, br stdout error text, doctor instruction-file check, one-word docs drift that reds the CI gate"}
+{"at":"2026-08-02T08:16:00.608399501+00:00","agent":"fixer","kind":"released","path":"src/doctor.rs","detail":"fixing confirmed verifier findings: symlink AGENTS.md wipe, br stdout error text, doctor instruction-file check, one-word docs drift that reds the CI gate"}
+{"at":"2026-08-02T08:19:56.514697638+00:00","agent":"docs-writer","kind":"acquired","path":"README.md","detail":"pact-v66 + documenting what shipped this run: br backend, init's instruction files, the 9th doctor check, check-docs.sh"}
+{"at":"2026-08-02T08:19:56.514770575+00:00","agent":"docs-writer","kind":"acquired","path":"CHANGELOG.md","detail":"pact-v66 + documenting what shipped this run: br backend, init's instruction files, the 9th doctor check, check-docs.sh"}
+{"at":"2026-08-02T08:19:56.514831941+00:00","agent":"docs-writer","kind":"acquired","path":"docs/leases.md","detail":"pact-v66 + documenting what shipped this run: br backend, init's instruction files, the 9th doctor check, check-docs.sh"}
+{"at":"2026-08-02T08:19:56.514897754+00:00","agent":"docs-writer","kind":"acquired","path":"docs/architecture.md","detail":"pact-v66 + documenting what shipped this run: br backend, init's instruction files, the 9th doctor check, check-docs.sh"}
+{"at":"2026-08-02T08:19:56.514957927+00:00","agent":"docs-writer","kind":"acquired","path":"docs/messaging.md","detail":"pact-v66 + documenting what shipped this run: br backend, init's instruction files, the 9th doctor check, check-docs.sh"}
+{"at":"2026-08-02T08:19:56.515012901+00:00","agent":"docs-writer","kind":"acquired","path":"docs/tui.md","detail":"pact-v66 + documenting what shipped this run: br backend, init's instruction files, the 9th doctor check, check-docs.sh"}
+{"at":"2026-08-02T08:28:54.966986461+00:00","agent":"docs-writer","kind":"released","path":"CHANGELOG.md","detail":"pact-v66 + documenting what shipped this run: br backend, init's instruction files, the 9th doctor check, check-docs.sh"}
+{"at":"2026-08-02T08:28:54.967089986+00:00","agent":"docs-writer","kind":"released","path":"README.md","detail":"pact-v66 + documenting what shipped this run: br backend, init's instruction files, the 9th doctor check, check-docs.sh"}
+{"at":"2026-08-02T08:28:54.967176329+00:00","agent":"docs-writer","kind":"released","path":"docs/architecture.md","detail":"pact-v66 + documenting what shipped this run: br backend, init's instruction files, the 9th doctor check, check-docs.sh"}
+{"at":"2026-08-02T08:28:54.967243856+00:00","agent":"docs-writer","kind":"released","path":"docs/leases.md","detail":"pact-v66 + documenting what shipped this run: br backend, init's instruction files, the 9th doctor check, check-docs.sh"}
+{"at":"2026-08-02T08:28:54.967300192+00:00","agent":"docs-writer","kind":"released","path":"docs/messaging.md","detail":"pact-v66 + documenting what shipped this run: br backend, init's instruction files, the 9th doctor check, check-docs.sh"}
+{"at":"2026-08-02T08:28:54.967355696+00:00","agent":"docs-writer","kind":"released","path":"docs/tui.md","detail":"pact-v66 + documenting what shipped this run: br backend, init's instruction files, the 9th doctor check, check-docs.sh"}
+{"at":"2026-08-02T13:29:39.715809876+00:00","agent":"otel-core","kind":"acquired","path":"Cargo.toml","detail":"pact-aw7.1: otel cargo feature, new src/otel.rs, init/shutdown wiring in main"}
+{"at":"2026-08-02T13:29:39.715993391+00:00","agent":"otel-core","kind":"acquired","path":"src/otel.rs","detail":"pact-aw7.1: otel cargo feature, new src/otel.rs, init/shutdown wiring in main"}
+{"at":"2026-08-02T13:29:39.716137042+00:00","agent":"otel-core","kind":"acquired","path":"src/main.rs","detail":"pact-aw7.1: otel cargo feature, new src/otel.rs, init/shutdown wiring in main"}
+{"at":"2026-08-02T13:33:38.989600884+00:00","agent":"human","kind":"force-released","path":"src/otel.rs","detail":"destroyed live claim of otel-core"}
+{"at":"2026-08-02T13:33:38.997264452+00:00","agent":"human","kind":"force-released","path":"src/main.rs","detail":"destroyed live claim of otel-core"}
+{"at":"2026-08-02T13:33:47.626773817+00:00","agent":"human","kind":"force-released","path":"Cargo.toml","detail":"destroyed live claim of otel-core"}
+{"at":"2026-08-02T13:34:21.095180088+00:00","agent":"otel-core","kind":"acquired","path":"Cargo.toml","detail":"pact-aw7.1: otel feature gate, transport choice, exit-latency proof"}
+{"at":"2026-08-02T13:34:21.095361700+00:00","agent":"otel-core","kind":"acquired","path":"src/otel.rs","detail":"pact-aw7.1: otel feature gate, transport choice, exit-latency proof"}
+{"at":"2026-08-02T13:34:21.095493829+00:00","agent":"otel-core","kind":"acquired","path":"src/main.rs","detail":"pact-aw7.1: otel feature gate, transport choice, exit-latency proof"}
+{"at":"2026-08-02T14:05:46.200119081+00:00","agent":"otel-core","kind":"released","path":"Cargo.toml","detail":"pact-aw7.1: otel feature gate, transport choice, exit-latency proof"}
+{"at":"2026-08-02T14:05:46.200298148+00:00","agent":"otel-core","kind":"released","path":"src/main.rs","detail":"pact-aw7.1: otel feature gate, transport choice, exit-latency proof"}
+{"at":"2026-08-02T14:05:46.200450275+00:00","agent":"otel-core","kind":"released","path":"src/otel.rs","detail":"pact-aw7.1: otel feature gate, transport choice, exit-latency proof"}
+{"at":"2026-08-02T14:08:21.654342871+00:00","agent":"doctor-gauge","kind":"acquired","path":"src/doctor.rs","detail":"aw7.7 doctor check gauges"}
+{"at":"2026-08-02T14:08:27.356979193+00:00","agent":"beads-span","kind":"acquired","path":"src/beads.rs","detail":"aw7.6: span the bd/br subprocess"}
+{"at":"2026-08-02T14:08:31.659703964+00:00","agent":"msg-metrics","kind":"acquired","path":"src/msg.rs","detail":"pact-aw7.4 messaging telemetry: sent/read counters, unread-age histogram"}
+{"at":"2026-08-02T14:08:31.891051771+00:00","agent":"lease-metrics","kind":"acquired","path":"src/lease.rs","detail":"aw7.3 lease metrics instrumentation"}
+{"at":"2026-08-02T14:11:03.752351151+00:00","agent":"span-dev","kind":"acquired","path":"src/main.rs","detail":"pact-aw7.2 root span attributes and exit-code plumbing"}
+{"at":"2026-08-02T14:11:03.752513316+00:00","agent":"span-dev","kind":"acquired","path":"src/otel.rs","detail":"pact-aw7.2 root span attributes and exit-code plumbing"}
+{"at":"2026-08-02T14:19:47.767684091+00:00","agent":"beads-span","kind":"released","path":"src/beads.rs","detail":"aw7.6: span the bd/br subprocess"}
+{"at":"2026-08-02T14:20:13.173458230+00:00","agent":"doctor-gauge","kind":"released","path":"src/doctor.rs","detail":"aw7.7 doctor check gauges"}
+{"at":"2026-08-02T14:21:03.703348792+00:00","agent":"msg-metrics","kind":"released","path":"src/msg.rs","detail":"pact-aw7.4 messaging telemetry: sent/read counters, unread-age histogram"}
+{"at":"2026-08-02T14:28:00.480046823+00:00","agent":"lease-metrics","kind":"released","path":"src/lease.rs","detail":"aw7.3 lease metrics instrumentation"}
+{"at":"2026-08-02T14:28:24.389014374+00:00","agent":"span-dev","kind":"released","path":"src/main.rs","detail":"pact-aw7.2 root span attributes and exit-code plumbing"}
+{"at":"2026-08-02T14:28:24.389186248+00:00","agent":"span-dev","kind":"released","path":"src/otel.rs","detail":"pact-aw7.2 root span attributes and exit-code plumbing"}
+{"at":"2026-08-02T14:28:56.036402719+00:00","agent":"span-dev","kind":"acquired","path":"src/main.rs","detail":"aw7.2 follow-up: converge child span names on the pact.* prefix, per lease-metrics in pact-wisp-1ur"}
+{"at":"2026-08-02T14:31:17.670151593+00:00","agent":"span-dev","kind":"released","path":"src/main.rs","detail":"aw7.2 follow-up: converge child span names on the pact.* prefix, per lease-metrics in pact-wisp-1ur"}
+{"at":"2026-08-02T14:35:39.693004569+00:00","agent":"integrator","kind":"acquired","path":"tests/cli.rs","detail":"aw7 integration: CLI telemetry tests + otel CI job + green both ways"}
+{"at":"2026-08-02T14:35:39.693233390+00:00","agent":"integrator","kind":"acquired","path":".github/workflows/ci.yml","detail":"aw7 integration: CLI telemetry tests + otel CI job + green both ways"}
+{"at":"2026-08-02T14:35:39.693375819+00:00","agent":"integrator","kind":"acquired","path":"mise.toml","detail":"aw7 integration: CLI telemetry tests + otel CI job + green both ways"}
+{"at":"2026-08-02T14:46:41.593543704+00:00","agent":"integrator","kind":"released","path":".github/workflows/ci.yml","detail":"aw7 integration: CLI telemetry tests + otel CI job + green both ways"}
+{"at":"2026-08-02T14:46:41.593725546+00:00","agent":"integrator","kind":"released","path":"mise.toml","detail":"aw7 integration: CLI telemetry tests + otel CI job + green both ways"}
+{"at":"2026-08-02T14:46:41.593857595+00:00","agent":"integrator","kind":"released","path":"tests/cli.rs","detail":"aw7 integration: CLI telemetry tests + otel CI job + green both ways"}
+{"at":"2026-08-02T15:12:36.235958358+00:00","agent":"fixer","kind":"acquired","path":"src/otel.rs","detail":"aw7 verifier findings: root-cause fixes + regression tests"}
+{"at":"2026-08-02T15:12:36.236137075+00:00","agent":"fixer","kind":"acquired","path":"src/lease.rs","detail":"aw7 verifier findings: root-cause fixes + regression tests"}
+{"at":"2026-08-02T15:12:36.236280416+00:00","agent":"fixer","kind":"acquired","path":"src/main.rs","detail":"aw7 verifier findings: root-cause fixes + regression tests"}
+{"at":"2026-08-02T15:12:36.236419439+00:00","agent":"fixer","kind":"acquired","path":"src/doctor.rs","detail":"aw7 verifier findings: root-cause fixes + regression tests"}
+{"at":"2026-08-02T15:12:36.236568571+00:00","agent":"fixer","kind":"acquired","path":"src/tui.rs","detail":"aw7 verifier findings: root-cause fixes + regression tests"}
+{"at":"2026-08-02T15:12:36.236711440+00:00","agent":"fixer","kind":"acquired","path":"mise.toml","detail":"aw7 verifier findings: root-cause fixes + regression tests"}
+{"at":"2026-08-02T15:12:36.236929753+00:00","agent":"fixer","kind":"acquired","path":".github/workflows/ci.yml","detail":"aw7 verifier findings: root-cause fixes + regression tests"}
+{"at":"2026-08-02T15:27:24.603670821+00:00","agent":"fixer","kind":"acquired","path":"docs/tui.md","detail":"one table row: check-docs.sh requires every doctor check name verbatim, and I added one"}
+{"at":"2026-08-02T15:36:51.332649435+00:00","agent":"fixer","kind":"released","path":".github/workflows/ci.yml","detail":"aw7 verifier findings: root-cause fixes + regression tests"}
+{"at":"2026-08-02T15:36:51.332792294+00:00","agent":"fixer","kind":"released","path":"docs/tui.md","detail":"one table row: check-docs.sh requires every doctor check name verbatim, and I added one"}
+{"at":"2026-08-02T15:36:51.332884448+00:00","agent":"fixer","kind":"released","path":"mise.toml","detail":"aw7 verifier findings: root-cause fixes + regression tests"}
+{"at":"2026-08-02T15:36:51.332969969+00:00","agent":"fixer","kind":"released","path":"src/doctor.rs","detail":"aw7 verifier findings: root-cause fixes + regression tests"}
+{"at":"2026-08-02T15:36:51.333049569+00:00","agent":"fixer","kind":"released","path":"src/lease.rs","detail":"aw7 verifier findings: root-cause fixes + regression tests"}
+{"at":"2026-08-02T15:36:51.333127406+00:00","agent":"fixer","kind":"released","path":"src/main.rs","detail":"aw7 verifier findings: root-cause fixes + regression tests"}
+{"at":"2026-08-02T15:36:51.333206244+00:00","agent":"fixer","kind":"released","path":"src/otel.rs","detail":"aw7 verifier findings: root-cause fixes + regression tests"}
+{"at":"2026-08-02T15:36:51.333289281+00:00","agent":"fixer","kind":"released","path":"src/tui.rs","detail":"aw7 verifier findings: root-cause fixes + regression tests"}
+{"at":"2026-08-02T15:41:18.874046909+00:00","agent":"dash","kind":"acquired","path":"ops/signoz","detail":"pact-aw7.8: SigNoz dashboard JSON + query scripts (new dir)"}
+{"at":"2026-08-02T15:56:54.566974230+00:00","agent":"dash","kind":"released","path":"ops/signoz","detail":"pact-aw7.8: SigNoz dashboard JSON + query scripts (new dir)"}
+{"at":"2026-08-02T16:00:49.140491386+00:00","agent":"docs-writer","kind":"acquired","path":"README.md","detail":"pact-aw7.5: docs/telemetry.md + the README/docs lines five otel peers asked for"}
+{"at":"2026-08-02T16:00:49.140593338+00:00","agent":"docs-writer","kind":"acquired","path":"CHANGELOG.md","detail":"pact-aw7.5: docs/telemetry.md + the README/docs lines five otel peers asked for"}
+{"at":"2026-08-02T16:00:49.140685742+00:00","agent":"docs-writer","kind":"acquired","path":"docs/telemetry.md","detail":"pact-aw7.5: docs/telemetry.md + the README/docs lines five otel peers asked for"}
+{"at":"2026-08-02T16:00:49.140771854+00:00","agent":"docs-writer","kind":"acquired","path":"docs/architecture.md","detail":"pact-aw7.5: docs/telemetry.md + the README/docs lines five otel peers asked for"}
+{"at":"2026-08-02T16:00:49.140851474+00:00","agent":"docs-writer","kind":"acquired","path":"docs/leases.md","detail":"pact-aw7.5: docs/telemetry.md + the README/docs lines five otel peers asked for"}
+{"at":"2026-08-02T16:00:49.140939340+00:00","agent":"docs-writer","kind":"acquired","path":"docs/messaging.md","detail":"pact-aw7.5: docs/telemetry.md + the README/docs lines five otel peers asked for"}
+{"at":"2026-08-02T16:00:49.141018980+00:00","agent":"docs-writer","kind":"acquired","path":"docs/tui.md","detail":"pact-aw7.5: docs/telemetry.md + the README/docs lines five otel peers asked for"}
+{"at":"2026-08-02T16:15:30.196679614+00:00","agent":"docs-writer","kind":"released","path":"CHANGELOG.md","detail":"pact-aw7.5: docs/telemetry.md + the README/docs lines five otel peers asked for"}
+{"at":"2026-08-02T16:15:30.196768270+00:00","agent":"docs-writer","kind":"released","path":"README.md","detail":"pact-aw7.5: docs/telemetry.md + the README/docs lines five otel peers asked for"}
+{"at":"2026-08-02T16:15:30.196829655+00:00","agent":"docs-writer","kind":"released","path":"docs/architecture.md","detail":"pact-aw7.5: docs/telemetry.md + the README/docs lines five otel peers asked for"}
+{"at":"2026-08-02T16:15:30.196915366+00:00","agent":"docs-writer","kind":"released","path":"docs/leases.md","detail":"pact-aw7.5: docs/telemetry.md + the README/docs lines five otel peers asked for"}
+{"at":"2026-08-02T16:15:30.196976170+00:00","agent":"docs-writer","kind":"released","path":"docs/messaging.md","detail":"pact-aw7.5: docs/telemetry.md + the README/docs lines five otel peers asked for"}
+{"at":"2026-08-02T16:15:30.197034048+00:00","agent":"docs-writer","kind":"released","path":"docs/telemetry.md","detail":"pact-aw7.5: docs/telemetry.md + the README/docs lines five otel peers asked for"}
+{"at":"2026-08-02T16:15:30.197091716+00:00","agent":"docs-writer","kind":"released","path":"docs/tui.md","detail":"pact-aw7.5: docs/telemetry.md + the README/docs lines five otel peers asked for"}
+{"at":"2026-08-04T12:45:31.641558433+00:00","agent":"docs-mise","kind":"acquired","path":"docs/install.md","detail":"documenting mise install + MCP client registration (install.md, mcp.md)"}
+{"at":"2026-08-04T12:45:31.641914986+00:00","agent":"docs-mise","kind":"acquired","path":"docs/mcp.md","detail":"documenting mise install + MCP client registration (install.md, mcp.md)"}
+{"at":"2026-08-04T13:01:01.456922769+00:00","agent":"docs-mise","kind":"released","path":"docs/install.md","detail":"documenting mise install + MCP client registration (install.md, mcp.md)"}
+{"at":"2026-08-04T13:01:01.457103799+00:00","agent":"docs-mise","kind":"released","path":"docs/mcp.md","detail":"documenting mise install + MCP client registration (install.md, mcp.md)"}
+{"at":"2026-08-04T15:37:36.248256437+00:00","agent":"worker-a","kind":"acquired","path":"src/mcp.rs","detail":"checking the shape fix"}
+{"at":"2026-08-04T15:37:36.906377271+00:00","agent":"worker-a","kind":"released","path":"src/mcp.rs","detail":"checking the shape fix"}

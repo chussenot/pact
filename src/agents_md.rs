@@ -95,6 +95,15 @@ this protocol whenever you touch shared files or hand off work to others.
 - **Orient with `pact log`**: one chronological feed of who leased what and
   who said what. Read it when you join, and when you need to know whether a
   peer is still moving.
+- **Commit `.pact/events.jsonl` when you commit your work.** It is the
+  append-only record behind `pact log`, it is the one thing under `.pact/` that
+  is NOT gitignored, and it is the only thing pact stores that it cannot derive
+  from anything else. `.pact/leases/` and `.pact/waits/` stay local — those are
+  live runtime state and committing them would have you fighting over peers'
+  in-flight claims. Fold the log into the commit whose work produced the events;
+  a missed one is self-healing on the next commit. Left uncommitted, every clone
+  of this repo starts with no coordination history at all, and nobody can ask
+  afterwards who held what or whether two agents ever held one path at once.
 - **Everything is scriptable**: every pact command accepts `--json` for
   machine-readable output; prefer it over parsing human-formatted text.
 
@@ -349,36 +358,135 @@ pub fn stale_instruction_files(repo_root: &Path) -> Result<Vec<PathBuf>> {
     Ok(stale)
 }
 
-/// Add a single `.pact/` line to `.gitignore`, idempotently, only if missing.
-/// Everything under `.pact/` is local runtime state — leases, message read
-/// state, and whatever else pact or an agent writes there — so the rule is the
-/// directory, not an enumeration of filenames. A repo that already ignores
-/// `.pact/`, or that carries the legacy pair (`.pact/leases/` plus
-/// `.pact/read.json`), is already covered and is left untouched.
+/// Ignore the *runtime* parts of `.pact/`, and deliberately not the event log.
+///
+/// This used to ignore `.pact/` wholesale, on the reasoning that everything under
+/// it is local runtime state. That was right about leases and wrong about
+/// history. A lease is a claim on a path *right now* — meaningless in a clone,
+/// and committing lock files would have agents fighting over each other's
+/// in-flight claims. [`EVENTS_LOG_PATH`] is the opposite: an append-only record
+/// of what happened, and the only thing pact stores that it cannot derive.
+/// Ignoring it meant every clone began with **zero** coordination history, so no
+/// question about how a fleet behaved could be asked after the fact. That is the
+/// same mistake gitignoring `.beads/interactions.jsonl` would be, for the same
+/// reason — applied this time to pact's own data.
+///
+/// **A re-run migrates an older repo.** A repo initialised before this change has
+/// `.pact/` in its `.gitignore`, and leaving that alone would keep the history
+/// lost for precisely the repos that have accumulated the most of it. `pact init`
+/// already owns the lines it wrote, so the broad entry is replaced in place with
+/// the specific runtime paths and everything else in the file is left untouched.
+///
+/// Idempotent both ways: a second run finds the narrow rules present and writes
+/// nothing.
 pub fn ensure_gitignore(repo_root: &Path) -> Result<()> {
     let path = repo_root.join(".gitignore");
     let existing = read_or_empty(&path)?;
 
-    let (mut dir, mut leases, mut read_state) = (false, false, false);
+    let mut out: Vec<String> = Vec::new();
+    let (mut narrowed, mut already) = (false, false);
+
     for line in existing.lines() {
-        match line.trim().trim_end_matches('/') {
-            ".pact" => dir = true,
-            ".pact/leases" => leases = true,
-            ".pact/read.json" => read_state = true,
-            _ => {}
+        let bare = line.trim().trim_end_matches('/');
+        if bare == ".pact" {
+            // The broad rule from an older pact. Replaced rather than appended
+            // to, so the file does not end up ignoring both the directory and a
+            // subset of it — which reads as though somebody was unsure.
+            out.push(RUNTIME_IGNORE_COMMENT_1.to_string());
+            out.push(RUNTIME_IGNORE_COMMENT_2.to_string());
+            out.extend(RUNTIME_IGNORE_RULES.iter().map(|r| (*r).to_string()));
+            narrowed = true;
+            continue;
         }
+        if line.trim() == RUNTIME_IGNORE_SENTINEL {
+            already = true;
+        }
+        out.push(line.to_string());
     }
-    if dir || (leases && read_state) {
+
+    if narrowed {
+        // Fall through and write.
+    } else if already {
+        return Ok(());
+    } else {
+        if !out.is_empty() {
+            out.push(String::new());
+        }
+        out.push(RUNTIME_IGNORE_COMMENT_1.to_string());
+        out.push(RUNTIME_IGNORE_COMMENT_2.to_string());
+        out.extend(RUNTIME_IGNORE_RULES.iter().map(|r| (*r).to_string()));
+    }
+
+    let mut content = out.join("\n");
+    content.push('\n');
+    write_atomic(&path, &content)
+}
+
+/// Ignore everything under `.pact/`, then re-include exactly the event log.
+///
+/// **Deny by default, and that ordering is the whole design.** The first draft of
+/// this change listed the runtime paths instead — `.pact/leases/`,
+/// `.pact/waits/` — which reads as more precise and is much worse. It silently
+/// dropped the property pact-rnc.16 exists for: a file an agent invents under
+/// `.pact/` must be ignored without anyone adding a rule for it. Running that
+/// draft on pact's own repository staged 31 evidence logs and a file containing a
+/// live `SIGNOZ_API_KEY`, because those had been covered by the broad rule and
+/// suddenly were not. An allow-list of what to hide is a list somebody has to
+/// keep complete; a deny-list with one exception is not.
+///
+/// The negation works because `.pact/*` ignores the *contents* of `.pact/` rather
+/// than the directory itself — git still descends into it, so re-including a file
+/// directly inside is allowed. (A rule of `.pact/` would ignore the directory
+/// outright and no `!` line beneath could reach in.) Verified with
+/// `git check-ignore` rather than reasoned about, in tests/events_log.rs.
+const RUNTIME_IGNORE_RULES: &[&str] = &[".pact/*", "!.pact/events.jsonl"];
+
+/// The line that decides whether the rules are already present. Keyed on the
+/// deny line: a repo with `.pact/*` has been through this.
+const RUNTIME_IGNORE_SENTINEL: &str = ".pact/*";
+
+const RUNTIME_IGNORE_COMMENT_1: &str =
+    "# Everything pact or an agent writes under .pact/ is local runtime state,";
+const RUNTIME_IGNORE_COMMENT_2: &str =
+    "# EXCEPT the append-only event log, which is history and belongs in git.";
+
+/// `.pact/events.jsonl`: the one file under `.pact/` that belongs in git.
+pub const EVENTS_LOG_PATH: &str = ".pact/events.jsonl";
+
+/// `merge=union` for the event log, so that committing an append-only file does
+/// not mean a conflict on every merge.
+///
+/// Included because without it, narrowing the ignore rule recreates the very
+/// problem that motivated ignoring `.pact/` in the first place: two agents on two
+/// branches append, git sees both sides changed the same trailing region, and
+/// every merge stops for a human who has nothing to decide. `merge=union` keeps
+/// both sides, which is the right resolution for a log whose entries are
+/// independent and whose inter-agent ordering carries no meaning. Verified: two
+/// branches appending different events merge with no conflict.
+///
+/// An existing rule for this path is left alone — that one really is the user's
+/// call, since a different merge driver is a deliberate choice.
+pub fn ensure_gitattributes(repo_root: &Path) -> Result<()> {
+    let path = repo_root.join(".gitattributes");
+    let existing = read_or_empty(&path)?;
+    if existing
+        .lines()
+        .any(|l| l.split_whitespace().next() == Some(EVENTS_LOG_PATH))
+    {
         return Ok(());
     }
 
-    let mut new_content = existing;
-    if !new_content.is_empty() && !new_content.ends_with('\n') {
-        new_content.push('\n');
+    let mut out: Vec<String> = existing.lines().map(str::to_string).collect();
+    if !out.is_empty() {
+        out.push(String::new());
     }
-    new_content.push_str(".pact/\n");
+    out.push("# pact: the event log is append-only, so a merge keeps BOTH sides".to_string());
+    out.push("# rather than stopping for a human who has nothing to decide.".to_string());
+    out.push(format!("{EVENTS_LOG_PATH} merge=union"));
 
-    write_atomic(&path, &new_content)
+    let mut content = out.join("\n");
+    content.push('\n');
+    write_atomic(&path, &content)
 }
 
 /// Whether AGENTS.md exists, has a managed block, and that block matches the
@@ -565,28 +673,118 @@ mod tests {
         ensure_gitignore(tmp.path()).unwrap();
 
         let content = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
-        assert!(content.lines().any(|l| l.trim() == ".pact/"));
+        let rules: Vec<&str> = content
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains(".pact") && !l.starts_with('#'))
+            .collect();
+        // Deny everything under .pact/, then re-include the log. The ORDER is
+        // significant to git, so this is a sequence comparison, not a set one.
+        assert_eq!(rules, RUNTIME_IGNORE_RULES);
+        assert!(
+            !content
+                .lines()
+                .any(|l| l.trim().trim_end_matches('/') == ".pact"),
+            "a broad .pact rule would swallow the event log:\n{content}"
+        );
     }
 
     /// The whole point of pact-rnc.16: agent-written files under `.pact/`
     /// (e.g. `.pact/evidence/*`) must not need a new gitignore rule each.
+    /// A repo initialised by an older pact carries a broad `.pact/` rule. Leaving
+    /// it would keep the history lost for exactly the repos that have the most of
+    /// it, so a re-run narrows it — in place, and without disturbing anything
+    /// else in the file.
     #[test]
-    fn ensure_gitignore_does_not_duplicate_existing_rules() {
-        let cases = [
-            ".pact/\n",
-            ".pact\n",
-            "target/\n.pact/leases/\n.pact/read.json\n", // legacy pair
-        ];
-        for original in cases {
+    fn ensure_gitignore_narrows_a_broad_rule_from_an_older_pact() {
+        for original in [".pact/\n", ".pact\n", "target/\n.pact/\n*.log\n"] {
             let tmp = tempfile::tempdir().unwrap();
             let path = tmp.path().join(".gitignore");
             std::fs::write(&path, original).unwrap();
 
             ensure_gitignore(tmp.path()).unwrap();
-
             let after = std::fs::read_to_string(&path).unwrap();
-            assert_eq!(after, original, "should have been left alone: {original:?}");
+
+            assert!(
+                !after
+                    .lines()
+                    .any(|l| l.trim().trim_end_matches('/') == ".pact"),
+                "the broad rule survived {original:?}:\n{after}"
+            );
+            for rule in RUNTIME_IGNORE_RULES {
+                assert!(
+                    after.lines().any(|l| l.trim() == *rule),
+                    "missing {rule}:\n{after}"
+                );
+            }
+            // Unrelated lines are not collateral.
+            for kept in original
+                .lines()
+                .filter(|l| l.trim().trim_end_matches('/') != ".pact")
+            {
+                assert!(after.lines().any(|l| l == kept), "lost {kept:?}:\n{after}");
+            }
         }
+    }
+
+    /// Already-narrow rules are a no-op, so `init` does not append a second copy.
+    #[test]
+    fn ensure_gitignore_leaves_narrow_rules_alone() {
+        let original = "target/\n.pact/*\n!.pact/events.jsonl\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".gitignore");
+        std::fs::write(&path, original).unwrap();
+
+        ensure_gitignore(tmp.path()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// The event log must never end up ignored by anything `init` writes — the
+    /// property every other assertion here is really about.
+    #[test]
+    fn ensure_gitignore_never_ignores_the_event_log() {
+        for original in ["", "target/\n", ".pact/\n", ".pact/leases/\n"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(".gitignore");
+            if !original.is_empty() {
+                std::fs::write(&path, original).unwrap();
+            }
+            ensure_gitignore(tmp.path()).unwrap();
+            let after = std::fs::read_to_string(&path).unwrap_or_default();
+            for line in after.lines().map(str::trim) {
+                assert_ne!(line, ".pact");
+                assert_ne!(line, ".pact/");
+                assert_ne!(line, EVENTS_LOG_PATH);
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_gitattributes_adds_union_merge_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        ensure_gitattributes(tmp.path()).unwrap();
+        ensure_gitattributes(tmp.path()).unwrap();
+
+        let content = std::fs::read_to_string(tmp.path().join(".gitattributes")).unwrap();
+        let hits: Vec<&str> = content
+            .lines()
+            .filter(|l| l.split_whitespace().next() == Some(EVENTS_LOG_PATH))
+            .collect();
+        assert_eq!(hits, [format!("{EVENTS_LOG_PATH} merge=union")]);
+    }
+
+    /// A deliberate choice of merge driver is the user's, not pact's.
+    #[test]
+    fn ensure_gitattributes_respects_an_existing_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".gitattributes");
+        let original = format!("{EVENTS_LOG_PATH} merge=ours\n");
+        std::fs::write(&path, &original).unwrap();
+
+        ensure_gitattributes(tmp.path()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     /// An agent only knows the commands this block tells it about.
@@ -803,9 +1001,9 @@ mod tests {
         let content = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
         let count = content
             .lines()
-            .filter(|l| l.trim().trim_end_matches('/') == ".pact")
+            .filter(|l| l.trim() == RUNTIME_IGNORE_SENTINEL)
             .count();
-        assert_eq!(count, 1);
+        assert_eq!(count, 1, "a second run appended a duplicate:\n{content}");
         assert!(content.contains("target/"));
     }
 }
