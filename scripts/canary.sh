@@ -200,6 +200,37 @@ PACT_AGENT=canary-a "$PACT" lease ls --json >"$LS" || fail "lease ls after relea
 jq -e 'length == 0' "$LS" >/dev/null || fail "leases remain after release --all: $(cat "$LS")"
 printf '  acquire, list and release round-tripped\n'
 
+# ----------------------------------------------------- actor attribution
+#
+# Every mutating backend call pact makes must be recorded against the AGENT that
+# caused it, not against whoever owns the checkout. Without that, a fleet's whole
+# bead history is attributed to one human and the audit trail cannot answer the
+# only question it exists for: who did this.
+#
+# Both backends take the same flag, and pact passes it — `bd` 1.1.2 documents
+# precedence `--actor` > `$BEADS_ACTOR` > `git user.name` > `$USER`, and `br`
+# 0.2.19 accepts `--actor` too. This asserts the end-to-end result rather than the
+# flag: the canary's git user is deliberately NOT an agent name, so a match on
+# `canary-a` can only come from attribution working.
+step "backend attributes writes to the agent, not the git user"
+GIT_USER="$(git config user.name)"
+[ "$GIT_USER" = "pact canary" ] || fail "expected the scratch repo's git user to be 'pact canary', got '$GIT_USER'"
+
+ACTOR_JSON="$WORK/actor.json"
+if ! bd show "$MSG_ID" --json >"$ACTOR_JSON" 2>&1; then
+	cat "$ACTOR_JSON" >&2
+	fail "could not read $MSG_ID back from the backend"
+fi
+# bd returns a bare object from `show`; br has returned an array. Accept either
+# rather than branching on the backend.
+RECORDED="$(jq -r 'if type == "array" then .[0] else . end | .created_by // ""' "$ACTOR_JSON")"
+printf '  git user.name: %s\n  created_by:    %s\n' "$GIT_USER" "$RECORDED"
+[ "$RECORDED" = "canary-a" ] ||
+	fail "message $MSG_ID is attributed to '$RECORDED', expected 'canary-a'. Either the backend
+stopped honouring --actor, or pact stopped passing it — in both cases every agent's
+bead activity is now recorded as whoever owns the checkout."
+printf '  attributed to the sending agent\n'
+
 # ------------------------------------------- bd must not touch git, still
 #
 # pact routes every bd invocation through the MAIN worktree (see `beads_root` in

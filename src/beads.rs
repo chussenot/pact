@@ -363,6 +363,38 @@ fn classify_workspace(beads_dir: &Path) -> Workspace {
 /// warning, leaving a second database next to the real one. Nothing leases the
 /// Beads store and nothing checked it, so an agent that had correctly leased
 /// both files it edited still wrote shared state no lease covered.
+impl BeadsCli {
+    /// Whether this backend accepts `--actor`, asked by running it rather than
+    /// keyed off a version number.
+    ///
+    /// Attribution is the difference between an audit trail that answers "who did
+    /// this" and one that says the human owns every bead in a fleet of twenty
+    /// agents. Both backends support the flag today — `bd` 1.1.2 documents
+    /// precedence `--actor` > `$BEADS_ACTOR` > `git user.name` > `$USER`, and `br`
+    /// 0.2.19 accepts `--actor <ACTOR>` — so this exists to notice if that stops
+    /// being true, not because it is currently in doubt.
+    ///
+    /// Cached: `doctor` and any other caller should cost one subprocess per
+    /// process, not one per question. A failure to run is reported as unsupported,
+    /// which is the safe direction — it understates rather than promising
+    /// attribution pact cannot deliver.
+    pub fn supports_actor(&self, repo_root: &Path) -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            Command::new(self.binary)
+                .args(["create", "--help"])
+                .current_dir(repo_root)
+                .output()
+                .map(|o| {
+                    let help = String::from_utf8_lossy(&o.stdout);
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    help.contains("--actor") || err.contains("--actor")
+                })
+                .unwrap_or(false)
+        })
+    }
+}
+
 pub fn conflicting_stores(repo_root: &Path) -> Option<(String, String)> {
     let beads = repo_root.join(".beads");
     let dolt = beads.join("embeddeddolt").is_dir();

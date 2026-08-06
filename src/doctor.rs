@@ -231,6 +231,19 @@ pub fn checks(root: &Path) -> DoctorReport {
                 format!("found, but `{} --version` failed: {e:#}", cli.binary())
             });
             let mut detail = format!("{} ({version})", cli.binary());
+            // Attribution, in the backend section because that is where the
+            // question belongs: it is a property of the CLI pact found, not of
+            // pact. Stated either way rather than only when broken — "who is this
+            // bead recorded against" is asked when a trail already looks wrong,
+            // and an absent line answers nothing.
+            if cli.supports_actor(root) {
+                detail.push_str(", attributes writes to the acting agent (--actor)");
+            } else {
+                detail.push_str(
+                    ", does NOT accept --actor: every agent's bead activity will be recorded \
+                     against this checkout's git user instead of the agent that caused it",
+                );
+            }
             let compat = beads::version_compat_warning(&version);
             if let Some(warning) = &compat {
                 detail.push_str(&format!(" — {warning}"));

@@ -719,16 +719,42 @@ fn read_label(agent: &str) -> String {
 #[cfg(feature = "ui")]
 pub fn mark_read_by_id(cli: &BeadsCli, repo_root: &Path, agent: &str, id: &str) -> Result<()> {
     let label = read_label(agent);
-    cli.run(repo_root, &["label", "add", id, &label])
+    let actor = actor_arg(agent);
+    cli.run(repo_root, &["label", "add", id, &label, &actor])
         .map(|_| ())
 }
 
 fn mark_read(cli: &BeadsCli, repo_root: &Path, agent: &str, issues: &[BdIssue]) -> Result<()> {
     let label = read_label(agent);
+    let actor = actor_arg(agent);
     let mut args = vec!["label", "add"];
     args.extend(issues.iter().map(|i| i.id.as_str()));
     args.push(&label);
+    args.push(&actor);
     cli.run(repo_root, &args).map(|_| ())
+}
+
+/// `--actor=<agent>`, so a backend write is attributed to the agent that caused
+/// it rather than to whoever owns the checkout.
+///
+/// Without it every bead mutation from every agent in a fleet is recorded as the
+/// human's `git user.name`, which makes the audit trail useless for exactly the
+/// question it exists to answer: who did this. `send` has always passed it — this
+/// is for the calls that did not.
+///
+/// Both backends accept the same flag, verified rather than assumed:
+///
+/// - `bd` 1.1.2 — `--actor string`, documented precedence `--actor` >
+///   `$BEADS_ACTOR` > `git user.name` > `$USER`.
+/// - `br` 0.2.19 — `--actor <ACTOR>`, alongside a richer per-agent scheme
+///   (`BR_AGENT_NAME`, `BR_HARNESS`, `BR_MODEL`) that pact does not use, because
+///   one flag that works on both beats two mechanisms to keep in step.
+///
+/// Deliberately NOT done by setting `git config user.name`: that would mutate a
+/// checkout other agents share to fake attribution for one of them, which is the
+/// opposite of an audit trail.
+fn actor_arg(agent: &str) -> String {
+    format!("--actor={agent}")
 }
 
 /// Every message bead in the repo, regardless of recipient, oldest first.

@@ -108,6 +108,48 @@ assigned to you (`bd list --assignee=<agent> --include-infra --json`,
 `--include-infra` because message issues are otherwise hidden from `bd list`
 by default) and filters to `issue_type == "message"` on pact's side.
 
+## Who a backend write is attributed to
+
+Every mutating call pact makes passes `--actor=<agent>`, so a bead operation is
+recorded against the agent that caused it rather than against whoever owns the
+checkout. Without it, a fleet of twenty agents produces a bead history entirely
+attributed to one human, and the audit trail cannot answer the one question it
+exists for.
+
+Both backends accept the same flag, checked by running them rather than read off
+a version number:
+
+| Backend | Mechanism | Precedence it documents |
+|---|---|---|
+| `bd` 1.1.2 | `--actor <string>` | `--actor` > `$BEADS_ACTOR` > `git user.name` > `$USER` |
+| `br` 0.2.19 | `--actor <ACTOR>` | also has a richer per-agent scheme: `BR_AGENT_NAME`, `BR_HARNESS`, `BR_MODEL` |
+
+pact uses the flag on both rather than br's env-var scheme, because one mechanism
+that works everywhere beats two that have to be kept in step. `pact doctor`'s
+**Beads CLI** line says which of the two it found, in either direction — the
+question gets asked when a trail already looks wrong, and an absent line answers
+nothing.
+
+What this is **not** doing: setting `git config user.name`. That would mutate a
+checkout other agents share in order to fake attribution for one of them, which
+is the opposite of an audit trail — and in a worktree fleet the checkout being
+mutated belongs to somebody else entirely.
+
+Where it lands differs by verb, which is worth knowing before trusting a query.
+Measured on `bd` 1.1.2:
+
+| Verb pact issues | Attribution recorded |
+|---|---|
+| `create` (a message) | the bead's `created_by` field |
+| `label add` (marking read) | accepted, but bd logs no interaction for label changes |
+
+So a message's author is attributable today and a *reader* is not, through no
+fault of pact's — the flag is passed either way, so if bd starts logging label
+changes the attribution is already correct rather than needing a second pass. The
+canary asserts the part that is observable: a message sent as `canary-a` must come
+back with `created_by: canary-a` while the scratch repo's git user is deliberately
+something else.
+
 ## Two backends, two argv
 
 pact speaks to either Beads CLI: `bd` (Go, embedded Dolt) or `br` (beads-rust,
