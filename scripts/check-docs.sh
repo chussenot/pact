@@ -180,7 +180,10 @@ while IFS= read -r hit; do
 	# and none were verified. GitHub slugs a heading by lowercasing it, dropping
 	# anything that is not a word character, space or hyphen, then joining on
 	# hyphens; reproduce that rather than guessing.
-	grep -qxF "$frag" < <(
+	# `-e`, because a fragment can legitimately start with a hyphen —
+	# `#--check-stale-holds` is a heading named after a flag, and without this grep
+	# reads it as an option and reports the anchor missing when it is right there.
+	grep -qxF -e "$frag" < <(
 		grep -E '^#{1,6}[[:space:]]' "$path" |
 			sed -E 's/^#+[[:space:]]*//; s/[[:space:]]+$//' |
 			tr 'A-Z' 'a-z' |
