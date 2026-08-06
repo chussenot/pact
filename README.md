@@ -164,5 +164,6 @@ what the tooling did to it, and require a quoted command as evidence.
 | [mcp.md](docs/mcp.md) | the optional read-only MCP server: the five tools, and why it cannot write |
 | [tui.md](docs/tui.md) | `pact ui` — tabs, keybindings, and the `ui` build feature |
 | [telemetry.md](docs/telemetry.md) | the optional OpenTelemetry export: what leaves the machine and what never does |
+| [testing.md](docs/testing.md) | the fleet soak: scripted workers at concurrency, and what it cannot prove |
 | [development.md](docs/development.md) | build, test, the CI gates and why each exists, the upstream canary |
 | [mascot-animations.md](docs/mascot-animations.md) | the mascot in `pact ui`: gestures, triggers, frame data |

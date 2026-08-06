@@ -94,6 +94,23 @@ run = [
   """,
 ]
 
+[tasks.fleet]
+description = "Soak-test pact at fleet concurrency with scripted workers (see docs/testing.md)"
+# Deliberately NOT in `check`. It is minutes long, it is probabilistic, and it
+# needs a Beads CLI — three properties that turn a required gate into one people
+# disable. `mise run fleet` when you have changed lease or message internals; CI
+# runs it weekly.
+#
+# The pair is what makes it a measurement rather than a demo: the control run has
+# leases removed and MUST lose updates, and the treatment run MUST lose none. A
+# green treatment on its own only means the workload never contended.
+run = [
+  "scripts/fleet-sim.sh -n 8 -t 20 --no-leases > /tmp/pact-fleet-control.txt",
+  "scripts/fleet-verify.sh \"$(tail -1 /tmp/pact-fleet-control.txt)\"",
+  "scripts/fleet-sim.sh -n 8 -t 20 > /tmp/pact-fleet-treatment.txt",
+  "scripts/fleet-verify.sh \"$(tail -1 /tmp/pact-fleet-treatment.txt)\"",
+]
+
 [tasks.check]
 description = "Run the full CI check locally: fmt, lint, test, otel, docs — serially, as CI does."
 # Sequential, and this is not a preference. `depends` runs tasks in PARALLEL, and

@@ -1,0 +1,194 @@
+name: Fleet soak
+
+# Soak-test pact's primitives at fleet concurrency, with scripted workers that
+# follow AGENTS.md's protocol mechanically. See docs/testing.md for what this can
+# and cannot prove.
+#
+# Scheduled and NOT on pull requests, for three reasons that each on their own
+# would be enough: it takes minutes, it is probabilistic, and it needs a Beads CLI
+# from somebody else's release process. A required check with any one of those
+# properties is a check that gets disabled the first time it is inconvenient — the
+# same reasoning that keeps canary.yml off PRs.
+#
+# The control run is the load-bearing half. It removes pact's leases and MUST lose
+# updates; if it does not, the workload never contended and the treatment run
+# passing means nothing. So a green treatment alone is not the pass condition —
+# the pair is.
+
+on:
+  schedule:
+    # Thursday 04:23 UTC. Off the hour because scheduled runs cluster there and
+    # queue; a weekday so a failure lands when somebody can read the issue.
+    - cron: "23 4 * * 4"
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: "Workers per run (default 20)"
+        required: false
+        type: string
+
+# A soak that overlaps itself is two fleets contending for one runner's IO, which
+# makes the timings meaningless. Manual runs supersede a scheduled one in flight.
+concurrency:
+  group: fleet
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+  # The report job asks the API which legs failed. An explicit permissions block
+  # denies everything not listed, so without this that call 403s.
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      # Never fail-fast. "control passed but treatment failed" and "both failed"
+      # are different diagnoses, and one leg cancelling the other erases that.
+      fail-fast: false
+      matrix:
+        include:
+          # The counterfactual, first in the list because it is what makes the
+          # rest a measurement.
+          - mode: control
+            flags: "--no-leases"
+          - mode: shared
+            flags: ""
+          - mode: worktrees
+            flags: "--worktrees"
+          - mode: steal-storm
+            flags: "--steal-storm"
+          - mode: scope-local
+            flags: "--scope-local"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch tip — pins the ACTION, not the toolchain; Rust stays current because the action installs whatever stable is at run time
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: fleet-${{ matrix.mode }}
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends jq
+
+      - name: Install bd
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Latest release: the harness is not asserting anything about a specific
+          # bd version, so pinning one here would only mean a second place to
+          # update. canary.yml is where bd version drift is under test.
+          TAG="$(gh release view --repo gastownhall/beads --json tagName -q .tagName)"
+          gh release download "$TAG" --repo gastownhall/beads \
+            --pattern '*linux*amd64*' --dir /tmp/bd || \
+            gh release download "$TAG" --repo gastownhall/beads --pattern '*linux*x86_64*' --dir /tmp/bd
+          cd /tmp/bd
+          for f in *; do
+            case "$f" in
+            *.tar.gz) tar -xzf "$f" ;;
+            *.zip) unzip -q "$f" ;;
+            esac
+          done
+          BIN="$(find /tmp/bd -type f -name bd -perm -u+x | head -n1)"
+          [ -n "$BIN" ] || { ls -R /tmp/bd; echo "::error::no bd binary in $TAG"; exit 1; }
+          install -m755 "$BIN" /usr/local/bin/bd
+          bd --version
+
+      - name: Soak (${{ matrix.mode }})
+        env:
+          WORKERS: ${{ inputs.workers || '20' }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086 # flags are a deliberate word-split
+          ./scripts/fleet-sim.sh -n "$WORKERS" -t 60 ${{ matrix.flags }} | tee /tmp/sim.log
+          RUN_DIR="$(tail -1 /tmp/sim.log)"
+          echo "RUN_DIR=$RUN_DIR" >>"$GITHUB_ENV"
+          ./scripts/fleet-verify.sh "$RUN_DIR"
+
+      # Logs only on failure: a passing soak's logs are megabytes nobody reads,
+      # and a failing one is undiagnosable without them.
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fleet-${{ matrix.mode }}-logs
+          path: |
+            ${{ env.RUN_DIR }}/logs
+            ${{ env.RUN_DIR }}/manifest.json
+            ${{ env.RUN_DIR }}/lost-updates.txt
+            ${{ env.RUN_DIR }}/double-wins.json
+            ${{ env.RUN_DIR }}/conflicts.txt
+            ${{ env.RUN_DIR }}/worker-summary.txt
+            ${{ env.RUN_DIR }}/repo/.pact/events.jsonl
+          if-no-files-found: warn
+          retention-days: 14
+
+  report:
+    needs: soak
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Open or update the fleet-soak issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Which modes failed, from the API rather than guesswork: "control
+          # failed alone" means the harness stopped being a test, while
+          # "shared failed" means pact stopped protecting the invariant. Those
+          # want opposite responses.
+          MODES="$(gh api "repos/$REPO/actions/runs/${{ github.run_id }}/jobs" \
+            --jq '.jobs[] | select(.conclusion == "failure") | .name' | paste -sd', ' || echo unknown)"
+          export MODES
+
+          # The body is built in python rather than in shell. It contains
+          # backticks and an apostrophe, and in any expanding shell context those
+          # become command substitution and quote-soup — a report step that
+          # executes fragments of its own prose is a bad way to find that out.
+          # One tool, no quoting hazard, and the markdown stays readable.
+          python3 - <<'PATCH'
+          import os, pathlib
+          body = f"""**failing modes:** {os.environ['MODES']}
+          **run:** {os.environ['RUN_URL']}
+
+          The fleet soak runs scripted workers through AGENTS.md's protocol at
+          concurrency. Logs are attached to the failing job as artifacts.
+
+          | failing mode | what it means |
+          | --- | --- |
+          | `control` only | the harness stopped being a test — the workload no longer contends, so every other mode passing proves nothing |
+          | `shared` | pact stopped protecting the invariant leases exist for: a write was lost, or two agents held one path |
+          | `worktrees` | shared resolution broke under load |
+          | `steal-storm` | the expired-lease takeover path broke |
+          | `scope-local` | isolation stopped isolating |
+
+          If the failure is a **double-win**, that is the written trigger
+          condition for the guard-file bead (pact-ehi), and the forensics belong
+          on that bead rather than in this issue.
+          """
+          # The YAML block scalar forced a common indent on every line; strip it
+          # so the issue does not render as one code block.
+          pathlib.Path("/tmp/body.md").write_text(
+              "\n".join(l[10:] if l.startswith(" " * 10) else l for l in body.splitlines()) + "\n"
+          )
+          PATCH
+          BODY="$(cat /tmp/body.md)"
+
+          EXISTING="$(gh issue list --label fleet-soak --state open --limit 1 --json number -q '.[0].number' || true)"
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+            echo "commented on existing fleet issue #$EXISTING"
+          else
+            gh label create fleet-soak --description "Scheduled fleet concurrency soak" --color 5319E7 2>/dev/null || true
+            gh issue create --title "Fleet soak failing" --label fleet-soak --body "$BODY"
+          fi

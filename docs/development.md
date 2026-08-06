@@ -85,6 +85,13 @@ behind `pact log`). Message read state is not there — it lives in `bd`, as one
 with a single `.pact/` line, so anything else an agent writes there is covered
 without a new rule.
 
+## Beyond the gates: the fleet soak
+
+`mise run fleet` runs scripted workers through the coordination protocol at
+concurrency, to soak-test the primitives under contention. It is deliberately not
+part of `check` — minutes long, probabilistic, and it needs a Beads CLI. See
+[testing.md](testing.md), which also states plainly what it cannot prove.
+
 ## Opt-in features
 
 Two features are off by default, and both are asserted to add **zero**
