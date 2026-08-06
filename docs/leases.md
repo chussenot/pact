@@ -103,22 +103,28 @@ window, deletes a live agent's lock. Measured with a tight poller: 203
 zero-byte observations in 300 acquire cycles under the old scheme, 0 under this
 one.
 
-**Taking over** an already-existing lock is a weaker guarantee, and worth
-knowing before you rely on it. The three takeover paths — reclaiming an expired
-lease, `--steal`, and a re-entrant refresh by the current holder — can't use
-`O_EXCL`, because the file is already there. They write a sibling temp file and
-`rename` it over the lock (atomic on one filesystem), then **re-read the lock
-and confirm it names them** with the exact timestamp they just wrote. If a
-concurrent takeover landed in between, the loser sees the winner's name and
-exits 2 instead of falsely reporting success.
+**Taking over** an already-existing lock — reclaiming an expired lease,
+`--steal`, and a re-entrant refresh by the current holder — can't use
+`O_EXCL` on the lock file itself, because the file is already there. They
+write a sibling temp file and `rename` it over the lock (atomic on one
+filesystem), then **re-read the lock and confirm it names them** with the
+exact timestamp they just wrote. If a concurrent takeover landed in between,
+the loser sees the winner's name and exits 2 instead of falsely reporting
+success.
 
-That verify narrows the race from "everything since we read the file" to
-"between our rename and our re-read". It does not close it: two takeovers
-landing inside that window can still both believe they won. Closing it fully
-would mean serializing takeovers behind an `O_EXCL` guard file, deliberately
-not built until a double-win is actually observed. For an advisory mechanism
-whose worst case is two agents editing one file — the thing leases only ever
-made *less likely*, never impossible — that trade is the honest one.
+That verify alone only narrows the race, from "everything since we read the
+file" to "between our rename and our re-read" — it does not close it,
+because two racers can each read the pre-takeover state before either
+writes. That stopped being a hypothetical: research against the compiled
+binary reproduced double- and even triple-wins via ordinary CLI-level `pact
+lease acquire` races, no fault injection needed — roughly 20-30% of rounds
+at 6-10 concurrent racers on one expired lock, and 2 of 30 rounds even at
+just two racers. So takeovers are now serialized behind a second `O_EXCL`
+guard file, held for the whole read-decide-write sequence, not just the
+rename — the second racer, once it gets the guard, reads the first racer's
+fresh write as current reality and makes its decision against that, not
+against a snapshot that is already stale. The post-write verify stays in
+place as a cheap check that the guard worked, not as the primary defense.
 
 ## Use case: two agents, one file
 

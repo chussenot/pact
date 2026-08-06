@@ -121,22 +121,20 @@ fn reentrant_acquire_by_same_agent_refreshes_without_error() {
     assert_ne!(t1, t2, "re-entrant acquire should refresh acquired_at");
 }
 
-/// Why we do NOT assert `successes == 1` (exactly-one wins):
+/// Exactly one of two racers wins a concurrent expired-lease steal.
 ///
-/// `verify_own_lease` (src/lease.rs) narrows the steal race from "time since
-/// read" to "between rename and re-read", but a residual window remains: both
-/// racers can complete write → rename → verify without interleaving, so both
-/// legitimately exit 0 on a fast machine or CI runner. The doc-comment on
-/// `verify_own_lease` explicitly documents this accepted trade-off for an
-/// advisory mechanism.
-///
-/// The strict exactly-one guarantee requires an `O_EXCL` guard file, which is
-/// intentionally deferred (YAGNI / backlog). Until then, the invariants we
-/// *can* assert — mirroring the unit test
-/// `concurrent_double_steal_disk_holder_returned_ok` — are:
-///   1. At least one process exits 0 (`successes >= 1`).
-///   2. The agent recorded on disk after both exit is one that exited 0.
-///   3. Any process that did NOT exit 0 must have exited exactly 2.
+/// Used to assert only `successes >= 1`: `verify_own_lease` alone narrowed the
+/// race from "time since read" to "between rename and re-read" without
+/// closing it, and research against the compiled binary
+/// (antithesis/scratchbook/properties/lease-double-win-reachable.md) showed
+/// that residual window was not a hypothetical — ordinary CLI-level races
+/// produced double-wins in real rounds, including at this test's own N=2
+/// shape. `WriteGuard` (src/lease.rs) now serializes the whole
+/// read-decide-write sequence, so the invariant is back to the one the name
+/// promises:
+///   1. Exactly one process exits 0.
+///   2. The agent recorded on disk after both exit is the one that exited 0.
+///   3. The other process exits exactly 2.
 #[test]
 fn concurrent_steal_of_expired_lease_has_consistent_outcome() {
     let tmp = init_repo();
@@ -175,14 +173,14 @@ fn concurrent_steal_of_expired_lease_has_consistent_outcome() {
     let code_a = status_a.code().unwrap_or(-1);
     let code_b = status_b.code().unwrap_or(-1);
 
-    // Invariant 1: at least one process exits 0.
+    // Invariant 1: exactly one process exits 0.
     let successes = [&status_a, &status_b]
         .iter()
         .filter(|s| s.success())
         .count();
-    assert!(
-        successes >= 1,
-        "at least one process must win the concurrent expired-lease steal; \
+    assert_eq!(
+        successes, 1,
+        "exactly one process must win the concurrent expired-lease steal; \
          agent-a={code_a}, agent-b={code_b}",
     );
 
@@ -201,6 +199,74 @@ fn concurrent_steal_of_expired_lease_has_consistent_outcome() {
         if code != 0 {
             assert_eq!(code, 2, "{name} exited {code}, expected 0 or 2");
         }
+    }
+}
+
+/// N-way regression guard for the exact reachability finding that motivated
+/// `WriteGuard`: real CLI-process races on one pre-expired lock produced
+/// double-wins in ~20-30% of rounds at N=6..10 and even triple-wins at N=6/N=8
+/// (antithesis/scratchbook/properties/lease-double-win-reachable.md,
+/// n-way-worktree-double-win-scaling.md), using this exact method — real
+/// `pact lease acquire` subprocesses, no thread racing, no forced scheduling.
+/// Several rounds so the assertion cannot pass by dodging the one round in
+/// several that used to reproduce it.
+#[test]
+fn concurrent_nway_steal_of_expired_lease_has_exactly_one_winner() {
+    const N: usize = 8;
+    const ROUNDS: usize = 5;
+
+    for round in 0..ROUNDS {
+        let tmp = init_repo();
+        let lock_path = tmp.path().join(".pact/leases/contested.txt.lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(2000);
+        let expired_lease = serde_json::json!({
+            "agent": "agent-dead",
+            "path": "contested.txt",
+            "acquired_at": stale.to_rfc3339(),
+            "ttl_secs": 900,
+            "note": null
+        });
+        std::fs::write(&lock_path, serde_json::to_string(&expired_lease).unwrap()).unwrap();
+
+        let children: Vec<_> = (0..N)
+            .map(|i| {
+                Command::new(env!("CARGO_BIN_EXE_pact"))
+                    .args(["lease", "acquire", "contested.txt"])
+                    .current_dir(tmp.path())
+                    .env("PACT_AGENT", format!("agent-{i}"))
+                    .spawn()
+                    .expect("failed to spawn racer")
+            })
+            .collect();
+
+        let codes: Vec<i32> = children
+            .into_iter()
+            .map(|mut c| c.wait().expect("racer wait failed").code().unwrap_or(-1))
+            .collect();
+
+        let successes = codes.iter().filter(|&&c| c == 0).count();
+        assert_eq!(
+            successes, 1,
+            "round {round}: exactly one of {N} racers must win; exit codes: {codes:?}"
+        );
+        for &code in &codes {
+            if code != 0 {
+                assert_eq!(
+                    code, 2,
+                    "round {round}: loser exited {code}, expected 0 or 2"
+                );
+            }
+        }
+
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&lock_path).unwrap()).unwrap();
+        let disk_agent = on_disk["agent"].as_str().unwrap();
+        let winner_index: usize = disk_agent.strip_prefix("agent-").unwrap().parse().unwrap();
+        assert_eq!(
+            codes[winner_index], 0,
+            "round {round}: disk names {disk_agent} but it did not exit 0; codes: {codes:?}"
+        );
     }
 }
 

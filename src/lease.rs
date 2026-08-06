@@ -448,20 +448,96 @@ fn read_lease(lock_path: &Path) -> Result<LeaseInfo> {
         .with_context(|| format!("parsing lease at {}", lock_path.display()))
 }
 
+/// A guard held for `~5s` or less: how long a takeover's read-decide-write
+/// sequence takes on disk. If a `.guard` file is older than that, its owner
+/// did not lose a race — it crashed mid-critical-section — so the next waiter
+/// steals it rather than deadlocking forever on a dead process.
+const STALE_GUARD_SECS: u64 = 5;
+
+/// Serializes every mutation to one lock path, closing the race
+/// `verify_own_lease` could only narrow (pact-iup, pact-ehi).
+///
+/// `verify_own_lease` alone lets two racers each read `existing` as
+/// takeover-eligible *before either writes*, then each write and each
+/// independently see their own name on re-read: both get `Ok`. That is not a
+/// hypothetical corner — reproduced directly against the compiled binary via
+/// ordinary CLI-level `pact lease acquire` races (no fault injection, no
+/// forced scheduling): double-wins in roughly 20-30% of rounds at N=6..10
+/// concurrent racers on one pre-expired lock, and even 2 of 30 rounds at
+/// plain N=2, plus genuine 3-way wins at N=6 and N=8. See
+/// `antithesis/scratchbook/properties/lease-double-win-reachable.md` and
+/// `n-way-worktree-double-win-scaling.md`. That evidence is what resolved the
+/// deferral both beads stated it on: "implement iff a double-win is observed."
+///
+/// This guard makes the read of `existing` and the write that follows it one
+/// atomic unit: the second racer, once it gets the guard, reads the FIRST
+/// racer's fresh write as `existing` and makes its decision against current
+/// reality — expired-reclaim, refresh and `--steal` all become correct
+/// instead of merely less-wrong. `verify_own_lease` stays in place after each
+/// write as a cheap check that the guard itself worked, not as the primary
+/// defense anymore.
+///
+/// `O_EXCL` on a sibling `.guard` file, not a second lock primitive: the
+/// initial free-path claim already gets exclusivity from `hard_link`'s
+/// create-only semantics, so this reuses the same guarantee rather than
+/// introducing `flock` or similar.
+struct WriteGuard {
+    path: PathBuf,
+}
+
+impl WriteGuard {
+    fn acquire(lock_path: &Path) -> Result<Self> {
+        let path = PathBuf::from(format!("{}.guard", lock_path.display()));
+        loop {
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|m| m.elapsed().ok())
+                        .is_some_and(|age| age.as_secs() >= STALE_GUARD_SECS);
+                    if stale {
+                        // A crashed holder, not a live one — see the struct doc
+                        // comment. Another waiter may win this race to remove
+                        // it; that is fine, `create_new` above is what decides
+                        // who actually gets the guard.
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("creating guard {}", path.display()));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// After a `write_lease_atomic` that was meant to take ownership, re-read the
 /// lock and confirm that it now belongs to `agent` with the exact `acquired_at`
 /// that was just written. If another agent's concurrent rename landed after
 /// ours, the file will name them instead — and we must return exit 2 rather
 /// than falsely reporting that we hold the lease.
 ///
-/// Cost: one read. Applied on ALL three post-conflict write paths:
-/// expired-takeover, re-entrant refresh, and `--steal`.
+/// Cost: one read. Applied on ALL post-conflict write paths: expired-takeover,
+/// re-entrant refresh, `--steal`, and `renew`.
 ///
-/// Residual window: the verify narrows the race from "time since read" to
-/// "between rename and re-read"; it does not close it entirely. This is an
-/// accepted trade-off for an advisory mechanism — a full fix would serialize
-/// takeovers via an `O_EXCL` guard file, deliberately not implemented (YAGNI
-/// until a double-win is observed in practice).
+/// Once a live [`WriteGuard`] surrounds the read-decide-write sequence, this
+/// can only ever succeed for the guard holder — nothing else can be mid-write
+/// at the same time. Kept anyway as a cheap, independent check that the guard
+/// mechanism itself worked, the same role an assertion plays after a lock.
 fn verify_own_lease(lock_path: &Path, agent: &str, acquired_at: &str) -> Result<()> {
     let on_disk = read_lease(lock_path)?;
     if on_disk.agent != agent || on_disk.acquired_at != acquired_at {
@@ -827,6 +903,11 @@ fn acquire_inner(
             })
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Serializes this whole branch — see WriteGuard's doc comment.
+            // Held from before the read that decides "is this takeover-eligible"
+            // through the write that acts on that decision, so a second racer
+            // can never read the same pre-mutation `existing` we did.
+            let _guard = WriteGuard::acquire(&lock_path)?;
             let existing = read_lease(&lock_path)?;
 
             if is_expired(&existing, now) {
@@ -1009,8 +1090,24 @@ fn acquire_many_fs(
                 // Put the pre-held leases back byte for byte. The "renewed"
                 // event the refresh already logged stays in the feed — an
                 // overstatement worth less than the code to retract it.
+                //
+                // Guarded and re-checked, not unconditional (pact-m7j.1.1): the
+                // gap between the batch's refresh and this rollback is exactly
+                // when a peer could legitimately `--steal` the still-refreshed
+                // lease. Restoring "before" over their fresh claim would
+                // silently destroy it; only restore if we are still the agent
+                // of record.
                 for before in &refreshed {
-                    if let Ok(lock_path) = lock_file_path(repo_root, &before.path) {
+                    let Ok(lock_path) = lock_file_path(repo_root, &before.path) else {
+                        continue;
+                    };
+                    let Ok(_guard) = WriteGuard::acquire(&lock_path) else {
+                        continue;
+                    };
+                    let still_ours = read_lease(&lock_path)
+                        .map(|l| l.agent == agent)
+                        .unwrap_or(false);
+                    if still_ours {
                         let _ = write_lease_atomic(&lock_path, before);
                     }
                 }
@@ -1048,9 +1145,18 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
     let mut sp = otel::span("pact.lease.release");
     sp.set("pact.path", relative.clone());
 
+    if !lock_path.exists() {
+        return Ok(None); // idempotent: nothing to release
+    }
+    // release_fs had no verify guard at all (pact-m7j.1.5): without it, a
+    // concurrent legitimate takeover's write could land between this read and
+    // the delete below, and we would delete their fresh claim believing it was
+    // still ours. Same guard as acquire_inner's takeover branches.
+    let _guard = WriteGuard::acquire(&lock_path)?;
     let existing = match read_lease(&lock_path) {
         Ok(lease) => lease,
-        Err(_) if !lock_path.exists() => return Ok(None), // idempotent: nothing to release
+        // Released by a peer while we waited for the guard.
+        Err(_) if !lock_path.exists() => return Ok(None),
         Err(e) => return Err(e),
     };
 
@@ -1217,6 +1323,10 @@ fn renew_fs(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
     if !lock_path.exists() {
         anyhow::bail!("no lease on {relative} to renew (use `pact lease acquire` to claim it)");
     }
+    // Same guard as acquire_inner's takeover branches (pact-m7j.1.6): renew
+    // never received it, so a concurrent steal's write could land between this
+    // read and the write below with nothing to catch it.
+    let _guard = WriteGuard::acquire(&lock_path)?;
     let existing = read_lease(&lock_path)?;
     if existing.agent != agent {
         count_transition("conflicted");
@@ -1240,6 +1350,7 @@ fn renew_fs(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
         ..existing
     };
     write_lease_atomic(&lock_path, &renewed)?;
+    verify_own_lease(&lock_path, agent, &renewed.acquired_at)?;
     log_event(
         repo_root,
         agent,
@@ -2249,11 +2360,13 @@ mod tests {
                 other => panic!("unexpected agent on disk: {other}"),
             }
 
-            // At least one thread won.
+            // Exactly one thread won: WriteGuard now serializes the
+            // read-decide-write sequence, closing the window
+            // verify_own_lease alone could only narrow.
             let successes = [&res_a, &res_b].iter().filter(|r| r.is_ok()).count();
-            assert!(
-                successes >= 1,
-                "nobody acquired the lease: a={res_a:?}, b={res_b:?}"
+            assert_eq!(
+                successes, 1,
+                "exactly one of two racers must win: a={res_a:?}, b={res_b:?}"
             );
 
             // Any loser detected by verify must exit 2, not some other code.
