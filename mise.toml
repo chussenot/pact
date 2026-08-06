@@ -29,9 +29,32 @@ description = "Run the test suite with every feature, then again with none"
 # disk. With the default leg last, `mise run test` followed by
 # `./target/debug/pact ui` answers "unrecognized subcommand" — the stale-binary
 # confusion this repo has already been bitten by once.
+#
+# The THIRD leg runs with no Beads CLI reachable, which is the configuration CI
+# actually has — and the one a developer machine structurally cannot reproduce,
+# because a developer has bd installed. That gap let
+# `a_worktree_of_a_bare_repo_anchors_state_and_refuses_messaging` pass locally and
+# fail on every CI push for four days: exit 3 has two causes ("no backend" and
+# "bare topology cannot message"), the test asserted the topology one, and without
+# a backend the other wins. Four red pushes were reported as green from local runs.
+#
+# It is also a supported configuration in its own right, not just a CI mimic:
+# `init`, `lease`, `log` and most of `doctor` work with no Beads CLI at all, and
+# exit 3 is documented for the parts that do not.
 run = [
   "cargo test",
   "cargo test --features $PACT_ALL_FEATURES",
+  """
+  # Exclude exactly the directories bd/br live in, rather than pattern-matching
+  # the PATH: on a machine without them this is a no-op, which is correct.
+  p="$PATH"
+  for b in bd br; do
+    d="$(command -v "$b" 2>/dev/null)" || continue
+    p="$(printf '%s' "$p" | tr ':' '\n' | grep -vxF "$(dirname "$d")" | paste -sd: -)"
+  done
+  echo "no-backend leg: bd=$(PATH="$p" command -v bd || echo absent) br=$(PATH="$p" command -v br || echo absent)"
+  PATH="$p" cargo test --features $PACT_ALL_FEATURES
+  """,
 ]
 
 [tasks.fmt]

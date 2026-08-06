@@ -10,7 +10,7 @@ Via [mise](https://mise.jdx.dev) tasks (`mise tasks ls` to list them):
 
 ```bash
 mise run build      # cargo build with every feature
-mise run test       # cargo test with no features, then with every feature
+mise run test       # cargo test: no features, every feature, then with NO Beads CLI
 mise run fmt        # cargo fmt
 mise run lint       # clippy -D warnings, every feature and then none
 mise run check-docs # scripts/check-docs.sh — README/docs vs the real CLI
@@ -37,6 +37,15 @@ Neither opt-in feature costs anything unasked, which is what makes installing
 them all safe: `otel` exports only when the standard `OTEL_*` variables are set
 (+0 ms unconfigured, measured), and `mcp` does nothing until a client spawns
 `pact mcp serve`.
+
+A third `test` leg runs with **no Beads CLI reachable**, which is the environment
+CI actually has and the one a developer machine cannot reproduce — a developer has
+`bd` installed. That gap is not hypothetical: exit 3 has two causes ("no backend"
+and "a bare worktree cannot message"), a test asserted the topology one, and
+without a backend the other wins. It passed locally and failed on every CI push
+for four days while local runs were reported as green. It is also a supported
+configuration in its own right: `init`, `lease`, `log` and most of `doctor` work
+with no Beads CLI at all.
 
 The **default** build is still gated locally, not only in CI, because some checks
 exist only there. `lint` runs clippy with every feature and then with none;

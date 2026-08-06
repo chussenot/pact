@@ -54,6 +54,26 @@ fn have_git() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// Is a Beads CLI reachable?
+///
+/// Needed because exit 3 has two causes and only one of them is about topology.
+/// `BeadsCli::locate()` runs before the bare-repo check, so with no backend at all
+/// `msg send` refuses with "no Beads CLI found on PATH" — also exit 3, also
+/// correct, and not the message the topology assertion is looking for.
+///
+/// This mattered: the assertion below passed locally for four days and failed on
+/// every CI push in that window, because ci.yml installs no Beads CLI and a
+/// developer machine has one. An assertion that can only be reached in one
+/// environment has to say so.
+fn have_beads() -> bool {
+    ["bd", "br"].iter().any(|b| {
+        Command::new(b)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    })
+}
+
 /// A real repository with one commit, plus a linked worktree on its own branch.
 /// Returns (tempdir, main worktree, linked worktree).
 fn repo_with_worktree(branch: &str, wt_name: &str) -> (TempDir, PathBuf, PathBuf) {
@@ -420,8 +440,10 @@ fn a_worktree_of_a_bare_repo_anchors_state_and_refuses_messaging() {
     assert!(doc.contains("common-gitdir"), "{doc}");
     assert!(doc.contains("BARE"), "{doc}");
 
-    // Messaging refuses with exit 3 and says why. `--to` a name that does not
-    // exist is fine: the refusal must come before any of that.
+    // Messaging refuses with exit 3 either way, and that much is asserted
+    // unconditionally: a bare worktree cannot message, and neither can a machine
+    // with no backend. `--to` a name that does not exist is fine — the refusal
+    // comes before any recipient resolution.
     let sent = pact(&wt, "agent-a", &["msg", "send", "--to", "agent-b", "hello"]);
     assert_eq!(
         sent.status.code(),
@@ -430,11 +452,22 @@ fn a_worktree_of_a_bare_repo_anchors_state_and_refuses_messaging() {
         stderr(&sent)
     );
     let why = stderr(&sent);
-    assert!(why.contains("BARE"), "must explain the topology: {why}");
-    assert!(
-        why.contains("Leases and the event log work") || why.contains("messaging does not"),
-        "must say what still works: {why}"
-    );
+    if have_beads() {
+        // Only reachable with a backend installed: `locate()` runs first, so
+        // without one the "no Beads CLI on PATH" refusal wins — a truer answer to
+        // a more fundamental problem, and the reason this branch is conditional
+        // rather than the assertion being weakened for everyone.
+        assert!(why.contains("BARE"), "must explain the topology: {why}");
+        assert!(
+            why.contains("Leases and the event log work") || why.contains("messaging does not"),
+            "must say what still works: {why}"
+        );
+    } else {
+        assert!(
+            why.contains("no Beads CLI"),
+            "with no backend, exit 3 should be about the missing CLI: {why}"
+        );
+    }
     // Nothing was created in the worktree as a side effect of refusing.
     assert!(
         !wt.join(".beads").exists(),
