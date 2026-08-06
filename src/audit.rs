@@ -45,6 +45,23 @@ use serde::Serialize;
 use crate::events::Event;
 use crate::lease::DEFAULT_TTL_SECS;
 
+/// The default TTL before pact recorded it per-event, used for holds whose
+/// opening event carries no `ttl_secs`.
+///
+/// NOT `DEFAULT_TTL_SECS`. Judging a historical hold against today's compiled
+/// default is how raising that default silently rewrites the past: every hold in
+/// this repository's log was taken under a 900s TTL and none exceeds 36m, so under
+/// a 45m default all 22 findings would vanish without anything having changed
+/// about them. A hold is compared against the TTL that was actually in force.
+const LEGACY_DEFAULT_TTL_SECS: u64 = 900;
+
+/// The fallback only means anything while the compiled default has moved past it:
+/// if the two are equal again, `holds_with_no_recorded_ttl_use_the_legacy_default`
+/// silently stops testing anything. A `const` assertion rather than one inside the
+/// test, because comparing two constants at run time is a clippy lint and this is
+/// knowable at compile time anyway.
+const _: () = assert!(crate::lease::DEFAULT_TTL_SECS > LEGACY_DEFAULT_TTL_SECS);
+
 /// How many contended paths and agents a summary lists before it stops being a
 /// summary. The full data is in the log; this is the part a human reads.
 const TOP_N: usize = 10;
@@ -106,6 +123,12 @@ pub struct Hold {
     /// renewed is following the protocol; one that did not is the smell.
     pub renewals: usize,
     pub held_secs: Option<i64>,
+    /// The TTL this hold was taken under, from the opening event.
+    pub ttl_secs: u64,
+    /// True when the opening event recorded no TTL and
+    /// [`LEGACY_DEFAULT_TTL_SECS`] was assumed. Surfaced so a reader can tell a
+    /// measured threshold from an inferred one.
+    pub ttl_assumed: bool,
 }
 
 /// Two agents holding one path at the same time.
@@ -185,8 +208,10 @@ pub struct CheckReport {
     pub unparseable_lines: usize,
     pub double_wins: Vec<DoubleWin>,
     pub stale_holds: Vec<Hold>,
-    /// The threshold `stale-holds` used, so a finding can be judged without
-    /// reading the source.
+    /// The **current** default TTL, for context only — *not* the threshold any
+    /// finding was judged against. Each `Hold` carries its own `ttl_secs`, read from
+    /// the event, so this field must never be used to re-derive a verdict: it moves
+    /// when the default is recalibrated and the findings do not.
     pub ttl_secs: Option<u64>,
 }
 
@@ -280,15 +305,15 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>) {
                 .then(a.0.cmp(&b.0))
         });
 
-        // agent -> (opened_line, opened_at, renewals)
-        let mut open: BTreeMap<String, (usize, String, usize)> = BTreeMap::new();
+        // agent -> (opened_line, opened_at, renewals, ttl_secs, ttl_assumed)
+        let mut open: BTreeMap<String, (usize, String, usize, u64, bool)> = BTreeMap::new();
 
         for (line, e) in rows {
             if opens(&e.kind) {
                 let others: Vec<HoldingAgent> = open
                     .iter()
                     .filter(|(a, _)| *a != &e.agent)
-                    .map(|(a, (l, at, _))| HoldingAgent {
+                    .map(|(a, (l, at, ..))| HoldingAgent {
                         agent: a.clone(),
                         since: at.clone(),
                         since_line: *l,
@@ -306,14 +331,25 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>) {
                 }
                 // A re-entrant acquire by the same agent refreshes rather than
                 // opening a second window, so the original open time is kept.
-                open.entry(e.agent.clone())
-                    .or_insert((line, e.at.clone(), 0));
+                open.entry(e.agent.clone()).or_insert((
+                    line,
+                    e.at.clone(),
+                    0,
+                    e.ttl_secs.unwrap_or(LEGACY_DEFAULT_TTL_SECS),
+                    e.ttl_secs.is_none(),
+                ));
             } else if e.kind == "renewed" {
                 if let Some(slot) = open.get_mut(&e.agent) {
                     slot.2 += 1;
+                    // A renew can change the TTL, so the window adopts the newest
+                    // one it was actually granted.
+                    if let Some(ttl) = e.ttl_secs {
+                        slot.3 = ttl;
+                        slot.4 = false;
+                    }
                 }
             } else if closes(&e.kind) {
-                if let Some((oline, oat, renewals)) = open.remove(&e.agent) {
+                if let Some((oline, oat, renewals, ttl, ttl_assumed)) = open.remove(&e.agent) {
                     let held = parse_at(&oat)
                         .zip(parse_at(&e.at))
                         .map(|(a, b)| (b - a).num_seconds());
@@ -327,6 +363,8 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>) {
                         closed_by: Some(e.kind.clone()),
                         renewals,
                         held_secs: held,
+                        ttl_secs: ttl,
+                        ttl_assumed,
                     });
                 }
             }
@@ -334,7 +372,7 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>) {
 
         // Whatever is still open at the end of the log: a live lease, or an agent
         // that exited without releasing. Reported with no close, never guessed at.
-        for (agent, (oline, oat, renewals)) in open {
+        for (agent, (oline, oat, renewals, ttl, ttl_assumed)) in open {
             holds.push(Hold {
                 path: path.to_string(),
                 agent,
@@ -345,6 +383,8 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>) {
                 closed_by: None,
                 renewals,
                 held_secs: None,
+                ttl_secs: ttl,
+                ttl_assumed,
             });
         }
     }
@@ -557,6 +597,9 @@ pub fn run_check(
     match check {
         Check::DoubleWin => report.double_wins = doubles,
         Check::StaleHolds => {
+            // No single threshold any more: each hold is judged against its own
+            // recorded TTL. `ttl_secs` on the report stays as the CURRENT default,
+            // for context only, and the per-hold value is what decided each row.
             report.ttl_secs = Some(DEFAULT_TTL_SECS);
             // Over TTL AND never renewed. The protocol says a long task must not
             // outlive its lease and to renew if it does, so a long hold that
@@ -567,7 +610,7 @@ pub fn run_check(
             report.stale_holds = holds
                 .into_iter()
                 .filter(|h| {
-                    let over = h.held_secs.unwrap_or(0) > DEFAULT_TTL_SECS as i64;
+                    let over = h.held_secs.unwrap_or(0) > h.ttl_secs as i64;
                     let lapsed = h.closed_by.as_deref() == Some("expired");
                     (over || lapsed) && h.renewals == 0
                 })
@@ -707,10 +750,7 @@ pub fn render_check(r: &CheckReport) -> String {
             "double-win" => {
                 "no overlapping hold windows — no two agents ever held one path at once".to_string()
             }
-            _ => format!(
-                "no holds past {} without a renew",
-                secs(r.ttl_secs.unwrap_or(DEFAULT_TTL_SECS) as i64)
-            ),
+            _ => "no holds ran past their own recorded TTL without a renew".to_string(),
         });
         return out.join("\n");
     }
@@ -747,10 +787,12 @@ pub fn render_check(r: &CheckReport) -> String {
             None => "still open".to_string(),
         };
         out.push(format!(
-            "  {:<40} {:<16} held {:>8}, {} (line {})",
+            "  {:<40} {:<16} held {:>8} vs ttl {:>7}{}, {} (line {})",
             h.path,
             h.agent,
             h.held_secs.map(secs).unwrap_or_else(|| "?".to_string()),
+            secs(h.ttl_secs as i64),
+            if h.ttl_assumed { "*" } else { " " },
             ended,
             h.opened_line
         ));
@@ -763,12 +805,21 @@ pub fn render_check(r: &CheckReport) -> String {
         // number that depends on an arbitrary tolerance is worse than no number.
         // Holds sharing an agent and a duration are almost certainly one acquire;
         // the reader can see that from the rows.
+        let assumed = r.stale_holds.iter().filter(|h| h.ttl_assumed).count();
+        if assumed > 0 {
+            out.push(format!(
+                "  * {assumed} hold(s) predate pact recording a TTL per event; judged against the \
+                 {}s default of that era, not today's.",
+                LEGACY_DEFAULT_TTL_SECS
+            ));
+        }
+        out.push(String::new());
         out.push(format!(
-            "{} hold(s) ran past the {} TTL without a single renew. Rows sharing an agent and a\n\
+            "{} hold(s) ran past their OWN recorded TTL without a single renew. Rows sharing an agent and a\n\
              duration are one `lease acquire` that named several paths. The protocol says a long\n\
              task must not outlive its lease, and `pact lease renew` refreshes it — a lapsed lease\n\
              is reclaimable by anyone, so each of these is a window where a peer could have taken\n\
-             a path its holder still believed it owned.",
+             a path its holder still believed it owned. (The current default is {}.)",
             r.stale_holds.len(),
             secs(r.ttl_secs.unwrap_or(DEFAULT_TTL_SECS) as i64)
         ));
@@ -984,6 +1035,79 @@ mod tests {
 
     /// A lease that lapsed is the same smell already realised, whatever its
     /// duration.
+    fn ev_ttl(at: &str, agent: &str, kind: &str, path: &str, ttl: u64) -> String {
+        format!(
+            r#"{{"at":"{at}","agent":"{agent}","kind":"{kind}","path":"{path}","ttl_secs":{ttl}}}"#
+        )
+    }
+
+    /// The assertion that makes raising the default safe. Each hold is judged
+    /// against the TTL IT recorded, so a hold taken under a short TTL stays a
+    /// finding no matter what the binary is compiled with — and one taken under a
+    /// long TTL is not a finding even though it ran longer.
+    #[test]
+    fn a_hold_is_judged_against_its_own_recorded_ttl_not_the_compiled_default() {
+        let tmp = with_log(&[
+            // 30 min under a 10 min TTL: over its own, and would ALSO be over a
+            // 900s default — so this row alone would not prove anything.
+            &ev_ttl("2026-08-01T10:00:00Z", "short", "acquired", "a.rs", 600),
+            &ev_ttl("2026-08-01T10:30:00Z", "short", "released", "a.rs", 600),
+            // 30 min under a 2 hour TTL: LONGER than the old 900s default, and
+            // still not a finding, because its own TTL covered it. Under a
+            // hardcoded threshold this would be reported.
+            &ev_ttl("2026-08-01T11:00:00Z", "generous", "acquired", "b.rs", 7200),
+            &ev_ttl("2026-08-01T11:30:00Z", "generous", "released", "b.rs", 7200),
+        ]);
+        let r = run_check(tmp.path(), Check::StaleHolds, None, false).unwrap();
+        assert_eq!(r.findings(), 1, "only the hold that outran its own TTL");
+        assert_eq!(r.stale_holds[0].agent, "short");
+        assert_eq!(r.stale_holds[0].ttl_secs, 600);
+        assert!(!r.stale_holds[0].ttl_assumed);
+    }
+
+    /// Events written before pact recorded a TTL are judged against the default of
+    /// THEIR era, not today's. Without this, raising the default would silently
+    /// clear every historical finding — 22 of them in this repository — with
+    /// nothing having changed about the holds.
+    #[test]
+    fn holds_with_no_recorded_ttl_use_the_legacy_default() {
+        let tmp = with_log(&[
+            // 20 minutes, no ttl_secs: over the 900s of its era, under a 2700s
+            // present-day default.
+            &ev("2026-08-01T10:00:00Z", "historic", "acquired", "a.rs"),
+            &ev("2026-08-01T10:20:00Z", "historic", "released", "a.rs"),
+        ]);
+        let r = run_check(tmp.path(), Check::StaleHolds, None, false).unwrap();
+        assert_eq!(
+            r.findings(),
+            1,
+            "a pre-recording hold must still be judged against 900s"
+        );
+        let h = &r.stale_holds[0];
+        assert_eq!(h.ttl_secs, LEGACY_DEFAULT_TTL_SECS);
+        assert!(
+            h.ttl_assumed,
+            "and the report must say the TTL was inferred"
+        );
+        let text = render_check(&r);
+        assert!(text.contains("predate pact recording a TTL"), "{text}");
+    }
+
+    /// A renew that grants a different TTL moves the window's threshold with it.
+    #[test]
+    fn a_renew_updates_the_ttl_the_hold_is_judged_against() {
+        let tmp = with_log(&[
+            &ev_ttl("2026-08-01T10:00:00Z", "a", "acquired", "a.rs", 600),
+            // Renewed onto a much longer TTL, so the 30-minute hold is covered.
+            &ev_ttl("2026-08-01T10:05:00Z", "a", "renewed", "a.rs", 7200),
+            &ev_ttl("2026-08-01T10:30:00Z", "a", "released", "a.rs", 7200),
+        ]);
+        let r = run_check(tmp.path(), Check::StaleHolds, None, false).unwrap();
+        // Renewals also disqualify it, which is the pre-existing rule; the point
+        // here is that the recorded TTL followed the renew.
+        assert_eq!(r.findings(), 0);
+    }
+
     #[test]
     fn a_lapsed_lease_is_a_stale_hold_even_if_short() {
         let tmp = with_log(&[

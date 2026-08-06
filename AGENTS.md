@@ -180,11 +180,14 @@ this protocol whenever you touch shared files or hand off work to others.
   evidence log, your own scratch dir) — nobody else writes it, so it needs no
   lease. Anything else: lease it. Leases are advisory, not enforced by the
   filesystem; respect them anyway.
-- **Keep a lease alive, then let it all go**: a lease lasts `--ttl` seconds
-  (default 900) and `pact lease renew <path>` refreshes it — a long task must
-  not outlive its lease. `pact lease release <path>` frees one file, `pact
-  lease release --all` frees everything you hold in a single call, so nothing
-  gets half-forgotten. Release before you report yourself finished, not after.
+- **Let it all go when you are done**: the default lease is 45 minutes; for
+  genuinely longer work, acquire with `--ttl` or `pact lease renew <path>`. That
+  default is measured, not guessed — `pact audit` put the p90 hold at 24 minutes
+  and the longest ever at 36, against one renewal in the entire history. So most
+  work never needs to think about the TTL at all. `pact lease release <path>`
+  frees one file, `pact lease release --all` frees everything you hold in a
+  single call, so nothing gets half-forgotten. Release before you report
+  yourself finished, not after.
 - **Ask whose file it is before you touch it, and hand it back by name**:
   `pact agents --for <path>` names the last agent to act on a path even after
   they released it and exited, and `pact lease acquire` tells you the same

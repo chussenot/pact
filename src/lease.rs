@@ -12,7 +12,38 @@ use crate::otel;
 use crate::output::exit_with;
 use crate::repo::pact_dir;
 
-pub const DEFAULT_TTL_SECS: u64 = 900;
+/// Default lease lifetime: 45 minutes.
+///
+/// **Calibrated from fleet telemetry on 2026-08-06**, not chosen. `pact audit` over
+/// this repository's own 147 preserved events (20 agents, 67 completed holds, six
+/// synthetic events excluded by annotation) measured:
+///
+/// | | seconds | |
+/// |---|---|---|
+/// | median hold | 842 | 14m2s |
+/// | p90 hold | 1455 | 24m15s |
+/// | longest hold | 2166 | 36m6s |
+///
+/// With **1 renewal in 147 events**. The old default was 900s, so the p90 hold ran
+/// 9 minutes past expiry and the longest ran 21 minutes past, each of them
+/// reclaimable by any peer while its holder was still working. Renewing is what the
+/// protocol asks for and the data says agents do not do it — once, ever. So the
+/// tool adapts to measured behaviour rather than demanding ceremony that is
+/// demonstrably skipped, which is the same call the claim-skip change made.
+///
+/// 2700 sits 1.85x the measured p90 and 1.25x the longest hold ever recorded here:
+/// enough headroom that the next long task is covered, not so much that an
+/// abandoned lease sits unreclaimable for an hour.
+///
+/// **One honest caveat about the evidence.** In that whole history there are
+/// **zero** expiry events: holds did exceed the TTL, but no peer ever actually
+/// reclaimed one. So this fixes a demonstrated exposure window rather than a
+/// demonstrated collision — the risk was real, nothing had yet exploited it.
+///
+/// Recalibrating is now a measurement rather than a guess: `pact audit` prints the
+/// distribution, and `--check stale-holds` judges each hold against the TTL *it*
+/// recorded, so changing this constant cannot rewrite the past.
+pub const DEFAULT_TTL_SECS: u64 = 2700;
 /// Clock-skew tolerance: a lease is only considered expired past `ttl + GRACE_SECS`.
 pub const GRACE_SECS: i64 = 30;
 
@@ -453,7 +484,22 @@ fn verify_own_lease(lock_path: &Path, agent: &str, acquired_at: &str) -> Result<
 /// Infallible on purpose: `events::append` swallows its own I/O errors, and
 /// this returns `()`, so no lease operation can ever fail *because* logging
 /// failed. A missing line in the feed is cheaper than a refused claim.
-fn log_event(repo_root: &Path, agent: &str, kind: &str, path: &str, detail: Option<String>) {
+/// `ttl_secs` is the TTL of the lease this event is ABOUT — the incoming holder's
+/// for an acquire or steal, the departing holder's for a release or expiry.
+///
+/// Recorded because `pact audit --check stale-holds` has to judge a hold against
+/// the TTL that was in force when it was taken, not against whatever the binary
+/// happens to be compiled with. Without it, raising the default silently
+/// reclassifies history: the 900s-era holds in this repo top out at 36m, so under
+/// a 45m default every one of them would quietly stop being a finding.
+fn log_event(
+    repo_root: &Path,
+    agent: &str,
+    kind: &str,
+    path: &str,
+    detail: Option<String>,
+    ttl_secs: u64,
+) {
     events::append(
         repo_root,
         &events::Event {
@@ -464,6 +510,7 @@ fn log_event(repo_root: &Path, agent: &str, kind: &str, path: &str, detail: Opti
             detail,
             // Lease events never annotate; only a hand-written
             // correction does. See audit::ANNOTATION_KIND.
+            ttl_secs: Some(ttl_secs),
             covers_lines: None,
             actor: None,
         },
@@ -771,6 +818,7 @@ fn acquire_inner(
                 "acquired",
                 &relative,
                 new_lease.note.clone(),
+                new_lease.ttl_secs,
             );
             count_transition("acquired");
             Ok(AcquireOutcome {
@@ -800,6 +848,8 @@ fn acquire_inner(
                         "lease lapsed (ttl {}s), taken over by {agent}",
                         existing.ttl_secs
                     )),
+                    // The DEAD holder's ttl: this row closes their window.
+                    existing.ttl_secs,
                 );
                 // Reported as `stolen` by AcquireOutcome, so logged as "stolen"
                 // too — but the detail says *why*, because taking over a dead
@@ -813,6 +863,8 @@ fn acquire_inner(
                         "took over expired lease of {} (ttl {}s)",
                         existing.agent, existing.ttl_secs
                     )),
+                    // The NEW holder's ttl: this row opens their window.
+                    new_lease.ttl_secs,
                 );
                 count_transition("expired");
                 record_hold(&existing, "expired");
@@ -831,6 +883,7 @@ fn acquire_inner(
                     "renewed",
                     &relative,
                     new_lease.note.clone(),
+                    new_lease.ttl_secs,
                 );
                 count_transition("renewed");
                 Ok(AcquireOutcome {
@@ -853,6 +906,7 @@ fn acquire_inner(
                         "displaced live holder {} via --steal",
                         existing.agent
                     )),
+                    new_lease.ttl_secs,
                 );
                 count_transition("stolen");
                 record_hold(&existing, "stolen");
@@ -1037,13 +1091,21 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                 "force-released",
                 &relative,
                 Some(format!("destroyed live claim of {holder}")),
+                existing.ttl_secs,
             );
             count_transition("force_released");
             record_hold(&existing, "force_released");
         }
         None => {
             record_hold(&existing, "released");
-            log_event(repo_root, agent, "released", &relative, existing.note);
+            log_event(
+                repo_root,
+                agent,
+                "released",
+                &relative,
+                existing.note,
+                existing.ttl_secs,
+            );
             count_transition("released");
         }
     }
@@ -1083,6 +1145,7 @@ fn collect_expired(repo_root: &Path, lock_path: &Path, lease: &LeaseInfo) {
                 "lease lapsed (ttl {}s), lock collected",
                 lease.ttl_secs
             )),
+            lease.ttl_secs,
         );
     }
 }
@@ -1177,7 +1240,14 @@ fn renew_fs(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
         ..existing
     };
     write_lease_atomic(&lock_path, &renewed)?;
-    log_event(repo_root, agent, "renewed", &relative, renewed.note.clone());
+    log_event(
+        repo_root,
+        agent,
+        "renewed",
+        &relative,
+        renewed.note.clone(),
+        renewed.ttl_secs,
+    );
     count_transition("renewed");
     Ok(renewed)
 }

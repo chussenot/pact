@@ -52,6 +52,16 @@ pub struct Event {
     pub path: Option<String>,
     /// Free text: the lease note, the displaced holder, etc.
     pub detail: Option<String>,
+    /// The TTL, in seconds, of the lease this event is about.
+    ///
+    /// `None` for events written before pact recorded it, which is why the field
+    /// is optional rather than defaulted to the current constant: `pact audit`
+    /// must be able to tell "this hold had a 900s TTL" from "this hold's TTL is
+    /// unknown, assume the default of the era". Defaulting here would erase that
+    /// distinction and make every historical hold look like it had whatever TTL
+    /// the reading binary was compiled with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
     /// `kind: "annotation"` only — the 1-based line numbers this annotation
     /// marks as not-real-history.
     ///
@@ -303,6 +313,7 @@ mod tests {
             kind: kind.into(),
             path: Some(path.into()),
             detail: None,
+            ttl_secs: None,
             // Lease events never annotate; only a hand-written
             // correction does. See audit::ANNOTATION_KIND.
             covers_lines: None,

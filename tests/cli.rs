@@ -378,10 +378,22 @@ fn row(stdout: &str, path: &str) -> Vec<String> {
 #[test]
 fn lease_ls_shows_age_and_a_state_label_per_lease() {
     let tmp = init_repo();
+    // Explicit `--ttl`, not the default. This test is about the active → stale →
+    // expired state machine, and the backdates below are chosen relative to the
+    // TTL; pinning it means recalibrating DEFAULT_TTL_SECS from telemetry cannot
+    // turn this red for a reason that has nothing to do with what it asserts.
     assert_ok(&pact(
         tmp.path(),
         "agent-a",
-        &["lease", "acquire", "fresh.txt", "stale.txt", "dead.txt"],
+        &[
+            "lease",
+            "acquire",
+            "fresh.txt",
+            "stale.txt",
+            "dead.txt",
+            "--ttl",
+            "900",
+        ],
     ));
     backdate(tmp.path(), "stale.txt", 910); // past ttl, inside the grace window
     backdate(tmp.path(), "dead.txt", 5000); // past ttl + grace
