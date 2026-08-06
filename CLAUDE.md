@@ -79,7 +79,7 @@ Invariants worth knowing, because each was broken at least once:
 is, the non-goals, provenance. Every *how* lives in `docs/`: `install.md`,
 `cli.md` (the command/exit-code contract), `onboarding.md`, `leases.md`,
 `messaging.md`, `architecture.md`, `mcp.md`, `tui.md`, `telemetry.md`,
-`development.md`, `testing.md`, `mascot-animations.md`.
+`development.md`, `testing.md`, `audit.md`, `mascot-animations.md`.
 
 Keep it that way. `scripts/check-docs.sh` (part of `mise run check`) compares
 `docs/cli.md`'s `Commands` block against the built binary in both directions,

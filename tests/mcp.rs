@@ -192,12 +192,16 @@ fn every_tool_call_leaves_the_repository_byte_identical() {
             ),
             call(5, "pact_doctor", serde_json::json!({})),
             call(6, "pact_events_tail", serde_json::json!({"limit": 100})),
+            // The sixth tool reads the whole event log, so it is exactly the kind
+            // of addition that could start creating `.pact/` on a read.
+            call(7, "pact_audit_summary", serde_json::json!({})),
+            call(8, "pact_audit_summary", serde_json::json!({"since": "30d"})),
         ],
     );
 
     assert_eq!(code, 0, "stdin EOF must be a clean exit");
-    // Six requests, one notification: six responses.
-    assert_eq!(responses.len(), 6, "got {responses:#?}");
+    // Eight requests, one notification: eight responses.
+    assert_eq!(responses.len(), 8, "got {responses:#?}");
 
     let by_id = |id: u64| {
         responses
@@ -208,7 +212,10 @@ fn every_tool_call_leaves_the_repository_byte_identical() {
 
     assert_eq!(by_id(1)["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(by_id(1)["result"]["serverInfo"]["name"], "pact");
-    assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 5);
+    // Pinned so a tool cannot be added without the read-only proof below covering
+    // it: the byte-identical assertion is what makes a new tool safe, and an
+    // unpinned count would let one slip in untested.
+    assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 6);
 
     // The lease we planted, seen through MCP: holder, path and note.
     let leases = &by_id(3)["result"]["structuredContent"]["leases"];

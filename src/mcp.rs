@@ -7,8 +7,8 @@
 //! watching a fleet, or a dashboard agent whose only tool surface is MCP, has
 //! no way to ask "who holds what, and is anyone blocked" without a human
 //! relaying it — the exact failure mode `pact msg` exists to remove one level
-//! up. `pact mcp serve` gives those observers the five questions and nothing
-//! else.
+//! up. `pact mcp serve` gives those observers a fixed set of questions and
+//! nothing else.
 //!
 //! ## Why it is read-only, and why that is not a limitation
 //!
@@ -77,7 +77,7 @@
 //! `initialize` request selects legacy, and everything else follows whichever
 //! the current request declared.
 //!
-//! What the tools return does not change between eras — the five names, their
+//! What the tools return does not change between eras — the tool names, their
 //! schemas and their JSON are era-independent, so all of this is envelope.
 //!
 //! Version handling, in both directions:
@@ -112,7 +112,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde_json::{json, Map, Value};
 
-use crate::{beads, doctor, events, lease, msg, otel, output};
+use crate::{audit, beads, doctor, events, lease, msg, otel, output};
 
 /// The revision we advertise when the client asks for something we do not know.
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -299,6 +299,32 @@ const TOOLS: &[Tool] = &[
              current, whether a Beads backend is on PATH, and whether the protocol files would \
              survive a clone. Checks only inspect; none of them repairs anything.",
         schema: no_args,
+    },
+    Tool {
+        name: "pact_audit_summary",
+        title: "Coordination history summary",
+        description: "Read-only. Analyses this repository's whole coordination history from the \
+             lease event log and returns aggregates: event counts by kind, the distinct agents, \
+             the time span covered, the most contended paths (which paths several different \
+             agents took, not merely the busiest), hold-time distribution as median/p90/max, the \
+             steal count, and per-agent activity. This is `pact audit`, and it answers the \
+             questions a tail of the log cannot — whether one file is a bottleneck for the whole \
+             fleet, whether anyone holds leases far longer than their peers. Reads only pact's own \
+             `.pact/` directory and never the Beads store. The named checks that can FAIL \
+             (`--check double-win`, `--check stale-holds`) are CLI-only: they exit non-zero to \
+             report a finding, which is a contract a tool result cannot express.",
+        schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "since": {
+                        "type": "string",
+                        "description": "Only events at or after this point: an RFC3339 timestamp, or a duration back from now such as 90m, 24h, 7d, 2w. Omit for the whole history.",
+                    }
+                },
+                "additionalProperties": false,
+            })
+        },
     },
     Tool {
         name: "pact_events_tail",
@@ -541,7 +567,7 @@ impl Server {
         //
         // `tool.name` and not the `name` off the wire, and the compiler is what
         // insists: `Span::set` takes `&'static str`, so the only strings that can
-        // reach it are the five literals in `TOOLS`. An unbounded attribute is
+        // reach it are the literals in `TOOLS`. An unbounded attribute is
         // not merely discouraged here, it does not typecheck.
         let mut span = otel::span("mcp tools/call");
         span.set("pact.mcp.tool", tool.name);
@@ -602,6 +628,15 @@ impl Server {
                 )?)
             }
             "pact_doctor" => Ok(serde_json::to_value(doctor::checks(&self.root))?),
+            // Reads `.pact/events.jsonl` only, like every other tool here — and
+            // creates nothing, which the read-only invariant test covers.
+            "pact_audit_summary" => {
+                let since = match args.get("since").and_then(Value::as_str) {
+                    Some(s) => Some(audit::parse_since(s)?),
+                    None => None,
+                };
+                Ok(serde_json::to_value(audit::summary(&self.root, since)?)?)
+            }
             "pact_events_tail" => {
                 // Clamped, not refused: a model that asks for 10_000 wants "as
                 // much as I can have", and an error teaches it nothing it can
@@ -845,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_reports_the_five_tools_with_schemas() {
+    fn tools_list_reports_every_tool_with_a_schema() {
         let r = respond(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
         let tools = r["result"]["tools"].as_array().expect("tools array");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -856,6 +891,7 @@ mod tests {
                 "pact_msg_inbox",
                 "pact_msg_thread",
                 "pact_doctor",
+                "pact_audit_summary",
                 "pact_events_tail"
             ]
         );
@@ -1026,7 +1062,7 @@ mod tests {
         assert_eq!(listing["result"]["resultType"], "complete");
         assert_eq!(listing["result"]["ttlMs"], CACHE_TTL_MS);
         assert_eq!(listing["result"]["cacheScope"], "public");
-        assert_eq!(listing["result"]["tools"].as_array().map(Vec::len), Some(5));
+        assert_eq!(listing["result"]["tools"].as_array().map(Vec::len), Some(6));
 
         let legacy = respond(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
         assert!(legacy["result"]["resultType"].is_null());
@@ -1159,6 +1195,7 @@ mod tests {
             ("pact_events_tail", json!({})),
             ("pact_msg_inbox", json!({"agent": "someone"})),
             ("pact_msg_thread", json!({"id": "pact-1"})),
+            ("pact_audit_summary", json!({})),
         ];
         for (name, args) in calls {
             let r = respond(&format!(
@@ -1266,6 +1303,7 @@ mod tests {
             ("pact_msg_inbox", "pact msg inbox"),
             ("pact_msg_thread", "pact msg read"),
             ("pact_events_tail", "pact log"),
+            ("pact_audit_summary", "pact audit"),
         ] {
             let tool = TOOLS.iter().find(|t| t.name == name).unwrap();
             assert!(

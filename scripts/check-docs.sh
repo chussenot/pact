@@ -73,7 +73,15 @@ walk() {
 		"Commands:") section=cmd; continue ;;
 		"Options:") section=opt; continue ;;
 		"Arguments:") section=arg; continue ;;
-		"") section=""; continue ;;
+		# A blank line ends the Commands list but NOT the Options list, because clap
+		# has two help layouts and picks between them on its own: a short doc
+		# comment gives the compact "flag  description" form, while a long one
+		# (several paragraphs, as `pact audit` has) gives an expanded form with a
+		# blank line between every option. Resetting on blank lines meant the
+		# expanded form was read as one flag followed by nothing — `pact audit`'s
+		# --check and --since were reported as documented-but-nonexistent while
+		# both were right there in --help.
+		"") [ "$section" = opt ] || section=""; continue ;;
 		esac
 		[ "$section" = cmd ] || [ "$section" = opt ] || continue
 

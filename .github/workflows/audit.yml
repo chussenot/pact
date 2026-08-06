@@ -1,0 +1,144 @@
+name: Self-audit
+
+# pact audits its own coordination history, weekly.
+#
+# The event log is committed (see docs/architecture.md), so this repository
+# carries a real record of how its own fleets behaved — and the checks that read
+# it are worth running against it continuously rather than when somebody
+# remembers. `--check double-win` in particular is the detector for the
+# guard-file backlog item (pact-ehi), whose written trigger condition is
+# "implement the guard file if and only if a double-win appears in a real events
+# log". This is what makes that condition machine-checked instead of aspirational.
+#
+# Scheduled and NOT on pull requests. It reads committed history, so a PR cannot
+# change what it finds unless the PR itself commits events — and a check whose
+# result does not depend on the diff has no business blocking the diff. It also
+# needs no Beads CLI and no network: audit reads `.pact/` and nothing else.
+
+on:
+  schedule:
+    # Monday 05:41 UTC. Off the hour because scheduled runs cluster there; early
+    # in the week so a finding has the week to be acted on.
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  # The report job asks the API which check failed. An explicit permissions block
+  # denies everything not listed, so without this that call 403s.
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      # Both checks always run. "stale-holds found something, double-win did not"
+      # is a completely different situation from the reverse, and fail-fast would
+      # hide whichever came second.
+      fail-fast: false
+      matrix:
+        check: [double-win, stale-holds]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The whole history, because that is the subject. A shallow checkout
+          # would still carry the current events.jsonl, but `--since` windows and
+          # any future check that correlates with commits need the real thing.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch tip — pins the ACTION, not the toolchain; Rust stays current because the action installs whatever stable is at run time
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - run: cargo build --quiet
+
+      # The summary is informational and always exits 0, so it is logged
+      # unconditionally: when a check does fire, the surrounding shape of the
+      # history is the first thing anybody will want.
+      - name: Summary
+        run: ./target/debug/pact audit
+
+      - name: Check ${{ matrix.check }}
+        id: check
+        run: |
+          set -euo pipefail
+          # 0 clean, 1 findings, anything else is audit itself failing — which is
+          # a different problem and must not be reported as a finding.
+          rc=0
+          ./target/debug/pact audit --check "${{ matrix.check }}" | tee /tmp/audit.txt || rc=$?
+          ./target/debug/pact audit --check "${{ matrix.check }}" --json >/tmp/audit.json 2>/dev/null || true
+          if [ "$rc" -gt 1 ]; then
+            echo "::error::pact audit exited $rc — the command failed rather than finding something"
+            exit "$rc"
+          fi
+          echo "findings=$rc" >>"$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: Upload findings
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: audit-${{ matrix.check }}
+          path: |
+            /tmp/audit.txt
+            /tmp/audit.json
+            .pact/events.jsonl
+          if-no-files-found: warn
+          retention-days: 90
+
+  report:
+    needs: audit
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Open or update the self-audit issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          CHECKS="$(gh api "repos/$REPO/actions/runs/${{ github.run_id }}/jobs" \
+            --jq '.jobs[] | select(.conclusion == "failure") | .name' | paste -sd', ' || echo unknown)"
+          export CHECKS
+          # Built in python: the body has backticks and an apostrophe, and in an
+          # expanding shell context those become command substitution and
+          # quote-soup. A report step that executes fragments of its own prose is
+          # a bad way to discover that.
+          python3 - <<'PATCH'
+          import os, pathlib
+          body = f"""**failing checks:** {os.environ['CHECKS']}
+          **run:** {os.environ['RUN_URL']}
+
+          `pact audit` found something in this repository's own committed
+          coordination history. The findings are attached to the failing job as
+          artifacts.
+
+          | check | what a finding means |
+          | --- | --- |
+          | `double-win` | two agents held one path at once. This is the **written trigger condition** for the guard-file backlog item (pact-ehi), which says to implement the guard file if and only if a double-win appears in a real events log. Attach the forensics to that bead — it is the evidence it has been waiting for, and the reason not to implement on suspicion. |
+          | `stale-holds` | leases ran past their TTL with no renew. A protocol-adherence finding about the agents rather than a defect in pact: they held paths their leases no longer covered. |
+
+          If `audit` exited with something other than 0 or 1, the command itself
+          failed and this is not a finding at all — see the run log.
+          """
+          pathlib.Path("/tmp/body.md").write_text(
+              "\n".join(l[10:] if l.startswith(" " * 10) else l for l in body.splitlines()) + "\n"
+          )
+          PATCH
+          BODY="$(cat /tmp/body.md)"
+
+          EXISTING="$(gh issue list --label self-audit --state open --limit 1 --json number -q '.[0].number' || true)"
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+            echo "commented on existing self-audit issue #$EXISTING"
+          else
+            gh label create self-audit --description "Weekly pact audit of pact's own history" --color 0E8A16 2>/dev/null || true
+            gh issue create --title "pact audit found something" --label self-audit --body "$BODY"
+          fi

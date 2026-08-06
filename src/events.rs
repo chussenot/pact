@@ -244,16 +244,40 @@ pub fn actors(repo_root: &Path) -> Result<Vec<(String, String, usize)>> {
 
 /// The whole log, oldest-first. `recent` is this truncated to a limit.
 fn all(repo_root: &Path) -> Result<Vec<Event>> {
+    Ok(numbered(repo_root)?.0.into_iter().map(|(_, e)| e).collect())
+}
+
+/// Every event paired with its 1-based line number, plus how many lines could not
+/// be parsed at all.
+///
+/// The line number **is** the event id. Events carry no identifier of their own,
+/// and inventing one would mean rewriting a log whose only virtue is being
+/// append-only — whereas "line 47 of .pact/events.jsonl" is stable for a given
+/// file and a human can go and look at it.
+///
+/// Unparseable lines are counted rather than discarded silently. An append-only
+/// log gets cut mid-write, so a truncated final line is expected rather than
+/// corrupt; `pact audit` reports the count so a reader can tell "the log has a
+/// torn tail" from "the log is full of junk".
+pub(crate) fn numbered(repo_root: &Path) -> Result<(Vec<(usize, Event)>, usize)> {
     let path = events_file_path(repo_root);
     let contents = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    Ok(contents
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect())
+    let mut out = Vec::new();
+    let mut skipped = 0;
+    for (i, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Event>(line) {
+            Ok(e) => out.push((i + 1, e)),
+            Err(_) => skipped += 1,
+        }
+    }
+    Ok((out, skipped))
 }
 
 #[cfg(test)]

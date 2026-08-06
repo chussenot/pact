@@ -287,6 +287,54 @@ cog's.
 
 ## Notes — unreleased
 
+### Added — `pact audit`, and two of the numbers that motivated it were wrong
+
+- **`pact audit`** reads `.pact/events.jsonl` and answers what a tail of the log
+  cannot: which paths several different agents took, how hold times are
+  distributed, who holds longest — and two named checks that can fail.
+  `--check double-win` reports two agents holding one path at once;
+  `--check stale-holds` reports leases held past their TTL with no renew. Exit 0
+  clean, 1 findings, reusing the documented codes rather than inventing one: a
+  finding is a result, not a usage error and not a lease conflict.
+- **Why `double-win` in particular.** The guard-file backlog item (pact-ehi) says
+  to implement the guard file *if and only if* a double-win appears in a real
+  events log. That was a falsifiable claim with no detector, which makes it a
+  claim nobody can act on and an invitation to build the guard file on suspicion.
+  The bead names the command and the command's `--help` names the bead. Run
+  against pact's own 153 preserved events it finds nothing, so the trigger has
+  **not** fired — which is now a measured statement rather than an absence of
+  complaints.
+- **Reads `.pact/` and nothing else**, and the restraint is the point. pact never
+  touches the Beads store directly, only the CLI, and an analytics command is
+  exactly where that invariant would be convenient to break because the data is
+  sitting in a JSONL file. Beads-side questions live in
+  `scripts/beads-retro.sh`, which is best-effort, jq-based, and says so in its
+  header. No new dependencies: line-by-line `serde_json`, tolerant of unknown
+  event kinds and of the torn final line an append-only log gets when it is cut
+  mid-write.
+- **Two of the three findings that motivated this did not survive measurement**,
+  which was worth more than the feature. "Zero preserved lease history" was true
+  and is fixed. "~30% dangling commit hashes" was an artefact of the regex: 9 of
+  17 candidates were not commit references at all — UUID fragments, session-id
+  pieces, a bd version hash, trace ids — and most of the genuine remainder are
+  deliberate citations of *another* repository, which cannot resolve here and
+  should not. Filtered properly it is 0 of 15. "87% claim skip" is not measurable
+  in either direction: bd 1.1.2 writes a status interaction **only on close**, so
+  a claim leaves no trace and the figure reads 100% for every repository whatever
+  anybody did. An early cut of `beads-retro.sh` shipped that number before the
+  check was run, and removing it is the honest outcome — a metric that returns the
+  same answer regardless of the behaviour it measures is worse than none, because
+  it looks like evidence.
+- `scripts/fleet-verify.sh` now calls `pact audit --check double-win --json`
+  instead of carrying 40 lines of jq. Two implementations of one invariant is one
+  too many: the jq copy would have had to independently know that `expired` is
+  logged under the dead holder's name, that a re-entrant acquire is a refresh
+  rather than a second window, and that a `--steal` over a live lease is an
+  overlap while a reclaim after expiry is not. A weekly workflow runs both checks
+  against this repository's own committed history, and `pact_audit_summary` is a
+  sixth read-only MCP tool covered by the same byte-identical read-only proof as
+  the other five.
+
 ### Added — worktrees share one coordination space, because advisory locks must
 
 - **Every `git worktree` of a repository now shares a single `.pact/`**: leases,

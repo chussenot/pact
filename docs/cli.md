@@ -27,6 +27,7 @@ pact msg sent
 pact msg read <id>
 pact log [-n | --limit <count>]
 pact doctor
+pact audit [--check <double-win|stale-holds>] [--since <rfc3339|duration>]
 pact ui
 pact mcp serve
 ```
@@ -57,7 +58,7 @@ scripted caller can see whose claim a `--force` destroyed.
 | Code | Meaning |
 |------|---------|
 | 0 | success |
-| 1 | generic error |
+| 1 | generic error — and `pact audit --check …` found something (a finding is a result, not a fault) |
 | 2 | lease held by another agent (or you don't hold the lease you're releasing) |
 | 3 | Beads CLI (`bd` or `br`) not found on `PATH` |
 | 4 | not in a git repository |

@@ -143,6 +143,7 @@ fi
 step "no double-win (two agents holding one path at once)"
 EVENTS="$REPO/.pact/events.jsonl"
 FINDINGS="$RUN_DIR/double-wins.json"
+FINDINGS_RAW="$RUN_DIR/audit-double-win.json"
 if [ "$IS_NO_LEASE" -eq 1 ]; then
 	# No leases were taken, so there are no hold windows to overlap. Skipped
 	# rather than failed: a missing event log is the definition of this mode.
@@ -157,35 +158,32 @@ elif [ "$IS_SCOPE_LOCAL" -eq 1 ]; then
 elif [ ! -f "$EVENTS" ]; then
 	problem "no event log at $EVENTS — nothing to reconstruct"
 else
-	# Tolerant of a truncated final line: an append-only log can be cut mid-write.
-	jq -sR '
-		split("\n") | map(select(length > 0))
-		| map(. as $l | try fromjson catch empty)
-		| map(select(.path != null))
-		| group_by(.path)
-		| map(
-			sort_by(.at)
-			| reduce .[] as $e ({open: {}, found: []};
-				if ($e.kind == "acquired" or $e.kind == "stolen") then
-					(if ((.open | keys | map(select(. != $e.agent)) | length) > 0)
-					 then .found += [{
-						path: $e.path,
-						at: $e.at,
-						incoming: $e.agent,
-						incoming_kind: $e.kind,
-						already_holding: (.open | to_entries | map({agent: .key, since: .value})),
-						detail: $e.detail
-					 }]
-					 else . end)
-					| .open[$e.agent] = $e.at
-				elif ($e.kind == "released" or $e.kind == "force-released" or $e.kind == "expired") then
-					.open |= del(.[$e.agent])
-				else . end)
-			| .found)
-		| flatten
-	' "$EVENTS" >"$FINDINGS" 2>/dev/null || echo '[]' >"$FINDINGS"
+	# `pact audit --check double-win --json`, not a jq reimplementation of it.
+	# This scan used to live here as 40 lines of jq, and two implementations of one
+	# invariant is one too many: the jq copy would have had to learn on its own
+	# that `expired` is logged under the DEAD holder's name, that a re-entrant
+	# acquire is a refresh rather than a second window, and that a `--steal` over a
+	# live lease IS an overlap while a reclaim after expiry is not. All four are in
+	# src/audit.rs with tests; keeping a second copy in shell means keeping a second
+	# copy of every one of those decisions correct.
+	#
+	# It also means the harness now exercises the command the guard-file bead
+	# (pact-ehi) names as its trigger detector, so the detector is under test by the
+	# thing most likely to produce a real finding.
+	PACT_AUDIT="$(jq -r .pact "$RUN_DIR/manifest.json")"
+	audit_rc=0
+	(cd "$REPO" && PACT_AGENT=verify "$PACT_AUDIT" audit --check double-win --json) \
+		>"$FINDINGS_RAW" 2>"$RUN_DIR/audit.err" || audit_rc=$?
+	if [ "$audit_rc" -gt 1 ]; then
+		# 0 clean, 1 findings; anything else means audit itself failed, which is a
+		# different problem from a double-win and must not be reported as one.
+		problem "pact audit exited $audit_rc: $(head -2 "$RUN_DIR/audit.err" | tr '\n' ' ')"
+		echo '[]' >"$FINDINGS"
+	else
+		jq '.double_wins' "$FINDINGS_RAW" >"$FINDINGS" 2>/dev/null || echo '[]' >"$FINDINGS"
+	fi
 
-	EVENT_COUNT="$(wc -l <"$EVENTS" | tr -d ' ')"
+	EVENT_COUNT="$(jq -r '.events_scanned // 0' "$FINDINGS_RAW" 2>/dev/null || echo 0)"
 	DW="$(jq 'length' "$FINDINGS")"
 	printf '    events scanned: %s\n    double-wins:    %s\n' "$EVENT_COUNT" "$DW"
 	if [ "$DW" -ne 0 ]; then

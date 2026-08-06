@@ -1,5 +1,6 @@
 mod agents;
 mod agents_md;
+mod audit;
 mod beads;
 mod doctor;
 mod events;
@@ -99,6 +100,24 @@ enum Command {
     },
     /// Check that pact, AGENTS.md, and the Beads CLI are all in a healthy state.
     Doctor,
+    /// Analyse this repo's coordination history in `.pact/events.jsonl`.
+    ///
+    /// Reads only `.pact/` — never the Beads store. Exits 1 when a check finds
+    /// something, 0 when it does not.
+    ///
+    /// `--check double-win` is the detector for the guard-file backlog item
+    /// (pact-ehi), whose written trigger condition is "implement the guard file
+    /// if and only if a double-win appears in a real events log". If this check
+    /// ever exits 1, that output IS the evidence that bead is waiting for.
+    Audit {
+        /// `double-win` or `stale-holds`. Omit for a summary.
+        #[arg(long)]
+        check: Option<String>,
+        /// Only events at or after this point: RFC3339, or a duration back from
+        /// now such as `90m`, `24h`, `7d`, `2w`.
+        #[arg(long)]
+        since: Option<String>,
+    },
     /// Interactive terminal dashboard over leases, messages, and doctor status.
     #[cfg(feature = "ui")]
     Ui,
@@ -335,6 +354,14 @@ fn subcommand_name(command: &Command) -> &'static str {
         },
         Command::Log { .. } => "log",
         Command::Doctor => "doctor",
+        Command::Audit { check, .. } => match check.as_deref() {
+            Some("double-win") => "audit double-win",
+            Some("stale-holds") => "audit stale-holds",
+            // One literal for anything else, including a bad value: the argument
+            // is user text and must never reach a span name.
+            Some(_) => "audit other",
+            None => "audit",
+        },
         #[cfg(feature = "ui")]
         Command::Ui => "ui",
         #[cfg(feature = "mcp")]
@@ -390,6 +417,7 @@ fn run(cli: Cli) -> Result<i32> {
             run_msg(&cwd, cli.agent.as_deref(), cli.json, action).map(|()| 0)
         }
         Command::Log { limit } => run_log(&cwd, cli.json, limit).map(|()| 0),
+        Command::Audit { check, since } => run_audit(&cwd, cli.json, check, since),
         #[cfg(feature = "ui")]
         Command::Ui => {
             let root = repo::find_repo_root(&cwd)?;
@@ -403,6 +431,36 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Mcp { action } => match action {
             McpAction::Serve => mcp::serve(repo::find_repo_root(&cwd)?),
         },
+    }
+}
+
+/// `pact audit`: the summary, or one named check.
+///
+/// Returns the process exit code rather than raising, in the same shape as
+/// `doctor`: a finding is a *result*, not an error, so it must not print
+/// `error:` and must not be confusable with a usage failure. 1 means "the check
+/// found something", which is the documented generic-failure code reused rather
+/// than a new one invented.
+fn run_audit(cwd: &Path, json: bool, check: Option<String>, since: Option<String>) -> Result<i32> {
+    let root = repo::find_repo_root(cwd)?;
+    let since = match since {
+        Some(s) => Some(audit::parse_since(&s)?),
+        None => None,
+    };
+
+    match check {
+        None => {
+            let summary = audit::summary(&root, since)?;
+            output::emit(json, &summary, audit::render_summary);
+            Ok(0)
+        }
+        Some(name) => {
+            let check = audit::Check::parse(&name)?;
+            let report = audit::run_check(&root, check, since)?;
+            output::emit(json, &report, audit::render_check);
+            // The whole point of a named check: a machine can branch on it.
+            Ok(if report.findings() == 0 { 0 } else { 1 })
+        }
     }
 }
 

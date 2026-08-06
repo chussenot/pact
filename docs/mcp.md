@@ -77,9 +77,9 @@ job. `pact_lease_list` uses the non-sweeping read instead, so an expired lease
 can still be reported here after the CLI would have swept it. A dashboard
 polling every few seconds must not be quietly reclaiming other agents' paths.
 
-## The five tools
+## The six tools
 
-All five are read-only, and each says so twice: in the first words of its
+All six are read-only, and each says so twice: in the first words of its
 description, and as machine-readable [tool
 annotations](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)
 a client can filter on without reading prose.
@@ -109,6 +109,7 @@ description.
 | `pact_msg_thread` | one conversation in full, bodies included | `pact msg read <id> --json` |
 | `pact_doctor` | is this repository's pact setup healthy | `pact doctor --json` |
 | `pact_events_tail` | what has happened, newest last | `pact log --json` |
+| `pact_audit_summary` | aggregates over the whole history: contention, hold-time distribution, per-agent activity | `pact audit --json` |
 
 Arguments:
 
@@ -121,14 +122,18 @@ Arguments:
 - `pact_doctor` — none
 - `pact_events_tail` — `limit` (integer, default 50, maximum 500; larger values
   are clamped rather than refused)
+- `pact_audit_summary` — `since` (string, optional: RFC3339 or a duration like
+  `7d`). The named checks (`--check double-win`, `--check stale-holds`) are
+  **CLI-only**: their contract is an exit code, and a tool result cannot express
+  one. See [audit.md](audit.md).
 
 Results carry the JSON twice: once as `structuredContent` and once serialized
 into a text block, which is what the protocol asks of a tool returning structured
 content.
 
-`structuredContent` is always a JSON **object**, so the four tools that answer
-with a list put it under a named key — `leases`, `messages`, `events` — while
-`pact_doctor` already had `{checks, healthy}`:
+`structuredContent` is always a JSON **object**, so the tools that answer with a
+list put it under a named key — `leases`, `messages`, `events` — while
+`pact_doctor` and `pact_audit_summary` are already objects:
 
 ```json
 { "leases": [ { "lease": { "agent": "worker-a", … }, "age_secs": 0, … } ] }
