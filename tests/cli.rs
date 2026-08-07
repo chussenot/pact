@@ -2978,3 +2978,225 @@ fn init_never_exposes_a_truncated_agents_md() {
         .count();
     assert_eq!(strays, 0, "temp files left next to the user's file");
 }
+
+/// Sibling of `init_never_exposes_a_truncated_agents_md`, same harness
+/// (concurrent hammer against the real binary), a different failure mode:
+/// that test's racer left AGENTS.md's own content static, so it could only
+/// catch truncation, never a lost update. This one races a thread that keeps
+/// EDITING AGENTS.md's user-owned prefix — bumping a `revision N` line, via a
+/// temp file + rename so the injected edit is itself a fully atomic write —
+/// concurrently with `pact init`.
+///
+/// `splice_block`'s old read-modify-write read the file once, computed its
+/// replacement in memory, and wrote it back with no lock and no version
+/// check. Pausing between that read and its commit-moment rename (reproduced
+/// live with strace delay injection) let a concurrent write land in between;
+/// the delayed rename then silently overwrote it with the stale copy — a
+/// lost update, made visible here as the revision counter going backwards.
+///
+/// The PRECISE version of that property — a single injected race, zero
+/// timing dependence — is proven deterministically by
+/// `agents_md::tests::write_atomic_cas_never_commits_over_a_write_that_landed_mid_call`,
+/// which is the authoritative acceptance test for this bug (reverting the
+/// fix makes it fail every time; restoring it makes it pass every time).
+/// Reproducing that same precision via wall-clock racing against the
+/// compiled binary was tried at length: `write_atomic_cas`'s own residual
+/// window (a couple of syscalls immediately before the rename — an
+/// acknowledged, inherent property of "recheck, then bounded retry" without
+/// a lock, not a bug) turned out close enough in scale to ordinary
+/// scheduling jitter that no zero-tolerance threshold reliably separated
+/// "the fix is present" from "it never shipped" without flaking — confirmed
+/// empirically, more than once, while writing this test. So the assertion
+/// below is deliberately generous: it treats a couple of distinct
+/// regressions as the fix's known residual, not a failure, while still
+/// catching the unfixed behavior, which reliably produced far more under
+/// this exact harness. This test's real job is the same as its sibling's:
+/// `init`, raced against a stream of real concurrent edits, must never
+/// crash, truncate the file, or duplicate/garble the managed block.
+#[test]
+fn init_survives_a_concurrently_mutating_agents_md() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let tmp = init_repo();
+    assert_ok(&pact(tmp.path(), "setup-agent", &["init", "--no-commit"]));
+    let agents_md = tmp.path().join("AGENTS.md");
+
+    // The user-owned prefix carries a monotonically increasing revision
+    // instead of static text, so the racer is genuinely mutating the file on
+    // every write, not just re-saving the same bytes `init` already knows.
+    fn with_revision(n: u32, block_onward: &str) -> String {
+        format!("# House rules\n\nrevision {n}\n\nkeep it lazy.\n\n{block_onward}")
+    }
+    fn revision_of(body: &str) -> Option<u32> {
+        body.lines()
+            .find_map(|l| l.strip_prefix("revision ")?.trim().parse().ok())
+    }
+    fn block_onward_of(body: &str) -> String {
+        body.find("<!-- pact:begin -->")
+            .map(|i| body[i..].to_string())
+            .unwrap_or_default()
+    }
+
+    let seeded = std::fs::read_to_string(&agents_md).unwrap();
+    std::fs::write(&agents_md, with_revision(0, &block_onward_of(&seeded))).unwrap();
+
+    let done = Arc::new(AtomicBool::new(false));
+
+    let root = tmp.path().to_path_buf();
+    let initter = std::thread::spawn(move || {
+        let mut successes = 0u32;
+        for _ in 0..40 {
+            if let Ok(out) = std::process::Command::new(env!("CARGO_BIN_EXE_pact"))
+                .args(["init", "--no-commit"])
+                .current_dir(&root)
+                .env("PACT_AGENT", "writer-agent")
+                .output()
+            {
+                if out.status.success() {
+                    successes += 1;
+                }
+            }
+        }
+        successes
+    });
+
+    let mutator_root = tmp.path().to_path_buf();
+    let mutator_done = Arc::clone(&done);
+    let mutator = std::thread::spawn(move || {
+        let agents_md = mutator_root.join("AGENTS.md");
+        let mut n = 0u32;
+        while !mutator_done.load(Ordering::Relaxed) {
+            n += 1;
+            if let Ok(current) = std::fs::read_to_string(&agents_md) {
+                let block_onward = block_onward_of(&current);
+                let tmp_path = mutator_root.join(format!(".mutator-tmp-{n}"));
+                if std::fs::write(&tmp_path, with_revision(n, &block_onward)).is_ok() {
+                    let _ = std::fs::rename(&tmp_path, &agents_md);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_micros(500));
+        }
+    });
+
+    // Count DISTINCT lost-update incidents (the revision going backwards),
+    // not every poll that observes one: a reverted value can sit on disk for
+    // several poll iterations before the mutator's next write corrects it,
+    // and counting every such poll would conflate "one incident, observed
+    // repeatedly" with "many incidents" — very different signals.
+    let mut bad = 0usize;
+    let mut max_seen = 0u32;
+    let mut last_seen = 0u32;
+    let mut distinct_regressions = 0usize;
+    while !initter.is_finished() {
+        match std::fs::read_to_string(&agents_md) {
+            // Truncated, or the user's own prefix is gone — same failure
+            // shapes `init_never_exposes_a_truncated_agents_md` checks for,
+            // now under a racer that is actively rewriting the file instead
+            // of leaving it untouched.
+            Ok(body) if body.is_empty() || !body.contains("# House rules") => bad += 1,
+            // Exactly one begin/end marker pair: a duplicated or malformed
+            // block would mean `init`'s "no markers found" branch fired
+            // against a torn or half-updated read instead of the real thing.
+            Ok(body)
+                if body.matches("<!-- pact:begin -->").count() != 1
+                    || body.matches("<!-- pact:end -->").count() != 1 =>
+            {
+                bad += 1;
+            }
+            Ok(body) => {
+                if let Some(rev) = revision_of(&body) {
+                    if rev < max_seen && rev != last_seen {
+                        distinct_regressions += 1;
+                    }
+                    last_seen = rev;
+                    max_seen = max_seen.max(rev);
+                }
+            }
+            Err(_) => bad += 1,
+        }
+    }
+    done.store(true, Ordering::Relaxed);
+    let successes = initter.join().unwrap();
+    mutator.join().unwrap();
+
+    assert_eq!(
+        bad, 0,
+        "observed {bad} truncated, malformed, or missing reads of AGENTS.md while it was \
+         being concurrently edited"
+    );
+    // Zero distinct regressions is the design's goal, but the mechanism is a
+    // compare-and-swap check immediately before the rename, not a lock: a
+    // write that lands in that syscall-scale gap AFTER the check but BEFORE
+    // the rename is a real, acknowledged residual (see write_atomic_cas's
+    // own doc comment, and the deterministic, timing-free proof of the same
+    // property in `agents_md::tests`,
+    // `write_atomic_cas_never_commits_over_a_write_that_landed_mid_call`,
+    // which is the authoritative test for this mechanism). This harness
+    // hammers far harder than any real concurrent edit ever would and can,
+    // rarely, still find that sliver — confirmed empirically while writing
+    // this test, where the unfixed read-modify-write reliably showed far
+    // more distinct regressions than the fix's occasional one or two.
+    assert!(
+        distinct_regressions <= 3,
+        "AGENTS.md's revision went backwards {distinct_regressions} distinct time(s) — more \
+         than the fix's small, acknowledged residual window should produce: `pact init` is \
+         clobbering concurrent edits with a stale read"
+    );
+    assert!(
+        successes > 0,
+        "every `pact init` failed under contention — the retry budget or backoff needs a look"
+    );
+
+    // And no litter beside the file it replaced, matching the sibling test.
+    let strays = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".pact-write"))
+        .count();
+    assert_eq!(strays, 0, "temp files left next to the user's file");
+}
+
+/// The narrow fix for a real past incident (AGENTS.md destroyed via a
+/// symlinked instruction file) only ever excluded a candidate that
+/// canonicalizes to AGENTS.md's OWN path. Nothing distinguished an
+/// intentional symlink (`CLAUDE.md` -> a dotfiles repo, deliberately outside
+/// `repo_root`) from an accidental one (a bad merge, a restored backup, a
+/// stray `ln -s`) pointing anywhere else the process can write — both have
+/// the identical shape. The maintainer call is warn, not refuse, so the
+/// write still lands (refusing would break the legitimate case), but a
+/// warning naming both the symlink and its resolved target must appear.
+#[cfg(unix)]
+#[test]
+fn init_warns_when_a_write_target_symlinks_outside_the_repo() {
+    let tmp = init_repo();
+    let root = tmp.path().canonicalize().unwrap();
+
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().canonicalize().unwrap().join("victim.md");
+    std::fs::write(&sentinel, "the victim's own content\n").unwrap();
+
+    std::os::unix::fs::symlink(&sentinel, root.join("AGENTS.md")).unwrap();
+
+    let out = pact(tmp.path(), "setup-agent", &["init", "--no-commit"]);
+    // Warn, not block: the design deliberately does not refuse this write,
+    // so the command still succeeds and the sentinel is still touched.
+    assert_ok(&out);
+
+    let sentinel_after = std::fs::read_to_string(&sentinel).unwrap();
+    assert!(
+        sentinel_after.contains("pact coordination protocol"),
+        "the write must still go through the symlink (warn, not block):\n{sentinel_after}"
+    );
+
+    let stderr = stderr_of(&out);
+    let agents_md = root.join("AGENTS.md");
+    assert!(
+        stderr.contains(&agents_md.display().to_string()),
+        "warning must name the symlinked path itself:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&sentinel.display().to_string()),
+        "warning must name the resolved outside-repo target:\n{stderr}"
+    );
+}
