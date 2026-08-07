@@ -1285,7 +1285,25 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
                 }
             }
             if to.is_empty() {
-                anyhow::bail!("no recipients resolved — nothing to send");
+                // Every `--to-owner-of` path resolved to the sender itself
+                // (the self-owner branch above warned and added nothing), and
+                // no explicit `--to` was given — clap requires one or the
+                // other. Refusing outright used to strand the sender exactly
+                // when `--to-owner-of` exists to save them from guessing a
+                // name (pact-m7j.10.5, reproduced live: an agent that had
+                // just taken over a path had no way to tell its previous
+                // co-editor). `msg::send`'s about-<path> tagging attaches to
+                // every `to_owner_of` path unconditionally, and
+                // `messages_about()` surfaces it to whoever leases that path
+                // next regardless of who `to` was — so addressing it to
+                // `agents::HUMAN` still delivers it forward through that
+                // pipeline instead of losing it.
+                output::warn(&format!(
+                    "note: every --to-owner-of path resolves to you; addressing to {} so the note \
+                     still reaches whoever leases it next",
+                    agents::HUMAN
+                ));
+                to.push(agents::HUMAN.to_string());
             }
             for recipient in &to {
                 check_recipient(recipient)?;

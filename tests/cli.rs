@@ -2087,6 +2087,56 @@ fn a_message_addressed_to_a_path_reaches_the_agent_who_last_held_it() {
     );
 }
 
+/// pact-m7j.10.5, reproduced in a real fleet run: when every `--to-owner-of`
+/// path resolves to the sender itself and no `--to` was given, the command
+/// used to bail with "no recipients resolved" — stranding an agent that had
+/// just taken over a path with no way to leave a note for whoever it took it
+/// from, the exact case `--to-owner-of` exists to save them from having to
+/// guess a name for. It now addresses `human` instead, and the note still
+/// follows the file to whoever leases it next via the same about-<path>
+/// pipeline `--to` never controlled in the first place.
+#[test]
+fn to_owner_of_self_resolution_addresses_human_instead_of_dropping_the_message() {
+    let Some(tmp) = bd_repo("to_owner_of_self_resolution") else {
+        return;
+    };
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-a",
+        &["lease", "acquire", "src/x.rs"],
+    ));
+
+    let sent = pact(
+        tmp.path(),
+        "agent-a",
+        &[
+            "msg",
+            "send",
+            "--to-owner-of",
+            "src/x.rs",
+            "note for whoever's next",
+        ],
+    );
+    assert_ok(&sent);
+    assert!(
+        stderr_of(&sent).contains("human"),
+        "must say it fell back to human: {}",
+        stderr_of(&sent)
+    );
+
+    assert_ok(&pact(tmp.path(), "agent-a", &["lease", "release", "--all"]));
+
+    // Whoever leases the path next sees it, exactly like an ordinary
+    // about-<path> message — the fallback recipient never gated that pipeline.
+    let out = pact(tmp.path(), "agent-b", &["lease", "acquire", "src/x.rs"]);
+    assert_ok(&out);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("unread message") && stderr.contains("note for whoever's next"),
+        "the note must still follow the file: {stderr}"
+    );
+}
+
 #[test]
 fn to_owner_of_an_untouched_path_is_an_error_not_a_silent_no_op() {
     let Some(tmp) = bd_repo("to_owner_of_an_untouched_path") else {

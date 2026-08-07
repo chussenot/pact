@@ -496,3 +496,26 @@ Two supporting changes:
   looking at a message there counts as reading it. Selection, not display:
   merely opening the tab would wipe the unread markers that make the list worth
   having.
+
+### When every path resolves to you
+
+`--to-owner-of` resolves to the *last* agent to act on a path — which, right
+after you take a file over, is you. pact says so and adds no recipient for that
+path. When that was the only addressing given, the send used to fail outright
+(`no recipients resolved — nothing to send`, exit 1), so the one agent with
+something to say about the handoff was the one agent that could not say it — the
+exact case `--to-owner-of` exists to spare you from guessing a name for. It now
+falls back to [`human`](#unknown-recipients-warn-then-send), warns, and sends:
+
+```
+$ pact msg send --to-owner-of src/otel.rs "flush is broken; I took the file over"
+note: you are yourself the last agent to work on src/otel.rs; not adding a recipient
+note: every --to-owner-of path resolves to you; addressing to human so the note still reaches whoever leases it next
+sent pact-wisp-20i to human (thread pact-wisp-20i)
+```
+
+The fallback recipient is not the delivery. `about-<path>` is attached to every
+`--to-owner-of` path whatever `to` says, and the unread-message notice above
+filters on the *sender*, never on the addressee — so the note still reaches
+whoever leases `src/otel.rs` next, exactly as an ordinary `--to-owner-of`
+message would. Addressing it to `human` only gives it a mailbox in the meantime.

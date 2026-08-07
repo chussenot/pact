@@ -184,7 +184,8 @@ double-win forensics and the event log as artifacts, then files or comments on o
 Worth recording, because it is the kind of thing the harness exists for and it is
 not a bug in pact.
 
-Three of four exit-2 conflicts sent no message, with:
+Three of four exit-2 conflicts sent no message, with what pact printed at the
+time:
 
 ```
 note: you are yourself the last agent to work on notify/iface.txt; not adding a recipient
@@ -195,8 +196,14 @@ The workers had used `pact msg send --to-owner-of <path>`, following the protoco
 block's instruction to address the *file* rather than the name. But
 `--to-owner-of` resolves the **last agent to act** on a path from the event log,
 which is right for a handoff and wrong at exit 2: a worker that previously held
-and released that path *is* the last actor, so it resolves to itself and pact
-correctly refuses to self-address.
+and released that path *is* the last actor, so it resolved to itself, and pact
+then treated a self-resolution as no recipient at all and refused the send.
+
+That second line is gone — a send whose every `--to-owner-of` path resolves to
+the sender now falls back to `human` and still tags the path
+([why](messaging.md#when-every-path-resolves-to-you)). The finding stands
+regardless: the message the worker wanted to send was for whoever holds the path
+*now*, and no addressing trick reaches them from the event log.
 
 The protocol block contains both idioms, and for contention the other sentence is
 the correct one — "`pact lease ls` names the holder; message them". The workers do
