@@ -401,17 +401,30 @@ pub fn stale_instruction_files(repo_root: &Path) -> Result<Vec<PathBuf>> {
 /// nothing.
 pub fn ensure_gitignore(repo_root: &Path) -> Result<()> {
     let path = repo_root.join(".gitignore");
-    let existing = read_or_empty(&path)?;
+    // Through write_atomic_cas, not a plain read-then-write (pact-m7j.9.11):
+    // gitignore_content recomputes its answer from whatever is actually on
+    // disk at commit time, so a concurrent hand-edit between the read and
+    // the rename is re-read and folded in on retry instead of silently
+    // discarded — the same race splice_block was fixed against in
+    // pact-m7j.9.2.
+    write_atomic_cas(&path, repo_root, gitignore_content)
+}
 
+/// Pure computation half of [`ensure_gitignore`], split out so a test can
+/// wrap it in [`write_atomic_cas`] directly and inject a race the same way
+/// the generic CAS tests do, instead of only exercising `ensure_gitignore`
+/// end to end with no injection point of its own.
+fn gitignore_content(existing: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let (mut narrowed, mut already) = (false, false);
 
     for line in existing.lines() {
         let bare = line.trim().trim_end_matches('/');
         if bare == ".pact" {
-            // The broad rule from an older pact. Replaced rather than appended
-            // to, so the file does not end up ignoring both the directory and a
-            // subset of it — which reads as though somebody was unsure.
+            // The broad rule from an older pact. Replaced rather than
+            // appended to, so the file does not end up ignoring both the
+            // directory and a subset of it — which reads as though somebody
+            // was unsure.
             out.push(RUNTIME_IGNORE_COMMENT_1.to_string());
             out.push(RUNTIME_IGNORE_COMMENT_2.to_string());
             out.extend(RUNTIME_IGNORE_RULES.iter().map(|r| (*r).to_string()));
@@ -427,7 +440,11 @@ pub fn ensure_gitignore(repo_root: &Path) -> Result<()> {
     if narrowed {
         // Fall through and write.
     } else if already {
-        return Ok(());
+        // Byte-for-byte what was already there — write_atomic_cas still
+        // renames it, same as splice_block does on an already-current
+        // AGENTS.md, rather than adding a second "is a write actually
+        // needed" branch here to skip it.
+        return existing.to_string();
     } else {
         if !out.is_empty() {
             out.push(String::new());
@@ -439,7 +456,7 @@ pub fn ensure_gitignore(repo_root: &Path) -> Result<()> {
 
     let mut content = out.join("\n");
     content.push('\n');
-    write_atomic(&path, &content, repo_root)
+    content
 }
 
 /// Ignore everything under `.pact/`, then re-include exactly the event log.
@@ -488,12 +505,19 @@ pub const EVENTS_LOG_PATH: &str = ".pact/events.jsonl";
 /// call, since a different merge driver is a deliberate choice.
 pub fn ensure_gitattributes(repo_root: &Path) -> Result<()> {
     let path = repo_root.join(".gitattributes");
-    let existing = read_or_empty(&path)?;
+    // Through write_atomic_cas, same reason as ensure_gitignore just above
+    // (pact-m7j.9.11).
+    write_atomic_cas(&path, repo_root, gitattributes_content)
+}
+
+/// Pure computation half of [`ensure_gitattributes`] — see
+/// [`gitignore_content`]'s doc comment for why this is split out.
+fn gitattributes_content(existing: &str) -> String {
     if existing
         .lines()
         .any(|l| l.split_whitespace().next() == Some(EVENTS_LOG_PATH))
     {
-        return Ok(());
+        return existing.to_string();
     }
 
     let mut out: Vec<String> = existing.lines().map(str::to_string).collect();
@@ -506,7 +530,7 @@ pub fn ensure_gitattributes(repo_root: &Path) -> Result<()> {
 
     let mut content = out.join("\n");
     content.push('\n');
-    write_atomic(&path, &content, repo_root)
+    content
 }
 
 /// Whether AGENTS.md exists, has a managed block, and that block matches the
@@ -525,52 +549,13 @@ fn has_current_block(path: &Path, body: &str) -> Result<bool> {
     Ok(existing[begin..end] == format!("{BEGIN_MARKER}\n{body}{END_MARKER}\n"))
 }
 
-/// Replace `path`'s contents without ever leaving it truncated.
-///
-/// `std::fs::write` truncates the destination and then writes. A crash, a full
-/// disk or a kill in between leaves the file empty or half-written — and the
-/// files this module writes are not pact's own state. They are `AGENTS.md`,
-/// `CLAUDE.md`, `GEMINI.md`, `.cursorrules`, `.gitignore`: files the user mostly
-/// wrote, whose content outside the markers this module promises never to
-/// touch. A truncated write breaks that promise completely rather than
-/// partially, and on a first `pact init` the file is not committed yet, so
-/// there is no copy to recover from — which is also the run most likely to be
-/// interrupted, because it is the one doing the most work.
-///
-/// Write beside the target and rename: rename is atomic on one filesystem, so a
-/// reader sees the old file or the new one and never a half of either. The
-/// temp name comes from the same shared helper the lease and event-log writers
-/// use, so all three sites cannot drift apart.
-///
-/// Permissions are carried over deliberately. A fresh temp file is created with
-/// the process umask, so renaming it over a file the user had chmod'ed would
-/// quietly reset the mode.
-fn write_atomic(path: &Path, contents: &str, repo_root: &Path) -> Result<()> {
-    let resolved = resolve_write_target(path, repo_root);
-    let dir = resolved.parent().unwrap_or(Path::new("."));
-    let tmp = dir.join(crate::events::unique_temp_name(".pact-write"));
-
-    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
-    if let Ok(meta) = std::fs::metadata(&resolved) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
-    }
-    match std::fs::rename(&tmp, &resolved) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Do not leave litter next to a user's file if the rename fails.
-            let _ = std::fs::remove_file(&tmp);
-            Err(e).with_context(|| format!("replacing {}", resolved.display()))
-        }
-    }
-}
-
 /// Follow a symlink to its target before replacing anything. `fs::write`
 /// writes THROUGH a link; `rename` would replace the link itself with a
 /// regular file, silently disconnecting a `CLAUDE.md` that somebody had
-/// pointed at their dotfiles. Atomicity is the change [`write_atomic`] and
-/// [`write_atomic_cas`] make; which file gets written is not, so resolve
-/// first and keep the old meaning. (A link that IS `AGENTS.md` under another
-/// name never reaches here — `present_targets` skips those aliases.)
+/// pointed at their dotfiles. Atomicity is the change [`write_atomic_cas`]
+/// makes; which file gets written is not, so resolve first and keep the old
+/// meaning. (A link that IS `AGENTS.md` under another name never reaches
+/// here — `present_targets` skips those aliases.)
 ///
 /// A resolved target outside `repo_root` gets a warning, every time, rather
 /// than either silently writing through it or refusing. Refusing would break
@@ -609,10 +594,10 @@ fn resolve_write_target(path: &Path, repo_root: &Path) -> PathBuf {
 /// writes.
 const MAX_CAS_ATTEMPTS: u32 = 5;
 
-/// Like [`write_atomic`], but for a read-modify-write: `modify` computes the
-/// new content from what is actually on disk, and may be called again with
-/// fresher content if a concurrent writer lands between the read `modify` was
-/// given and the commit-moment rename.
+/// An atomic write for a read-modify-write: `modify` computes the new content
+/// from what is actually on disk, and may be called again with fresher
+/// content if a concurrent writer lands between the read `modify` was given
+/// and the commit-moment rename.
 ///
 /// The plain read-then-write this replaced had no lock and no version check:
 /// pausing between its read and its rename (reproduced live with strace delay
@@ -864,6 +849,78 @@ mod tests {
         assert!(after.ends_with("\n\n# After\n"));
         assert!(!after.contains("stale content"));
         assert!(after.contains(&managed_block()));
+    }
+
+    /// pact-m7j.9.11: `ensure_gitignore`/`ensure_gitattributes` used to
+    /// compute their answer from a single read and write it with the plain,
+    /// non-CAS `write_atomic` — the same read-modify-write shape pact-m7j.9.2
+    /// fixed for `splice_block` after reproducing a concurrent hand-edit
+    /// landing between the read and the rename and being silently,
+    /// completely lost. Same injected race as
+    /// `write_atomic_cas_never_commits_over_a_write_that_landed_mid_call`,
+    /// but through the real `gitignore_content` closure `ensure_gitignore`
+    /// actually uses, so this proves the wiring, not just the primitive.
+    #[test]
+    fn ensure_gitignore_does_not_discard_a_concurrent_hand_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".gitignore");
+        std::fs::write(&path, "target/\n").unwrap();
+
+        let mut calls = 0u32;
+        write_atomic_cas(&path, tmp.path(), |existing| {
+            calls += 1;
+            if calls == 1 {
+                std::fs::write(&path, "target/\nnode_modules/\n").unwrap();
+            }
+            gitignore_content(existing)
+        })
+        .unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            calls, 2,
+            "expected exactly one retry after the injected race"
+        );
+        assert!(
+            after.contains("node_modules/"),
+            "the concurrent hand-edit must survive: {after}"
+        );
+        assert!(
+            after.contains(RUNTIME_IGNORE_SENTINEL),
+            "the pact rules must still be added: {after}"
+        );
+    }
+
+    /// Same race, `ensure_gitattributes`'s side.
+    #[test]
+    fn ensure_gitattributes_does_not_discard_a_concurrent_hand_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".gitattributes");
+        std::fs::write(&path, "*.bin binary\n").unwrap();
+
+        let mut calls = 0u32;
+        write_atomic_cas(&path, tmp.path(), |existing| {
+            calls += 1;
+            if calls == 1 {
+                std::fs::write(&path, "*.bin binary\n*.psd binary\n").unwrap();
+            }
+            gitattributes_content(existing)
+        })
+        .unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            calls, 2,
+            "expected exactly one retry after the injected race"
+        );
+        assert!(
+            after.contains("*.psd binary"),
+            "the concurrent hand-edit must survive: {after}"
+        );
+        assert!(
+            after.contains(EVENTS_LOG_PATH),
+            "the pact rule must still be added: {after}"
+        );
     }
 
     #[test]
