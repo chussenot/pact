@@ -43,6 +43,18 @@ fn pact_cmd(repo: &Path, args: &[&str]) -> Command {
     cmd
 }
 
+/// Like [`pact`], but run from `cwd` instead of the repo root — for tests
+/// that need a path spelled relative to a subdirectory, the exact case
+/// `normalize_path` exists to resolve consistently either way.
+fn pact_from(cwd: &Path, agent: &str, args: &[&str]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pact"));
+    cmd.args(args)
+        .current_dir(cwd)
+        .env_remove("PACT_AGENT")
+        .env("PACT_AGENT", agent);
+    cmd.output().expect("failed to run pact binary")
+}
+
 fn stdout_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -3175,6 +3187,79 @@ fn to_owner_of_reports_who_it_resolved_to() {
     assert!(
         stderr.contains("resolved to owner-agent") && stderr.contains("last seen"),
         "must name the resolution and its age: {stderr}"
+    );
+}
+
+/// pact-m7j.8.6: `normalize_path` fixed one-file-one-lock, but `prior_owners`
+/// and `--to-owner-of`'s resolution each did their own raw string comparison
+/// against un-normalized input — so the same real file, spelled relative to a
+/// subdirectory instead of the repo root, looked like a file nobody had ever
+/// touched on both surfaces, even though the lock itself resolved correctly.
+/// Reproduced live in the original bug report against a real bd 1.1.2 store;
+/// this pins it against this repo's own real backend.
+#[test]
+fn prior_owner_and_to_owner_of_agree_across_cwd_relative_spellings() {
+    let Some(tmp) = bd_repo("prior_owner_agrees_across_cwd_spellings") else {
+        return;
+    };
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+    assert_ok(&pact(
+        tmp.path(),
+        "owner-agent",
+        &["lease", "acquire", "src/shared.rs"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "owner-agent",
+        &["lease", "release", "--all"],
+    ));
+
+    // Re-acquire the SAME file from src/, spelled relative to it rather than
+    // the canonical src/shared.rs.
+    let reacquired = pact_from(
+        &tmp.path().join("src"),
+        "second-agent",
+        &["lease", "acquire", "shared.rs"],
+    );
+    assert_ok(&reacquired);
+    let stderr = stderr_of(&reacquired);
+    assert!(
+        stderr.contains("owner-agent") && stderr.contains("was last"),
+        "the CWD-relative spelling must still surface the prior owner: {stderr}"
+    );
+
+    // --to-owner-of, also typed from src/, must resolve to the agent who now
+    // holds it (second-agent) instead of erroring "no agent has ever leased
+    // it" — the exact false assertion the original bug report reproduced.
+    let sent = pact_from(
+        &tmp.path().join("src"),
+        "third-agent",
+        &["msg", "send", "--to-owner-of", "shared.rs", "body"],
+    );
+    assert_ok(&sent);
+    assert!(
+        stderr_of(&sent).contains("resolved to second-agent"),
+        "--to-owner-of must resolve the CWD-relative spelling to the real owner: {}",
+        stderr_of(&sent)
+    );
+
+    // The send above also tagged the message about-<path> — from src/, using
+    // the CWD-relative spelling. A FOURTH agent, checking the canonical
+    // spelling from the repo root, must still see the "unread message about"
+    // advisory: the write-side tag and the read-side query must land on the
+    // same label however each command line spelled the path.
+    let checked = pact(
+        tmp.path(),
+        "fourth-agent",
+        &["lease", "acquire", "src/shared.rs", "--steal"],
+    );
+    assert_ok(&checked);
+    assert!(
+        stderr_of(&checked).contains("unread message"),
+        "a message tagged from a CWD-relative spelling must be found by a query \
+         from the canonical spelling: {}",
+        stderr_of(&checked)
     );
 }
 

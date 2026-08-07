@@ -384,7 +384,17 @@ fn case_insensitive_fs() -> bool {
 /// break the case the feature was built for. `..` is folded here rather than by
 /// the filesystem, so a symlinked directory resolves by name; that is the same
 /// bargain the rest of the module already makes by keying locks on paths.
-fn normalize_path(repo_root: &Path, path: &str) -> String {
+///
+/// `pub(crate)`, not private, because the lock itself was not the only place
+/// answering "who owns this path?" — `events::owner_of`, `msg::about_path`'s
+/// label, and `msg send --to-owner-of`'s resolution each did their own,
+/// simpler comparison of un-normalized input, so the same file addressed from
+/// two CWDs got two different answers on those surfaces even after pact-r2s.1
+/// fixed it for the lock (pact-m7j.8.6). Every current caller derives
+/// `repo_root` the same way (`repo::find_repo_root(&cwd)`, once, in `main`),
+/// so `cwd_in_repo` above is satisfied by construction everywhere this is
+/// called — including from other modules.
+pub(crate) fn normalize_path(repo_root: &Path, path: &str) -> String {
     let p = Path::new(path);
     // A relative path is resolved against the CWD — but only when the CWD is
     // actually inside this repo. Every production caller derives `repo_root` by

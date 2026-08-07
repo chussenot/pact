@@ -452,7 +452,14 @@ pub fn send(
 /// individually `show`n) just to throw almost all of it away. Both backends
 /// bound `list --json` to one label directly; see `list_issues`.
 pub fn about_path(cli: &BeadsCli, repo_root: &Path, path: &str) -> Result<Vec<Message>> {
-    let label = format!("{ABOUT}{}", encode_path(path));
+    // Normalized exactly here, once, before comparison — pact-m7j.8.6: `path`
+    // arrives as whatever the caller's own CWD made of it (`messages_about`'s
+    // `path` is the raw `lease acquire` argument), while the label this
+    // queries against was written from a create-time call that normalizes
+    // its own `about` list the same way (see `send`). One file must produce
+    // one label however either command line spelled it.
+    let relative = crate::lease::normalize_path(repo_root, path);
+    let label = format!("{ABOUT}{}", encode_path(&relative));
     let issues = list_issues(cli, repo_root, None, Some(&label))?;
     Ok(to_messages(issues, None))
 }

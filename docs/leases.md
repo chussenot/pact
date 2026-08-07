@@ -104,6 +104,17 @@ which records what git saw at clone time and can describe a different machine.
 Only the lock *filename* is folded. `pact lease ls` and every error message show
 the spelling you used.
 
+**The advisory surfaces answer the same question, and now agree with the
+lock.** The prior-owner note `acquire` prints, the "unread message about"
+check, and `msg send --to-owner-of`'s resolution each used to compare paths
+without this normalization — reproduced live: a file released as
+`src/foo.rs` from the root, then re-acquired as `foo.rs` from `src/`, showed
+no prior-owner note and no pending-message note, and `--to-owner-of foo.rs`
+typed from `src/` answered "no agent has ever leased foo.rs" for a file that
+very much had an owner. All three now normalize before comparing
+(pact-m7j.8.6), so a file's coordination history is found the same way
+regardless of which command, or which CWD, asks about it.
+
 ### How much atomicity you actually get
 
 All of it is conditional on the two racers having agreed on the lock key: where

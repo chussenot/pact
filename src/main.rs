@@ -1148,7 +1148,16 @@ fn prior_owners(root: &Path, paths: &[String], agent: &str) -> Vec<String> {
     paths
         .iter()
         .filter_map(|p| {
-            let owner = events::owner_of(root, p).ok().flatten()?;
+            // Normalized before the lookup, not after — pact-m7j.8.6: `p` is
+            // this command's own raw CLI argument, and `events::owner_of` does
+            // a plain string comparison against whatever `acquire` itself
+            // logged (already normalized). Without this, `acquire foo.rs` from
+            // a subdirectory found no prior owner for a file `acquire
+            // src/foo.rs` from the root had just released. The suggested
+            // `--to-owner-of` command below also needs the canonical spelling:
+            // it will be typed back verbatim, quite possibly from a third CWD.
+            let relative = lease::normalize_path(root, p);
+            let owner = events::owner_of(root, &relative).ok().flatten()?;
             // Your own history is not news.
             if owner.agent == agent {
                 return None;
@@ -1163,8 +1172,8 @@ fn prior_owners(root: &Path, paths: &[String], agent: &str) -> Vec<String> {
                 .map(|d| format!(" — their note: {d}"))
                 .unwrap_or_default();
             Some(format!(
-                "note: {p} was last {} by {} ({ago}){note}. `pact log` has the history; \
-                 `pact msg send --to-owner-of {p}` reaches them.",
+                "note: {relative} was last {} by {} ({ago}){note}. `pact log` has the history; \
+                 `pact msg send --to-owner-of {relative}` reaches them.",
                 owner.kind, owner.agent
             ))
         })
@@ -1349,6 +1358,20 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
             if body.trim().is_empty() {
                 anyhow::bail!("empty message body — nothing to send");
             }
+            // Normalized once, here, before anything compares it — pact-m7j.8.6:
+            // `to_owner_of` is whatever the caller's own CWD made of it, and
+            // both uses below need the SAME canonical spelling `acquire`
+            // itself would have produced: the lookup just below (so a path
+            // typed from a subdirectory still resolves to its real prior
+            // owner) and, further down, the `about-<path>` labels this send
+            // is tagged with (so a later `about_path` query — typed from yet
+            // another CWD — still finds it). Reassigning rather than reading
+            // through a second binding, so nothing downstream can reach the
+            // un-normalized spelling by mistake.
+            let to_owner_of: Vec<String> = to_owner_of
+                .iter()
+                .map(|p| lease::normalize_path(&root, p))
+                .collect();
             // Resolve paths to the agents who last worked on them. This is
             // what makes a handoff survive its author: 51 of 59 messages in one
             // fleet run were never read, because they were addressed to
