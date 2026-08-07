@@ -170,7 +170,7 @@ warning) work without one. Either implementation will do:
 | Backend | What it is | What its `.beads/` looks like |
 |---|---|---|
 | [`bd`](https://github.com/gastownhall/beads) | Go, embedded Dolt | `.beads/embeddeddolt/` |
-| [`br`](https://github.com/dicklesworthstone/beads-rust) | Rust, SQLite | `.beads/<name>.db` |
+| [`br`](https://github.com/Dicklesworthstone/beads_rust) | Rust, SQLite | `.beads/<name>.db` |
 
 **The store on disk picks the backend, not a preference.** The two don't share
 data, so pact walks up for the first `.beads/`, reads which tool made it, and

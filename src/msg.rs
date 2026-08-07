@@ -683,7 +683,7 @@ fn list_issues(
 ) -> Result<Vec<BdIssue>> {
     let args = list_args(cli.is_br(), assignee, label);
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    let issues = parse_issues(&cli.run(repo_root, &borrowed)?, cli)?;
+    let issues = parse_issues(&cli.run(repo_root, &borrowed)?, cli, repo_root)?;
     if !cli.is_br() {
         return Ok(issues);
     }
@@ -884,7 +884,7 @@ fn replies_of(cli: &BeadsCli, repo_root: &Path, root: &BdIssue) -> Result<Vec<Bd
             repo_root,
             &["list", "--include-infra", "--json", &parent_arg],
         )?;
-        return parse_issues(&out, cli);
+        return parse_issues(&out, cli, repo_root);
     }
     let out = cli.run(
         repo_root,
@@ -980,9 +980,22 @@ pub fn all_messages(cli: &BeadsCli, repo_root: &Path) -> Result<Vec<Message>> {
 }
 
 /// `list --json` output -> issues. bd emits a bare array, br an envelope.
-fn parse_issues(stdout: &str, cli: &BeadsCli) -> Result<Vec<BdIssue>> {
-    let payload: ListPayload = serde_json::from_str(stdout)
-        .with_context(|| format!("parsing `{} list --json` output", cli.binary()))?;
+///
+/// A parse failure here is frequently a backend-shape mismatch rather than a
+/// transient error, so the error path checks the installed backend's version
+/// against pact's tested range (`version_compat_warning`) and folds the hint
+/// in — "outside tested range" turns a bare serde error into an actionable one
+/// instead of leaving the reader to guess why the shape changed.
+fn parse_issues(stdout: &str, cli: &BeadsCli, repo_root: &Path) -> Result<Vec<BdIssue>> {
+    let payload: ListPayload = serde_json::from_str(stdout).with_context(|| {
+        let mut msg = format!("parsing `{} list --json` output", cli.binary());
+        if let Ok(version) = cli.version(repo_root) {
+            if let Some(hint) = crate::beads::version_compat_warning(&version) {
+                msg.push_str(&format!(" ({} {version} is {hint})", cli.binary()));
+            }
+        }
+        msg
+    })?;
     Ok(payload.into_issues())
 }
 
@@ -1150,7 +1163,10 @@ mod tests {
     /// The pre-br entry point, kept for the tests that predate the split so
     /// they still assert the same thing about the same bytes.
     fn parse_messages(stdout: &str, viewer: Option<&str>) -> Result<Vec<Message>> {
-        Ok(to_messages(parse_issues(stdout, &bd())?, viewer))
+        Ok(to_messages(
+            parse_issues(stdout, &bd(), Path::new("/nonexistent"))?,
+            viewer,
+        ))
     }
 
     /// A real `br`-initialised repo, for the one test (pact-m7j.6.1) that needs
@@ -1860,14 +1876,56 @@ mod tests {
            "labels":["read-by-br-dev"],"dependency_count":0,"dependent_count":0}
         ],"total":1,"limit":0,"offset":0,"has_more":false}"#;
 
-        let from_br = to_messages(parse_issues(BR_LIST, &br()).unwrap(), Some("br-dev"));
+        let from_br = to_messages(
+            parse_issues(BR_LIST, &br(), Path::new("/nonexistent")).unwrap(),
+            Some("br-dev"),
+        );
         assert_eq!(from_br.len(), 1);
         assert_eq!(from_br[0].from, "sender");
         assert_eq!(from_br[0].to, "br-dev");
         assert!(from_br[0].read, "read-by- labels work the same on br");
 
         // The bd array still parses through the same function, unchanged.
-        assert_eq!(parse_issues(LIST_JSON, &bd()).unwrap().len(), 4);
+        assert_eq!(
+            parse_issues(LIST_JSON, &bd(), Path::new("/nonexistent"))
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+
+    /// pact-m7j.6.2: a parse failure caused by a backend-shape mismatch should
+    /// say so, using the tested-version-range check pact already has
+    /// (`version_compat_warning`) instead of leaving the reader with a bare
+    /// serde error. `binary` is directly settable to any program (see the
+    /// hung-child test in `beads.rs`), so a tiny script standing in for `br`
+    /// prints a known out-of-range version on `--version` without needing a
+    /// real backend on PATH.
+    #[test]
+    fn parse_failure_folds_in_the_tested_range_hint_for_an_out_of_range_backend() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("fake-br");
+        std::fs::write(&script, "#!/bin/sh\necho 'br 0.4.0'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Leaked to get the `&'static str` the field requires; a test-only,
+        // one-time leak of a temp path is not a real leak.
+        let binary: &'static str =
+            Box::leak(script.to_string_lossy().into_owned().into_boxed_str());
+        let cli = BeadsCli { binary };
+
+        let err = parse_issues("not json", &cli, tmp.path())
+            .expect_err("malformed stdout must not parse");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("outside tested range"),
+            "expected the tested-range hint in the parse error, got: {message}"
+        );
+        assert!(
+            message.contains("0.2.0") && message.contains("0.3.0"),
+            "expected br's actual tested bounds, got: {message}"
+        );
     }
 
     /// pact-l94/pact-m7j.6.1: br has no `list --parent`, so replies come from

@@ -411,10 +411,10 @@ fn missing_backend_message(workspace: Workspace) -> String {
             .to_string(),
         Workspace::Br => "br (beads-rust) not found on PATH — this repo's .beads/ is a br \
              (SQLite) workspace, which bd cannot read; install br: \
-             https://github.com/dicklesworthstone/beads-rust"
+             https://github.com/Dicklesworthstone/beads_rust"
             .to_string(),
         Workspace::None => "no Beads CLI found on PATH — install br \
-             (https://github.com/dicklesworthstone/beads-rust) or bd \
+             (https://github.com/Dicklesworthstone/beads_rust) or bd \
              (https://github.com/gastownhall/beads)"
             .to_string(),
     }
