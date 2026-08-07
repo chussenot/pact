@@ -47,6 +47,25 @@ pub const DEFAULT_TTL_SECS: u64 = 2700;
 /// Clock-skew tolerance: a lease is only considered expired past `ttl + GRACE_SECS`.
 pub const GRACE_SECS: i64 = 30;
 
+/// Sanity bound on how old a lease's computed age may plausibly be before
+/// `is_expired` trusts it enough to auto-reclaim (pact-m7j.4.4, forward clock
+/// jump).
+///
+/// `is_expired(lease, now)` is a pure function of two timestamps: it cannot
+/// tell "this really has been held for months" apart from "the wall clock
+/// jumped forward" — both produce an identical, huge `now - acquired_at`.
+/// Rather than guess, an age past this bound is treated as too implausible to
+/// auto-expire; the normal ttl+grace reclaim is refused and an explicit
+/// `--steal` is required instead, exactly as for a live, non-expired lease.
+///
+/// 30 days is deliberately generous and deliberately stateless — it does not
+/// depend on the persisted clock watermark below, which solves the opposite
+/// (backward-jump) direction. It is far larger than [`DEFAULT_TTL_SECS`]
+/// (2700s) or any hold `pact audit` has ever measured (36 minutes, longest
+/// on record) or any plausible renewal chain, while still catching a
+/// multi-month or multi-year jump.
+const MAX_PLAUSIBLE_AGE_SECS: i64 = 30 * 24 * 60 * 60;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseInfo {
     pub agent: String,
@@ -412,6 +431,12 @@ fn lock_file_path(repo_root: &Path, relative: &str) -> Result<PathBuf> {
         .join(format!("{}.lock", encode_path(relative))))
 }
 
+fn parse_acquired_raw(lease: &LeaseInfo) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(&lease.acquired_at)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
 fn parse_acquired(lease: &LeaseInfo) -> DateTime<Utc> {
     // A lock file with an unparsable timestamp is a corruption case we don't
     // expect in practice (we always write RFC3339 ourselves). For an advisory
@@ -419,20 +444,90 @@ fn parse_acquired(lease: &LeaseInfo) -> DateTime<Utc> {
     // the Unix epoch (1970-01-01) so the lease is immediately reclaimable
     // rather than held forever (the old `Utc::now()` fallback reset the timer
     // on every read, making a corrupt lease immortal until `--steal`).
-    DateTime::parse_from_rfc3339(&lease.acquired_at)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or(DateTime::UNIX_EPOCH)
+    parse_acquired_raw(lease).unwrap_or(DateTime::UNIX_EPOCH)
 }
 
 fn is_expired(lease: &LeaseInfo, now: DateTime<Utc>) -> bool {
-    let acquired = parse_acquired(lease);
-    now > acquired + chrono::Duration::seconds(lease.ttl_secs as i64 + GRACE_SECS)
+    match parse_acquired_raw(lease) {
+        Some(acquired) => {
+            // pact-m7j.4.4: an implausibly large age says more about `now`
+            // than about this lease. Bail out to "not expired" (i.e.
+            // "needs --steal") before trusting it, rather than auto-reclaiming
+            // on a forward clock jump. This does not apply to the corrupt-
+            // timestamp fallback below — that failure is about bad data, not
+            // a suspicious `now`, and must keep tending towards reclaimable.
+            if now - acquired > chrono::Duration::seconds(MAX_PLAUSIBLE_AGE_SECS) {
+                return false;
+            }
+            now > acquired + chrono::Duration::seconds(lease.ttl_secs as i64 + GRACE_SECS)
+        }
+        None => true,
+    }
 }
 
 fn age_and_remaining(lease: &LeaseInfo, now: DateTime<Utc>) -> (i64, i64) {
     let acquired = parse_acquired(lease);
     let age = (now - acquired).num_seconds();
     (age, lease.ttl_secs as i64 - age)
+}
+
+/// `.pact/clock_watermark`: a single RFC3339 timestamp recording the highest
+/// wall-clock `now` any pact command in this repo has ever observed.
+///
+/// This is the backward-jump counterpart to [`MAX_PLAUSIBLE_AGE_SECS`]
+/// (pact-m7j.4.5): that constant keeps a *forward* clock jump from
+/// auto-expiring a lease that is actually still live; this watermark keeps a
+/// *backward* jump from resurrecting a lease that had already genuinely
+/// expired under a `now` we already saw. `is_expired`/`age_and_remaining`
+/// stay pure functions of `(lease, now)` — the correction lives entirely in
+/// what callers pass as `now`, computed via [`effective_now`] or
+/// [`effective_now_readonly`] instead of raw `Utc::now()`.
+fn watermark_file(repo_root: &Path) -> PathBuf {
+    crate::repo::pact_dir_path(repo_root).join("clock_watermark")
+}
+
+fn read_watermark(repo_root: &Path) -> Option<DateTime<Utc>> {
+    let contents = std::fs::read_to_string(watermark_file(repo_root)).ok()?;
+    DateTime::parse_from_rfc3339(contents.trim())
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// The wall clock, corrected against the persisted watermark but never
+/// persisting a new one — safe to call from a read-only path like `peek`,
+/// which must not leave `.pact/` behind on a mere question (pact-rnc.19,
+/// pact-rnc.27).
+fn effective_now_readonly(repo_root: &Path) -> DateTime<Utc> {
+    let raw = Utc::now();
+    match read_watermark(repo_root) {
+        Some(watermark) if watermark > raw => watermark,
+        _ => raw,
+    }
+}
+
+/// Same correction as [`effective_now_readonly`], and also bumps the
+/// persisted watermark when `raw` is a new high point. Only call this from a
+/// path that already mutates `.pact/` (acquire, renew, `lease ls`'s sweep) —
+/// never from a read-only path.
+fn effective_now(repo_root: &Path) -> DateTime<Utc> {
+    let raw = Utc::now();
+    match read_watermark(repo_root) {
+        Some(watermark) if watermark >= raw => watermark,
+        _ => {
+            // `raw` is a new high point (or none was ever recorded): persist
+            // it. Best-effort: a lost write only costs one extra operation
+            // before the next backward jump self-corrects, and a logging-style
+            // failure here must never break the lease operation that
+            // triggered it.
+            if let Ok(dir) = pact_dir(repo_root) {
+                let tmp = dir.join(crate::events::unique_temp_name("clock_watermark"));
+                if std::fs::write(&tmp, raw.to_rfc3339()).is_ok() {
+                    let _ = std::fs::rename(&tmp, dir.join("clock_watermark"));
+                }
+            }
+            raw
+        }
+    }
 }
 
 /// Write `lease` to `lock_path` atomically: write to a sibling temp file, then
@@ -964,7 +1059,9 @@ fn acquire_inner(
 ) -> Result<AcquireOutcome> {
     let relative = normalize_path(repo_root, path);
     let lock_path = lock_file_path(repo_root, &relative)?;
-    let now = Utc::now();
+    // pact-m7j.4.4/4.5: the clock-corrected "now", not raw `Utc::now()` — see
+    // `effective_now`'s doc comment.
+    let now = effective_now(repo_root);
     let (branch, worktree) = worktree_stamp(repo_root);
     let new_lease = LeaseInfo {
         agent: agent.to_string(),
@@ -1161,7 +1258,8 @@ fn acquire_inner(
 fn held_by_self(repo_root: &Path, agent: &str, relative: &str) -> Option<LeaseInfo> {
     let lock_path = lock_file_path(repo_root, relative).ok()?;
     let existing = read_lease(&lock_path).ok()?;
-    (existing.agent == agent && !is_expired(&existing, Utc::now())).then_some(existing)
+    (existing.agent == agent && !is_expired(&existing, effective_now(repo_root)))
+        .then_some(existing)
 }
 
 /// Acquire several paths atomically: either the agent ends up holding all of
@@ -1500,7 +1598,7 @@ fn renew_fs(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
     // survives every renew.
     let (branch, worktree) = worktree_stamp(repo_root);
     let renewed = LeaseInfo {
-        acquired_at: Utc::now().to_rfc3339(),
+        acquired_at: effective_now(repo_root).to_rfc3339(),
         branch,
         worktree,
         ..existing
@@ -1527,7 +1625,12 @@ fn scan(repo_root: &Path) -> Result<Vec<(PathBuf, LeaseEntry)>> {
     // Non-creating path: listing leases is a question, and a question must not
     // leave a `.pact/` behind in a repo that has never used pact (pact-rnc.27).
     let leases_dir = crate::repo::pact_dir_path(repo_root).join("leases");
-    let now = Utc::now();
+    // Read-only correction (pact-m7j.4.5): `scan` backs `peek`, which must not
+    // mutate `.pact/` on a mere question, so this must not persist a new
+    // watermark — see `effective_now_readonly`'s doc comment. `list` still
+    // benefits: the watermark it reads was written by whatever `acquire`/
+    // `renew` call created the lease it is now sweeping.
+    let now = effective_now_readonly(repo_root);
     let mut entries = Vec::new();
 
     let dir = match std::fs::read_dir(&leases_dir) {
@@ -1800,6 +1903,33 @@ mod tests {
     }
 
     #[test]
+    fn forward_clock_jump_does_not_auto_expire_a_live_lease() {
+        // pact-m7j.4.4: a lease acquired moments ago must not be reclaimed
+        // just because `now` is observed far in the future (NTP correction,
+        // manual clock change, VM pause/resume, container drift). The raw
+        // computed age here vastly exceeds ttl+grace — that is the point:
+        // `is_expired` must refuse to trust it rather than auto-reclaim, and
+        // require an explicit `--steal` instead, same as a live lease.
+        let acquired_at = Utc::now() - Duration::seconds(60); // a real, recent acquire
+        let lease = LeaseInfo {
+            agent: "agent-a".into(),
+            path: "x".into(),
+            acquired_at: acquired_at.to_rfc3339(),
+            ttl_secs: DEFAULT_TTL_SECS,
+            note: None,
+            branch: None,
+            worktree: None,
+        };
+        // Years past ttl+grace, not just minutes: a forward jump, not a slow
+        // overrun.
+        let jumped_now = acquired_at + Duration::days(800);
+        assert!(
+            !is_expired(&lease, jumped_now),
+            "a lease acquired 60s ago must not auto-expire just because `now` jumped ~2 years forward"
+        );
+    }
+
+    #[test]
     fn corrupt_count_detects_unreadable_lock_files() {
         let tmp = repo();
         let root = tmp.path();
@@ -1994,16 +2124,73 @@ mod tests {
     /// Plant a lock file that is already `age_secs` old, without going through
     /// `acquire` — the only way to test expiry without sleeping.
     fn claim_aged(root: &Path, agent: &str, path: &str, ttl_secs: u64, age_secs: i64) {
+        claim_at(
+            root,
+            agent,
+            path,
+            ttl_secs,
+            Utc::now() - Duration::seconds(age_secs),
+        );
+    }
+
+    /// Same as `claim_aged`, but takes the exact `acquired_at` instant rather
+    /// than an age relative to the real wall clock — needed to plant a lease
+    /// relative to a fabricated clock watermark instead of real "now".
+    fn claim_at(root: &Path, agent: &str, path: &str, ttl_secs: u64, acquired_at: DateTime<Utc>) {
         let lease = LeaseInfo {
             agent: agent.into(),
             path: path.into(),
-            acquired_at: (Utc::now() - Duration::seconds(age_secs)).to_rfc3339(),
+            acquired_at: acquired_at.to_rfc3339(),
             ttl_secs,
             note: None,
             branch: None,
             worktree: None,
         };
         write_lease_atomic(&lock_file_path(root, path).unwrap(), &lease).unwrap();
+    }
+
+    #[test]
+    fn backward_clock_jump_does_not_resurrect_an_expired_lease() {
+        // pact-m7j.4.5: a lease that is genuinely expired must not be seen as
+        // live again just because the wall clock jumps backward. There is no
+        // way to move the real system clock from a test, so this fabricates
+        // a watermark *ahead* of the real clock instead — from the code's
+        // point of view that is indistinguishable from "the real clock later
+        // jumped behind a `now` some earlier pact command already observed",
+        // which is exactly the scenario the persisted watermark exists for.
+        let tmp = repo();
+        let root = tmp.path();
+
+        let watermark = Utc::now() + Duration::days(400);
+        let ttl = 100u64;
+        // Genuinely expired *relative to the watermark*: past ttl+grace as
+        // measured from the already-observed point in time.
+        let acquired_at = watermark - Duration::seconds(ttl as i64 + GRACE_SECS + 1);
+        claim_at(root, "agent-a", "dead.rs", ttl, acquired_at);
+
+        // Plant the watermark after the claim (claim_at's write_lease_atomic
+        // already created `.pact/`).
+        std::fs::write(watermark_file(root), watermark.to_rfc3339()).unwrap();
+
+        // Confirm the fabricated setup really is a backward jump relative to
+        // this lease: the raw wall clock right now is still *before*
+        // `acquired_at`, so a naive `is_expired(&lease, Utc::now())` would
+        // report it as not even acquired yet, let alone expired.
+        assert!(
+            Utc::now() < acquired_at,
+            "test setup: the real clock must be behind the fabricated watermark"
+        );
+
+        let entries = peek(root, true).unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.lease.path == "dead.rs")
+            .expect("dead.rs must still be visible to peek");
+        assert!(
+            entry.expired,
+            "a lease already expired relative to the watermark must be reported expired \
+             promptly via the watermark, not gated on the real clock re-advancing past the jump"
+        );
     }
 
     fn lock_exists(root: &Path, path: &str) -> bool {
