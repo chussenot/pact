@@ -13,8 +13,9 @@
 //! that is missing, so the store on disk decides the backend and only a repo
 //! with no Beads workspace yet gets to express a preference.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
@@ -28,6 +29,26 @@ const TESTED_BD_MAX_EXCLUSIVE: (u64, u64, u64) = (1, 2, 0);
 /// the tested window is the 0.2.x line rather than anything wider.
 const TESTED_BR_MIN: (u64, u64, u64) = (0, 2, 0);
 const TESTED_BR_MAX_EXCLUSIVE: (u64, u64, u64) = (0, 3, 0);
+
+/// Default ceiling on how long [`BeadsCli::run`] waits for the child before
+/// treating it as hung, overridable via `PACT_BEADS_TIMEOUT_SECS` — the same
+/// env-var-configurable-behaviour convention as `PACT_STATE_DIR` and
+/// `PACT_WORKTREE_SCOPE`. Also what makes the timeout testable at all: a test
+/// can shrink it to a second instead of waiting out a real 30.
+const DEFAULT_BEADS_TIMEOUT_SECS: u64 = 30;
+
+/// How often [`BeadsCli::run`] polls the child for exit while it waits. Short
+/// enough that the timeout is honoured to within a fraction of a second,
+/// nowhere near frequent enough to be the ~10x/second budget `tui.rs` guards.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+fn beads_timeout() -> std::time::Duration {
+    let secs = std::env::var("PACT_BEADS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_BEADS_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
 
 pub struct BeadsCli {
     // pub(crate) so tui.rs's tests can construct one directly without a real
@@ -124,6 +145,14 @@ impl BeadsCli {
     /// command shells out at least once, the TUI's Messages tab once did it per
     /// refresh tick, and not turning that into ten subprocesses a second was the
     /// single hardest constraint in the mascot feature — measured by nothing.
+    ///
+    /// Bounded by [`beads_timeout`] (`PACT_BEADS_TIMEOUT_SECS`, default 30s): a
+    /// child that never exits — wedged on a TTY/credential prompt, an internal
+    /// bug, a backend write-lock — used to hang this call, and everything built
+    /// on it, forever. Past the deadline the child is killed and this returns
+    /// exit 3, the same "backend unavailable" code `beads_root` already uses
+    /// for the bare-repository topology: a hung subprocess is the same class of
+    /// problem as no Beads workspace to talk to.
     pub fn run(&self, repo_root: &Path, args: &[&str]) -> Result<String> {
         // One Beads store per repository, not per checkout. A linked worktree
         // has no `.beads/` of its own, so running the backend in the caller's
@@ -148,26 +177,93 @@ impl BeadsCli {
         }
         let started = std::time::Instant::now();
 
-        let output = Command::new(self.binary)
+        // `spawn`, not `output`, because `output` blocks until the child exits
+        // with no way to give up early. Stdin closed to match `output`'s own
+        // behaviour (a prompt reading it gets immediate EOF rather than our
+        // terminal). Stdout/stderr are drained on their own threads rather than
+        // read after the fact, so a chatty child cannot fill a pipe buffer and
+        // block while we are merely sleeping between polls below — the same
+        // problem `output` avoids internally, reimplemented here because we
+        // also need to poll for a timeout.
+        let mut child = match Command::new(self.binary)
             .args(args)
             .current_dir(repo_root)
-            .output()
-            .with_context(|| format!("spawning {} {:?}", self.binary, args));
-        let output = match output {
-            Ok(o) => o,
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawning {} {:?}", self.binary, args))
+        {
+            Ok(c) => c,
             Err(e) => {
                 sp.fail("spawn");
                 self.record(&shape, started, "spawn");
                 return Err(e);
             }
         };
+
+        let mut stdout_pipe = child.stdout.take().expect("stdout is piped");
+        let mut stderr_pipe = child.stderr.take().expect("stderr is piped");
+        let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout_pipe.read_to_end(&mut buf);
+            let _ = stdout_tx.send(buf);
+        });
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut buf);
+            let _ = stderr_tx.send(buf);
+        });
+
+        let timeout = beads_timeout();
+        let deadline = started + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                Ok(None) => {
+                    // Past the deadline: kill and reap so no zombie is left
+                    // behind, then report it the same way `beads_root` reports
+                    // "no Beads workspace" — exit 3, reusing "backend
+                    // unavailable" rather than inventing a code.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    sp.fail("timeout");
+                    self.record(&shape, started, "timeout");
+                    return Err(exit_with(
+                        3,
+                        format!(
+                            "{} {:?} did not finish within {}s (PACT_BEADS_TIMEOUT_SECS) and was \
+                             killed; the Beads backend may be hung on a prompt, an internal bug, \
+                             or a write lock",
+                            self.binary,
+                            args,
+                            timeout.as_secs()
+                        ),
+                    ));
+                }
+                Err(e) => {
+                    sp.fail("wait");
+                    self.record(&shape, started, "wait");
+                    return Err(anyhow::Error::from(e)
+                        .context(format!("waiting on {} {:?}", self.binary, args)));
+                }
+            }
+        };
+        let stdout = stdout_rx.recv().unwrap_or_default();
+        let stderr = stderr_rx.recv().unwrap_or_default();
+
         // `.code()` is None when a signal killed it, which is not an exit code
         // and must not be faked as one.
-        if let Some(code) = output.status.code() {
+        if let Some(code) = status.code() {
             sp.set("process.exit.code", i64::from(code));
         }
-        if !output.status.success() {
-            let outcome = if output.status.code().is_some() {
+        if !status.success() {
+            let outcome = if status.code().is_some() {
                 "exit"
             } else {
                 "signal"
@@ -178,14 +274,14 @@ impl BeadsCli {
                 "{} {:?} failed ({}): {}",
                 self.binary,
                 args,
-                output.status,
+                status,
                 failure_reason(
-                    &String::from_utf8_lossy(&output.stdout),
-                    &String::from_utf8_lossy(&output.stderr),
+                    &String::from_utf8_lossy(&stdout),
+                    &String::from_utf8_lossy(&stderr),
                 )
             );
         }
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stdout = String::from_utf8_lossy(&stdout).into_owned();
         // Learn the version for free from the one call that already asks for
         // it, rather than probing. See BACKEND_VERSION. `set` returning Ok
         // means we are the call that learned it, and that call has to carry the
@@ -671,5 +767,93 @@ mod tests {
         assert!(bd.starts_with("bd (beads) not found") && bd.contains("br cannot read"));
         let br = missing_backend_message(Workspace::Br);
         assert!(br.starts_with("br (beads-rust) not found") && br.contains("bd cannot read"));
+    }
+
+    /// A plain `.git/` directory is all `beads_root` needs to treat a temp dir
+    /// as an ordinary (non-bare, non-worktree) checkout — the same shortcut
+    /// `tests/cli.rs` and `tests/mcp.rs` use for their `init_repo` helpers.
+    fn init_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        tmp
+    }
+
+    /// Restores `PACT_BEADS_TIMEOUT_SECS` on drop (including on panic), so one
+    /// test's override can never leak into whichever test runs next in this
+    /// process — unit tests across every module in this binary-only crate share
+    /// one address space and one environment.
+    struct TimeoutOverride(Option<String>);
+    impl TimeoutOverride {
+        fn set(secs: &str) -> Self {
+            let previous = std::env::var("PACT_BEADS_TIMEOUT_SECS").ok();
+            std::env::set_var("PACT_BEADS_TIMEOUT_SECS", secs);
+            TimeoutOverride(previous)
+        }
+    }
+    impl Drop for TimeoutOverride {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("PACT_BEADS_TIMEOUT_SECS", v),
+                None => std::env::remove_var("PACT_BEADS_TIMEOUT_SECS"),
+            }
+        }
+    }
+
+    /// The bug this whole change exists to fix: `sleep 100` stands in for a
+    /// `bd`/`br` that never exits — wedged on a prompt, a bug, a write lock.
+    /// `BeadsCli` is directly constructible with an arbitrary `binary` (see the
+    /// struct's own doc comment; `msg.rs` and `main.rs` already build one this
+    /// way in their own tests), so no real Beads CLI is needed to prove `run`
+    /// returns instead of hanging.
+    #[test]
+    fn a_hung_child_is_killed_and_reported_as_exit_3_within_the_timeout() {
+        let _override = TimeoutOverride::set("1");
+        let repo = init_repo();
+        let cli = BeadsCli { binary: "sleep" };
+
+        let started = std::time::Instant::now();
+        let err = cli
+            .run(repo.path(), &["100"])
+            .expect_err("a child that never exits must not make run() hang");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            crate::output::code_for(&err),
+            3,
+            "a hung backend reuses exit 3, the same code as no Beads workspace: {err:#}"
+        );
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("PACT_BEADS_TIMEOUT_SECS"),
+            "the message should name the knob to raise: {message}"
+        );
+        // Generous relative to the 1s timeout so a loaded CI box cannot flake
+        // this, but nowhere near the 100s `sleep` would have taken uncapped —
+        // the whole point is that this returns, not that it is instant.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "run() took {elapsed:?} against a 1s timeout; it did not return promptly"
+        );
+    }
+
+    /// The fast path must be unaffected by the new poll loop: a command that
+    /// exits immediately still returns its real stdout, not an artefact of
+    /// polling (a partial read, an extra newline, a timeout error).
+    #[test]
+    fn a_normal_call_still_returns_promptly_with_its_real_stdout() {
+        let repo = init_repo();
+        let cli = BeadsCli { binary: "echo" };
+
+        let started = std::time::Instant::now();
+        let out = cli
+            .run(repo.path(), &["hello-from-a-fast-child"])
+            .expect("a fast, well-behaved child must still succeed");
+        let elapsed = started.elapsed();
+
+        assert_eq!(out.trim(), "hello-from-a-fast-child");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "polling logic must not slow down the fast path: {elapsed:?}"
+        );
     }
 }

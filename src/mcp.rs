@@ -392,28 +392,54 @@ impl Server {
     /// Split from [`serve`] on the real streams so the framing is testable
     /// without a subprocess: every protocol-level test in this module drives
     /// this function over a `&[u8]` and a `Vec<u8>`.
-    pub fn run(&self, input: impl BufRead, output: &mut impl Write) -> Result<i32> {
-        for line in input.lines() {
-            let line = line?;
-            // A blank line is not a message. The spec forbids embedded newlines
-            // rather than promising there are no empty ones, and answering a
-            // parse error to a stray "\n" would be noise on a channel where
-            // every byte we write must be a message.
-            if line.trim().is_empty() {
-                continue;
+    ///
+    /// Each line's [`Self::handle`] runs on its own scoped thread, so a call
+    /// blocked in `BeadsCli::run` (`pact_msg_inbox`, `pact_msg_thread`) cannot
+    /// delay reading — or answering — the NEXT line. `pact mcp serve` is a
+    /// long-lived shared session; before this, one hung Beads call starved
+    /// every other in-flight tool, including `pact_doctor`, the one an
+    /// operator would reach for specifically to diagnose a suspected backend
+    /// problem. `thread::scope` rather than `thread::spawn` because `output`
+    /// (often `&mut Stdout`) is borrowed, not owned, and a scope statically
+    /// guarantees every spawned thread has finished before `run` returns — no
+    /// leaked thread outliving the borrow. Responses may therefore land out of
+    /// request order, which is protocol-legal: JSON-RPC identifies each one by
+    /// `id`, not by position (see `result_shape_follows_the_requests_era` and
+    /// friends below, which assert by id rather than by line).
+    pub fn run(&self, input: impl BufRead, output: &mut (impl Write + Send)) -> Result<i32> {
+        // One lock around the shared writer, not one per tool: two responses
+        // completing at the same instant must not interleave their bytes on
+        // the wire, and a `Mutex` is simpler than a channel-plus-writer-thread
+        // for output this small and this infrequent.
+        let output = std::sync::Mutex::new(output);
+        std::thread::scope(|scope| {
+            for line in input.lines() {
+                let line = line?;
+                // A blank line is not a message. The spec forbids embedded
+                // newlines rather than promising there are no empty ones, and
+                // answering a parse error to a stray "\n" would be noise on a
+                // channel where every byte we write must be a message.
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let output = &output;
+                scope.spawn(move || {
+                    if let Some(response) = self.handle(&line) {
+                        let mut output = output.lock().unwrap();
+                        // One line, always: `to_string` never emits a newline,
+                        // and a pretty-printed response would break the
+                        // framing outright.
+                        let _ = writeln!(output, "{response}");
+                        // Unbuffered from the client's point of view. Without
+                        // this the response can sit in our BufWriter while the
+                        // client blocks reading it and neither side moves — a
+                        // deadlock that looks exactly like a hung server.
+                        let _ = output.flush();
+                    }
+                });
             }
-            if let Some(response) = self.handle(&line) {
-                // One line, always: `to_string` never emits a newline, and a
-                // pretty-printed response would break the framing outright.
-                writeln!(output, "{response}")?;
-                // Unbuffered from the client's point of view. Without this the
-                // response can sit in our BufWriter while the client blocks
-                // reading it and neither side moves — a deadlock that looks
-                // exactly like a hung server.
-                output.flush()?;
-            }
-        }
-        Ok(0)
+            Ok(0)
+        })
     }
 
     /// One request line in, at most one response line out. `None` for a
@@ -1298,14 +1324,25 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "one line per request, none for the rest");
-        for line in &lines {
-            let v: Value = serde_json::from_str(line).expect("each line is one message");
-            assert_eq!(v["jsonrpc"], "2.0");
-            // The framing rule: no message may contain an embedded newline.
-            assert!(!line.contains('\n'));
-        }
+        let responses: Vec<Value> = lines
+            .iter()
+            .map(|line| {
+                let v: Value = serde_json::from_str(line).expect("each line is one message");
+                assert_eq!(v["jsonrpc"], "2.0");
+                // The framing rule: no message may contain an embedded newline.
+                assert!(!line.contains('\n'));
+                v
+            })
+            .collect();
+        // By id, not by position: each line now runs on its own thread (see
+        // `run`'s doc comment), so responses may legitimately land out of
+        // request order.
+        let initialize_response = responses
+            .iter()
+            .find(|r| r["id"] == 1)
+            .expect("a response to id 1");
         assert_eq!(
-            serde_json::from_str::<Value>(lines[0]).unwrap()["result"]["protocolVersion"],
+            initialize_response["result"]["protocolVersion"],
             PROTOCOL_VERSION
         );
     }
