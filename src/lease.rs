@@ -1178,7 +1178,21 @@ fn acquire_inner(
                         stolen: true,
                     });
                 }
-                Err(read_err) => return Err(read_err),
+                // Same "ownership unknown" case as release_fs's corrupt-lock
+                // branch, so it gets the same exit code: 2, not the generic 1
+                // this used to fall through to by returning the raw parse
+                // error unwrapped. AGENTS.md tells every agent to branch on
+                // exit 2 for "this path is not available", not on message
+                // text — a corrupt lock is exactly that (pact-m7j.4.8).
+                Err(read_err) => {
+                    return Err(exit_with(
+                        2,
+                        format!(
+                            "lock file for {relative} is corrupt ({read_err:#}); ownership \
+                             cannot be determined — use --steal to recover it"
+                        ),
+                    ));
+                }
             };
 
             if is_expired(&existing, now) {
@@ -1693,8 +1707,11 @@ fn renew_fs(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
         // is not safe — but the error must point somewhere, not just repeat
         // `serde_json`'s parse failure back at the caller. `--steal` is
         // exactly the recovery path built for a corrupt lock (pact-m7j.4.2).
+        // Same exit code as release_fs's and acquire_inner's corrupt-lock
+        // branches: 2, "this path is not available", not the generic 1
+        // this used to carry (pact-m7j.4.8).
         exit_with(
-            1,
+            2,
             format!(
                 "lock file for {relative} is corrupt and cannot be renewed ({e:#}); \
                  use `pact lease acquire {relative} --steal` to recover it"

@@ -420,11 +420,18 @@ detail line names them, and each says what it did:
 
 | Command | On a corrupt lock |
 |---|---|
-| `lease acquire` | fails (exit 1) with the parse error — ownership is unknown, so the path is not free |
+| `lease acquire` | exit 2 with the parse error — ownership is unknown, so the path is not free, the same code a confirmed live claim exits |
 | `lease acquire --steal` | warns, takes the path, logs `stolen` with the parse error as its detail |
-| `lease renew` | fails, naming `pact lease acquire <path> --steal` instead of printing a raw parse error |
+| `lease renew` | exit 2, naming `pact lease acquire <path> --steal` instead of printing a raw parse error |
 | `lease release` | exit 2 naming `--force`: `existing.agent` can't be read, so a plain release would be guessing |
 | `lease release --force` | warns and removes it, logging `force-released` with **no** displaced holder — no name survived to report one |
+
+Exit 2 across every refusing row is deliberate, not incidental: AGENTS.md tells
+an agent to branch on that code for "this path is not available," not on
+message text, and a corrupt lock's remediation (`--steal` or `--force`) is
+identical to a confirmed live claim's. It was not always consistent —
+`acquire` exited 1 (generic) and `renew` exited 1 by an unexplained deliberate
+choice until pact-m7j.4.8 aligned both with `release`'s original 2.
 
 `pact doctor` also reports **orphaned staging files**: `staging-*`/`tmp-*`
 debris in `.pact/leases/` from a write that died between staging and rename.

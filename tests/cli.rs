@@ -365,6 +365,10 @@ fn release_all_of_only_expired_leases_says_it_held_none() {
 /// on that path — `--steal` included, even though overriding a problematic
 /// existing claim is the entire reason `--steal` exists. Before the fix this
 /// exited 1 with a `serde_json` parse error instead of recovering the lease.
+///
+/// pact-m7j.4.8: a plain (non-`--steal`) acquire against that same corrupt
+/// lock used to exit 1 (generic) instead of 2 ("this path is not available"),
+/// the code AGENTS.md tells every agent to branch on instead of message text.
 #[test]
 fn steal_recovers_a_lease_behind_a_corrupt_lock_file() {
     let tmp = init_repo();
@@ -379,12 +383,15 @@ fn steal_recovers_a_lease_behind_a_corrupt_lock_file() {
 
     // Without --steal, a corrupt lock must still block a plain acquire —
     // ownership cannot be verified, so this must not become a silent
-    // takeover of whatever is sitting behind unreadable bytes.
+    // takeover of whatever is sitting behind unreadable bytes. It must exit
+    // 2, the same code a confirmed live claim exits, since the remediation
+    // (--steal) is identical either way.
     let plain = pact(tmp.path(), "agent-b", &["lease", "acquire", "corrupt.rs"]);
-    assert_ne!(
+    assert_eq!(
         plain.status.code(),
-        Some(0),
-        "a corrupt lock must not be silently claimable without --steal"
+        Some(2),
+        "a corrupt lock must exit 2 like any other unavailable path: {}",
+        stderr_of(&plain)
     );
 
     let out = pact(
@@ -400,7 +407,9 @@ fn steal_recovers_a_lease_behind_a_corrupt_lock_file() {
 
 /// Same fix, applied to `renew` for consistency: ownership can't be checked
 /// against unparsable content, so renewing must fail — but with a message
-/// that names the recovery path instead of echoing a raw parse error.
+/// that names the recovery path instead of echoing a raw parse error. Also
+/// exits 2, not 1 (pact-m7j.4.8): the original fix set this to 1, inconsistent
+/// with `release_fs`'s corrupt-lock branch, which was already 2.
 #[test]
 fn renew_of_a_corrupt_lock_points_at_steal_instead_of_a_raw_parse_error() {
     let tmp = init_repo();
@@ -412,8 +421,8 @@ fn renew_of_a_corrupt_lock_points_at_steal_instead_of_a_raw_parse_error() {
     std::fs::write(lock_path(tmp.path(), "corrupt2.rs"), b"not json at all").unwrap();
 
     let out = pact(tmp.path(), "agent-a", &["lease", "renew", "corrupt2.rs"]);
-    assert_ne!(out.status.code(), Some(0));
     let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
     assert!(
         stderr.contains("--steal"),
         "must point at the recovery path: {stderr}"
@@ -433,7 +442,7 @@ fn release_of_a_corrupt_lock_requires_force() {
     std::fs::write(lock_path(tmp.path(), "corrupt3.rs"), b"not json at all").unwrap();
 
     let plain = pact(tmp.path(), "agent-a", &["lease", "release", "corrupt3.rs"]);
-    assert_ne!(plain.status.code(), Some(0));
+    assert_eq!(plain.status.code(), Some(2));
     assert!(
         lock_path(tmp.path(), "corrupt3.rs").exists(),
         "a plain release must refuse, not silently remove a corrupt lock"
