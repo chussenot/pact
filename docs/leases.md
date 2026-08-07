@@ -366,6 +366,31 @@ The state label is derived from the same `expired` flag that garbage collection
 acts on, not recomputed — so the label can never claim something the sweep
 disagrees with.
 
+### When the wall clock jumps
+
+Expiry is `now > acquired_at + ttl + grace` and nothing else, so it cannot tell
+"this lease really is a month old" from "the clock moved." Both directions are
+covered, by two mechanisms that share no state:
+
+- **Forward.** An age past `MAX_PLAUSIBLE_AGE_SECS` (`src/lease.rs`) says more
+  about `now` than about the lease, so pact refuses to auto-expire it and
+  requires an explicit `--steal`, exactly as for a live claim. The bound is
+  stateless and deliberately generous — far past any TTL, and past the longest
+  hold `pact audit` has ever measured here — because a lease that has genuinely
+  been held for that long belongs to an agent nobody expects back, and `--steal`
+  is the honest way to take it. Guessing the other way silently hands a live
+  agent's path to somebody else on a machine whose clock ran forward.
+- **Backward.** `.pact/clock_watermark` holds the highest `now` any pact command
+  in this repo has observed. `acquire` and `renew` raise it and use the higher
+  of the two as `now`; every read path — `lease ls`, `pact ui`, `doctor` —
+  corrects against it but never writes it, because a question must not create
+  state. Without it, an NTP step backwards would make a lease that had already
+  expired read as `active` again until the clock caught up.
+
+`is_expired` itself stays a pure function of `(lease, now)`. Both corrections
+live in what the caller passes as `now`, so nothing downstream — the state
+labels, the sweep, `pact audit` — has to know either mechanism exists.
+
 ### The fourth outcome: a lock file pact can't read
 
 A lock whose `acquired_at` won't parse is treated as **epoch 0** — 1970, which
@@ -383,10 +408,48 @@ can't tell whose it is. Those are counted separately and reported by
 ✗ corrupt leases: 2 unreadable lock files (remove manually from .pact/leases/)
 ```
 
-Deleting them is a manual step on purpose. Everything else pact garbage-collects
-is a file it wrote and can still read; an unreadable one is the only case where
-it can't tell an abandoned lease from a live agent's claim it merely failed to
-parse, and guessing wrong silently destroys someone's lock.
+pact never clears one on its own, and that part is on purpose: everything else
+it garbage-collects is a file it wrote and can still read, while an unreadable
+one is the only case where it can't tell an abandoned lease from a live agent's
+claim it merely failed to parse, and guessing wrong silently destroys someone's
+lock. But refusing *every* route out of it went too far. A corrupt lock used to
+fail `acquire --steal` as well, with a raw serde parse error — the one command
+whose entire purpose is overriding a claim you have decided not to respect. The
+explicit overrides now reach it, and each says what it did:
+
+| Command | On a corrupt lock |
+|---|---|
+| `lease acquire` | fails (exit 1) with the parse error — ownership is unknown, so the path is not free |
+| `lease acquire --steal` | warns, takes the path, logs `stolen` with the parse error as its detail |
+| `lease renew` | fails, naming `pact lease acquire <path> --steal` instead of printing a raw parse error |
+| `lease release` | exit 2 naming `--force`: `existing.agent` can't be read, so a plain release would be guessing |
+| `lease release --force` | warns and removes it, logging `force-released` with **no** displaced holder — no name survived to report one |
+
+`pact doctor` also reports **orphaned staging files**: `staging-*`/`tmp-*`
+debris in `.pact/leases/` from a write that died between staging and rename.
+`corrupt leases` cannot see those — it only looks at `*.lock`, and a staging
+file never got that extension — so without their own check they accumulate
+invisibly. Doctor prescribes manual removal here too, with the added reason
+that a staging file might belong to a write happening right now.
+
+### A prior claim the lock files don't know about
+
+An empty `.pact/leases/` — a fresh clone, or the wipe `pact doctor` just
+prescribed — looks locally identical to a path nobody has ever touched. The
+shared `.pact/events.jsonl` may disagree, and `acquire` now says so: when the
+log's last word on the path is an `acquired` with no later
+release/expiry/steal, it names that holder and when, before letting you
+proceed.
+
+```
+warning: the shared event log's last word on shared.rs is an unresolved acquire by agent-a at
+2026-08-01T00:00:00+00:00 (no later release/expiry/steal on record) — .pact/leases/ has no
+matching lock locally, so this acquire is proceeding, but that prior claim was never closed out
+```
+
+A warning, not a refusal. The doctor-prescribed wipe produces this exact shape
+and is a legitimate recovery, so blocking here would misfire on precisely the
+case doctor sends people to.
 
 ### Why `lease ls` leads with age, not remaining TTL
 
@@ -648,7 +711,8 @@ telemetry compiled out means no filesystem work at all. `release --all` sweeps
 any markers you left behind, because a conflict you never retried would
 otherwise leak one small file per `(agent, path)` forever — and not retrying is
 exactly what the protocol tells a blocked agent to do. `lease ls` and
-`pact doctor` do not see these files; they only look at `*.lock`.
+`pact doctor` do not see these files: both look inside `.pact/leases/`, and
+`.pact/waits/` is a sibling directory neither reads.
 
 ## Why advisory, not mandatory
 

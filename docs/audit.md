@@ -95,6 +95,42 @@ because grouping them would need a timestamp tolerance — one `acquire` writes 
 row per path, microseconds apart — and a number that depends on an arbitrary
 tolerance is worse than no number.
 
+## Closes with nothing open
+
+Reconstruction pairs every `released` / `force-released` / `expired` with the
+`acquired` / `stolen` it closes, keyed by agent and path. A close matching no
+open hold used to be dropped where it was found — no hold, no counter, no
+trace — so `by_kind`'s raw count of close events could disagree with how many
+holds actually closed, and nothing said why. The summary and every `--check`
+now report it, and `--json` carries it as `orphaned_closes`:
+
+```
+  note   8 close event(s) with no matching open — not counted as a Hold
+```
+
+It counts "this did not add up" and never guesses what: audit does not
+synthesize a best-effort hold for history it cannot reconstruct. A nonzero
+count is normal. This repository's own 8 are all explained, and none is a
+defect:
+
+- **Four are `force-released`.** That event is logged under the agent *doing*
+  the forcing, with the displaced holder named only in the free-text detail —
+  unlike `expired`, which is deliberately logged under the dead holder. So a
+  force-release closes nothing here, and the holder's window runs on until that
+  agent next touches the path, which is why a hold spanning one reads as a
+  single long window rather than two.
+- **Four have an acquire the log never recorded.** `cli-wire` released four
+  source files eight minutes into this log's history and no `acquired` for any
+  of them appears anywhere in the file: it claimed them before the first line
+  was written. A hold that straddles the start of recorded history has a close
+  and no open, permanently.
+
+Two more causes look identical to those and are equally benign: a `--since`
+window that begins after the open, and an annotation covering an open line but
+not its close. What is left after all four is a line the log actually lost — a
+torn append, or a trim that raced a writer — which is the only reason the
+counter is worth printing.
+
 ## Provenance: the log is append-only, corrections are annotations
 
 `.pact/events.jsonl` is committed and never rewritten. Entries are not edited or
@@ -123,6 +159,15 @@ Rules that follow from that:
 - The annotation row itself is never counted as an event, in either mode.
   Otherwise a correction would inflate the totals with a record that describes the
   log rather than the fleet.
+- The `actor` is **format-checked and flagged, never enforced**. One that fails
+  `identity::validate` (the same `[a-z0-9][a-z0-9-]{1,31}` every agent name
+  must match) prints `[INVALID ACTOR — does not match [a-z0-9][a-z0-9-]{1,31}]`
+  after the name, and the annotation still takes effect. Rejecting it would let
+  one malformed field silently swallow the correction it was written to record,
+  which is worse than the forgeable field already was. An absent `actor` prints
+  as `unknown` and is *not* flagged — nobody signed this is a different
+  condition from somebody signed it with garbage. pact writes no annotation
+  itself, so read time is the only gate there is to put this behind.
 - Older pact binaries need no change: `kind` is a `String`, so an annotation
   parses as an unknown kind, opens no hold window and closes none. They just do
   not apply the exclusion — which over-reports rather than hiding events, the safe

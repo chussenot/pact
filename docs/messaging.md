@@ -630,6 +630,52 @@ Two supporting changes:
   merely opening the tab would wipe the unread markers that make the list worth
   having.
 
+### The tag goes on at create time
+
+The `about-<path>` label is passed to `bd`/`br create` in the same call that
+makes the bead, not added by a `label add` afterwards. A second call is a second
+thing that can fail or be raced, and the window it opened was one where the
+message existed and was findable by name but not by path — exactly the state
+this mechanism exists to close.
+
+The label is `about-` plus the path with `/` as `__` and **every byte outside
+`[A-Za-z0-9_:-]` replaced by `-`**. That narrowing is not cosmetic: br 0.2.19
+rejects a `.` in a label outright, so before it, every tag on a real file path
+— anything with an extension — failed on br and the message was delivered
+untagged, with only a swallowed warning to show for it. bd accepts the wider
+set, so the narrow encoding is a subset that works on both rather than a second
+scheme to keep in sync. It is one-way: nothing decodes a label back to a path,
+it only re-encodes the path being queried and compares.
+
+### When that check can't run, it says so
+
+The check runs against a backend that may be absent, wedged, or never installed
+here, so "looked and found nothing" and "could not look" must not render the
+same way. They don't:
+
+| Situation | `pact lease acquire` prints |
+|---|---|
+| no `.beads/` in the repo at all | nothing |
+| `.beads/` exists, check ran, nothing unread | nothing |
+| `.beads/` exists, check ran, something unread | the `note: N unread message(s) about …` line above |
+| `.beads/` exists, check could not run | `note: could not check for pending messages about <path>: <why>` |
+
+The first row took two goes to get right. The check ran unconditionally at
+first, so a repository that had never run `bd`/`br init` — the lease-only
+population, who never opted into messaging at all — got "could not check for
+pending messages" on every single acquire, forever, for a lookup that could not
+have found anything. Silence is correct there: nothing was ever set up. Once
+`.beads/` exists, a failure to check is worth a line, because something that
+*was* set up has become unreachable.
+
+None of it moves the exit code. The lease succeeded, and acquiring one has never
+depended on the messaging backend — it must not start now. Each path in a batch
+acquire also resolves on its own, so one path's failed lookup cannot pass for a
+sibling's genuine all-clear, and one path's finding cannot make a failed check
+elsewhere look like it worked. A backend missing from `PATH` is the one
+exception, because it is a property of the call rather than of any path: one
+line naming every path, instead of the same line repeated per path.
+
 ### When every path resolves to you
 
 `--to-owner-of` resolves to the *last* agent to act on a path — which, right
