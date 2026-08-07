@@ -47,6 +47,27 @@ pub const DEFAULT_TTL_SECS: u64 = 2700;
 /// Clock-skew tolerance: a lease is only considered expired past `ttl + GRACE_SECS`.
 pub const GRACE_SECS: i64 = 30;
 
+/// A TTL at or beyond this is functionally "forever" for a coordination
+/// lease -- 100 years. Real inputs never approach it; it exists to cap the
+/// u64 CLI value before it becomes an i64 fed to `chrono::Duration::seconds`,
+/// which panics ("TimeDelta::seconds out of bounds") once seconds exceeds
+/// roughly `i64::MAX / 1000` -- verified directly against chrono 0.4.45.
+/// Saturating to `i64::MAX` still crosses that line, trading a silent
+/// misexpiry for a hard crash on every subsequent `is_expired` check against
+/// the same lease, which is worse (pact-m7j.9.10).
+pub const MAX_TTL_SECS: i64 = 100 * 365 * 24 * 60 * 60;
+
+/// `ttl_secs` arrives from the CLI as an unbounded `u64` (`--ttl` has no
+/// range check). A bare `as i64` bit-reinterprets any value at or past 2^63
+/// as negative, inverting "hold forever" into "already expired" the instant
+/// it is read back. Every call site that turns a stored or requested TTL
+/// into a `chrono::Duration` or an `i64` comparison must go through this.
+pub fn ttl_as_i64(ttl_secs: u64) -> i64 {
+    i64::try_from(ttl_secs)
+        .unwrap_or(i64::MAX)
+        .min(MAX_TTL_SECS)
+}
+
 /// Sanity bound on how old a lease's computed age may plausibly be before
 /// `is_expired` trusts it enough to auto-reclaim (pact-m7j.4.4, forward clock
 /// jump).
@@ -459,7 +480,7 @@ fn is_expired(lease: &LeaseInfo, now: DateTime<Utc>) -> bool {
             if now - acquired > chrono::Duration::seconds(MAX_PLAUSIBLE_AGE_SECS) {
                 return false;
             }
-            now > acquired + chrono::Duration::seconds(lease.ttl_secs as i64 + GRACE_SECS)
+            now > acquired + chrono::Duration::seconds(ttl_as_i64(lease.ttl_secs) + GRACE_SECS)
         }
         None => true,
     }
@@ -468,7 +489,7 @@ fn is_expired(lease: &LeaseInfo, now: DateTime<Utc>) -> bool {
 fn age_and_remaining(lease: &LeaseInfo, now: DateTime<Utc>) -> (i64, i64) {
     let acquired = parse_acquired(lease);
     let age = (now - acquired).num_seconds();
-    (age, lease.ttl_secs as i64 - age)
+    (age, ttl_as_i64(lease.ttl_secs) - age)
 }
 
 /// `.pact/clock_watermark`: a single RFC3339 timestamp recording the highest
@@ -2068,6 +2089,36 @@ mod tests {
             DateTime::UNIX_EPOCH,
             "corrupt timestamp must parse as Unix epoch"
         );
+    }
+
+    /// pact-m7j.9.10: `--ttl` is an unbounded `u64` CLI arg with no range
+    /// check. A bare `ttl_secs as i64` bit-reinterprets `u64::MAX` as `-1`,
+    /// so a lease requested to last "forever" used to read back as already
+    /// expired (and `remaining` as negative) the instant it was checked.
+    #[test]
+    fn a_u64_max_ttl_reads_as_active_not_already_expired() {
+        let (lease, now) = lease_aged(u64::MAX, 0);
+        assert!(
+            !is_expired(&lease, now),
+            "a u64::MAX ttl must not read back as already expired"
+        );
+        let (_, remaining) = age_and_remaining(&lease, now);
+        assert!(
+            remaining > 0,
+            "remaining must not go negative for a u64::MAX ttl: {remaining}"
+        );
+    }
+
+    /// The same overflow reached `chrono::Duration::seconds` if a naive fix
+    /// merely saturated the cast to `i64::MAX` instead of capping well below
+    /// it: `Duration::seconds` panics ("TimeDelta::seconds out of bounds")
+    /// past roughly `i64::MAX / 1000`. A panic on every subsequent expiry
+    /// check against the same lease is worse than the original silent
+    /// misexpiry, so this pins the non-panicking behavior directly.
+    #[test]
+    fn ttl_as_i64_stays_within_chrono_duration_bounds() {
+        let capped = ttl_as_i64(u64::MAX);
+        let _ = chrono::Duration::seconds(capped + GRACE_SECS);
     }
 
     #[test]

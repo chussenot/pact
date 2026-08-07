@@ -391,6 +391,22 @@ covered, by two mechanisms that share no state:
 live in what the caller passes as `now`, so nothing downstream — the state
 labels, the sweep, `pact audit` — has to know either mechanism exists.
 
+### `--ttl` has no upper bound, but expiry math does
+
+`--ttl` takes a bare `u64` with no range check — nothing stops `--ttl
+18446744073709551615`. `ttl_secs` feeds `chrono::Duration::seconds` as an
+`i64`, though, and a bit-for-bit cast turns any value at or past 2^63 negative:
+a lease asked to last "forever" used to read back as already expired the
+instant anything checked it. `ttl_as_i64` (`src/lease.rs`) is the one
+conversion every reader goes through, and it caps at 100 years rather than
+saturating to `i64::MAX` — `Duration::seconds` panics on a value anywhere
+near that, so saturating there would trade a silent misexpiry for a hard
+crash on every later check of the same lease. 100 years is not a considered
+limit on how long a lease may run; it exists only so the cast can never flip
+sign or blow past what `chrono` can represent. Whether pact should instead
+reject an unreasonable `--ttl` outright at the CLI is still an open question
+(pact-m7j.9.10) — nothing here takes a position on it either way.
+
 ### The fourth outcome: a lock file pact can't read
 
 A lock whose `acquired_at` won't parse is treated as **epoch 0** — 1970, which

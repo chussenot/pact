@@ -44,7 +44,7 @@ use serde::Serialize;
 
 use crate::events::Event;
 use crate::identity;
-use crate::lease::DEFAULT_TTL_SECS;
+use crate::lease::{ttl_as_i64, DEFAULT_TTL_SECS};
 
 /// The default TTL before pact recorded it per-event, used for holds whose
 /// opening event carries no `ttl_secs`.
@@ -666,7 +666,7 @@ pub fn run_check(
             report.stale_holds = holds
                 .into_iter()
                 .filter(|h| {
-                    let over = h.held_secs.unwrap_or(0) > h.ttl_secs as i64;
+                    let over = h.held_secs.unwrap_or(0) > ttl_as_i64(h.ttl_secs);
                     let lapsed = h.closed_by.as_deref() == Some("expired");
                     (over || lapsed) && h.renewals == 0
                 })
@@ -864,7 +864,7 @@ pub fn render_check(r: &CheckReport) -> String {
             h.path,
             h.agent,
             h.held_secs.map(secs).unwrap_or_else(|| "?".to_string()),
-            secs(h.ttl_secs as i64),
+            secs(ttl_as_i64(h.ttl_secs)),
             if h.ttl_assumed { "*" } else { " " },
             ended,
             h.opened_line
@@ -894,7 +894,7 @@ pub fn render_check(r: &CheckReport) -> String {
              is reclaimable by anyone, so each of these is a window where a peer could have taken\n\
              a path its holder still believed it owned. (The current default is {}.)",
             r.stale_holds.len(),
-            secs(r.ttl_secs.unwrap_or(DEFAULT_TTL_SECS) as i64)
+            secs(ttl_as_i64(r.ttl_secs.unwrap_or(DEFAULT_TTL_SECS)))
         ));
     }
 
@@ -1136,6 +1136,36 @@ mod tests {
         assert_eq!(r.stale_holds[0].agent, "short");
         assert_eq!(r.stale_holds[0].ttl_secs, 600);
         assert!(!r.stale_holds[0].ttl_assumed);
+    }
+
+    /// pact-m7j.9.10: a bare `ttl_secs as i64` bit-reinterprets `u64::MAX` as
+    /// `-1`, so a "hold forever" lease's TTL read back negative and every
+    /// hold — however short — compared as `over` it. `Check::StaleHolds` has
+    /// its own independent cast from `lease.rs`'s, so this pins it separately.
+    #[test]
+    fn a_u64_max_ttl_is_never_reported_as_stale() {
+        let tmp = with_log(&[
+            &ev_ttl(
+                "2026-08-01T10:00:00Z",
+                "forever",
+                "acquired",
+                "a.rs",
+                u64::MAX,
+            ),
+            &ev_ttl(
+                "2026-08-01T10:00:10Z",
+                "forever",
+                "released",
+                "a.rs",
+                u64::MAX,
+            ),
+        ]);
+        let r = run_check(tmp.path(), Check::StaleHolds, None, false).unwrap();
+        assert_eq!(
+            r.findings(),
+            0,
+            "a u64::MAX ttl must never read back as already over its own TTL"
+        );
     }
 
     /// Events written before pact recorded a TTL are judged against the default of
