@@ -1527,6 +1527,71 @@ fn init_points_existing_instruction_files_at_agents_md_and_creates_none() {
     );
 }
 
+/// pact-m7j.9.5. The AGENTS.md-alias filter in `present_targets` only ever
+/// excluded a candidate that canonicalizes to AGENTS.md's OWN path — nothing
+/// caught two OTHER candidates resolving to each other (a dotfiles-style
+/// setup: `GEMINI.md` and `.cursorrules` both symlinked to one shared file).
+/// Before the fix, `init` spliced both nominal targets independently; since
+/// they are the same underlying file, the second write clobbers the first's
+/// block, and `doctor` reports one of them stale immediately after `init`
+/// claimed to update it. The fix skips the later alias instead of writing it.
+#[cfg(unix)]
+#[test]
+fn init_skips_the_later_of_two_instruction_targets_aliased_to_each_other() {
+    let tmp = init_repo();
+    let root = tmp.path();
+
+    // A shared file outside the managed filename list, symlinked at by two
+    // different `INSTRUCTION_TARGETS` names — the dotfiles-style layout the
+    // design note calls "likely intentional, not broken".
+    std::fs::write(root.join("shared-instructions.md"), "# shared\n").unwrap();
+    std::os::unix::fs::symlink("shared-instructions.md", root.join("GEMINI.md")).unwrap();
+    std::os::unix::fs::symlink("shared-instructions.md", root.join(".cursorrules")).unwrap();
+
+    let out = pact(root, "init-agent", &["init", "--no-commit", "--json"]);
+    assert_ok(&out);
+    let report = json_stdout(&out);
+    let managed = report["instruction_files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("init --json must report instruction_files: {report}"));
+    assert_eq!(
+        managed.len(),
+        1,
+        "the two aliases must count as one managed file: {report}"
+    );
+    assert!(
+        managed[0]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("GEMINI.md"),
+        "the earlier-listed alias (GEMINI.md) should be the one written: {report}"
+    );
+
+    let shared = std::fs::read_to_string(root.join("shared-instructions.md")).unwrap();
+    assert_eq!(
+        shared.matches("<!-- pact:begin -->").count(),
+        1,
+        "the shared file must carry exactly one managed block, not one per alias:\n{shared}"
+    );
+
+    // The acceptance check: doctor must not report anything stale right after
+    // an init that claimed to update it. Not `assert_ok`: overall health also
+    // depends on unrelated checks (e.g. no Beads CLI on PATH in one `mise run
+    // test` leg), so only this one check's `ok` is asserted.
+    let doc = pact(root, "init-agent", &["doctor", "--json"]);
+    let checks = json_stdout(&doc);
+    let check = checks["checks"]
+        .as_array()
+        .expect("doctor emits a checks array")
+        .iter()
+        .find(|c| c["name"] == "other instruction files current")
+        .expect("doctor should have an opinion about instruction files");
+    assert_eq!(
+        check["ok"], true,
+        "doctor must not flag a file init just wrote as stale: {check}"
+    );
+}
+
 // ------------------------------------------- msg over the br backend (pact-l94)
 
 /// pact-l94, requested by br-dev in thread pact-wisp-0ma. The plain round trip
