@@ -943,6 +943,76 @@ fn msg_send_rejects_an_all_whitespace_body_file() {
     );
 }
 
+/// A message body is free text from another agent, printed verbatim by design
+/// (byte fidelity, pact-rnc.25) — but a raw terminal escape sequence in that
+/// text is not "content", it's a command aimed at whoever's terminal renders
+/// it: clear the screen, ring the bell, rewrite what's on screen next. This
+/// pins the fix at the only place that matters — the actual bytes written to
+/// stdout, not the `String` `render_*` builds before `output::line` ever sees
+/// it — across every human-rendered surface that showed a gap: the one-line
+/// inbox row (`render_inbox`, truncated through `one_line`) and the untruncated
+/// thread view (`render_full`, `msg read`).
+#[test]
+fn escape_sequences_in_a_message_body_never_reach_the_terminal() {
+    let Some(tmp) = bd_repo("escape_sequences_in_a_message_body_never_reach_the_terminal") else {
+        return;
+    };
+
+    // ESC CSI clear-screen + home, then BEL, then enough filler to push the
+    // inbox row past one_line's 60-char cap so its truncation path also runs
+    // over the attack bytes rather than just the render_full path.
+    let attack_body = format!("clear\x1b[2Jscreen\x07BEL-{}", "x".repeat(80));
+
+    let send = pact(
+        tmp.path(),
+        "sender-agent",
+        &["msg", "send", "--to", "reader-agent", &attack_body],
+    );
+    assert_ok(&send);
+
+    // render_inbox: one line per message, body truncated through one_line.
+    let inbox = pact(tmp.path(), "reader-agent", &["msg", "inbox"]);
+    assert_ok(&inbox);
+    assert!(
+        !inbox.stdout.contains(&0x1b),
+        "ESC byte leaked into `msg inbox` stdout: {:?}",
+        inbox.stdout
+    );
+    assert!(
+        !inbox.stdout.contains(&0x07),
+        "BEL byte leaked into `msg inbox` stdout: {:?}",
+        inbox.stdout
+    );
+    assert!(
+        stdout_of(&inbox).contains("clear"),
+        "surrounding printable text should survive sanitization: {}",
+        stdout_of(&inbox)
+    );
+
+    // render_full via `msg read <id>`: the untruncated thread view.
+    let id = inbox_json(tmp.path(), "reader-agent")[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let read = pact(tmp.path(), "reader-agent", &["msg", "read", &id]);
+    assert_ok(&read);
+    assert!(
+        !read.stdout.contains(&0x1b),
+        "ESC byte leaked into `msg read` stdout: {:?}",
+        read.stdout
+    );
+    assert!(
+        !read.stdout.contains(&0x07),
+        "BEL byte leaked into `msg read` stdout: {:?}",
+        read.stdout
+    );
+    let read_out = stdout_of(&read);
+    assert!(
+        read_out.contains("clear") && read_out.contains("screen") && read_out.contains("BEL-x"),
+        "surrounding printable text should survive sanitization, untruncated: {read_out}"
+    );
+}
+
 /// `-V` is the machine-facing form and must stay the bare `pact <semver>` line;
 /// `--version` carries the build stamp. Guarding both together is the point —
 /// the value of the stamp is answering "is the binary on PATH the one I built?",
