@@ -325,6 +325,47 @@ outside its own prefix, and it does nothing else here. Replies still hang off
 the root in bd's own shape, so a thread reads `pact-msg-<hash>`,
 `pact-msg-<hash>.1`, and so on.
 
+## Replaying a fan-out that failed partway: `--skip`
+
+The id trick above only covers a thread's **root** — the first `--to`.
+Recipients 2..N of a fan-out are parented on that root and carry no `--id` of
+their own (see the second limit above), so if `create` fails partway through —
+say, recipient 3 of 4 — an identical retry re-sends to every recipient again,
+duplicating the ones who already got it. The error already names them:
+
+```
+$ pact msg send --to alice --to bob --to carol --json "shared decision"
+error: sending to carol: 2 recipient(s) already got this (alice, bob) — replay
+with --skip for them instead of re-sending blind
+```
+
+With `--json`, that same fact is a structured shape on stderr instead of prose:
+
+```json
+{
+  "already_sent": ["alice", "bob"],
+  "failed_at": "carol",
+  "reason": "br [...] failed (exit status: 1): ..."
+}
+```
+
+Read `already_sent` back and pass each name as `--skip <agent>` (repeatable,
+like `--to`) on the retry — the recipient list stays the same, but pact drops
+the skipped names before sending, so only the recipient that actually failed
+is attempted:
+
+```
+$ pact msg send --to alice --to bob --to carol --skip alice --skip bob "shared decision"
+note: 2 recipient(s) skipped — already sent to them, not re-sending
+sent pact-msg-... to carol (thread pact-msg-...)
+```
+
+This is a **new, opt-in path**, not a change to what an identical replay does:
+run the exact same command again with no `--skip`, and alice/bob still
+duplicate exactly as the second limit above describes. `--skip` exists for the
+sender who already knows, from a failed attempt's own error, which recipients
+not to touch again.
+
 ## Read state: shared labels, not a local file
 
 An agent that reads a message adds a `read-by-<agent>` label to the bead. That's
@@ -522,7 +563,7 @@ data point.
 ## Command reference
 
 ```
-pact msg send --to <agent> [--to <agent>...] [--thread <id>] [--subject <text>] (<body> | --body-file <path|->)
+pact msg send --to <agent> [--to <agent>...] [--thread <id>] [--subject <text>] [--skip <agent>...] (<body> | --body-file <path|->)
 pact msg inbox [--unread-only] [--full]
 pact msg sent
 pact msg read <id>

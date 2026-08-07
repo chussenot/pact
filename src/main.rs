@@ -220,6 +220,12 @@ enum MsgAction {
         /// Read the body from a file, or "-" for stdin. No shell escaping.
         #[arg(long, value_name = "PATH|-")]
         body_file: Option<String>,
+        /// Recipient to leave out of this send; repeat for several. For
+        /// replaying a partially-failed send without re-delivering to whoever
+        /// already got it — read `already_sent` from the failed attempt's
+        /// `--json` error and pass each name here (pact-m7j.6.5).
+        #[arg(long, value_name = "AGENT")]
+        skip: Vec<String>,
     },
     /// List messages addressed to you, one line each.
     Inbox {
@@ -308,6 +314,10 @@ fn main() {
     // business walking the filesystem for a repo root.
     telemetry.set("pact.subcommand", subcommand);
     telemetry.set("pact.json", cli.json);
+    // Captured before `run(cli)` moves `cli` by value: the error arm below
+    // needs to know whether `--json` was requested, to decide whether a
+    // structured error (pact-m7j.6.5) prints as JSON or as the usual text.
+    let json = cli.json;
     // The *resolved* identity, so `--agent` shows up too — otel.rs can only
     // see PACT_AGENT. An unresolvable identity is simply absent: `whoami` and
     // `doctor` exist to be run when it is broken, and they must still trace.
@@ -337,7 +347,16 @@ fn main() {
             }
         }
         Err(e) => {
-            output::warn(&format!("error: {e:#}"));
+            // A partially-failed `msg send` carries a structured shape a
+            // `--json` caller can act on (`already_sent`, for a `--skip`
+            // replay) instead of parsing this same fact out of prose
+            // (pact-m7j.6.5). Every other error still prints as plain text —
+            // `json_send_failure` returns `None` for anything that is not a
+            // `msg::SendFailure`.
+            match msg::json_send_failure(&e).filter(|_| json) {
+                Some(structured) => output::warn(&structured),
+                None => output::warn(&format!("error: {e:#}")),
+            }
             let code = output::code_for(&e);
             if let Some(w) = repo::take_warning() {
                 output::warn(&w);
@@ -1253,6 +1272,7 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
             subject,
             body,
             body_file,
+            skip,
         } => {
             let body = match body_file {
                 Some(p) => read_body(&p)?,
@@ -1325,6 +1345,23 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
                     agents::HUMAN
                 ));
                 to.push(agents::HUMAN.to_string());
+            }
+            // pact-m7j.6.5: a replay of a partially-failed send names the
+            // recipients who already got it (`already_sent` in the previous
+            // attempt's `--json` error) so this one does not duplicate
+            // delivery to them. Applied after every other recipient source
+            // (`--to`, `--to-owner-of`, the HUMAN fallback above) has already
+            // built the list, so `--skip` behaves the same regardless of how
+            // a name got into `to`.
+            if !skip.is_empty() {
+                let before = to.len();
+                to.retain(|r| !skip.contains(r));
+                let skipped = before - to.len();
+                if skipped > 0 {
+                    output::warn(&format!(
+                        "note: {skipped} recipient(s) skipped — already sent to them, not re-sending"
+                    ));
+                }
             }
             for recipient in &to {
                 check_recipient(recipient)?;
@@ -2188,6 +2225,7 @@ mod tests {
                 subject: Some("secret".to_string()),
                 body: Some("the body".to_string()),
                 body_file: None,
+                skip: Vec::new(),
             },
         };
         for command in [&acquire, &send] {

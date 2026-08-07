@@ -214,8 +214,10 @@ impl BdIssue {
 ///
 /// Returns one Message per recipient, root first. An empty recipient list is an
 /// error. Not atomic — bd has no transaction across N creates — so a failure
-/// part-way through leaves the earlier recipients' messages sent; the error
-/// says which, and `sent()` lists them, so nobody has to re-send blind.
+/// part-way through leaves the earlier recipients' messages sent; the error is
+/// a [`SendFailure`] naming exactly which (`sent()` also lists them), and a
+/// caller with `--json` can retry with `--skip` for those recipients instead
+/// of re-sending to them blind (pact-m7j.6.5).
 /// Everything about a message except who it goes to.
 ///
 /// A struct rather than four more parameters: `send` was already at the limit,
@@ -228,6 +230,59 @@ pub struct Draft<'a> {
     /// Paths this message is ABOUT, from `--to-owner-of`. Recorded as labels so
     /// delivery can follow the file after the agent it resolved to has exited.
     pub about: &'a [String],
+}
+
+/// `send()` failed partway through a multi-recipient fan-out (pact-m7j.6.5).
+/// `already_sent` is exactly the recipients who already got this message —
+/// re-sending the identical command without `--skip` for them duplicates
+/// delivery, since only the thread ROOT (the first recipient) is protected by
+/// [`idempotency_key`]'s upsert; recipients 2..N are not. Exposed as
+/// `--json`'s error shape so a caller can retry with `--skip <agent>` for each
+/// name here instead of parsing prose, per this session's design decision to
+/// keep messaging's retry story flag-based rather than content-addressed (the
+/// same choice pact-m7j.6.4 made for the single-recipient case).
+///
+/// `reason` is a one-shot text snapshot of the underlying failure, for a
+/// `--json` reader who wants "why" without a second command. It is NOT how the
+/// human-readable path learns that text: `send()` attaches this struct via
+/// `anyhow::Error::context`, not `map_err`, so the original error survives as
+/// this error's source — `{:#}` prints it via the normal chain, and, more
+/// importantly, `output::code_for`'s `downcast_ref::<ExitError>()` still finds
+/// a nested `ExitError` (a bare-repo topology, a missing backend) through that
+/// chain. Replacing the error outright silently downgraded every such failure
+/// to the generic exit code 1, which broke `pact`'s documented exit-code
+/// contract for exactly the callers it exists to help.
+#[derive(Debug, Serialize)]
+pub struct SendFailure {
+    pub already_sent: Vec<String>,
+    pub failed_at: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for SendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.already_sent.is_empty() {
+            write!(f, "sending to {}: nothing was sent", self.failed_at)
+        } else {
+            write!(
+                f,
+                "sending to {}: {} recipient(s) already got this ({}) — replay with \
+                 --skip for them instead of re-sending blind",
+                self.failed_at,
+                self.already_sent.len(),
+                self.already_sent.join(", "),
+            )
+        }
+    }
+}
+
+impl std::error::Error for SendFailure {}
+
+/// If `err` is a [`SendFailure`], its `--json` shape — for a caller that wants
+/// to retry with `--skip` rather than parse the human-readable text. `None`
+/// for every other error, so a generic failure still prints as plain text.
+pub fn json_send_failure(err: &anyhow::Error) -> Option<String> {
+    serde_json::to_string_pretty(err.downcast_ref::<SendFailure>()?).ok()
 }
 
 pub fn send(
@@ -299,7 +354,7 @@ pub fn send(
     let addressing = addressing_mode();
     let is_reply = thread.is_some();
     for recipient in to {
-        let issue = create(
+        let issue = match create(
             cli,
             repo_root,
             agent,
@@ -307,20 +362,22 @@ pub fn send(
             thread_id.as_deref(),
             &title,
             body,
-        )
-        .with_context(|| match messages.len() {
-            0 => format!("sending to {recipient}: nothing was sent"),
-            n => format!(
-                "sending to {recipient}: {n} of {} recipient(s) already got this ({}) — \
-                 do not re-send to them",
-                to.len(),
-                messages
-                    .iter()
-                    .map(|m| m.to.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        })?;
+        ) {
+            Ok(issue) => issue,
+            Err(e) => {
+                // Captured before `e` is moved into `context`: the source
+                // chain still carries this text (and anything under it, like
+                // an `ExitError`'s code), but the JSON shape wants it as a
+                // plain string, not something a reader has to re-derive from
+                // the chain.
+                let reason = format!("{e:#}");
+                return Err(e.context(SendFailure {
+                    already_sent: messages.iter().map(|m| m.to.clone()).collect(),
+                    failed_at: recipient.clone(),
+                    reason,
+                }));
+            }
+        };
         let id = issue.id;
         let thread = thread_id.get_or_insert_with(|| id.clone()).clone();
         ids.push(id.clone());
@@ -339,7 +396,7 @@ pub fn send(
         // One bead created, so one message sent. Counted here rather than after
         // the loop because a partial fan-out failure returns early, and the
         // recipients who *did* get it are exactly what a sender must not
-        // re-send to (see the with_context above).
+        // re-send to (see `SendFailure::already_sent` above).
         otel::count(
             "pact.msg.sent",
             1,

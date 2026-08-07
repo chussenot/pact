@@ -2948,6 +2948,203 @@ fn a_retried_identical_send_does_not_duplicate_on_bd() {
     );
 }
 
+/// A stand-in `bd` that fails outright when asked to create a bead for
+/// `fail_for`, and forwards to the real `bd` (resolved once, from the current
+/// PATH, before this directory is ever prepended to one) for everything else.
+/// Lets a test force a partial fan-out failure at a specific recipient
+/// against a REAL backend (pact-m7j.6.5), instead of guessing at a bd
+/// argument shape that happens to error.
+fn bd_wrapper_that_fails_for(fail_for: &str) -> TempDir {
+    let real_bd = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .map(|dir| dir.join("bd"))
+        .find(|p| p.is_file())
+        .expect("real bd must be on PATH for this test");
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("bd");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  \
+             if [ \"$a\" = \"--assignee={fail_for}\" ]; then\n    \
+             echo 'synthetic failure for testing' >&2\n    exit 7\n  fi\n\
+             done\nexec {real} \"$@\"\n",
+            fail_for = fail_for,
+            real = real_bd.display(),
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    dir
+}
+
+/// Like [`pact`], but with `path_prefix` searched before the rest of `PATH` —
+/// so a wrapper binary placed there shadows the real one for this call only,
+/// without touching any other test's environment.
+fn pact_with_path_prefix(repo: &Path, agent: &str, args: &[&str], path_prefix: &Path) -> Output {
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let new_path = std::env::join_paths(
+        std::iter::once(path_prefix.to_path_buf()).chain(std::env::split_paths(&existing)),
+    )
+    .unwrap();
+    pact_cmd(repo, args)
+        .env("PACT_AGENT", agent)
+        .env("PATH", new_path)
+        .output()
+        .expect("failed to run pact binary")
+}
+
+/// The `--json` error object pact printed on stderr, skipping over whatever
+/// human-readable warnings (an unrecognized recipient, a collapsed duplicate)
+/// were written first — `output::warn` is one funnel for both, so a
+/// structured error is not the only thing on the stream, just the last thing.
+fn json_stderr(out: &Output) -> serde_json::Value {
+    let stderr = stderr_of(out);
+    let start = stderr
+        .find('{')
+        .unwrap_or_else(|| panic!("no JSON object on stderr: {stderr}"));
+    serde_json::from_str(&stderr[start..])
+        .unwrap_or_else(|e| panic!("stderr tail not JSON: {e}\nstderr: {stderr}"))
+}
+
+/// pact-m7j.6.5: replaying a partially-failed multi-recipient send with
+/// `--skip` for the recipients an earlier attempt's `--json` error already
+/// named as sent must not duplicate delivery to them, and must still attempt
+/// the recipient that actually failed.
+#[test]
+fn a_partially_failed_send_replays_safely_with_skip() {
+    let Some(tmp) = bd_repo("a_partially_failed_send_replays_safely_with_skip") else {
+        return;
+    };
+    let wrapper = bd_wrapper_that_fails_for("agent-d");
+
+    // agent-b (recipient 1, thread root) and agent-c (recipient 2) succeed;
+    // agent-d (recipient 3) fails.
+    let failed = pact_with_path_prefix(
+        tmp.path(),
+        "sender",
+        &[
+            "msg",
+            "send",
+            "--to",
+            "agent-b",
+            "--to",
+            "agent-c",
+            "--to",
+            "agent-d",
+            "--subject",
+            "shared decision",
+            "--json",
+            "friday?",
+        ],
+        wrapper.path(),
+    );
+    assert_eq!(
+        failed.status.code(),
+        Some(1),
+        "a partial failure is still a failure: {}",
+        stderr_of(&failed)
+    );
+    let err = json_stderr(&failed);
+    let already_sent: Vec<&str> = err["already_sent"]
+        .as_array()
+        .unwrap_or_else(|| panic!("already_sent missing or not an array: {err}"))
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(already_sent, ["agent-b", "agent-c"], "{err}");
+    assert_eq!(err["failed_at"], "agent-d", "{err}");
+
+    // Replay with --skip for the two recipients the failed attempt's JSON
+    // already said got it. No wrapper this time: agent-d succeeds.
+    assert_ok(&pact(
+        tmp.path(),
+        "sender",
+        &[
+            "msg",
+            "send",
+            "--to",
+            "agent-b",
+            "--to",
+            "agent-c",
+            "--to",
+            "agent-d",
+            "--subject",
+            "shared decision",
+            "--skip",
+            "agent-b",
+            "--skip",
+            "agent-c",
+            "friday?",
+        ],
+    ));
+
+    for agent in ["agent-b", "agent-c", "agent-d"] {
+        let inbox = inbox_json(tmp.path(), agent);
+        assert_eq!(
+            inbox.as_array().map(Vec::len),
+            Some(1),
+            "{agent} must end up with exactly one bead: {inbox}"
+        );
+    }
+}
+
+/// The other half of pact-m7j.6.5: a naive identical replay (no `--skip`) is
+/// deliberately UNCHANGED by this fix. bd's own `--id`/`--force` upsert
+/// (pact-m7j.6.4) already protects the thread ROOT — the first `--to` — from
+/// duplicating on an identical retry; that upsert key is only computed when
+/// there is no `--parent`, so recipients 2..N of a fan-out carry no such
+/// protection and still duplicate. Confirmed against real bd 1.1.2: this is
+/// the actual pre-existing behavior, not a hypothetical the fix leaves alone.
+#[test]
+fn a_naive_replay_without_skip_still_duplicates_non_root_recipients() {
+    let Some(tmp) = bd_repo("a_naive_replay_without_skip_still_duplicates_non_root_recipients")
+    else {
+        return;
+    };
+    let wrapper = bd_wrapper_that_fails_for("agent-d");
+    let send_args: &[&str] = &[
+        "msg",
+        "send",
+        "--to",
+        "agent-b",
+        "--to",
+        "agent-c",
+        "--to",
+        "agent-d",
+        "--subject",
+        "shared decision",
+        "friday?",
+    ];
+
+    let failed = pact_with_path_prefix(tmp.path(), "sender", send_args, wrapper.path());
+    assert_eq!(failed.status.code(), Some(1), "{}", stderr_of(&failed));
+
+    // Naive identical replay: no --skip, no wrapper (agent-d succeeds now).
+    assert_ok(&pact(tmp.path(), "sender", send_args));
+
+    assert_eq!(
+        inbox_json(tmp.path(), "agent-b").as_array().map(Vec::len),
+        Some(1),
+        "the thread root is already protected by pact-m7j.6.4's --id upsert"
+    );
+    assert_eq!(
+        inbox_json(tmp.path(), "agent-c").as_array().map(Vec::len),
+        Some(2),
+        "recipient 2 carries no --id and duplicates on a naive replay — \
+         the gap --skip exists to let a sender avoid, left unchanged here"
+    );
+    assert_eq!(
+        inbox_json(tmp.path(), "agent-d").as_array().map(Vec::len),
+        Some(1),
+        "agent-d only ever succeeded once, on the replay"
+    );
+}
+
 /// Deduping must not reorder a genuine fan-out: the thread root is the first
 /// distinct recipient, and dropping a later duplicate must not move it.
 #[test]
