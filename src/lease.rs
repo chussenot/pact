@@ -634,10 +634,18 @@ impl WriteGuard {
 }
 
 /// After a `write_lease_atomic` that was meant to take ownership, re-read the
-/// lock and confirm that it now belongs to `agent` with the exact `acquired_at`
-/// that was just written. If another agent's concurrent rename landed after
-/// ours, the file will name them instead — and we must return exit 2 rather
-/// than falsely reporting that we hold the lease.
+/// lock and confirm that it now belongs to `agent`. If another agent's
+/// concurrent rename landed after ours, the file will name them instead — and
+/// we must return exit 2 rather than falsely reporting that we hold the
+/// lease.
+///
+/// Deliberately does NOT also compare `acquired_at` (pact-m7j.1.4): two
+/// concurrent acquires under one `PACT_AGENT` value can each write a
+/// different `acquired_at` for the same path, and whichever write lands
+/// second makes the first's `acquired_at` stale on disk. That is a
+/// same-identity refresh race, not a peer takeover — "the other one" is still
+/// this agent, so the lease was never lost, and there is nobody to message.
+/// Only a *different* on-disk agent means we actually lost the path.
 ///
 /// Cost: one read. Applied on ALL post-conflict write paths: expired-takeover,
 /// re-entrant refresh, `--steal`, and `renew`.
@@ -646,19 +654,19 @@ impl WriteGuard {
 /// can only ever succeed for the guard holder — nothing else can be mid-write
 /// at the same time. Kept anyway as a cheap, independent check that the guard
 /// mechanism itself worked, the same role an assertion plays after a lock.
-fn verify_own_lease(lock_path: &Path, agent: &str, acquired_at: &str) -> Result<()> {
+fn verify_own_lease(lock_path: &Path, agent: &str) -> Result<()> {
     let on_disk = read_lease(lock_path)?;
-    if on_disk.agent != agent || on_disk.acquired_at != acquired_at {
-        return Err(exit_with(
-            2,
-            format!(
-                "lease on {} was taken by {} in a concurrent steal; this agent did not win",
-                lock_path.display(),
-                on_disk.agent
-            ),
-        ));
+    if on_disk.agent == agent {
+        return Ok(());
     }
-    Ok(())
+    Err(exit_with(
+        2,
+        format!(
+            "lease on {} was taken by {} in a concurrent steal; this agent did not win",
+            lock_path.display(),
+            on_disk.agent
+        ),
+    ))
 }
 
 /// Record a lease transition in the activity log (pact-rnc.13). Releasing a
@@ -1020,7 +1028,7 @@ fn acquire_inner(
 
             if is_expired(&existing, now) {
                 write_lease_atomic(&lock_path, &new_lease)?;
-                verify_own_lease(&lock_path, agent, &new_lease.acquired_at)?;
+                verify_own_lease(&lock_path, agent)?;
                 // The previous claim ended here, and this is the only moment
                 // anyone notices (pact-rnc.13). Without this row the feed's last
                 // word on `existing.agent` is still "acquired", i.e. it reports a
@@ -1085,7 +1093,7 @@ fn acquire_inner(
                 // record every refresh distinctly — that is the auditability
                 // this branch has, and it existed before this comment did.
                 write_lease_atomic(&lock_path, &new_lease)?;
-                verify_own_lease(&lock_path, agent, &new_lease.acquired_at)?;
+                verify_own_lease(&lock_path, agent)?;
                 log_event(
                     repo_root,
                     agent,
@@ -1105,7 +1113,7 @@ fn acquire_inner(
                     holder_location(&existing)
                 ));
                 write_lease_atomic(&lock_path, &new_lease)?;
-                verify_own_lease(&lock_path, agent, &new_lease.acquired_at)?;
+                verify_own_lease(&lock_path, agent)?;
                 log_event(
                     repo_root,
                     agent,
@@ -1216,8 +1224,12 @@ fn acquire_many_fs(
                     let _ = release(repo_root, agent, taken, false);
                 }
                 // Put the pre-held leases back byte for byte. The "renewed"
-                // event the refresh already logged stays in the feed — an
-                // overstatement worth less than the code to retract it.
+                // event the refresh already logged stays in the feed — but
+                // logged alone it would be the feed's last word on this path,
+                // telling a reader (and `pact audit --check stale-holds`,
+                // pact-m7j.1.3) that a real renewal justified the hold when it
+                // was undone moments later. The "restored" event below closes
+                // that gap (pact-m7j.1.2).
                 //
                 // Guarded and re-checked, not unconditional (pact-m7j.1.1): the
                 // gap between the batch's refresh and this rollback is exactly
@@ -1237,6 +1249,22 @@ fn acquire_many_fs(
                         .unwrap_or(false);
                     if still_ours {
                         let _ = write_lease_atomic(&lock_path, before);
+                        log_event(
+                            repo_root,
+                            agent,
+                            "restored",
+                            &before.path,
+                            Some(format!(
+                                "batch acquire failed on a later path; reverted this refresh, \
+                                 restoring the pre-batch lease (acquired_at {})",
+                                before.acquired_at
+                            )),
+                            // The ttl now back in force: the pre-batch one, not
+                            // the batch's, so a stale-holds check judges the
+                            // restored hold by the promise that is actually
+                            // live again.
+                            before.ttl_secs,
+                        );
                     }
                 }
                 // One per batch that actually unwound, not one per path, and
@@ -1478,7 +1506,7 @@ fn renew_fs(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
         ..existing
     };
     write_lease_atomic(&lock_path, &renewed)?;
-    verify_own_lease(&lock_path, agent, &renewed.acquired_at)?;
+    verify_own_lease(&lock_path, agent)?;
     log_event(
         repo_root,
         agent,
@@ -2144,6 +2172,53 @@ mod tests {
         );
     }
 
+    /// pact-m7j.1.2: the rollback above restores the pre-batch lease on disk,
+    /// but until now left no trace that it had — the feed's last word on the
+    /// path stayed the "renewed" event the refresh logged, never retracted or
+    /// explained. A "restored" event must land, naming the path and the
+    /// pre-batch `acquired_at` it put back.
+    #[test]
+    fn acquire_many_rollback_logs_the_restoration() {
+        let tmp = repo();
+        let root = tmp.path();
+        let before = acquire(root, "agent-a", "src/mine.rs", 900, false, None)
+            .unwrap()
+            .lease;
+        claim(root, "agent-b", "src/theirs.rs");
+
+        assert!(acquire_many(
+            root,
+            "agent-a",
+            &["src/mine.rs".to_string(), "src/theirs.rs".to_string()],
+            30,
+            false,
+            None,
+        )
+        .is_err());
+
+        assert_eq!(
+            event_kinds(root),
+            vec![
+                ("acquired".to_string(), "src/mine.rs".to_string()),
+                ("acquired".to_string(), "src/theirs.rs".to_string()),
+                ("renewed".to_string(), "src/mine.rs".to_string()),
+                ("restored".to_string(), "src/mine.rs".to_string()),
+            ],
+            "the refresh's renewed event must be followed by a restored event, \
+             not left as the feed's last, uncorrected word on the path"
+        );
+        let restored = crate::events::recent(root, 1).unwrap();
+        assert!(
+            restored[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains(&before.acquired_at),
+            "the restored event should name the pre-batch acquired_at it put back: {:?}",
+            restored[0].detail
+        );
+    }
+
     // ---- pact-rnc.24: release_all reports only real releases -------------
 
     #[test]
@@ -2478,10 +2553,7 @@ mod tests {
         claim(root, "agent-a", "raced.rs");
         let lock_path = lock_file_path(root, "raced.rs").unwrap();
 
-        // Simulate: we just wrote agent-a's lease (acquired_at = now)…
-        let our_acquired_at = Utc::now().to_rfc3339();
-
-        // …but then agent-b's rename overwrote it.
+        // agent-b's rename overwrote agent-a's just-written lease.
         let other = LeaseInfo {
             agent: "agent-b".into(),
             path: "raced.rs".into(),
@@ -2494,7 +2566,7 @@ mod tests {
         write_lease_atomic(&lock_path, &other).unwrap();
 
         // agent-a's verify must now fail with exit 2.
-        let err = verify_own_lease(&lock_path, "agent-a", &our_acquired_at).unwrap_err();
+        let err = verify_own_lease(&lock_path, "agent-a").unwrap_err();
         assert_eq!(
             crate::output::code_for(&err),
             2,
@@ -2648,10 +2720,7 @@ mod tests {
         claim(root, "agent-a", "boundary.rs");
         let lock_path = lock_file_path(root, "boundary.rs").unwrap();
 
-        // Simulate: agent-a just wrote a refresh (acquired_at = now)…
-        let our_acquired_at = Utc::now().to_rfc3339();
-
-        // …but agent-b's rename overwrote it before we could verify.
+        // agent-b's rename overwrote agent-a's refresh before it could verify.
         let thief = LeaseInfo {
             agent: "agent-b".into(),
             path: "boundary.rs".into(),
@@ -2664,7 +2733,7 @@ mod tests {
         write_lease_atomic(&lock_path, &thief).unwrap();
 
         // agent-a's verify must fail with exit 2.
-        let err = verify_own_lease(&lock_path, "agent-a", &our_acquired_at).unwrap_err();
+        let err = verify_own_lease(&lock_path, "agent-a").unwrap_err();
         assert_eq!(
             crate::output::code_for(&err),
             2,
@@ -2696,10 +2765,8 @@ mod tests {
         // agent-a attempts re-entrant acquire — it reads agent-a (stale cached
         // state won't be there; the function re-reads), but we already swapped
         // it. The function will write agent-a's lease, then verify will find
-        // agent-b if we don't swap again. To test the verify path precisely,
-        // we call verify_own_lease with a timestamp that cannot match disk.
-        let fake_acquired = Utc::now().to_rfc3339();
-        let err2 = verify_own_lease(&lock_path2, "agent-a", &fake_acquired).unwrap_err();
+        // agent-b on disk instead.
+        let err2 = verify_own_lease(&lock_path2, "agent-a").unwrap_err();
         assert_eq!(
             crate::output::code_for(&err2),
             2,
@@ -2710,5 +2777,37 @@ mod tests {
         let on_disk = read_lease(&lock_path2).unwrap();
         assert_eq!(on_disk.agent, "agent-b");
         assert_eq!(on_disk.acquired_at, thief2.acquired_at);
+    }
+
+    /// pact-m7j.1.4: two concurrent `acquire` calls under the SAME agent
+    /// identity can each write a different `acquired_at` for the same path —
+    /// only one write wins the race, so the loser's `acquired_at` no longer
+    /// matches disk. That is a same-identity refresh race, not a peer
+    /// takeover: `on_disk.agent` names the caller's own identity, so the old
+    /// error ("was taken by agent-a") told the caller it lost to itself.
+    /// `verify_own_lease` must treat any on-disk agent match as success,
+    /// whatever `acquired_at` says.
+    #[test]
+    fn verify_own_lease_succeeds_when_the_disk_agent_is_the_caller_itself() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim(root, "agent-a", "raced.rs");
+        let lock_path = lock_file_path(root, "raced.rs").unwrap();
+
+        // agent-a's own concurrent racer won the write with a different
+        // acquired_at than the one we're verifying.
+        let winner = LeaseInfo {
+            agent: "agent-a".into(),
+            path: "raced.rs".into(),
+            acquired_at: Utc::now().to_rfc3339(),
+            ttl_secs: DEFAULT_TTL_SECS,
+            note: None,
+            branch: None,
+            worktree: None,
+        };
+        write_lease_atomic(&lock_path, &winner).unwrap();
+
+        verify_own_lease(&lock_path, "agent-a")
+            .expect("same-identity race must not be reported as a lost steal");
     }
 }

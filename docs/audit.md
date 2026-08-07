@@ -41,7 +41,11 @@ evidence the bead is waiting for.
 
 Reconstructs hold windows per path and reports any moment two different agents
 had one open. `acquired` and `stolen` open a window; `released`,
-`force-released` and `expired` close one; `renewed` is neither.
+`force-released` and `expired` close one; `renewed` and `restored` are
+neither — `restored` is a multi-path `lease acquire` retracting a refresh it
+had to undo when a later path in the same batch failed (see
+[leases.md](leases.md)), and it un-counts that refresh's `renewed` so a
+rolled-back hold can still be flagged by `--check stale-holds`.
 
 Four decisions in that reconstruction are what make it usable rather than noisy,
 and each has a test:

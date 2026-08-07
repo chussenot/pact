@@ -35,9 +35,9 @@ const KEEP_LINES: usize = 4000;
 
 /// One lease-lifecycle event. `kind` is one of the strings emitted by
 /// `lease.rs`: `"acquired"`, `"renewed"`, `"released"`, `"stolen"`,
-/// `"force-released"`, `"expired"`. Kept as a plain `String` rather than an enum
-/// so an older `pact` reading a newer log shows an unknown kind instead of
-/// refusing to parse the line.
+/// `"force-released"`, `"expired"`, `"restored"`. Kept as a plain `String`
+/// rather than an enum so an older `pact` reading a newer log shows an
+/// unknown kind instead of refusing to parse the line.
 ///
 /// `"expired"` is the only kind whose `agent` did not run the command that wrote
 /// it: a lapsed lease is noticed by whoever collects the lock, and the event
