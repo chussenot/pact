@@ -471,6 +471,72 @@ fn release_all_of_only_expired_leases_says_it_held_none() {
 
 // ------------------------------------------------ corrupt lock recovery
 
+/// pact-m7j.7.2: docs/leases.md documents `--steal`/`--force` as advisory
+/// overrides with no authorization check and no automatic notification to
+/// the displaced agent — "nothing stops an agent from editing a file it
+/// hasn't leased, the same way nothing stops you from `git push --force` over
+/// a coworker's branch." This pins that contract against a future well-
+/// intentioned patch (an age check, an auto-notify) silently changing it:
+/// both overrides must still succeed against a live, non-expired,
+/// just-acquired lease with no authorization gate, must still warn on
+/// stderr, and must never send a message as an automatic side effect.
+#[test]
+fn steal_and_force_release_have_no_auth_check_and_send_no_automatic_notification() {
+    let Some(tmp) = bd_repo("steal_and_force_have_no_auth_or_notify") else {
+        return;
+    };
+
+    // A live, non-expired lease held by agent-a — acquired moments ago, the
+    // least sympathetic case for an authorization gate to wave through.
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-a",
+        &["lease", "acquire", "guarded.rs"],
+    ));
+
+    let stolen = pact(
+        tmp.path(),
+        "agent-b",
+        &["lease", "acquire", "guarded.rs", "--steal", "--json"],
+    );
+    assert_ok(&stolen);
+    assert_eq!(
+        json_stdout(&stolen)["stolen"],
+        true,
+        "no authorization check must block a live, non-expired steal"
+    );
+    assert!(
+        stderr_of(&stolen).contains("stealing non-expired lease"),
+        "the override must still warn on stderr: {}",
+        stderr_of(&stolen)
+    );
+
+    let forced = pact(
+        tmp.path(),
+        "agent-c",
+        &["lease", "release", "guarded.rs", "--force"],
+    );
+    assert_ok(&forced);
+    let force_stderr = stderr_of(&forced);
+    assert!(
+        force_stderr.contains("destroyed agent-b's live claim")
+            && force_stderr.contains("not notified"),
+        "release --force must still warn, and say it did not notify: {force_stderr}"
+    );
+
+    // Neither override sent a message as an automatic side effect: nobody's
+    // inbox has anything in it.
+    for agent in ["agent-a", "agent-b", "agent-c"] {
+        let inbox = pact(tmp.path(), agent, &["msg", "inbox", "--json"]);
+        assert_ok(&inbox);
+        assert_eq!(
+            json_stdout(&inbox).as_array().map(Vec::len),
+            Some(0),
+            "{agent}'s inbox must stay empty — no automatic notification on override"
+        );
+    }
+}
+
 /// pact-m7j.4.2: a lock file whose JSON cannot be parsed used to make
 /// `read_lease`'s `?` propagate a raw parse error from EVERY acquire attempt
 /// on that path — `--steal` included, even though overriding a problematic
