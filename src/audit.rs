@@ -43,6 +43,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
 use crate::events::Event;
+use crate::identity;
 use crate::lease::DEFAULT_TTL_SECS;
 
 /// The default TTL before pact recorded it per-event, used for holds whose
@@ -419,6 +420,18 @@ pub struct Annotation {
     pub actor: Option<String>,
     pub note: Option<String>,
     pub covers_lines: Vec<usize>,
+    /// `false` when `actor` is `Some` but fails [`identity::validate`]'s
+    /// `[a-z0-9][a-z0-9-]{1,31}` format check. `true` when `actor` is absent —
+    /// unattributed is a different, already-surfaced condition ("unknown" in
+    /// the rendered report), not a malformed one.
+    ///
+    /// pact has no command that writes an annotation itself — every one today
+    /// is a hand-typed JSONL line — so there is no write-time gate to put this
+    /// check behind. Flagging it here, where the line is read back, is the
+    /// only reachable point: rejecting the line outright would make a single
+    /// bad `actor` field silently swallow the correction it was meant to
+    /// record, which is worse than trusting a forgeable field already was.
+    pub actor_valid: bool,
 }
 
 /// Read the log, drop annotated lines unless asked not to, and narrow by `--since`.
@@ -447,6 +460,10 @@ fn load(
             actor: e.actor.clone(),
             note: e.detail.clone(),
             covers_lines: covers,
+            actor_valid: e
+                .actor
+                .as_deref()
+                .is_none_or(|a| identity::validate(a).is_ok()),
         });
     }
 
@@ -672,9 +689,14 @@ pub fn render_summary(s: &Summary) -> String {
         ));
         for a in &s.annotations {
             out.push(format!(
-                "         line {} by {}: {}",
+                "         line {} by {}{}: {}",
                 a.line,
                 a.actor.as_deref().unwrap_or("unknown"),
+                if a.actor_valid {
+                    ""
+                } else {
+                    " [INVALID ACTOR — does not match [a-z0-9][a-z0-9-]{1,31}]"
+                },
                 a.note.as_deref().unwrap_or("(no note)")
             ));
         }
@@ -1173,6 +1195,95 @@ mod tests {
         assert_eq!(raw.events, 4);
         assert_eq!(raw.excluded_by_annotation, 0);
         assert!(raw.agents.contains(&"ghost".to_string()));
+    }
+
+    fn annotation_with_actor(covers: &[usize], note: &str, actor: &str) -> String {
+        let lines: Vec<String> = covers.iter().map(|n| n.to_string()).collect();
+        format!(
+            r#"{{"at":"2026-08-06T12:00:00Z","agent":"maintainer","kind":"annotation","detail":"{note}","covers_lines":[{}],"actor":"{actor}"}}"#,
+            lines.join(",")
+        )
+    }
+
+    /// CURRENT (pre-fix) behavior, documented rather than changed: `actor` is
+    /// forgeable free text pact never validated, and a malformed one still gets
+    /// to exercise the exclusion exactly like a well-formed one — the mechanism
+    /// chosen for this pass is to flag a bad actor, not to reject the
+    /// correction it accompanies, precisely so this stays true.
+    #[test]
+    fn a_malformed_actor_still_excludes_its_covered_lines_like_a_well_formed_one() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "real", "acquired", "src/a.rs"),
+            &ev("2026-08-01T11:00:00Z", "ghost", "acquired", "ghost.rs"),
+            // "NOT-A-VALID-ACTOR!!" fails identity::validate: uppercase and
+            // punctuation are both outside [a-z0-9][a-z0-9-]{1,31}.
+            &annotation_with_actor(&[2], "synthetic", "NOT-A-VALID-ACTOR!!"),
+        ]);
+        let s = summary(tmp.path(), None, false).unwrap();
+        assert_eq!(
+            s.excluded_by_annotation, 1,
+            "a malformed actor does not stop the annotation from taking effect"
+        );
+        assert_eq!(s.events, 1);
+    }
+
+    /// The fix for this pass: an annotation whose `actor` fails
+    /// `identity::validate`'s `[a-z0-9][a-z0-9-]{1,31}` check is now flagged as
+    /// such — distinctly from a well-formed actor and from no actor at all —
+    /// both in the struct (`actor_valid`) and in the rendered report.
+    #[test]
+    fn an_annotation_with_an_invalid_actor_is_flagged_distinctly() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "real", "acquired", "src/a.rs"),
+            &ev("2026-08-01T10:05:00Z", "real", "released", "src/a.rs"),
+            // Excluded by the well-formed annotation below, so
+            // `excluded_by_annotation > 0` and the annotation section of the
+            // rendered summary actually runs.
+            &ev("2026-08-01T11:00:00Z", "ghost", "acquired", "ghost.rs"),
+            &annotation_with_actor(&[3], "well-formed", "maintainer"),
+            &annotation_with_actor(&[], "malformed", "NOT-A-VALID-ACTOR!!"),
+        ]);
+        let s = summary(tmp.path(), None, false).unwrap();
+        assert_eq!(s.events, 2, "the ghost line is excluded, real ones are not");
+        assert_eq!(s.annotations.len(), 2);
+        let good = s.annotations.iter().find(|a| a.line == 4).unwrap();
+        let bad = s.annotations.iter().find(|a| a.line == 5).unwrap();
+        assert!(good.actor_valid, "a well-formed actor is not flagged");
+        assert!(
+            !bad.actor_valid,
+            "an actor failing identity::validate must be flagged invalid"
+        );
+
+        let text = render_summary(&s);
+        assert!(
+            text.contains("INVALID ACTOR"),
+            "the report must call out the bad one distinctly: {text}"
+        );
+        // And the well-formed line must NOT carry the same flag.
+        let good_line = text
+            .lines()
+            .find(|l| l.contains("line 4"))
+            .expect("line 4 rendered");
+        assert!(!good_line.contains("INVALID ACTOR"), "{good_line}");
+    }
+
+    /// An absent actor is a different, already-surfaced condition ("unknown")
+    /// and must not be flagged as malformed — that would conflate "nobody
+    /// signed this" with "someone signed this with garbage".
+    #[test]
+    fn an_absent_actor_is_not_flagged_invalid() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "real", "acquired", "src/a.rs"),
+            r#"{"at":"2026-08-06T12:00:00Z","agent":"maintainer","kind":"annotation","detail":"no actor field","covers_lines":[1]}"#,
+        ]);
+        let s = summary(tmp.path(), None, false).unwrap();
+        assert_eq!(s.annotations.len(), 1);
+        assert!(s.annotations[0].actor.is_none());
+        assert!(
+            s.annotations[0].actor_valid,
+            "absent is not the same as invalid"
+        );
+        assert!(!render_summary(&s).contains("INVALID ACTOR"));
     }
 
     /// The assertion the whole mechanism exists for: an annotated double-win must
