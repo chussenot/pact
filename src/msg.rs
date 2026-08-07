@@ -611,8 +611,27 @@ fn create(
     let args = create_args(cli.is_br(), to, parent, agent, title, body, about);
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
     let stdout = cli.run(repo_root, &borrowed)?;
-    serde_json::from_str(&stdout)
-        .with_context(|| format!("parsing `{} create --json` output", cli.binary()))
+    let issue: BdIssue = serde_json::from_str(&stdout)
+        .with_context(|| format!("parsing `{} create --json` output", cli.binary()))?;
+    // bd's `--id`/`--force` upsert (pact-m7j.6.4, root messages only — see
+    // create_args) echoes THIS call's wall-clock time as `created_at` even
+    // when the id already existed and nothing was actually created: verified
+    // against a real scratch store, `bd create --id= --force` run twice
+    // returns a different `created_at` each time, while `bd show` afterward
+    // still reports the original. There is no field in the response that says
+    // "this was a no-op upsert", so rather than guess, re-read the one field
+    // that can lie from the source that cannot: cheap (one extra `show`, only
+    // on the id-bearing path, never for a reply or for br, which has no `--id`
+    // to replay through), and correct on both a genuine first create and a
+    // replay alike, instead of needing to tell the two apart (pact-m7j.6.7).
+    if !cli.is_br() && parent.is_none() {
+        let confirmed = show(cli, repo_root, &issue.id)?;
+        return Ok(BdIssue {
+            created_at: confirmed.created_at,
+            ..issue
+        });
+    }
+    Ok(issue)
 }
 
 pub fn inbox(

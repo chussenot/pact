@@ -325,6 +325,16 @@ outside its own prefix, and it does nothing else here. Replies still hang off
 the root in bd's own shape, so a thread reads `pact-msg-<hash>`,
 `pact-msg-<hash>.1`, and so on.
 
+A second, quieter consequence pact corrects for rather than exposes: `bd
+create --id= --force` echoes its OWN call's wall-clock time as `created_at`
+even on a replay that upserts an existing bead and creates nothing — verified
+against a real store, two identical `create` calls report two different
+`created_at`s while `bd show` reports the original throughout. `msg send`'s
+`--json` response re-reads the bead via `show` on the id-bearing path before
+reporting `created_at`, so a retry's own response agrees with what `msg
+inbox`/`msg sent` show moments later, instead of a --json consumer trusting a
+value that would never match history (pact-m7j.6.7).
+
 ## Replaying a fan-out that failed partway: `--skip`
 
 The id trick above only covers a thread's **root** — the first `--to`.

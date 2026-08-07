@@ -3464,6 +3464,60 @@ fn a_retried_identical_send_does_not_duplicate_on_bd() {
     );
 }
 
+/// pact-m7j.6.7: `bd create --id= --force` echoes ITS OWN call's wall-clock
+/// time as `created_at` even when the id already existed and nothing was
+/// actually created — verified against a real scratch bd store. Before the
+/// fix, the retry's own `--json` response reported a `created_at` that
+/// disagreed with what `bd show`/`msg inbox` reported moments later for the
+/// same bead. bd-only, same reason as the sibling test above.
+#[test]
+fn a_retried_send_reports_the_original_created_at_not_the_retrys() {
+    let Some(tmp) = bd_repo("a_retried_send_reports_the_original_created_at") else {
+        return;
+    };
+    let send = || {
+        pact(
+            tmp.path(),
+            "sender",
+            &[
+                "msg",
+                "send",
+                "--to",
+                "recipient",
+                "--subject",
+                "long send",
+                "--json",
+                "the harness dropped stdout before I saw the exit code",
+            ],
+        )
+    };
+    let first = send();
+    assert_ok(&first);
+    let first_created_at = json_stdout(&first)[0]["created_at"].clone();
+
+    // The retry: same agent, same recipient, same subject and body. bd's
+    // upsert lands on the same bead (a_retried_identical_send_does_not_
+    // duplicate_on_bd covers that); this test is about what the retry's OWN
+    // response says about it.
+    let retry = send();
+    assert_ok(&retry);
+    let retry_created_at = json_stdout(&retry)[0]["created_at"].clone();
+
+    let inbox = pact(tmp.path(), "recipient", &["msg", "inbox", "--json"]);
+    assert_ok(&inbox);
+    let stored_created_at = json_stdout(&inbox)[0]["created_at"].clone();
+
+    assert_eq!(
+        retry_created_at, stored_created_at,
+        "the retry's own --json response must report the persisted created_at, \
+         not its own call's wall-clock time"
+    );
+    assert_eq!(
+        first_created_at, retry_created_at,
+        "the original and the retry must agree: it is the same bead"
+    );
+}
+
 /// A stand-in `bd` that fails outright when asked to create a bead for
 /// `fail_for`, and forwards to the real `bd` (resolved once, from the current
 /// PATH, before this directory is ever prepended to one) for everything else.
