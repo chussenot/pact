@@ -2743,6 +2743,63 @@ fn a_message_about_a_path_is_delivered_to_whoever_leases_it_next() {
     );
 }
 
+/// br twin of the test above (pact-m7j.10.1). Doubles as the end-to-end proof
+/// for `encode_path`'s charset fix: `src/otel.rs` contains a `.`, which a real
+/// br 0.2.19 store rejects outright in a label ("invalid characters", exit 4)
+/// — before that fix AND before 10.1's atomic `--labels` (which turns a
+/// rejected label from a swallowed warning into a hard `msg send` failure),
+/// this exact scenario either silently failed to tag the bead or failed to
+/// send at all. If it did, `third-agent`'s acquire below would see nothing.
+#[test]
+fn a_message_about_a_path_is_delivered_to_whoever_leases_it_next_on_br() {
+    let Some(tmp) = br_repo("a_message_about_a_path_is_delivered_on_br") else {
+        return;
+    };
+    assert_ok(&pact(
+        tmp.path(),
+        "first-owner",
+        &["lease", "acquire", "src/otel.rs"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "first-owner",
+        &["lease", "release", "--all"],
+    ));
+
+    let sent = pact(
+        tmp.path(),
+        "second-agent",
+        &[
+            "msg",
+            "send",
+            "--to-owner-of",
+            "src/otel.rs",
+            "--subject",
+            "BLOCKER: flush",
+            "spans never sent",
+        ],
+    );
+    assert_ok(&sent);
+    assert!(
+        !stderr_of(&sent).contains("could not tag"),
+        "the label must land in the same create call, not a separate one that \
+         can fail: {}",
+        stderr_of(&sent)
+    );
+
+    let out = pact(
+        tmp.path(),
+        "third-agent",
+        &["lease", "acquire", "src/otel.rs"],
+    );
+    assert_ok(&out);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("unread message") && stderr.contains("BLOCKER: flush"),
+        "the message must follow the file to its next holder on br too: {stderr}"
+    );
+}
+
 /// Advisory, and quiet when it has nothing to say: a path with no messages
 /// about it must not grow a line, or the signal is lost in ceremony.
 #[test]
@@ -2756,6 +2813,67 @@ fn leasing_a_path_with_no_messages_about_it_says_nothing_extra() {
         !stderr_of(&out).contains("unread message"),
         "{}",
         stderr_of(&out)
+    );
+}
+
+/// pact-m7j.10.3: with no Beads CLI reachable at all, the check that would
+/// have surfaced a genuine unread message must say it could not run — not
+/// print nothing, which was byte-identical to the genuinely clean case above.
+#[test]
+fn no_backend_on_path_reports_a_check_failure_not_silence() {
+    let Some(tmp) = bd_repo("no_backend_on_path_reports_a_check_failure") else {
+        return;
+    };
+    // A genuine unread message about src/x.rs, sent while bd is still
+    // reachable, so the ONLY thing missing for the acquire below is the
+    // backend to check it with.
+    assert_ok(&pact(
+        tmp.path(),
+        "first-owner",
+        &["lease", "acquire", "src/x.rs"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "first-owner",
+        &["lease", "release", "--all"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "sender",
+        &["msg", "send", "--to-owner-of", "src/x.rs", "body"],
+    ));
+
+    // Acquire again with PATH pointing at an empty directory: no bd, no br.
+    let empty_path = tmp.path().join("no-backend-here");
+    std::fs::create_dir(&empty_path).unwrap();
+    let mut cmd = pact_cmd(tmp.path(), &["lease", "acquire", "src/x.rs"]);
+    cmd.env("PACT_AGENT", "no-backend-agent")
+        .env("PATH", &empty_path);
+    let broken = cmd.output().expect("failed to run pact binary");
+    assert_ok(&broken);
+    let broken_stderr = stderr_of(&broken);
+    assert!(
+        broken_stderr.contains("could not check for pending messages"),
+        "a missing backend must say so, not look clean: {broken_stderr}"
+    );
+
+    // The genuinely clean comparison: healthy backend, a path with nothing to
+    // report. Before this fix these two cases were byte-identical (both
+    // printed nothing extra); now only this one is quiet.
+    let clean = pact(
+        tmp.path(),
+        "no-backend-agent",
+        &["lease", "acquire", "quiet.rs"],
+    );
+    assert_ok(&clean);
+    let clean_stderr = stderr_of(&clean);
+    assert!(
+        !clean_stderr.contains("could not check"),
+        "a genuinely healthy, clean check must not also claim it could not check: {clean_stderr}"
+    );
+    assert_ne!(
+        broken_stderr, clean_stderr,
+        "a missing backend and a genuinely clean path must not read the same"
     );
 }
 

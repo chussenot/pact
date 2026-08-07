@@ -1012,6 +1012,30 @@ fn run_agents(cwd: &Path, json: bool, for_path: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// The outcome of checking one leased path for pending messages about it.
+///
+/// pact-m7j.10.3/10.4: a plain `Vec<String>` of findings could not tell "we
+/// checked and it's clean" apart from "we could not check at all" — both
+/// rendered as zero lines, so a `bd` that was down, absent, or timed out
+/// looked exactly like a healthy path with nothing to report. Worse, in a
+/// batch acquire a genuine failure on one path rendered identically to a
+/// genuine clean result on another, so the one visible finding made the whole
+/// mechanism look like it had worked. This type keeps the three states apart
+/// all the way to the terminal.
+#[derive(Debug)]
+enum MessageCheck {
+    /// Checked, nothing unread. The common case, and printed as nothing —
+    /// see `messages_about`'s own note on that.
+    Clean,
+    /// Checked, found something: the warning line to print.
+    Found(String),
+    /// Could not check: the warning line to print, distinct from both of the
+    /// above. Must never affect `lease acquire`'s exit code — the lease
+    /// already succeeded, and acquiring one must not start depending on the
+    /// messaging backend, which `lease` has never needed.
+    Failed(String),
+}
+
 /// Unread messages about the paths being leased, surfaced to whoever is taking
 /// them over.
 ///
@@ -1023,32 +1047,56 @@ fn run_agents(cwd: &Path, json: bool, for_path: Option<&str>) -> Result<()> {
 /// who had just released it — so the moment someone leases that file is exactly
 /// the moment the message becomes useful again (pact-4tj).
 ///
-/// Silent when `bd` is absent: acquiring a lease must not start depending on
-/// the messaging backend, which `lease` has never needed.
-fn messages_about(root: &Path, paths: &[String], agent: &str) -> Vec<String> {
-    let Ok(cli) = beads::BeadsCli::locate() else {
-        return Vec::new();
+/// One [`MessageCheck`] per path, same order as `paths` — except when no
+/// Beads CLI could even be located, which is a property of the whole call and
+/// not any one path, so that case reports once for every path named rather
+/// than repeating an identical "not found on PATH" line per path.
+fn messages_about(root: &Path, paths: &[String], agent: &str) -> Vec<MessageCheck> {
+    let cli = match beads::BeadsCli::locate() {
+        Ok(cli) => cli,
+        Err(e) => {
+            return vec![MessageCheck::Failed(format!(
+                "note: could not check for pending messages about {}: {e:#}",
+                paths.join(", ")
+            ))];
+        }
     };
     paths
         .iter()
-        .filter_map(|path| {
-            let waiting: Vec<msg::Message> = msg::about_path(&cli, root, path)
-                .ok()?
+        .map(|path| check_one_path(msg::about_path(&cli, root, path), path, agent))
+        .collect()
+}
+
+/// One path's [`MessageCheck`], from its own `about_path` result — split out
+/// of [`messages_about`] so this per-path resolution (an `Ok`/`Err` from ONE
+/// path must never affect a SIBLING path's result, pact-m7j.10.4) is testable
+/// directly against synthetic results, without spawning a Beads CLI for two
+/// paths and needing a way to make exactly one of two identical-shaped
+/// subprocess calls fail.
+fn check_one_path(result: Result<Vec<msg::Message>>, path: &str, agent: &str) -> MessageCheck {
+    match result {
+        Ok(msgs) => {
+            let waiting: Vec<msg::Message> = msgs
                 .into_iter()
                 // Yours already, or already read by you: not news.
                 .filter(|m| m.from != agent && !m.read_by.iter().any(|r| r == agent))
                 .collect();
-            let first = waiting.first()?;
-            Some(format!(
-                "note: {} unread message(s) about {path}, oldest from {} — \"{}\". \
-                 Read it before you edit: `pact msg read {}`",
-                waiting.len(),
-                first.from,
-                first.subject.as_deref().unwrap_or("(no subject)"),
-                first.id
-            ))
-        })
-        .collect()
+            match waiting.first() {
+                Some(first) => MessageCheck::Found(format!(
+                    "note: {} unread message(s) about {path}, oldest from {} — \"{}\". \
+                     Read it before you edit: `pact msg read {}`",
+                    waiting.len(),
+                    first.from,
+                    first.subject.as_deref().unwrap_or("(no subject)"),
+                    first.id
+                )),
+                None => MessageCheck::Clean,
+            }
+        }
+        Err(e) => MessageCheck::Failed(format!(
+            "note: could not check for pending messages about {path}: {e:#}"
+        )),
+    }
 }
 
 /// Advisory lines for paths someone else worked on recently.
@@ -1141,8 +1189,13 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
             for line in prior {
                 output::warn(&line);
             }
-            for line in messages_about(&root, &paths, &agent) {
-                output::warn(&line);
+            for check in messages_about(&root, &paths, &agent) {
+                match check {
+                    MessageCheck::Clean => {}
+                    MessageCheck::Found(line) | MessageCheck::Failed(line) => {
+                        output::warn(&line);
+                    }
+                }
             }
             Ok(())
         }
@@ -1927,6 +1980,51 @@ mod tests {
             } else {
                 Vec::new()
             },
+        }
+    }
+
+    /// pact-m7j.10.4: a failed check on one path must render distinctly from
+    /// both a genuine finding and a genuine clean result on a sibling path in
+    /// the same batch acquire — before this fix, `about_path`'s `Err` and its
+    /// `Ok(vec![])` were both a bare `.ok()?` inside one `filter_map`,
+    /// indistinguishable from each other and from a clean path.
+    ///
+    /// Exercised directly against [`check_one_path`], the exact function
+    /// `messages_about` calls once per path, rather than through two real
+    /// subprocess calls: `about_path`'s argv is byte-identical for every path
+    /// in a batch (filtering is client-side — see its own doc comment), so
+    /// the only way to fail exactly one of two real calls is to target it by
+    /// call order, and this sandbox's nested child processes do not reliably
+    /// share file-based state across sibling invocations for that to key off
+    /// of. The property under test — one path's `Result` cannot leak into
+    /// another's — is a fact about this function's signature and match arms,
+    /// not about process timing, so testing it here is not a downgrade.
+    #[test]
+    fn a_failed_check_on_one_path_renders_distinctly_from_a_clean_or_found_sibling() {
+        let found = check_one_path(
+            Ok(vec![message("m1", "peer", "flush the buffer", false)]),
+            "patha",
+            "checker",
+        );
+        assert!(
+            matches!(found, MessageCheck::Found(ref s) if s.contains("patha") && s.contains("peer")),
+            "expected a Found naming the path and sender"
+        );
+
+        let clean = check_one_path(Ok(vec![]), "pathb", "checker");
+        assert!(matches!(clean, MessageCheck::Clean));
+
+        let failed = check_one_path(
+            Err(anyhow::anyhow!("boom: injected transient failure")),
+            "pathc",
+            "checker",
+        );
+        match failed {
+            MessageCheck::Failed(line) => {
+                assert!(line.contains("pathc"), "{line}");
+                assert!(line.contains("boom"), "{line}");
+            }
+            other => panic!("expected Failed, got a variant that is not it: {other:?}"),
         }
     }
 
