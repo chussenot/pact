@@ -462,11 +462,14 @@ fn read_lease(lock_path: &Path) -> Result<LeaseInfo> {
         .with_context(|| format!("parsing lease at {}", lock_path.display()))
 }
 
-/// A guard held for `~5s` or less: how long a takeover's read-decide-write
-/// sequence takes on disk. If a `.guard` file is older than that, its owner
-/// did not lose a race — it crashed mid-critical-section — so the next waiter
-/// steals it rather than deadlocking forever on a dead process.
-const STALE_GUARD_SECS: u64 = 5;
+/// How long [`WriteGuard::acquire`] waits for the lock before giving up and
+/// reporting contention rather than assuming anything about the current
+/// holder. Generous relative to the critical section's normal cost (a
+/// handful of filesystem syscalls) even under heavy N-way contention; see the
+/// struct doc comment for why this is a diagnostic bound, not a reclaim
+/// trigger.
+const GUARD_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const GUARD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Serializes every mutation to one lock path, closing the race
 /// `verify_own_lease` could only narrow (pact-iup, pact-ehi).
@@ -491,51 +494,142 @@ const STALE_GUARD_SECS: u64 = 5;
 /// write as a cheap check that the guard itself worked, not as the primary
 /// defense anymore.
 ///
-/// `O_EXCL` on a sibling `.guard` file, not a second lock primitive: the
-/// initial free-path claim already gets exclusivity from `hard_link`'s
-/// create-only semantics, so this reuses the same guarantee rather than
-/// introducing `flock` or similar.
+/// A real `flock(2)`, not a hand-rolled marker file — the first version of
+/// this guard used a sibling `.guard` file created via `O_EXCL`, reclaimed
+/// once it looked older than a fixed wall-clock threshold on the theory that
+/// "older than the critical section could legitimately take" meant "the
+/// holder crashed." TLA+ model checking (pact-kqb) proved that reasoning
+/// unsound: under genuine N-way contention (the same N=5..10 shape
+/// `lease-double-win-reachable.md` already reproduced), a live, working
+/// holder can legitimately still be inside the critical section once the
+/// threshold elapses — no crash required, just contention — and a waiter that
+/// reclaims on that basis steals the guard out from under a holder who is
+/// still using it, reopening the exact double-win this guard exists to
+/// close, through a different door. A follow-up fix that only closed the
+/// second flaw TLC found (`Drop` deleting the marker file unconditionally,
+/// not just an ownership-checked ONE) was hand-verified NOT to help: in the
+/// traced counterexample both racers complete their write and verify before
+/// either `Drop` runs, so a token check on `Drop` never gets a chance to
+/// matter. The staleness heuristic itself was the load-bearing flaw, and no
+/// wall-clock heuristic can fix it — only genuine proof of the holder's death
+/// can. `flock` provides that for free: the kernel releases it the instant
+/// the holding process's file descriptor closes, on a clean exit AND on a
+/// crash, so there is no "is the holder actually dead" question to answer
+/// with a guess. The guard file itself is never deleted — `flock`'s
+/// exclusivity is per-inode, so unlinking the path while a waiter might still
+/// be about to open (and lock) that same name would let a new inode at the
+/// same path start a fresh, unrelated lock series, splitting exactly the
+/// mutual exclusion this exists to provide. An empty file left behind per
+/// ever-contested lock path is the accepted cost.
 struct WriteGuard {
-    path: PathBuf,
+    // Holds the fd open for the guard's lifetime; dropping it closes the fd,
+    // which is what releases the flock. No explicit unlock call needed, and
+    // nothing else about the file is inspected once held — only its exclusive
+    // hold matters.
+    _file: std::fs::File,
 }
 
-impl WriteGuard {
-    fn acquire(lock_path: &Path) -> Result<Self> {
-        let path = PathBuf::from(format!("{}.guard", lock_path.display()));
-        loop {
-            match std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)
-            {
-                Ok(_) => return Ok(Self { path }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|m| m.elapsed().ok())
-                        .is_some_and(|age| age.as_secs() >= STALE_GUARD_SECS);
-                    if stale {
-                        // A crashed holder, not a live one — see the struct doc
-                        // comment. Another waiter may win this race to remove
-                        // it; that is fine, `create_new` above is what decides
-                        // who actually gets the guard.
-                        let _ = std::fs::remove_file(&path);
-                        continue;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| format!("creating guard {}", path.display()));
-                }
-            }
+#[cfg(unix)]
+mod flock_ffi {
+    use std::os::unix::io::RawFd;
+
+    // Not the `libc` crate: three constants and one syscall don't earn a new
+    // dependency (this codebase already reaches for a bare `extern "C"` block
+    // rather than pulling one in for less than this — see `otel.rs`'s urandom
+    // read). `flock(2)` is POSIX; every Unix pact ships for links against it.
+    extern "C" {
+        fn flock(fd: RawFd, operation: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+
+    /// `Ok(true)`: acquired. `Ok(false)`: another process holds it right now
+    /// (`EWOULDBLOCK`). `Err`: something else went wrong.
+    pub fn try_lock_exclusive(fd: RawFd) -> std::io::Result<bool> {
+        if unsafe { flock(fd, LOCK_EX | LOCK_NB) } == 0 {
+            return Ok(true);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            Ok(false)
+        } else {
+            Err(err)
         }
     }
 }
 
-impl Drop for WriteGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+/// `.pact/guards/<encoded>.lock.guard`, a SIBLING of `leases/`, never inside
+/// it. The guard file is never deleted (see [`WriteGuard`]'s doc comment), so
+/// anything that lists `.pact/leases/` expecting to see only `.lock` files —
+/// `scan()`'s extension filter already handles that correctly, but a raw
+/// directory count elsewhere does not — must never be handed one.
+fn guard_file_path(lock_path: &Path) -> PathBuf {
+    let leases_dir = lock_path.parent().unwrap_or(Path::new("."));
+    let pact_dir = leases_dir.parent().unwrap_or(Path::new("."));
+    let file_name = lock_path.file_name().unwrap_or_default();
+    pact_dir
+        .join("guards")
+        .join(file_name)
+        .with_extension("lock.guard")
+}
+
+impl WriteGuard {
+    fn acquire(lock_path: &Path) -> Result<Self> {
+        let path = guard_file_path(lock_path);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        // Never `create_new`: many processes opening this SAME file
+        // concurrently is the normal case here — `flock`, not file creation,
+        // is what provides exclusivity. Never removed on the way out either;
+        // see the struct doc comment for why unlinking it would reopen the
+        // exact race this whole guard exists to close.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            // Content is irrelevant — only the inode's identity as an flock
+            // target matters — so never truncate an existing guard file, in
+            // case a future version ever does put something in it.
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening guard {}", path.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let deadline = std::time::Instant::now() + GUARD_WAIT_TIMEOUT;
+            loop {
+                if flock_ffi::try_lock_exclusive(file.as_raw_fd())
+                    .with_context(|| format!("locking guard {}", path.display()))?
+                {
+                    return Ok(Self { _file: file });
+                }
+                if std::time::Instant::now() >= deadline {
+                    // Reported, never silently seized: giving up here is the
+                    // one thing that must NOT reclaim the guard on a guess —
+                    // that guess is exactly what pact-kqb proved unsound.
+                    return Err(exit_with(
+                        2,
+                        format!(
+                            "lease guard on {} has been held by another process for over {}s; \
+                             not proceeding — if it is truly stuck, that process needs to be \
+                             found and stopped, not assumed dead",
+                            lock_path.display(),
+                            GUARD_WAIT_TIMEOUT.as_secs()
+                        ),
+                    ));
+                }
+                std::thread::sleep(GUARD_POLL_INTERVAL);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // No Windows target, and the absence is a decision rather than an
+            // omission (see release.yml) — `flock(2)` is the only sound
+            // primitive here (see the struct doc comment for why a hand-rolled
+            // marker file is not), and it is POSIX-only.
+            compile_error!("WriteGuard requires flock(2); pact does not build on non-Unix");
+        }
     }
 }
 
@@ -2326,18 +2420,12 @@ mod tests {
         );
     }
 
-    /// When two threads race to steal the same expired lease, the verify check
-    /// prevents a loser from falsely believing it holds the file. The invariant
-    /// guaranteed by `verify_own_lease`:
+    /// When two threads race to steal the same expired lease, `WriteGuard`
+    /// serializes the whole read-decide-write sequence, so exactly one wins:
     ///   • The agent whose data is on disk at the end always returned `Ok`.
-    ///   • Any thread that detected it lost (via verify) returns exit 2.
-    ///   • At least one thread wins (the lease is not left in limbo).
-    ///
-    /// Note: there is a narrow window where both threads can verify before the
-    /// other's rename lands, in which case both return `Ok` but only one is
-    /// the actual disk holder. That remaining window is exercised by the
-    /// integration test `concurrent_steal_of_expired_lease_has_consistent_outcome`,
-    /// where process startup overhead makes the verify effective in practice.
+    ///   • The other thread returns exit 2, detected by `verify_own_lease` —
+    ///     now a cheap check that the guard worked, not the primary defense.
+    ///   • Exactly one thread wins (never zero, never both).
     #[test]
     fn concurrent_double_steal_disk_holder_returned_ok() {
         // Run many iterations to probe different interleavings.
@@ -2394,6 +2482,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// pact-kqb, found by TLA+ model checking of `WriteGuard`'s first
+    /// implementation (a sibling `.guard` file reclaimed once it looked older
+    /// than a fixed wall-clock threshold): a LIVE holder legitimately still
+    /// inside the critical section — no crash, just contention or an
+    /// unusually slow disk — could look "stale" by the same clock and get
+    /// preempted by a waiter, reopening the exact double-win this guard
+    /// exists to close. TLC's counterexample needed no crash at all, only
+    /// time. The fix removed the wall-clock heuristic entirely in favor of a
+    /// real `flock(2)`, which the kernel releases only when the holder's file
+    /// descriptor actually closes — so there is no elapsed-time threshold to
+    /// beat, at any duration. This proves it directly: hold the guard for
+    /// six seconds (past the fixed guard's old STALE_GUARD_SECS = 5, the
+    /// exact boundary TLC's trace crossed) while alive, and confirm a
+    /// concurrent waiter is still blocked at that point, not just eventually
+    /// unblocked once the holder actually releases.
+    #[test]
+    fn a_live_guard_holder_is_never_preempted_no_matter_how_long_it_holds() {
+        let tmp = repo();
+        let root = tmp.path();
+        let lock_path = lock_file_path(root, "hot.rs").unwrap();
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+
+        let (holder_ready_tx, holder_ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder_lock_path = lock_path.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = WriteGuard::acquire(&holder_lock_path).unwrap();
+            holder_ready_tx.send(()).unwrap();
+            // Alive and doing nothing wrong — not crashed, not deadlocked —
+            // for longer than the old heuristic's threshold. The point being
+            // proven is precisely that duration alone must never matter.
+            release_rx.recv().unwrap();
+        });
+        holder_ready_rx.recv().unwrap();
+
+        let waiter_lock_path = lock_path.clone();
+        let waiter = std::thread::spawn(move || WriteGuard::acquire(&waiter_lock_path));
+
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        assert!(
+            !waiter.is_finished(),
+            "a concurrent acquire must still be blocked after outlasting the OLD staleness \
+             threshold, since the holder is alive and has not released — this is exactly the \
+             TLC counterexample: reclaiming here would be the double-win reopened"
+        );
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        waiter
+            .join()
+            .unwrap()
+            .expect("the waiter must succeed once the holder genuinely releases");
     }
 
     /// A broken event log must not break a lease operation: `append` swallows

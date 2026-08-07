@@ -140,12 +140,29 @@ writes. That stopped being a hypothetical: research against the compiled
 binary reproduced double- and even triple-wins via ordinary CLI-level `pact
 lease acquire` races, no fault injection needed — roughly 20-30% of rounds
 at 6-10 concurrent racers on one expired lock, and 2 of 30 rounds even at
-just two racers. So takeovers are now serialized behind a second `O_EXCL`
-guard file, held for the whole read-decide-write sequence, not just the
-rename — the second racer, once it gets the guard, reads the first racer's
-fresh write as current reality and makes its decision against that, not
-against a snapshot that is already stale. The post-write verify stays in
+just two racers. So takeovers are now serialized behind a real `flock(2)` on
+a sibling guard file, held for the whole read-decide-write sequence, not just
+the rename — the second racer, once it gets the lock, reads the first
+racer's fresh write as current reality and makes its decision against that,
+not against a snapshot that is already stale. The post-write verify stays in
 place as a cheap check that the guard worked, not as the primary defense.
+
+The first version of that guard used `O_EXCL` on the sibling file instead of
+a real lock, reclaiming it once it looked older than a fixed threshold — the
+theory being that a guard nobody had touched in that long must belong to a
+crashed holder. TLA+ model checking proved that reasoning unsound: under
+genuine contention, a live holder can legitimately still be inside the
+critical section once the threshold elapses, no crash required — and a
+waiter that reclaims on that basis steals the guard out from under a holder
+who is still using it, reopening the exact double-win the guard exists to
+close, through a different door. `flock` has no such heuristic to get wrong:
+the kernel releases it the instant the holder's file descriptor closes, on a
+clean exit or a crash alike, so there is nothing to guess about. The guard
+file itself is never deleted — unlinking it while a waiter might still be
+about to open that same name would let a fresh inode start an unrelated lock
+series at the same path, splitting the very exclusivity this exists to
+provide — so `.pact/guards/` accumulates one empty file per lock path that
+has ever been contested, a deliberate and cheap cost.
 
 ## Use case: two agents, one file
 
