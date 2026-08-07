@@ -315,13 +315,28 @@ fn pointer_block(expands_imports: bool) -> String {
 /// `pact doctor` reported the block stale and prescribed the command doing the
 /// damage. Symlinking every tool's file at `AGENTS.md` is the whole agents-md
 /// convention, so this is a normal layout, not an exotic one.
+///
+/// The same collision can happen between two *targets* rather than a target
+/// and `AGENTS.md` — `GEMINI.md` and `.cursorrules` symlinked to each other,
+/// or both to some third shared file. Both look like ordinary candidates, so
+/// splicing each independently means the second write clobbers the first's
+/// block, and `pact doctor` reports the first stale immediately after `init`
+/// claimed to update it. So: once a candidate's canonical path has already
+/// been claimed by an earlier entry in `INSTRUCTION_TARGETS`, skip it rather
+/// than write it — the same "skip the alias" choice already made for
+/// AGENTS.md, just applied across the whole list instead of one fixed target.
 fn present_targets(repo_root: &Path) -> Vec<(PathBuf, bool)> {
     let agents = repo_root.join("AGENTS.md").canonicalize().ok();
+    let mut seen = std::collections::HashSet::new();
     INSTRUCTION_TARGETS
         .iter()
         .map(|(name, expands_imports)| (repo_root.join(name), *expands_imports))
         .filter(|(path, _)| path.is_file())
         .filter(|(path, _)| agents.is_none() || path.canonicalize().ok() != agents)
+        .filter(|(path, _)| match path.canonicalize().ok() {
+            Some(canon) => seen.insert(canon),
+            None => true,
+        })
         .collect()
 }
 
@@ -1133,6 +1148,46 @@ mod tests {
         assert!(
             managed_instruction_files(tmp.path()) == vec![tmp.path().join(".windsurfrules")],
             "an alias of AGENTS.md is not a separate managed file"
+        );
+    }
+
+    /// pact-m7j.9.5: two OTHER targets aliased to each other (not to
+    /// AGENTS.md) used to both get spliced independently — since they are the
+    /// same underlying file, the second write clobbers the first's block, and
+    /// `doctor` reported one stale right after `init` claimed to update both.
+    /// `GEMINI.md` sorts first in `INSTRUCTION_TARGETS`, so it is the one kept;
+    /// `.cursorrules` is the later alias, skipped rather than written.
+    #[cfg(unix)]
+    #[test]
+    fn two_targets_aliased_to_each_other_are_treated_as_one_managed_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        apply(tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("shared.md"), "# shared\n").unwrap();
+        std::os::unix::fs::symlink("shared.md", tmp.path().join("GEMINI.md")).unwrap();
+        std::os::unix::fs::symlink("shared.md", tmp.path().join(".cursorrules")).unwrap();
+
+        let managed = ensure_instruction_files(tmp.path()).unwrap();
+
+        assert_eq!(
+            managed,
+            vec![tmp.path().join("GEMINI.md")],
+            "only the earlier-listed alias should be written"
+        );
+        let shared = std::fs::read_to_string(tmp.path().join("shared.md")).unwrap();
+        assert_eq!(
+            shared.matches(BEGIN_MARKER).count(),
+            1,
+            "the shared file must carry exactly one managed block:\n{shared}"
+        );
+        // The acceptance property: doctor must not disagree with the init it
+        // just ran.
+        assert!(
+            stale_instruction_files(tmp.path()).unwrap().is_empty(),
+            "doctor must not flag a file init just wrote as stale"
+        );
+        assert_eq!(
+            managed_instruction_files(tmp.path()),
+            vec![tmp.path().join("GEMINI.md")]
         );
     }
 
