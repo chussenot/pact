@@ -1196,8 +1196,12 @@ fn acquire_many_fs(
                     let _ = release(repo_root, agent, taken, false);
                 }
                 // Put the pre-held leases back byte for byte. The "renewed"
-                // event the refresh already logged stays in the feed — an
-                // overstatement worth less than the code to retract it.
+                // event the refresh already logged stays in the feed — but
+                // logged alone it would be the feed's last word on this path,
+                // telling a reader (and `pact audit --check stale-holds`,
+                // pact-m7j.1.3) that a real renewal justified the hold when it
+                // was undone moments later. The "restored" event below closes
+                // that gap (pact-m7j.1.2).
                 //
                 // Guarded and re-checked, not unconditional (pact-m7j.1.1): the
                 // gap between the batch's refresh and this rollback is exactly
@@ -1217,6 +1221,22 @@ fn acquire_many_fs(
                         .unwrap_or(false);
                     if still_ours {
                         let _ = write_lease_atomic(&lock_path, before);
+                        log_event(
+                            repo_root,
+                            agent,
+                            "restored",
+                            &before.path,
+                            Some(format!(
+                                "batch acquire failed on a later path; reverted this refresh, \
+                                 restoring the pre-batch lease (acquired_at {})",
+                                before.acquired_at
+                            )),
+                            // The ttl now back in force: the pre-batch one, not
+                            // the batch's, so a stale-holds check judges the
+                            // restored hold by the promise that is actually
+                            // live again.
+                            before.ttl_secs,
+                        );
                     }
                 }
                 // One per batch that actually unwound, not one per path, and
@@ -2059,6 +2079,53 @@ mod tests {
         assert_eq!(
             after.acquired_at, before.acquired_at,
             "the batch reset the lease's age, so peers see it as fresher than it is"
+        );
+    }
+
+    /// pact-m7j.1.2: the rollback above restores the pre-batch lease on disk,
+    /// but until now left no trace that it had — the feed's last word on the
+    /// path stayed the "renewed" event the refresh logged, never retracted or
+    /// explained. A "restored" event must land, naming the path and the
+    /// pre-batch `acquired_at` it put back.
+    #[test]
+    fn acquire_many_rollback_logs_the_restoration() {
+        let tmp = repo();
+        let root = tmp.path();
+        let before = acquire(root, "agent-a", "src/mine.rs", 900, false, None)
+            .unwrap()
+            .lease;
+        claim(root, "agent-b", "src/theirs.rs");
+
+        assert!(acquire_many(
+            root,
+            "agent-a",
+            &["src/mine.rs".to_string(), "src/theirs.rs".to_string()],
+            30,
+            false,
+            None,
+        )
+        .is_err());
+
+        assert_eq!(
+            event_kinds(root),
+            vec![
+                ("acquired".to_string(), "src/mine.rs".to_string()),
+                ("acquired".to_string(), "src/theirs.rs".to_string()),
+                ("renewed".to_string(), "src/mine.rs".to_string()),
+                ("restored".to_string(), "src/mine.rs".to_string()),
+            ],
+            "the refresh's renewed event must be followed by a restored event, \
+             not left as the feed's last, uncorrected word on the path"
+        );
+        let restored = crate::events::recent(root, 1).unwrap();
+        assert!(
+            restored[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains(&before.acquired_at),
+            "the restored event should name the pre-batch acquired_at it put back: {:?}",
+            restored[0].detail
         );
     }
 

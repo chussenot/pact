@@ -348,6 +348,20 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>) {
                         slot.4 = false;
                     }
                 }
+            } else if e.kind == "restored" {
+                // pact-m7j.1.3: `acquire_many`'s rollback undid exactly one
+                // "renewed" it had logged for this path — the refresh never
+                // survived, so it must not go on counting as a renewal that
+                // exempts this hold from `stale-holds`. And the TTL back in
+                // force is whatever this event carries (the pre-batch one),
+                // not the higher one the undone refresh briefly granted.
+                if let Some(slot) = open.get_mut(&e.agent) {
+                    slot.2 = slot.2.saturating_sub(1);
+                    if let Some(ttl) = e.ttl_secs {
+                        slot.3 = ttl;
+                        slot.4 = false;
+                    }
+                }
             } else if closes(&e.kind) {
                 if let Some((oline, oat, renewals, ttl, ttl_assumed)) = open.remove(&e.agent) {
                     let held = parse_at(&oat)
@@ -1106,6 +1120,37 @@ mod tests {
         // Renewals also disqualify it, which is the pre-existing rule; the point
         // here is that the recorded TTL followed the renew.
         assert_eq!(r.findings(), 0);
+    }
+
+    /// pact-m7j.1.3: `acquire_many`'s rollback logs a "restored" event when it
+    /// undoes a refresh (lease.rs, pact-m7j.1.2). That "renewed" it undoes must
+    /// stop counting toward the hold's renewal total — otherwise the phantom
+    /// renewal exempts a hold from `stale-holds` even after it later genuinely
+    /// lapses, which is exactly the case this check exists to catch.
+    #[test]
+    fn a_restored_hold_still_counts_as_never_renewed() {
+        let tmp = with_log(&[
+            // Pre-batch acquire under a 600s ttl.
+            &ev_ttl("2026-08-01T10:00:00Z", "a", "acquired", "a.rs", 600),
+            // A batch acquire refreshes it onto a much longer ttl...
+            &ev_ttl("2026-08-01T10:01:00Z", "a", "renewed", "a.rs", 7200),
+            // ...then fails on a later path and rolls the refresh back.
+            &ev_ttl("2026-08-01T10:02:00Z", "a", "restored", "a.rs", 600),
+            // No further activity: the restored 600s ttl lapses for real.
+            &ev_ttl("2026-08-01T11:00:00Z", "a", "expired", "a.rs", 600),
+        ]);
+        let r = run_check(tmp.path(), Check::StaleHolds, None, false).unwrap();
+        assert_eq!(
+            r.findings(),
+            1,
+            "the retracted renewal must not exempt a hold that really lapsed"
+        );
+        assert_eq!(r.stale_holds[0].renewals, 0, "the renewal was undone");
+        assert_eq!(
+            r.stale_holds[0].ttl_secs, 600,
+            "judged against the restored ttl, not the batch's"
+        );
+        assert_eq!(r.stale_holds[0].closed_by.as_deref(), Some("expired"));
     }
 
     #[test]
