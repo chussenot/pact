@@ -2,6 +2,34 @@ use std::io::{self, Write};
 
 use serde::Serialize;
 
+/// Replace any control character other than `\n`/`\t` with the Unicode
+/// replacement character (`\u{FFFD}`).
+///
+/// Message bodies, subjects and lease notes are free text supplied by other
+/// agents and printed verbatim by design (byte fidelity for `--body-file`,
+/// pact-rnc.25) — but "verbatim" must stop at bytes that are actually
+/// terminal commands. A body containing a raw ESC (`\x1b`) sequence would
+/// otherwise be interpreted by whatever terminal displays it: clear the
+/// screen, move the cursor, rewrite the prompt. `c.is_control()` is the same
+/// filter `ratatui-core` already applies before drawing a `Span` (`pact ui`
+/// is not exposed to this), so both surfaces agree on what "displayable"
+/// means. `\n` and `\t` are explicitly exempted: multi-line bodies and
+/// tab-formatted tables are legitimate output, not an attack. Substitution
+/// rather than deletion keeps the 1-char-for-1-char length/position
+/// intuition and can't accidentally concatenate text that was meant to stay
+/// apart.
+fn sanitize_for_terminal(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Write `s` and a newline to `w`. A closed reader (EPIPE) is not an error.
 ///
 /// Exit-status decision (pact-rnc.26): a broken pipe produces **no panic, no
@@ -16,6 +44,7 @@ use serde::Serialize;
 /// reader already walked away is strictly cheaper than making a completed
 /// action look failed, so we drop the bytes and stay quiet.
 fn write_line(w: &mut impl Write, s: &str) {
+    let s = sanitize_for_terminal(s);
     if let Err(e) = writeln!(w, "{s}") {
         if e.kind() != io::ErrorKind::BrokenPipe {
             // A real write failure is worth mentioning, but still not fatal:
@@ -113,6 +142,39 @@ mod tests {
         let mut buf = Vec::new();
         write_line(&mut buf, "hello");
         assert_eq!(buf, b"hello\n");
+    }
+
+    #[test]
+    fn sanitize_replaces_control_bytes_but_keeps_newline_and_tab() {
+        let attack = "before\x1b[2J\x1b[H\x07 a\tb\nc after";
+        assert_eq!(
+            sanitize_for_terminal(attack),
+            "before\u{FFFD}[2J\u{FFFD}[H\u{FFFD} a\tb\nc after"
+        );
+    }
+
+    #[test]
+    fn sanitize_is_a_no_op_on_plain_text() {
+        assert_eq!(
+            sanitize_for_terminal("plain text, no surprises"),
+            "plain text, no surprises"
+        );
+    }
+
+    /// `write_line` is the single funnel every rendered surface goes through
+    /// (`line`, `warn`, and everything `emit` calls) — this pins that the
+    /// escape sequence never reaches the writer, not just that the helper
+    /// function works in isolation.
+    #[test]
+    fn write_line_strips_escape_sequences_before_writing() {
+        let mut buf = Vec::new();
+        write_line(&mut buf, "clear-screen: \x1b[2J\x07 done");
+        assert!(!buf.contains(&0x1b), "ESC byte leaked into output: {buf:?}");
+        assert!(!buf.contains(&0x07), "BEL byte leaked into output: {buf:?}");
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "clear-screen: \u{FFFD}[2J\u{FFFD} done\n"
+        );
     }
 
     #[test]
