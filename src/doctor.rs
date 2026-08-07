@@ -465,6 +465,109 @@ fn worktree_checks(ctx: &repo::RepoContext, checks: &mut Vec<DoctorCheck>) {
             Err(e) => format!("{} is NOT usable: {e}", ctx.state_dir.display()),
         },
     });
+
+    // PACT_STATE_DIR (Placement::StateDirOverride) has no collision detection
+    // of its own: point two UNRELATED checkouts at the same override directory
+    // by mistake and their leases silently merge into one shared space — no
+    // error, no warning, nothing distinguishes "my own history" from "someone
+    // else's checkout landed here because an env var was copy-pasted".
+    // Checked only under the override: an ordinary repo has no stray directory
+    // to compare against, and every other placement rule already puts state
+    // somewhere this repository, and only this repository, could have put it.
+    //
+    // Emitted unconditionally regardless, like every other check here, so it
+    // stays checkable both directions by scripts/check-docs.sh and findable
+    // before it ever fires.
+    let foreign = if ctx.placement == repo::Placement::StateDirOverride {
+        foreign_leases(ctx)
+    } else {
+        Vec::new()
+    };
+    checks.push(DoctorCheck {
+        name: "state dir isolation",
+        ok: true,
+        warn: !foreign.is_empty(),
+        detail: match ctx.placement {
+            repo::Placement::StateDirOverride if foreign.is_empty() => format!(
+                "PACT_STATE_DIR={} — no signs of another repository sharing it",
+                ctx.state_dir.display()
+            ),
+            repo::Placement::StateDirOverride => format!(
+                "PACT_STATE_DIR={} looks shared with a DIFFERENT repository — {} lease(s) do not \
+                 match this checkout's topology and most likely came from elsewhere: {}. If that \
+                 is not intentional, point PACT_STATE_DIR somewhere unique per repository; two \
+                 checkouts sharing one space merge their leases with no other warning.",
+                ctx.state_dir.display(),
+                foreign.len(),
+                foreign.join(", ")
+            ),
+            _ => "PACT_STATE_DIR is not set — not applicable".to_string(),
+        },
+    });
+}
+
+/// Leases under a `PACT_STATE_DIR` override that could not have been written
+/// by ANY worktree of this process's own repository (pact-m7j.8.5).
+///
+/// Two signals, cheapest and most exact first:
+///
+/// - a lease naming a `worktree`: real worktree names come straight from
+///   `.git/worktrees/<name>` (see [`repo::RepoContext`] and
+///   `has_linked_worktrees`), so a name absent from that directory could not
+///   have been stamped by any worktree of THIS repository, full stop.
+/// - a lease with no worktree metadata — an ordinary checkout with no linked
+///   worktrees, or an older lock file predating that field — falls back to
+///   its `path`. The exact file is not required to exist: leasing a file that
+///   does not exist yet is a documented workflow (docs/leases.md, "Working on
+///   a new file you can't compile yet"), and that workflow always happens
+///   inside a directory that already exists (`src/parser.rs` inside a real
+///   `src/`). So the bar is lower — does the path's PARENT directory exist
+///   under this checkout — and a path whose parent also does not exist is not
+///   explained by that workflow; it most plausibly belongs to a different
+///   repository entirely.
+///
+/// A heuristic, not a proof — same as `beads::conflicting_stores` before it —
+/// which is exactly why this only ever warns.
+fn foreign_leases(ctx: &repo::RepoContext) -> Vec<String> {
+    let known_worktrees = known_worktree_names(ctx);
+    lease::peek(&ctx.worktree_root, true)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| match &entry.lease.worktree {
+            Some(name) => !known_worktrees.contains(name.as_str()),
+            None => {
+                let full = ctx.worktree_root.join(&entry.lease.path);
+                !full.exists() && !full.parent().is_some_and(Path::exists)
+            }
+        })
+        .map(|entry| format!("{} (held by {})", entry.lease.path, entry.lease.agent))
+        .collect()
+}
+
+/// Every worktree name this repository's own gitdir could have produced: the
+/// main worktree's own directory name, plus every entry under
+/// `<shared_root>/.git/worktrees/` — the same directory `has_linked_worktrees`
+/// already reads, just enumerated here instead of merely tested for
+/// non-emptiness.
+///
+/// Read from `shared_root`, not `ctx.git_dir`: for a linked worktree
+/// `git_dir` is that ONE worktree's own entry
+/// (`<common>/worktrees/<name>`), not the directory its siblings are listed
+/// under, while `shared_root` is the plain, non-bare checkout every
+/// worktree-carrying placement already resolves TO.
+fn known_worktree_names(ctx: &repo::RepoContext) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    if let Some(name) = ctx.shared_root.file_name() {
+        names.insert(name.to_string_lossy().into_owned());
+    }
+    if let Ok(entries) = std::fs::read_dir(ctx.shared_root.join(".git").join("worktrees")) {
+        names.extend(
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned()),
+        );
+    }
+    names
 }
 
 /// Can we actually create and remove a file in the state dir?

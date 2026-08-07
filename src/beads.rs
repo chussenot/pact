@@ -470,24 +470,27 @@ impl BeadsCli {
     /// 0.2.19 accepts `--actor <ACTOR>` — so this exists to notice if that stops
     /// being true, not because it is currently in doubt.
     ///
-    /// Cached: `doctor` and any other caller should cost one subprocess per
-    /// process, not one per question. A failure to run is reported as unsupported,
-    /// which is the safe direction — it understates rather than promising
-    /// attribution pact cannot deliver.
+    /// NOT cached (pact-m7j.9.9) — re-run on every call, the same freedom
+    /// [`version`](Self::version) already has and for the same reason: an
+    /// ordinary CLI invocation is a fresh process either way, but `pact mcp
+    /// serve` and `pact ui` are long-lived, and a process-lifetime cache
+    /// answered a `bd`/`br` swapped mid-session with whatever the FIRST call
+    /// saw, forever. `pact doctor`'s "Beads CLI" check is the one caller today,
+    /// so the accepted cost is one extra `bd/br create --help` subprocess per
+    /// doctor invocation. A failure to run is reported as unsupported, which is
+    /// the safe direction — it understates rather than promising attribution
+    /// pact cannot deliver.
     pub fn supports_actor(&self, repo_root: &Path) -> bool {
-        static SUPPORTED: OnceLock<bool> = OnceLock::new();
-        *SUPPORTED.get_or_init(|| {
-            Command::new(self.binary)
-                .args(["create", "--help"])
-                .current_dir(repo_root)
-                .output()
-                .map(|o| {
-                    let help = String::from_utf8_lossy(&o.stdout);
-                    let err = String::from_utf8_lossy(&o.stderr);
-                    help.contains("--actor") || err.contains("--actor")
-                })
-                .unwrap_or(false)
-        })
+        Command::new(self.binary)
+            .args(["create", "--help"])
+            .current_dir(repo_root)
+            .output()
+            .map(|o| {
+                let help = String::from_utf8_lossy(&o.stdout);
+                let err = String::from_utf8_lossy(&o.stderr);
+                help.contains("--actor") || err.contains("--actor")
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -854,6 +857,45 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "polling logic must not slow down the fast path: {elapsed:?}"
+        );
+    }
+
+    /// pact-m7j.9.9: `supports_actor` used to cache its answer in a
+    /// process-lifetime `OnceLock`, correct for a fresh-process CLI invocation
+    /// but wrong for `pact mcp serve`/`pact ui`, which stay up long enough to
+    /// see the installed `bd`/`br` swapped out from under them. Points
+    /// `BeadsCli` at an absolute path to a stub script (never at a bare name on
+    /// `PATH`) so this cannot race any other test in this process that shells
+    /// out by binary name.
+    #[cfg(unix)]
+    #[test]
+    fn supports_actor_is_re_derived_every_call_not_cached_for_the_process() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = init_repo();
+        let stub_dir = tempfile::tempdir().unwrap();
+        let script = stub_dir.path().join("stub-bd");
+        let write_stub = |contents: &str| {
+            std::fs::write(&script, contents).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+
+        write_stub("#!/bin/sh\necho 'usage: create [--title] [--json]'\n");
+        let binary: &'static str =
+            Box::leak(script.to_string_lossy().into_owned().into_boxed_str());
+        let cli = BeadsCli { binary };
+        assert!(
+            !cli.supports_actor(repo.path()),
+            "stub help text names no --actor, so this must report false"
+        );
+
+        // Same `BeadsCli`, same process, the stub swapped in place — standing
+        // in for a `bd`/`br` upgrade or PATH change during a long-lived
+        // `pact mcp serve`/`pact ui` session.
+        write_stub("#!/bin/sh\necho 'usage: create [--actor ACTOR] [--json]'\n");
+        assert!(
+            cli.supports_actor(repo.path()),
+            "a cached answer would still report false here; it must be re-derived per call"
         );
     }
 }

@@ -124,6 +124,7 @@ here that the CLI does not emit, fails CI:
 | `state placement` | which rule put the state directory where it is |
 | `event log survives a clone` | is `.pact/events.jsonl` tracked; warns (`!`) when it is ignored, because the history dies at the next clone |
 | `state dir writable` | can pact actually write there — the shared directory of a linked worktree may not be yours |
+| `state dir isolation` | only meaningful under `PACT_STATE_DIR`; warns (`!`) when leases there look like they came from a different repository |
 | `AGENTS.md block current` | does the managed block match this pact version |
 | `CLAUDE.md reaches the protocol` | Claude Code loads `CLAUDE.md`, never `AGENTS.md` |
 | `other instruction files current` | `GEMINI.md` and friends, same staleness question |

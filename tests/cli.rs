@@ -2335,6 +2335,71 @@ fn doctor_warns_when_two_beads_stores_share_one_directory() {
     );
 }
 
+/// pact-m7j.8.5: `PACT_STATE_DIR` had no collision detection at all. Point two
+/// UNRELATED checkouts at the same override directory — the mistake it exists
+/// to make possible for tests, the fleet harness and demos — and their leases
+/// silently shared one space with no signal that anything was wrong: before
+/// this fix, `pact doctor` from the second repo reported `Placement::
+/// StateDirOverride` with no check that noticed the other repo's lease
+/// sitting right there.
+///
+/// Two independently-created repos, not a submodule and its superproject (the
+/// bead's other suggested shape): the simpler way to get two checkouts that
+/// share nothing at all — no worktree relationship, no common ancestor
+/// directory, nothing but the environment variable in common.
+#[test]
+fn doctor_flags_a_state_dir_shared_with_an_unrelated_repository() {
+    let repo_a = init_repo();
+    let repo_b = init_repo();
+    let shared_state = tempfile::tempdir().unwrap();
+
+    // A lease from repo A, landing in the directory both repos are about to
+    // share. Its path's parent (`only-in-a/`) exists under neither bare test
+    // repo, but that's fine — nothing here checks repo A against itself.
+    let acquire = Command::new(env!("CARGO_BIN_EXE_pact"))
+        .args(["lease", "acquire", "only-in-a/marker.rs"])
+        .current_dir(repo_a.path())
+        .env_remove("PACT_AGENT")
+        .env("PACT_AGENT", "agent-a")
+        .env("PACT_STATE_DIR", shared_state.path())
+        .output()
+        .expect("failed to run pact binary");
+    assert_ok(&acquire);
+
+    let check = |repo: &Path| -> serde_json::Value {
+        let out = Command::new(env!("CARGO_BIN_EXE_pact"))
+            .args(["doctor", "--json"])
+            .current_dir(repo)
+            .env_remove("PACT_AGENT")
+            .env("PACT_AGENT", "agent-b")
+            .env("PACT_STATE_DIR", shared_state.path())
+            .output()
+            .expect("failed to run pact binary");
+        json_stdout(&out)["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "state dir isolation")
+            .cloned()
+            .unwrap_or_else(|| panic!("no `state dir isolation` check in {out:?}"))
+    };
+
+    let from_b = check(repo_b.path());
+    assert_eq!(
+        from_b["warn"], true,
+        "a lease from an unrelated repo sharing this PACT_STATE_DIR must be flagged: {from_b}"
+    );
+    assert_eq!(
+        from_b["ok"], true,
+        "warns, never fails — the same contract as `one Beads store`: {from_b}"
+    );
+    let detail = from_b["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("only-in-a/marker.rs") && detail.contains("agent-a"),
+        "must name the foreign lease and its holder: {detail}"
+    );
+}
+
 /// pact-m7j.10.7: `conflicting_stores` had exactly one call site in the whole
 /// binary — `doctor.rs`. Reproduced live: with the identical on-disk conflict
 /// the test above exercises, `pact doctor` warned correctly and, seconds
