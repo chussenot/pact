@@ -49,6 +49,11 @@ skips leases and messaging entirely, and looks exactly like a fleet that never
 started. That is why `pact doctor` has an opinion about whether the protocol is
 current, reachable, and would survive a clone.
 
+`init` is also bound by the protocol it writes: it refuses to rewrite an
+instruction file that is under a live lease. A tool that tells every agent to
+lease what it writes, and then writes through those leases itself, is teaching
+that the protocol is optional.
+
 → [docs/onboarding.md](docs/onboarding.md)
 
 ### Leases, because advisory beats mandatory when the participants crash

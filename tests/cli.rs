@@ -1283,6 +1283,85 @@ fn init_still_succeeds_when_the_commit_cannot_be_made() {
     );
 }
 
+/// `AGENTS.md` itself tells every agent to lease everything it writes, but
+/// `init` used to rewrite AGENTS.md/CLAUDE.md with zero lease check at all —
+/// not a narrowed race, a total absence (pact-m7j.9.3). A held lease on
+/// either file must refuse the whole init, not just warn.
+#[test]
+fn init_refuses_to_write_through_a_live_lease_on_a_managed_file() {
+    let Some(tmp) = git_repo("init_refuses_live_lease") else {
+        return;
+    };
+    git_identity(tmp.path());
+
+    assert_ok(&pact(
+        tmp.path(),
+        "alice",
+        &[
+            "lease",
+            "acquire",
+            "AGENTS.md",
+            "--note",
+            "editing the intro",
+        ],
+    ));
+
+    let out = pact(tmp.path(), "bob", &["init", "--no-commit"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("alice"), "must name the holder: {stderr}");
+    assert!(
+        !tmp.path().join("AGENTS.md").exists(),
+        "must not write anything when refusing"
+    );
+
+    // --force overrides, exactly like every other takeover in pact.
+    assert_ok(&pact(
+        tmp.path(),
+        "bob",
+        &["init", "--no-commit", "--force"],
+    ));
+    assert!(tmp.path().join("AGENTS.md").exists());
+}
+
+/// The agent that leased `AGENTS.md` itself is not a peer to refuse against:
+/// re-entrant `init` over your own hold must succeed without `--force`.
+#[test]
+fn init_writes_through_its_own_holders_lease() {
+    let Some(tmp) = git_repo("init_writes_through_own_lease") else {
+        return;
+    };
+    git_identity(tmp.path());
+
+    assert_ok(&pact(
+        tmp.path(),
+        "alice",
+        &["lease", "acquire", "AGENTS.md"],
+    ));
+    let out = pact(tmp.path(), "alice", &["init", "--no-commit"]);
+    assert_ok(&out);
+    assert!(tmp.path().join("AGENTS.md").exists());
+}
+
+/// `init` also writes `.gitignore`/`.gitattributes`; a live lease on either
+/// must refuse the run exactly like one on `AGENTS.md`/`CLAUDE.md`.
+#[test]
+fn init_refuses_to_write_through_a_live_lease_on_gitignore() {
+    let Some(tmp) = git_repo("init_refuses_live_lease_gitignore") else {
+        return;
+    };
+    git_identity(tmp.path());
+
+    assert_ok(&pact(
+        tmp.path(),
+        "alice",
+        &["lease", "acquire", ".gitignore"],
+    ));
+    let out = pact(tmp.path(), "bob", &["init", "--no-commit"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr_of(&out));
+    assert!(!tmp.path().join("AGENTS.md").exists());
+}
+
 fn git_identity(repo: &Path) {
     run_git(repo, &["config", "user.email", "tests@pact.invalid"]);
     run_git(repo, &["config", "user.name", "pact tests"]);

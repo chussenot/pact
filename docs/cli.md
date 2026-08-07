@@ -13,7 +13,7 @@ have not made.
 ## Commands
 
 ```
-pact init [--print] [--no-commit]
+pact init [--print] [--no-commit] [--force]
 pact whoami
 pact agents
 pact lease acquire <path>... [--ttl <seconds>] [--steal] [--note <text>]
@@ -47,6 +47,12 @@ and `--json` flag. `--all` on `release` is mutually exclusive with both
 `<path>` and `--force`; `--body-file` is mutually exclusive with the positional
 body. clap rejects those combinations rather than silently ignoring one.
 
+`init --force` writes through a live lease on a file `init` would rewrite;
+without it `init` exits 2 and writes nothing at all
+([why](onboarding.md#init-refuses-to-write-through-a-live-lease)). It is the
+same explicit-override shape as `acquire --steal` and `release --force`, and
+like both it is unrelated to `--no-commit`, which only skips the commit.
+
 Batching doesn't change the shape a one-path script already parses: a single-path
 `lease acquire --json` still emits the lease *object* (several paths emit an
 array), and a single `--to` still prints `sent <id> to <who> (thread <id>)`.
@@ -59,7 +65,7 @@ scripted caller can see whose claim a `--force` destroyed.
 |------|---------|
 | 0 | success |
 | 1 | generic error — and `pact audit --check …` found something (a finding is a result, not a fault) |
-| 2 | lease held by another agent (or you don't hold the lease you're releasing) |
+| 2 | lease conflict — held by another agent, or you don't hold the one you're releasing, or `init` found one on a file it rewrites |
 | 3 | Beads CLI (`bd` or `br`) not found on `PATH` |
 | 4 | not in a git repository |
 | 5 | usage error — unknown subcommand, bad or missing flag value |

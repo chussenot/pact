@@ -63,6 +63,38 @@ Three properties, each of which is the interesting part:
 applied — a rule pact writes and Cursor ignores is worse than no rule, because
 it looks done.
 
+## `init` refuses to write through a live lease
+
+`AGENTS.md` tells every agent to lease anything it writes, and `init` rewrites
+exactly that kind of shared file — but for a long time `init` was the one
+writer exempt from its own instruction, and would silently overwrite a file a
+peer was mid-edit on (a reproduced bug, not a narrowed race). It now peeks for
+a live lease first and refuses the whole run with **exit 2**, naming the holder:
+
+```
+error: lease on AGENTS.md is held by alice; refusing to let `pact init` write through it (use --force to override)
+```
+
+Three things are worth knowing about the shape of that refusal:
+
+- **It is all-or-nothing, checked before any file is touched.** A refusal
+  halfway through — `AGENTS.md` rewritten, then a stop on `GEMINI.md` — leaves
+  the repo in a state neither agent asked for, so the check runs up front, the
+  same way several paths in one `lease acquire` are taken together.
+- **It covers every file `init` writes**: `AGENTS.md`, `CLAUDE.md`, every
+  instruction file it would point at `AGENTS.md` (the table above),
+  `.gitignore`, and `.gitattributes`.
+- **Your own lease is not a peer's.** If you hold the lease `init` is about to
+  write through, it proceeds without `--force` — re-entrant, the same as
+  acquiring a path you already hold.
+- **`--force` writes through someone else's anyway**, mirroring
+  `lease acquire --steal` and `lease release --force`: overriding a live claim
+  is allowed, but never as a default and never silently.
+
+The check is a peek — `init` reads the leases, it does not take one. A bounded
+rewrite-and-exit does not need a claim of its own, only the courtesy of
+honouring someone else's. `--print` writes nothing, so it is never refused.
+
 **Use case:** you set up a new repo for multi-agent work. You run
 `pact init` once and commit the result. From then on, cloning the repo and
 pointing any agent at it is enough; re-running `pact init` after upgrading

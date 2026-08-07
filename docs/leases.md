@@ -456,6 +456,14 @@ why `release --json` emits an object rather than a bare path:
 
 `displaced` is `null` when you released your own claim.
 
+That shape now has a third instance outside `lease` entirely: `pact init`
+refuses (exit 2) rather than rewrite `AGENTS.md` or another instruction file
+someone holds a live lease on, and `init --force` writes through it
+([why](onboarding.md#init-refuses-to-write-through-a-live-lease)). It is the
+one place pact honours a lease rather than merely recording it — leases stay
+advisory between agents, but pact's own writer is no longer exempt from the
+protocol it ships.
+
 `--all` releases every lease the calling agent holds, in one call, and prints
 what it released:
 

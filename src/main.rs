@@ -72,6 +72,13 @@ enum Command {
         /// nobody who clones.
         #[arg(long)]
         no_commit: bool,
+        /// Write through a live lease another agent holds on AGENTS.md,
+        /// CLAUDE.md, or another managed instruction file. Without it, `init`
+        /// refuses (exit 2) rather than overwriting a file someone else is
+        /// mid-edit on — the same override every other takeover in pact needs
+        /// an explicit flag for.
+        #[arg(long)]
+        force: bool,
     },
     /// Show what pact resolved: identity, paths, and the bd it will use.
     Whoami,
@@ -413,9 +420,19 @@ fn run(cli: Cli) -> Result<i32> {
         // because its report *is* the output; everything else succeeds or
         // raises, and `Ok(())` means exit 0.
         Command::Doctor => run_doctor(&cwd, cli.json),
-        Command::Init { print, no_commit } => {
-            run_init(&cwd, print, no_commit, cli.json).map(|()| 0)
-        }
+        Command::Init {
+            print,
+            no_commit,
+            force,
+        } => run_init(
+            &cwd,
+            print,
+            no_commit,
+            force,
+            cli.agent.as_deref(),
+            cli.json,
+        )
+        .map(|()| 0),
         Command::Whoami => run_whoami(&cwd, cli.agent.as_deref(), cli.json).map(|()| 0),
         Command::Agents { r#for } => run_agents(&cwd, cli.json, r#for.as_deref()).map(|()| 0),
         Command::Lease { action } => {
@@ -491,7 +508,74 @@ Written by `pact init`: the managed block in AGENTS.md, the pointer back to it
 in every agent-instruction file this repo already has (CLAUDE.md, GEMINI.md,
 copilot-instructions.md, …), and the .pact/ line in .gitignore.";
 
-fn run_init(cwd: &Path, print: bool, no_commit: bool, json: bool) -> Result<()> {
+/// Refuse to write through a live lease another agent holds on one of the
+/// files `init` is about to rewrite (pact-m7j.9.3): `AGENTS.md` itself tells
+/// every agent to lease everything it writes, and `init` rewrites exactly
+/// that kind of shared, multi-writer file without ever having checked before
+/// this existed. A peek, not an acquire: init does not need to hold a lease
+/// to do a bounded rewrite-and-exit, only to refuse when someone else already
+/// holds one — the same asymmetry `lease::peek` exists for elsewhere.
+fn refuse_if_a_target_is_leased(
+    root: &Path,
+    targets: &[PathBuf],
+    agent_flag: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    if force {
+        return Ok(());
+    }
+    let held = lease::peek(root, false)?;
+    if held.is_empty() {
+        return Ok(());
+    }
+    // Resolved lazily, and its absence is not itself an error: the common
+    // bootstrap case (no PACT_AGENT set, nothing leased on any target) must
+    // keep working exactly as before. Only reached at all when something IS
+    // held, and even then only matters for telling "my own re-entrant hold"
+    // apart from "someone else's" below.
+    let self_agent = identity::resolve_agent(agent_flag).ok();
+    for target in targets {
+        let Ok(relative) = target.strip_prefix(root) else {
+            continue;
+        };
+        let relative = relative.to_string_lossy();
+        // Compared as lock keys, not raw strings: a lease taken as `agents.md`
+        // on a case-insensitive filesystem is the same lock as `AGENTS.md`,
+        // and comparing the raw `LeaseInfo.path` spellings would miss it.
+        let key = lease::encode_path(&relative);
+        let Some(entry) = held
+            .iter()
+            .find(|e| lease::encode_path(&e.lease.path) == key)
+        else {
+            continue;
+        };
+        // Our own lease, re-entrant: an agent that followed the protocol and
+        // leased the file it is about to `init` over must not be refused for
+        // doing exactly that. Unresolved identity does NOT get this pass —
+        // it cannot be proven to be the holder, so it is treated as a peer.
+        if self_agent.as_deref() == Some(entry.lease.agent.as_str()) {
+            continue;
+        }
+        return Err(output::exit_with(
+            2,
+            format!(
+                "lease on {relative} is held by {}; refusing to let `pact init` write through it \
+                 (use --force to override)",
+                entry.lease.agent
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn run_init(
+    cwd: &Path,
+    print: bool,
+    no_commit: bool,
+    force: bool,
+    agent_flag: Option<&str>,
+    json: bool,
+) -> Result<()> {
     if print {
         // `--json` has to be honoured here too. It used to fall through and emit
         // raw markdown at exit 0, so `pact init --print --json | jq` failed to
@@ -518,6 +602,21 @@ fn run_init(cwd: &Path, print: bool, no_commit: bool, json: bool) -> Result<()> 
     }
     let root = repo::find_repo_root(cwd)?;
     repo::pact_dir(&root)?;
+
+    // Checked before any write, not per-file inside `apply`/`ensure_*`: a
+    // partial rewrite (AGENTS.md updated, then refused on CLAUDE.md) would be
+    // worse than the all-or-nothing this mirrors from `acquire_many`. Covers
+    // every file `run_init` writes below, not just the two the bug report
+    // named: `.gitignore`/`.gitattributes` are managed writes too.
+    let mut candidates = vec![
+        root.join("AGENTS.md"),
+        root.join("CLAUDE.md"),
+        root.join(".gitignore"),
+        root.join(".gitattributes"),
+    ];
+    candidates.extend(agents_md::managed_instruction_files(&root));
+    refuse_if_a_target_is_leased(&root, &candidates, agent_flag, force)?;
+
     // Child span (pact-aw7.2): `init` has two distinct costs — writing the
     // instruction files, and the git commit below — and a single root span
     // cannot tell you which one you waited on. The count is a number, never a
