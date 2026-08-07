@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 pub const BEGIN_MARKER: &str = "<!-- pact:begin -->";
 pub const END_MARKER: &str = "<!-- pact:end -->";
@@ -116,46 +116,48 @@ Run `pact doctor` if anything above seems out of date.
 /// (creating the file if absent). Running twice produces zero diff.
 pub fn apply(repo_root: &Path) -> Result<PathBuf> {
     let path = repo_root.join("AGENTS.md");
-    splice_block(&path, &managed_block())?;
+    splice_block(&path, &managed_block(), repo_root)?;
     Ok(path)
 }
 
 /// Idempotently splice `body` between the pact markers in `path`, creating the
 /// file if absent and leaving every byte outside the markers alone.
-fn splice_block(path: &Path, body: &str) -> Result<()> {
-    let existing = read_or_empty(path)?;
-
+///
+/// Goes through [`write_atomic_cas`] rather than a plain read-then-write: see
+/// that function for why a bare read/compute/rename can silently discard a
+/// concurrent edit.
+fn splice_block(path: &Path, body: &str, repo_root: &Path) -> Result<()> {
     let block = format!("{BEGIN_MARKER}\n{body}{END_MARKER}\n");
 
-    let new_content = match find_block_bounds(&existing) {
-        // Both markers present, in order: splice the new block in between
-        // them, byte-for-byte identical everywhere else.
-        Some((begin, end)) => {
-            let mut s = String::with_capacity(existing.len() + block.len());
-            s.push_str(&existing[..begin]);
-            s.push_str(&block);
-            s.push_str(&existing[end..]);
-            s
-        }
-        // No markers (or only one — malformed, treated the same as "no
-        // valid block" rather than trying to repair it): append a fresh
-        // block after whatever is already there.
-        None => {
-            let mut s = existing;
-            if !s.is_empty() {
-                if !s.ends_with('\n') {
-                    s.push('\n');
-                }
-                if !s.ends_with("\n\n") {
-                    s.push('\n');
-                }
+    write_atomic_cas(path, repo_root, |existing| {
+        match find_block_bounds(existing) {
+            // Both markers present, in order: splice the new block in between
+            // them, byte-for-byte identical everywhere else.
+            Some((begin, end)) => {
+                let mut s = String::with_capacity(existing.len() + block.len());
+                s.push_str(&existing[..begin]);
+                s.push_str(&block);
+                s.push_str(&existing[end..]);
+                s
             }
-            s.push_str(&block);
-            s
+            // No markers (or only one — malformed, treated the same as "no
+            // valid block" rather than trying to repair it): append a fresh
+            // block after whatever is already there.
+            None => {
+                let mut s = existing.to_string();
+                if !s.is_empty() {
+                    if !s.ends_with('\n') {
+                        s.push('\n');
+                    }
+                    if !s.ends_with("\n\n") {
+                        s.push('\n');
+                    }
+                }
+                s.push_str(&block);
+                s
+            }
         }
-    };
-
-    write_atomic(path, &new_content)
+    })
 }
 
 /// The line that pulls `AGENTS.md` into `CLAUDE.md`. Claude Code resolves a
@@ -210,7 +212,7 @@ pub fn ensure_claude_md(repo_root: &Path) -> Result<ClaudeMd> {
         return Ok(ClaudeMd::AlreadyImported(path));
     }
 
-    splice_block(&path, &claude_block())?;
+    splice_block(&path, &claude_block(), repo_root)?;
     Ok(ClaudeMd::Managed(path))
 }
 
@@ -339,7 +341,7 @@ pub fn managed_instruction_files(repo_root: &Path) -> Vec<PathBuf> {
 pub fn ensure_instruction_files(repo_root: &Path) -> Result<Vec<PathBuf>> {
     let mut managed = Vec::new();
     for (path, expands_imports) in present_targets(repo_root) {
-        splice_block(&path, &pointer_block(expands_imports))?;
+        splice_block(&path, &pointer_block(expands_imports), repo_root)?;
         managed.push(path);
     }
     Ok(managed)
@@ -419,7 +421,7 @@ pub fn ensure_gitignore(repo_root: &Path) -> Result<()> {
 
     let mut content = out.join("\n");
     content.push('\n');
-    write_atomic(&path, &content)
+    write_atomic(&path, &content, repo_root)
 }
 
 /// Ignore everything under `.pact/`, then re-include exactly the event log.
@@ -486,7 +488,7 @@ pub fn ensure_gitattributes(repo_root: &Path) -> Result<()> {
 
     let mut content = out.join("\n");
     content.push('\n');
-    write_atomic(&path, &content)
+    write_atomic(&path, &content, repo_root)
 }
 
 /// Whether AGENTS.md exists, has a managed block, and that block matches the
@@ -525,31 +527,133 @@ fn has_current_block(path: &Path, body: &str) -> Result<bool> {
 /// Permissions are carried over deliberately. A fresh temp file is created with
 /// the process umask, so renaming it over a file the user had chmod'ed would
 /// quietly reset the mode.
-fn write_atomic(path: &Path, contents: &str) -> Result<()> {
-    // Follow a symlink to its target before replacing anything. `fs::write`
-    // wrote THROUGH a link; `rename` would replace the link itself with a
-    // regular file, silently disconnecting a `CLAUDE.md` that somebody had
-    // pointed at their dotfiles. Atomicity is the change being made here;
-    // which file gets written is not, so resolve first and keep the old
-    // meaning. (A link that IS `AGENTS.md` under another name never reaches
-    // this function — `ensure_instruction_files` skips those aliases.)
-    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let path = resolved.as_path();
-    let dir = path.parent().unwrap_or(Path::new("."));
+fn write_atomic(path: &Path, contents: &str, repo_root: &Path) -> Result<()> {
+    let resolved = resolve_write_target(path, repo_root);
+    let dir = resolved.parent().unwrap_or(Path::new("."));
     let tmp = dir.join(crate::events::unique_temp_name(".pact-write"));
 
     std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
-    if let Ok(meta) = std::fs::metadata(path) {
+    if let Ok(meta) = std::fs::metadata(&resolved) {
         let _ = std::fs::set_permissions(&tmp, meta.permissions());
     }
-    match std::fs::rename(&tmp, path) {
+    match std::fs::rename(&tmp, &resolved) {
         Ok(()) => Ok(()),
         Err(e) => {
             // Do not leave litter next to a user's file if the rename fails.
             let _ = std::fs::remove_file(&tmp);
-            Err(e).with_context(|| format!("replacing {}", path.display()))
+            Err(e).with_context(|| format!("replacing {}", resolved.display()))
         }
     }
+}
+
+/// Follow a symlink to its target before replacing anything. `fs::write`
+/// writes THROUGH a link; `rename` would replace the link itself with a
+/// regular file, silently disconnecting a `CLAUDE.md` that somebody had
+/// pointed at their dotfiles. Atomicity is the change [`write_atomic`] and
+/// [`write_atomic_cas`] make; which file gets written is not, so resolve
+/// first and keep the old meaning. (A link that IS `AGENTS.md` under another
+/// name never reaches here — `present_targets` skips those aliases.)
+///
+/// A resolved target outside `repo_root` gets a warning, every time, rather
+/// than either silently writing through it or refusing. Refusing would break
+/// the legitimate case this exists to support — `CLAUDE.md` symlinked to
+/// e.g. `~/dotfiles/CLAUDE.md`, deliberately outside the repo — and nothing
+/// distinguishes that from an accidental symlink (a bad merge, a restored
+/// backup, a copy-pasted template, a stray `ln -s`) by location alone: both
+/// share the identical shape. Reproduced live: symlinking `AGENTS.md` to
+/// `../victim-outside-repo.md` and running `pact init --no-commit` spliced
+/// pact's protocol block into the victim file, exit 0, nothing in the output
+/// naming what happened. This names both the nominal path and the resolved
+/// target, so that output is the thing that catches it instead.
+fn resolve_write_target(path: &Path, repo_root: &Path) -> PathBuf {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let is_symlink = std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_symlink {
+        let root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+        if !resolved.starts_with(&root) {
+            crate::output::warn(&format!(
+                "warning: {} is a symlink to {}, which is outside the repository at {} — \
+                 writing through it anyway; if this is not the intentional dotfiles-style \
+                 layout, check where it points",
+                path.display(),
+                resolved.display(),
+                root.display()
+            ));
+        }
+    }
+    resolved
+}
+
+/// Bounded attempts for [`write_atomic_cas`]'s retry loop, after which it
+/// fails loudly rather than spinning forever against a file under constant
+/// writes.
+const MAX_CAS_ATTEMPTS: u32 = 5;
+
+/// Like [`write_atomic`], but for a read-modify-write: `modify` computes the
+/// new content from what is actually on disk, and may be called again with
+/// fresher content if a concurrent writer lands between the read `modify` was
+/// given and the commit-moment rename.
+///
+/// The plain read-then-write this replaced had no lock and no version check:
+/// pausing between its read and its rename (reproduced live with strace delay
+/// injection) let a concurrent write to `AGENTS.md` complete during the
+/// pause, and the delayed rename then silently and completely overwrote it —
+/// no error, no warning, no event logged. This closes that window: content is
+/// re-read immediately before the rename, and if it no longer matches what
+/// `modify` was given, that attempt's output is discarded and `modify` is
+/// re-run against the fresh content instead of clobbering it. After
+/// [`MAX_CAS_ATTEMPTS`] straight conflicts it gives up with a loud error
+/// rather than loop forever against a file under constant writes.
+fn write_atomic_cas(
+    path: &Path,
+    repo_root: &Path,
+    mut modify: impl FnMut(&str) -> String,
+) -> Result<()> {
+    // Resolved once: the symlink target itself is not expected to move mid
+    // retry-loop, and re-resolving per attempt would repeat the escaped-target
+    // warning once per conflict instead of once per call.
+    let resolved = resolve_write_target(path, repo_root);
+    let dir = resolved.parent().unwrap_or(Path::new("."));
+
+    let mut before = read_or_empty(path)?;
+    for attempt in 1..=MAX_CAS_ATTEMPTS {
+        let new_content = modify(&before);
+
+        let tmp = dir.join(crate::events::unique_temp_name(".pact-write"));
+        std::fs::write(&tmp, &new_content).with_context(|| format!("writing {}", tmp.display()))?;
+        if let Ok(meta) = std::fs::metadata(&resolved) {
+            let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        }
+
+        // The commit-moment check: has the file changed since `before` was
+        // read? If so, `new_content` was computed from data that is no longer
+        // current — discard it and retry from what is actually on disk now,
+        // rather than rename over a newer write.
+        let now = read_or_empty(path)?;
+        if now != before {
+            let _ = std::fs::remove_file(&tmp);
+            if attempt == MAX_CAS_ATTEMPTS {
+                bail!(
+                    "{} changed concurrently while pact was writing it ({attempt} attempts in a \
+                     row); giving up rather than risk overwriting the latest edit",
+                    path.display()
+                );
+            }
+            before = now;
+            continue;
+        }
+
+        return match std::fs::rename(&tmp, &resolved) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e).with_context(|| format!("replacing {}", resolved.display()))
+            }
+        };
+    }
+    unreachable!("loop above always returns by the last attempt")
 }
 
 /// Read a file's contents, treating "does not exist" as an empty string.
@@ -580,6 +684,83 @@ fn find_block_bounds(content: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic proof of the compare-and-swap fix — no thread, no sleep,
+    /// no timing luck. The `modify` closure itself performs the "concurrent
+    /// write" partway through its own call, which is exactly the interleaving
+    /// the incident reproduced by pausing pact (via strace delay injection)
+    /// between its read and its commit-moment rename: a write lands in that
+    /// gap. Without the CAS recheck, `modify` is called once, and whatever it
+    /// returns — computed from the PRE-race content — is written and renamed
+    /// over the concurrent edit unconditionally, discarding it. With the
+    /// fix, the recheck right before the rename catches the mismatch, and
+    /// `modify` is called again against the fresh content instead.
+    #[test]
+    fn write_atomic_cas_never_commits_over_a_write_that_landed_mid_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("AGENTS.md");
+        std::fs::write(&path, "# Notes\n\noriginal\n").unwrap();
+
+        let mut calls = 0u32;
+        write_atomic_cas(&path, tmp.path(), |existing| {
+            calls += 1;
+            if calls == 1 {
+                // The concurrent writer's edit completes while THIS call is
+                // still running — i.e. strictly between the read `existing`
+                // came from and write_atomic_cas's commit-moment rename.
+                std::fs::write(&path, "# Notes\n\nconcurrent edit\n").unwrap();
+            }
+            format!("{existing}\nmanaged: true\n")
+        })
+        .unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            calls, 2,
+            "expected exactly one retry after the injected race"
+        );
+        assert!(
+            after.contains("concurrent edit"),
+            "the concurrent edit must survive, not be silently discarded:\n{after}"
+        );
+        assert!(
+            !after.contains("original\nmanaged: true"),
+            "must not commit a version computed from the stale pre-race read:\n{after}"
+        );
+    }
+
+    /// Same injected race, but on every single attempt: the retry budget
+    /// must be bounded and the failure loud, never an infinite loop and
+    /// never a silent partial write.
+    #[test]
+    fn write_atomic_cas_gives_up_loudly_under_sustained_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("AGENTS.md");
+        std::fs::write(&path, "# Notes\n\nv0\n").unwrap();
+
+        let mut calls = 0u32;
+        let err = write_atomic_cas(&path, tmp.path(), |_existing| {
+            calls += 1;
+            // A change on every attempt, including the last: the file
+            // never settles, so every recheck must find a mismatch.
+            std::fs::write(&path, format!("# Notes\n\nv{calls}\n")).unwrap();
+            "new content".to_string()
+        })
+        .unwrap_err();
+
+        assert_eq!(calls, MAX_CAS_ATTEMPTS, "must not retry past the bound");
+        assert!(
+            format!("{err:#}").contains("changed concurrently"),
+            "error must name the reason: {err:#}"
+        );
+        // No litter left behind by the abandoned attempts.
+        let strays = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".pact-write"))
+            .count();
+        assert_eq!(strays, 0, "temp files left behind after giving up");
+    }
 
     /// A hand-written `@AGENTS.md` must not get a second, pact-managed one:
     /// two imports inline the whole file twice into Claude's context.
