@@ -186,6 +186,15 @@ pub struct Summary {
     /// Lines the parser could not read. A torn final line is normal for an
     /// append-only log; a large number here means something else is wrong.
     pub unparseable_lines: usize,
+    /// A close-kind event (`released`/`force-released`/`expired`) with no
+    /// matching open entry — mirrors `excluded_by_annotation`'s shape for the
+    /// same reason: `reconstruct` used to drop such an event with no Hold, no
+    /// counter and no trace, which let `by_kind`'s raw count of close events
+    /// silently disagree with how many Holds actually closed. This module's
+    /// philosophy is to never synthesize a best-effort Hold for history it
+    /// cannot actually reconstruct, so this is a count of "something didn't
+    /// add up", not a guess at what did.
+    pub orphaned_closes: usize,
     pub by_kind: BTreeMap<String, usize>,
     pub agents: Vec<String>,
     pub first_event_at: Option<String>,
@@ -206,6 +215,9 @@ pub struct CheckReport {
     /// the same defect as a statistic that did.
     pub excluded_by_annotation: usize,
     pub unparseable_lines: usize,
+    /// See `Summary::orphaned_closes` — same meaning, computed by the same
+    /// `reconstruct` pass this check also runs.
+    pub orphaned_closes: usize,
     pub double_wins: Vec<DoubleWin>,
     pub stale_holds: Vec<Hold>,
     /// The **current** default TTL, for context only — *not* the threshold any
@@ -285,7 +297,13 @@ fn closes(kind: &str) -> bool {
 /// An acquire arriving while somebody *else* is open is the double-win; an
 /// acquire while the *same* agent is open is a re-entrant refresh, which pact
 /// does deliberately and which must not be reported.
-fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>) {
+///
+/// The third element is the count of close-kind events (`released` /
+/// `force-released` / `expired`) that named an agent+path with no open entry
+/// to close. Without a hold to close, such an event otherwise vanishes from
+/// the reconstruction with no Hold, no counter and no trace — see
+/// `Summary::orphaned_closes`.
+fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>, usize) {
     let mut by_path: BTreeMap<&str, Vec<(usize, &Event)>> = BTreeMap::new();
     for (line, e) in events {
         if let Some(p) = e.path.as_deref() {
@@ -295,6 +313,7 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>) {
 
     let mut holds = Vec::new();
     let mut doubles = Vec::new();
+    let mut orphaned_closes = 0;
 
     for (path, mut rows) in by_path {
         // Stable by time, then by line, so two events in the same millisecond
@@ -366,6 +385,10 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>) {
                         ttl_secs: ttl,
                         ttl_assumed,
                     });
+                } else {
+                    // A close with nothing open to close: never guessed at
+                    // with a synthetic Hold, only counted.
+                    orphaned_closes += 1;
                 }
             }
         }
@@ -389,7 +412,7 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>) {
         }
     }
 
-    (holds, doubles)
+    (holds, doubles, orphaned_closes)
 }
 
 fn percentile(sorted: &[i64], p: f64) -> i64 {
@@ -488,7 +511,7 @@ pub fn summary(
     let loaded = load(repo_root, since, include_annotated)?;
     let unparseable = loaded.unparseable;
     let events = loaded.events;
-    let (holds, _) = reconstruct(&events);
+    let (holds, _, orphaned_closes) = reconstruct(&events);
 
     let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
     let mut agents: BTreeSet<String> = BTreeSet::new();
@@ -558,6 +581,7 @@ pub fn summary(
         excluded_by_annotation: loaded.excluded,
         annotations: loaded.annotations,
         unparseable_lines: unparseable,
+        orphaned_closes,
         steals: by_kind.get("stolen").copied().unwrap_or(0),
         by_kind,
         agents: agents.into_iter().collect(),
@@ -579,7 +603,7 @@ pub fn run_check(
     let loaded = load(repo_root, since, include_annotated)?;
     let unparseable = loaded.unparseable;
     let events = loaded.events;
-    let (holds, doubles) = reconstruct(&events);
+    let (holds, doubles, orphaned_closes) = reconstruct(&events);
 
     let mut report = CheckReport {
         check: match check {
@@ -589,6 +613,7 @@ pub fn run_check(
         events_scanned: events.len(),
         excluded_by_annotation: loaded.excluded,
         unparseable_lines: unparseable,
+        orphaned_closes,
         double_wins: Vec::new(),
         stale_holds: Vec::new(),
         ttl_secs: None,
@@ -660,6 +685,12 @@ pub fn render_summary(s: &Summary) -> String {
         out.push(format!(
             "  note   {} unreadable line(s) — a torn final line is normal for an append-only log",
             s.unparseable_lines
+        ));
+    }
+    if s.orphaned_closes > 0 {
+        out.push(format!(
+            "  note   {} close event(s) with no matching open — not counted as a Hold",
+            s.orphaned_closes
         ));
     }
     // Never silent. A statistic that omits data without saying so is a statistic
@@ -737,6 +768,12 @@ pub fn render_check(r: &CheckReport) -> String {
     )];
     if r.unparseable_lines > 0 {
         out.push(format!("  {} unreadable line(s)", r.unparseable_lines));
+    }
+    if r.orphaned_closes > 0 {
+        out.push(format!(
+            "  {} close event(s) with no matching open — not counted as a Hold",
+            r.orphaned_closes
+        ));
     }
     if r.excluded_by_annotation > 0 {
         out.push(format!(
@@ -1117,6 +1154,27 @@ mod tests {
         let r = run_check(tmp.path(), Check::StaleHolds, None, false).unwrap();
         assert_eq!(r.findings(), 1);
         assert_eq!(r.stale_holds[0].closed_by.as_deref(), Some("expired"));
+    }
+
+    /// A close-kind event with no matching open entry used to vanish from the
+    /// reconstruction with no trace at all: no Hold, no counter, nothing.
+    /// `orphaned_closes` is how that fact becomes visible instead of silent.
+    #[test]
+    fn a_close_with_no_open_is_counted_as_an_orphaned_close_not_silently_dropped() {
+        let tmp = with_log(&[&ev("2026-08-01T10:00:00Z", "ghost", "released", "src/a.rs")]);
+
+        let s = summary(tmp.path(), None, false).unwrap();
+        assert_eq!(s.events, 1, "the raw event is still counted");
+        assert_eq!(
+            s.orphaned_closes, 1,
+            "but it closed no Hold, and that mismatch must be visible"
+        );
+        assert!(render_summary(&s).contains("no matching open"));
+
+        // Every check that runs `reconstruct` reports the same count.
+        let r = run_check(tmp.path(), Check::DoubleWin, None, false).unwrap();
+        assert_eq!(r.orphaned_closes, 1);
+        assert!(render_check(&r).contains("no matching open"));
     }
 
     #[test]
