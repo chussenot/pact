@@ -922,3 +922,79 @@ fn a_worktree_of_a_submodule_shares_state_with_the_submodules_own_checkout() {
         "the worktree of the submodule must not have its own .pact/"
     );
 }
+
+/// (pact-m7j.8.4) `a_submodule_stays_scoped_while_superproject_worktrees_still_share`
+/// above proves the isolation with the two `pact lease acquire` calls
+/// sequenced by the test harness (superproject first, submodule second).
+/// This proves the same isolation holds when the two race for the filesystem
+/// with true parallelism — real `.spawn()` on both sides, no waiting in
+/// between, same idiom as `concurrent_acquire_across_worktrees_has_consistent_outcome`.
+/// Regression fence, not a bug fix: no `src/` change accompanies this test.
+#[test]
+fn submodule_and_superproject_leases_stay_isolated_under_concurrent_contention() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+
+    const ROUNDS: usize = 5;
+    for round in 0..ROUNDS {
+        let (_tmp, main, sub) = repo_with_submodule();
+
+        // Same relative path string, claimed from the superproject root and
+        // from the submodule's own checkout root, spawned together.
+        let mut super_child = Command::new(env!("CARGO_BIN_EXE_pact"))
+            .args(["lease", "acquire", "lib.rs"])
+            .current_dir(&main)
+            .env("PACT_AGENT", "agent-super")
+            .env_remove("PACT_WORKTREE_SCOPE")
+            .spawn()
+            .expect("failed to spawn superproject acquire");
+        let mut sub_child = Command::new(env!("CARGO_BIN_EXE_pact"))
+            .args(["lease", "acquire", "lib.rs"])
+            .current_dir(&sub)
+            .env("PACT_AGENT", "agent-sub")
+            .env_remove("PACT_WORKTREE_SCOPE")
+            .spawn()
+            .expect("failed to spawn submodule acquire");
+
+        let super_status = super_child.wait().expect("superproject wait failed");
+        let sub_status = sub_child.wait().expect("submodule wait failed");
+
+        assert!(
+            super_status.success(),
+            "round {round}: superproject acquire must not contend with the submodule's \
+             separate coordination space"
+        );
+        assert!(
+            sub_status.success(),
+            "round {round}: submodule acquire must not contend with the superproject's \
+             separate coordination space"
+        );
+
+        // Each root's board must list only its own lease, never the other
+        // root's — the point of the isolation under real concurrent pressure.
+        let board = |dir: &Path| -> Vec<serde_json::Value> {
+            let out = stdout(&pact(dir, "x", &["lease", "ls", "--json"]));
+            serde_json::from_str::<serde_json::Value>(&out)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        let super_board = board(&main);
+        let sub_board = board(&sub);
+        assert_eq!(
+            super_board.len(),
+            1,
+            "round {round}: superproject board must hold exactly its own lease: {super_board:?}"
+        );
+        assert_eq!(
+            sub_board.len(),
+            1,
+            "round {round}: submodule board must hold exactly its own lease: {sub_board:?}"
+        );
+        assert_eq!(super_board[0]["lease"]["agent"], "agent-super");
+        assert_eq!(sub_board[0]["lease"]["agent"], "agent-sub");
+    }
+}
