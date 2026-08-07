@@ -411,6 +411,37 @@ lease, and pact reports which one happened:
   unlike expiry, a human or agent is choosing to override someone else's
   active claim. `stolen: true`.
 
+### The trust boundary: `PACT_AGENT` is self-asserted
+
+Re-entrant refresh is decided by one plain string comparison —
+`existing.agent == agent` — and `agent` is whatever `PACT_AGENT` (or
+`--agent`) says. pact validates that string for *format* only
+(`[a-z0-9][a-z0-9-]{1,31}`); nothing ties it to an OS process, a session, or
+any credential. A PID or per-invocation nonce was considered and rejected for
+this: pact is a CLI, not a daemon, so the legitimate case — the same logical
+agent re-running `pact lease acquire` to extend its own claim — is already a
+*different process* every time. A field that flagged "different process" as a
+takeover would misfire on exactly the workflow the protocol asks agents to
+use, while doing nothing for the case it was meant to catch.
+
+The consequence: pact cannot tell "the same agent, resuming" from "a second,
+unrelated process that happens to export the same `PACT_AGENT` value." Both
+take the re-entrant-refresh path, and — unlike `--steal`, which is loud
+specifically because it knows it's overriding a *different* agent — this path
+prints nothing and reports `stolen: false`, because as far as pact can tell
+nothing was overridden. A second process can hand a live, long-TTL lease a
+short TTL and a different note with no warning on either side; the only trace
+is a `renewed` event in `pact log`, indistinguishable from genuine
+self-renewal.
+
+This is why **no two independent agents may ever share one `PACT_AGENT`
+value**, in the same repo, across worktrees, or across fleets running against
+it concurrently — pact has no way to catch a collision, so it has to be
+guaranteed out of band (see the [worktree-per-agent
+recipe](onboarding.md#recipe-one-agent-per-git-worktree), which already
+relies on exactly this: two worktrees sharing one `PACT_AGENT` are, on
+purpose, one agent as far as leases are concerned).
+
 ## Renewing a long task's lease
 
 ```

@@ -1064,6 +1064,26 @@ fn acquire_inner(
                 })
             } else if existing.agent == agent {
                 // Re-entrant refresh: same holder, just bump acquired_at.
+                //
+                // `existing.agent == agent` is a plain string comparison against
+                // `PACT_AGENT` (or `--agent`), which `identity::validate` checks
+                // for FORMAT only, never provenance — pact has no PID, session,
+                // or credential to compare, and every real caller of `acquire`
+                // is a fresh CLI process per invocation (no long-lived caller
+                // re-acquires within one process; see acceptance discussion on
+                // pact-m7j.7.1), so a PID/session field would only ever
+                // misfire on the ordinary "run `acquire` again to refresh"
+                // workflow rather than catch anything. Investigated and
+                // rejected — see docs/leases.md's trust-boundary section.
+                //
+                // This branch is therefore silent by design (no warning, no
+                // `stolen` flag) unlike `--steal`, which knows it is
+                // overriding a *different* agent. The one thing that DOES
+                // distinguish it from a first-time `acquire`: `log_event`
+                // below writes kind `"renewed"`, not `"acquired"`, so
+                // `pact log` / `.pact/events.jsonl` / `pact audit` already
+                // record every refresh distinctly — that is the auditability
+                // this branch has, and it existed before this comment did.
                 write_lease_atomic(&lock_path, &new_lease)?;
                 verify_own_lease(&lock_path, agent, &new_lease.acquired_at)?;
                 log_event(
@@ -1878,6 +1898,68 @@ mod tests {
                 .unwrap()
                 .agent,
             "agent-a"
+        );
+    }
+
+    /// pact-m7j.7.1: `existing.agent == agent` is a string comparison against a
+    /// self-asserted `PACT_AGENT`, with no PID or session behind it — and every
+    /// real caller of `acquire` is a fresh CLI process per invocation (verified
+    /// via `grep` across the codebase: only `main.rs`'s `lease acquire` dispatch
+    /// calls it in production; nothing long-lived re-acquires within one
+    /// process). Two `acquire()` calls in this test stand in for exactly that:
+    /// two independent process invocations that happen to export the same
+    /// `PACT_AGENT`. This characterizes the documented behaviour (see
+    /// docs/leases.md, "The trust boundary") rather than a bug being fixed
+    /// here — a PID/session field was investigated and rejected because it
+    /// would only ever misfire on the ordinary refresh workflow, not catch a
+    /// genuine collision. If this test ever fails, docs/leases.md's trust
+    /// section needs to change with it.
+    #[test]
+    fn reentrant_refresh_silently_overwrites_regardless_of_calling_process() {
+        let tmp = repo();
+        let root = tmp.path();
+
+        let first = acquire(
+            root,
+            "agent-a",
+            "f.rs",
+            3600,
+            false,
+            Some("first process, long ttl".into()),
+        )
+        .unwrap();
+        assert!(!first.stolen);
+
+        // A second, distinguishable invocation (different note, much shorter
+        // ttl) with the identical `PACT_AGENT` string.
+        let second = acquire(
+            root,
+            "agent-a",
+            "f.rs",
+            30,
+            false,
+            Some("second process, different note".into()),
+        )
+        .unwrap();
+
+        // Succeeds silently: no error, no `stolen` flag — indistinguishable
+        // from genuine self-renewal, which is exactly the documented gap.
+        assert!(!second.stolen);
+        assert_eq!(second.lease.ttl_secs, 30, "the shorter ttl silently wins");
+        assert_eq!(
+            second.lease.note.as_deref(),
+            Some("second process, different note"),
+            "the first process's note is silently overwritten, with no warning"
+        );
+
+        // The event log is the one place this is distinguishable at all: a
+        // `renewed` kind, not `acquired` — auditable, but not a warning.
+        assert_eq!(
+            event_kinds(root),
+            vec![
+                ("acquired".to_string(), "f.rs".to_string()),
+                ("renewed".to_string(), "f.rs".to_string()),
+            ]
         );
     }
 
