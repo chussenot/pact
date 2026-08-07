@@ -2120,6 +2120,45 @@ mod tests {
         );
     }
 
+    /// pact-m7j.4.3: `parse_acquired`'s `unwrap_or(UNIX_EPOCH)` is type-level
+    /// total over any parse `Err`, so it already covers a far wider
+    /// adversarial space than the single garbage string above exercises —
+    /// this locks that coverage in, on both the producer side
+    /// (`parse_acquired` itself) and the consumer side (`is_expired`), so a
+    /// future refactor of either cannot narrow the fallback without a test
+    /// failing. Expected to pass against current code unchanged; the value
+    /// is the regression guard, not a fix.
+    #[test]
+    fn parse_acquired_falls_back_to_epoch_for_every_adversarial_shape() {
+        let adversarial_timestamps = [
+            "",
+            "2026-08-01T10:00:00", // ISO-8601-like, but RFC3339 requires an offset
+            "2026-08-01T10:00",    // truncated RFC3339 prefix, the shape a torn write leaves
+            "2026-08-01T10:00:00+00:00\u{0}garbage", // embedded control character
+            "99999-08-01T10:00:00+00:00", // out-of-range year
+        ];
+        for ts in adversarial_timestamps {
+            let lease = LeaseInfo {
+                agent: "agent-a".into(),
+                path: "x".into(),
+                acquired_at: ts.into(),
+                ttl_secs: DEFAULT_TTL_SECS,
+                note: None,
+                branch: None,
+                worktree: None,
+            };
+            assert_eq!(
+                parse_acquired(&lease),
+                DateTime::UNIX_EPOCH,
+                "{ts:?} must fall back to epoch 0"
+            );
+            assert!(
+                is_expired(&lease, Utc::now()),
+                "{ts:?} must read as expired, not immortal"
+            );
+        }
+    }
+
     /// pact-m7j.9.10: `--ttl` is an unbounded `u64` CLI arg with no range
     /// check. A bare `ttl_secs as i64` bit-reinterprets `u64::MAX` as `-1`,
     /// so a lease requested to last "forever" used to read back as already
