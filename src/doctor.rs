@@ -293,7 +293,9 @@ pub fn checks(root: &Path) -> DoctorReport {
             ok: false,
             warn: false,
             detail: format!(
-                "{n} unreadable lock file{} (remove manually from .pact/leases/)",
+                "{n} unreadable lock file{} (`pact lease acquire <path> --steal` recovers one; \
+                 `pact lease release <path> --force` removes it; manual deletion from \
+                 .pact/leases/ also works)",
                 if n == 1 { "" } else { "s" }
             ),
         }),

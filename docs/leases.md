@@ -405,17 +405,18 @@ can't tell whose it is. Those are counted separately and reported by
 `pact doctor`:
 
 ```
-✗ corrupt leases: 2 unreadable lock files (remove manually from .pact/leases/)
+✗ corrupt leases: 2 unreadable lock files (`pact lease acquire <path> --steal` recovers one; `pact lease release <path> --force` removes it; manual deletion from .pact/leases/ also works)
 ```
 
 pact never clears one on its own, and that part is on purpose: everything else
 it garbage-collects is a file it wrote and can still read, while an unreadable
 one is the only case where it can't tell an abandoned lease from a live agent's
 claim it merely failed to parse, and guessing wrong silently destroys someone's
-lock. But refusing *every* route out of it went too far. A corrupt lock used to
-fail `acquire --steal` as well, with a raw serde parse error — the one command
-whose entire purpose is overriding a claim you have decided not to respect. The
-explicit overrides now reach it, and each says what it did:
+lock. That used to leave manual deletion as the only way out, including for
+`acquire --steal` — the one command whose entire purpose is overriding a claim
+you have decided not to respect, which instead failed on the same raw serde
+parse error as a plain `acquire`. The explicit overrides now reach it, and the
+detail line names them, and each says what it did:
 
 | Command | On a corrupt lock |
 |---|---|
