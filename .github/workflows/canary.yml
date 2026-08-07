@@ -141,6 +141,121 @@ jobs:
           CANARY_LEG: ${{ matrix.leg }}
         run: scripts/canary.sh
 
+  # br's sibling to the bd matrix above: same pinned+latest split, same
+  # release-based install, same non-blocking scheduling — see canary-br.sh for
+  # why the two backends do not share one script (br is SQLite, not bd's
+  # git-embedded Dolt, and the exercised assertions differ past the resolve
+  # and install steps).
+  canary-br:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [pinned, latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch tip — pins the ACTION, not the toolchain; Rust stays current because the action installs whatever stable is at run time
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Resolve the br version for this leg
+        id: br
+        env:
+          LEG: ${{ matrix.leg }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The tested range comes out of src/beads.rs. Restating it here would
+          # create a second copy that drifts from the code it describes, which
+          # is the exact failure this canary exists to catch.
+          # No `| head -1`: under pipefail, head exits first, sed takes SIGPIPE
+          # and the step dies with 141 and no output — see the bd leg above.
+          triplet() {
+            local out
+            out="$(sed -nE "s/^const $1: \(u64, u64, u64\) = \(([0-9]+), ([0-9]+), ([0-9]+)\);/\1.\2.\3/p" src/beads.rs)"
+            printf '%s' "${out%%$'\n'*}"
+          }
+          MIN="$(triplet TESTED_BR_MIN)"
+          MAX="$(triplet TESTED_BR_MAX_EXCLUSIVE)"
+          if [ -z "$MIN" ] || [ -z "$MAX" ]; then
+            echo "::error::could not read TESTED_BR_MIN/MAX out of src/beads.rs — has the declaration changed shape?"
+            exit 1
+          fi
+          echo "tested range: $MIN <= v < $MAX"
+
+          # Stable releases only: a pre-release is not what a user installs.
+          gh release list --repo Dicklesworthstone/beads_rust --limit 100 --json tagName,isPrerelease \
+            -q '.[] | select(.isPrerelease | not) | .tagName' \
+            | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V > versions.txt
+
+          if [ "$LEG" = latest ]; then
+            VERSION="$(tail -1 versions.txt)"
+          else
+            # Newest release that is >= MIN and < MAX. sort -V does the ordering
+            # so there is no arithmetic on version components here.
+            VERSION="$(awk -v min="$MIN" -v max="$MAX" '
+              function cmp(a, b,   x, y, i) {
+                split(a, x, "."); split(b, y, ".")
+                for (i = 1; i <= 3; i++) { if (x[i] + 0 != y[i] + 0) return (x[i] + 0 < y[i] + 0) ? -1 : 1 }
+                return 0
+              }
+              cmp($0, min) >= 0 && cmp($0, max) < 0
+            ' versions.txt | tail -1)"
+          fi
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::no stable br release found for leg=$LEG (range $MIN..$MAX). Releases seen:"
+            cat versions.txt
+            exit 1
+          fi
+          echo "leg=$LEG resolved to br $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install br ${{ steps.br.outputs.version }}
+        env:
+          VERSION: ${{ steps.br.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Unlike bd's stable beads_<version>_linux_amd64.tar.gz, br's asset
+          # naming has already drifted once inside the tested 0.2.x window:
+          # v0.2.3-v0.2.7 always embedded a `v` before the version in the
+          # filename (br-v0.2.7-linux_amd64.tar.gz), v0.2.19+ never does
+          # (br-0.2.19-linux_amd64.tar.gz), and a few releases in between
+          # shipped both. A hardcoded pattern would silently stop matching
+          # some in-range releases, so the filename is resolved from the
+          # release's own asset list at run time instead of assumed.
+          #
+          # No `| head -1` here either, for the same pipefail reason as above:
+          # the match is sliced out of a variable, never off the end of a pipe.
+          ASSETS="$(gh release view "v${VERSION}" --repo Dicklesworthstone/beads_rust --json assets -q '.assets[].name')"
+          MATCHES="$(grep -E "^br-v?${VERSION//./\\.}-linux_amd64\.tar\.gz\$" <<<"$ASSETS" || true)"
+          ASSET="${MATCHES%%$'\n'*}"
+          if [ -z "$ASSET" ]; then
+            echo "::error::no linux_amd64 tarball found among v${VERSION}'s assets:"
+            printf '%s\n' "$ASSETS"
+            exit 1
+          fi
+          echo "resolved asset: $ASSET"
+          gh release download "v${VERSION}" --repo Dicklesworthstone/beads_rust \
+            --pattern "$ASSET" --output br.tar.gz
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf br.tar.gz -C "$HOME/.local/bin" br
+          chmod +x "$HOME/.local/bin/br"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Confirm br runs
+        run: |
+          set -euo pipefail
+          br --version
+
+      - name: Run the canary
+        env:
+          CANARY_LEG: ${{ matrix.leg }}
+        run: scripts/canary-br.sh
+
   # A separate job, not a step inside the matrix. As a step it ran once per leg,
   # and because both legs fail at the same moment neither `gh issue list` saw the
   # other's issue yet — so the first real failure opened TWO issues, which is the
@@ -174,4 +289,35 @@ jobs:
           else
             gh label create canary --description "Scheduled canary against a real bd release" --color B60205 2>/dev/null || true
             gh issue create --title "Canary failing (bd)" --label canary --body "$BODY"
+          fi
+
+  # br's sibling to `report`, kept separate rather than folded into one job:
+  # each backend gets its own dedup label and issue, so "bd broke" and "br
+  # broke" never collide into one thread that names the wrong backend.
+  report-br:
+    needs: canary-br
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Open or update the br canary issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          LEGS="$(gh api "repos/$REPO/actions/runs/${{ github.run_id }}/jobs" \
+            --jq '.jobs[] | select(.conclusion == "failure") | .name' | paste -sd', ' || echo unknown)"
+
+          BODY="$(printf '**failing legs:** %s\n**run:** %s\n\nThe canary exercises pact against a real br release.\n\n| pinned | latest | meaning |\n| --- | --- | --- |\n| fail | fail | pact broke |\n| pass | fail | upstream br drifted |\n\nSee the run log for the failing assertion.\n' \
+            "$LEGS" "$RUN_URL")"
+
+          EXISTING="$(gh issue list --label canary-br --state open --limit 1 --json number -q '.[0].number' || true)"
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+            echo "commented on existing canary issue #$EXISTING"
+          else
+            gh label create canary-br --description "Scheduled canary against a real br release" --color B60205 2>/dev/null || true
+            gh issue create --title "Canary failing (br)" --label canary-br --body "$BODY"
           fi
