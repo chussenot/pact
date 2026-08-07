@@ -1258,6 +1258,59 @@ fn reading_a_message_clears_the_readers_unread_and_shows_the_sender_it_landed() 
     );
 }
 
+/// pact-m7j.6.6: `mark_read` used to trust `label add`'s exit code with no
+/// re-read to confirm the specific label landed — unlike `lease.rs`'s
+/// `verify_own_lease`, built for the identical shape of problem ("a rename
+/// reporting success is not proof you're the one who ends up holding it").
+/// This checks the label independently of pact's own read path, by shelling
+/// out to the real `bd` binary directly instead of asking `pact msg inbox`
+/// (which would just re-exercise the same `show`/`list` code the fix itself
+/// calls).
+#[test]
+fn reading_a_message_lands_the_read_by_label_verified_independently_via_bd() {
+    let Some(tmp) = bd_repo("reading_a_message_lands_the_read_by_label_verified") else {
+        return;
+    };
+    assert_ok(&pact(
+        tmp.path(),
+        "sender-agent",
+        &["msg", "send", "--to", "reader-agent", "verify me"],
+    ));
+
+    let unread = pact(
+        tmp.path(),
+        "reader-agent",
+        &["msg", "inbox", "--unread-only", "--json"],
+    );
+    assert_ok(&unread);
+    let id = json_stdout(&unread)[0]["id"]
+        .as_str()
+        .expect("one pending message")
+        .to_string();
+
+    assert_ok(&pact(tmp.path(), "reader-agent", &["msg", "read", &id]));
+
+    let shown = Command::new("bd")
+        .args(["show", &id, "--json"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("bd show");
+    assert!(shown.status.success(), "{}", stderr_of(&shown));
+    // `bd show <id> --json` returns an array even for one id (same shape
+    // show_many's own doc comment in msg.rs describes).
+    let issues: serde_json::Value =
+        serde_json::from_slice(&shown.stdout).expect("bd show --json output");
+    let labels: Vec<&str> = issues[0]["labels"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        labels.contains(&"read-by-reader-agent"),
+        "bd's own record must carry the read-by label, verified independently \
+         of pact's own read path: {labels:?}"
+    );
+}
+
 #[test]
 fn msg_send_rejects_an_all_whitespace_body_file() {
     let Some(tmp) = bd_repo("msg_send_rejects_an_all_whitespace_body_file") else {

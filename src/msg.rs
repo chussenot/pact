@@ -960,14 +960,49 @@ pub fn mark_read_by_id(cli: &BeadsCli, repo_root: &Path, agent: &str, id: &str) 
         .map(|_| ())
 }
 
+/// `verify_own_lease` (`lease.rs`) exists because "a rename... reporting
+/// success is not proof you're the one who ends up holding it" — a
+/// contested write's exit code says the subprocess didn't error, not that
+/// the specific change it was asked to make is the one that landed. This
+/// mirrors that shape for `label add`: after `cli.run` returns `Ok`, re-fetch
+/// every issue and confirm `read_label(agent)` is actually on it before
+/// reporting success (pact-m7j.6.6). Extensive direct testing against live
+/// bd/br (190+ and 160+ concurrent real-backend calls respectively, see the
+/// bead) found zero silent losses — both backends serialize writes
+/// internally — so this is a regression guard against that assumption
+/// changing under a future backend upgrade, not a fix for an observed loss.
 fn mark_read(cli: &BeadsCli, repo_root: &Path, agent: &str, issues: &[BdIssue]) -> Result<()> {
+    if issues.is_empty() {
+        return Ok(());
+    }
     let label = read_label(agent);
     let actor = actor_arg(agent);
+    let ids: Vec<&str> = issues.iter().map(|i| i.id.as_str()).collect();
     let mut args = vec!["label", "add"];
-    args.extend(issues.iter().map(|i| i.id.as_str()));
+    args.extend(ids.iter().copied());
     args.push(&label);
     args.push(&actor);
-    cli.run(repo_root, &args).map(|_| ())
+    cli.run(repo_root, &args)?;
+
+    let confirmed = show_many(cli, repo_root, &ids)?;
+    let missing: Vec<&str> = confirmed
+        .iter()
+        .filter(|i| {
+            !i.labels
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|l| l == &label)
+        })
+        .map(|i| i.id.as_str())
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "label add exited 0 but {label} did not land on: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// `--actor=<agent>`, so a backend write is attributed to the agent that caused
