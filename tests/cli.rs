@@ -2270,6 +2270,119 @@ fn doctor_warns_when_two_beads_stores_share_one_directory() {
     );
 }
 
+/// pact-m7j.10.7: `conflicting_stores` had exactly one call site in the whole
+/// binary — `doctor.rs`. Reproduced live: with the identical on-disk conflict
+/// the test above exercises, `pact doctor` warned correctly and, seconds
+/// later, `pact msg inbox` against the SAME repo reported "inbox empty", exit
+/// 0, and said nothing about the second store it was silently ignoring.
+/// `msg.rs`, `run_msg` and the MCP message tools had no side channel to report
+/// it. This is the plumbing fix: `run_msg` now calls the same
+/// `beads::conflict_warning` doctor.rs does, so the fact reaches stderr on
+/// every msg invocation where it is true.
+#[test]
+fn msg_inbox_names_a_conflicting_store_on_its_own_stderr() {
+    let Some(tmp) = bd_repo("msg_inbox_names_a_conflicting_store_on_its_own_stderr") else {
+        return;
+    };
+    // The stray br store beside the real bd one `bd_repo` just created — the
+    // forward-order half of pact-nv4's own incident, reused here rather than
+    // invented fresh so this test is provably the same conflict doctor sees.
+    std::fs::write(tmp.path().join(".beads").join("beads.db"), "").unwrap();
+
+    let out = pact(tmp.path(), "someone", &["msg", "inbox"]);
+    assert_ok(&out);
+    assert_eq!(
+        stdout_of(&out).trim(),
+        "inbox empty",
+        "the resolution itself is unchanged by this fix — bd is still queried"
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("two stores in .beads/") && stderr.contains("beads.db"),
+        "msg inbox must name the conflict pact doctor already sees, not stay \
+         silent about it: {stderr}"
+    );
+}
+
+/// pact-m7j.10.6, the reverse-order half of the same incident, reproduced
+/// exactly: `br init`, then a REAL message (`br create` with a live
+/// `--assignee`), then `bd init` in the same `.beads/`. `bd init` succeeds at
+/// exit 0 with no warning of its own and leaves its empty `embeddeddolt/` as
+/// what `BeadsCli::locate()` reads from then on — confirmed live via `bd list
+/// --json` returning `[]` while `br list --json` still shows the record.
+/// `PACT_AGENT=someone pact msg inbox`, the exact command AGENTS.md tells
+/// every agent to run first, used to answer "inbox empty" with no hint that
+/// its own recipient's real message was sitting one directory entry away.
+///
+/// Fixing the tiebreak itself (data-aware `classify_workspace`, or refusing
+/// `bd init` outright over a non-empty store) is a declined-for-now
+/// architecture question — see `beads::conflict_warning`'s doc comment. What
+/// this test proves is the mitigation: the silence is gone even though the
+/// resolution is not.
+#[test]
+fn msg_inbox_after_bd_init_over_a_live_br_store_still_warns() {
+    let Some(tmp) = br_repo("msg_inbox_after_bd_init_over_a_live_br_store_still_warns_br_half")
+    else {
+        return;
+    };
+
+    let create = Command::new("br")
+        .args([
+            "create",
+            "--type=message",
+            "--title=hello",
+            "--description=a real message, about to be shadowed",
+            "--assignee=someone",
+            "--actor=sender",
+            "--json",
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("br create");
+    assert!(create.status.success(), "br create: {}", stderr_of(&create));
+
+    let on_path = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join("bd").is_file()))
+        .unwrap_or(false);
+    if !on_path {
+        eprintln!(
+            "SKIP msg_inbox_after_bd_init_over_a_live_br_store_still_warns: \
+             bd not found on PATH"
+        );
+        return;
+    }
+    let bd_init = Command::new("bd")
+        .arg("init")
+        .current_dir(tmp.path())
+        .output()
+        .expect("bd init");
+    assert!(
+        bd_init.status.success(),
+        "bd init atop a live br store must still succeed (that half of the \
+         behaviour is unchanged by this fix): {}",
+        stderr_of(&bd_init)
+    );
+
+    let out = pact(tmp.path(), "someone", &["msg", "inbox"]);
+    assert_ok(&out);
+    // (a) the underlying resolution is unchanged by design: bd's freshly
+    // created, empty store is still what answers, so the real message stays
+    // invisible here — that is the declined tiebreak change, not a bug this
+    // fix introduces.
+    assert_eq!(
+        stdout_of(&out).trim(),
+        "inbox empty",
+        "bd's own store has no messages, and that tiebreak is not what this fix changes"
+    );
+    // (b) but the mitigation fires in exactly this reverse-order scenario,
+    // not only the forward one the previous test covers.
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("two stores in .beads/"),
+        "must name the conflict in the br-then-bd order this bug reproduced: {stderr}"
+    );
+}
+
 // ------------------------------------------------------- telemetry (pact-aw7)
 
 /// A collector that completes the TCP handshake and then never says another

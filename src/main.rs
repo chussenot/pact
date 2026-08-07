@@ -1234,6 +1234,15 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
 
 fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) -> Result<()> {
     let root = repo::find_repo_root(cwd)?;
+    // `pact doctor` already detects a second, ignored Beads store
+    // (pact-nv4), but nothing routed that fact through the commands that
+    // actually query one — an agent running `pact msg inbox` against a repo
+    // with a shadowed store saw "inbox empty" and no hint why (pact-m7j.10.7).
+    // Every invocation, not just the first: this process has no memory of a
+    // previous run, and the fact is as true on the tenth call as the first.
+    if let Some(warning) = beads::conflict_warning(&root) {
+        output::warn(&warning);
+    }
     let cli = beads::BeadsCli::locate()?;
     let agent = identity::resolve_agent(agent_flag)?;
     match action {
