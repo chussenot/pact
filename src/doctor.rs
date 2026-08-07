@@ -211,18 +211,12 @@ pub fn checks(root: &Path) -> DoctorReport {
     // invisible — an empty store can shadow a full one and every command keeps
     // answering normally, until someone runs the other backend directly and
     // sees an empty issue list.
-    let conflict = beads::conflicting_stores(root);
+    let conflict_warning = beads::conflict_warning(root);
     checks.push(DoctorCheck {
         name: "one Beads store",
         ok: true,
-        warn: conflict.is_some(),
-        detail: match &conflict {
-            None => "no conflicting store".to_string(),
-            Some((used, ignored)) => format!(
-                "two stores in .beads/ — pact uses {used} and ignores {ignored}; \
-                 remove the one you do not want, or the backends will disagree"
-            ),
-        },
+        warn: conflict_warning.is_some(),
+        detail: conflict_warning.unwrap_or_else(|| "no conflicting store".to_string()),
     });
 
     checks.push(match beads::BeadsCli::locate() {

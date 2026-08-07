@@ -409,6 +409,19 @@ pub fn conflicting_stores(repo_root: &Path) -> Option<(String, String)> {
     ))
 }
 
+/// The sentence [`conflicting_stores`] is worth, worded once so every caller
+/// that needs to say it says it identically (pact-m7j.10.7). `doctor.rs`
+/// originated this wording; `run_msg` (main.rs) and the MCP message tools
+/// reuse it rather than inventing their own phrasing for the same fact — a
+/// second, ignored store sitting next to the one pact actually queries.
+pub fn conflict_warning(repo_root: &Path) -> Option<String> {
+    let (used, ignored) = conflicting_stores(repo_root)?;
+    Some(format!(
+        "two stores in .beads/ — pact uses {used} and ignores {ignored}; \
+         remove the one you do not want, or the backends will disagree"
+    ))
+}
+
 fn sqlite_db(beads_dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(beads_dir)
         .ok()?

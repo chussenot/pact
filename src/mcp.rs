@@ -614,7 +614,7 @@ impl Server {
                 let agent = required_str(args, "agent")?;
                 let cli = beads::BeadsCli::locate()?;
                 let messages = msg::inbox(&cli, &self.root, agent, flag(args, "unread_only"))?;
-                Ok(wrap("messages", messages)?)
+                self.wrap_messages(messages)
             }
             // `peek_thread`, NOT `read_thread`: the latter writes a
             // `read-by-<agent>` label. See the module docs.
@@ -622,10 +622,7 @@ impl Server {
                 let id = required_str(args, "id")?;
                 let viewer = args.get("agent").and_then(Value::as_str);
                 let cli = beads::BeadsCli::locate()?;
-                Ok(wrap(
-                    "messages",
-                    msg::peek_thread(&cli, &self.root, viewer, id)?,
-                )?)
+                self.wrap_messages(msg::peek_thread(&cli, &self.root, viewer, id)?)
             }
             "pact_doctor" => Ok(serde_json::to_value(doctor::checks(&self.root))?),
             // Reads `.pact/events.jsonl` only, like every other tool here — and
@@ -650,6 +647,20 @@ impl Server {
             // Unreachable: `tools_call` checked the name against TOOLS.
             other => Err(anyhow::anyhow!("unknown tool \"{other}\"")),
         }
+    }
+
+    /// `wrap("messages", …)` plus the same store-conflict fact `pact doctor`
+    /// and the CLI's `run_msg` already surface (pact-m7j.10.7) — the two
+    /// message tools are the ones that shell out to Beads here, and a model
+    /// reading `structuredContent` has no stderr to notice a warning on
+    /// otherwise. Folded into the response instead, under a key that is
+    /// simply absent when there is nothing to say.
+    fn wrap_messages(&self, messages: Vec<msg::Message>) -> Result<Value> {
+        let mut value = wrap("messages", messages)?;
+        if let Some(warning) = beads::conflict_warning(&self.root) {
+            value["store_conflict"] = Value::String(warning);
+        }
+        Ok(value)
     }
 }
 
