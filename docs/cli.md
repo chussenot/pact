@@ -21,7 +21,7 @@ pact lease renew <path>
 pact lease release <path> [--force]
 pact lease release --all
 pact lease ls [--all]
-pact msg send (--to <agent>... | --to-owner-of <path>...) [--thread <id>] [--subject <text>] (<body> | --body-file <path|->)
+pact msg send (--to <agent>... | --to-owner-of <path>...) [--thread <id>] [--subject <text>] [--skip <agent>...] (<body> | --body-file <path|->)
 pact msg inbox [--unread-only] [--full]
 pact msg sent
 pact msg read <id>
@@ -58,6 +58,12 @@ Batching doesn't change the shape a one-path script already parses: a single-pat
 array), and a single `--to` still prints `sent <id> to <who> (thread <id>)`.
 `lease release --json` now emits an object — `{"path": …, "displaced": …}` — so a
 scripted caller can see whose claim a `--force` destroyed.
+
+A `msg send` to several recipients that fails partway through fails as a
+structured error under `--json` — `{"already_sent": […], "failed_at": …,
+"reason": …}` — so a retry can pass `--skip <agent>` (repeatable) for each
+already-sent name instead of duplicating delivery to them. See
+[messaging.md](messaging.md#replaying-a-fan-out-that-failed-partway---skip).
 
 ## Exit codes
 

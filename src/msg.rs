@@ -47,11 +47,16 @@
 //!   returns a bare array — hence [`parse_issues`] accepts either.
 //! - `br list --json` omits `parent`, and `br list` has no `--parent` filter, so
 //!   neither the thread column nor `read_thread`'s reply fetch can come from it.
-//!   `br show <id>… --json` *does* carry `parent`, and a root's `dependents`
-//!   name its children as `parent-child` edges. So on br every listing is
-//!   `list` (for the ids) followed by one `show` (for the records): two
-//!   subprocesses instead of one, in exchange for the same data bd gives, from
-//!   the backend itself rather than from guessing at br's `<id>.<n>` id shape.
+//!   `br show <id>… --json` *does* carry `parent`, so a thread's root is found
+//!   the same way bd finds it. Its replies are NOT read from that same `show`
+//!   response's `dependents` field, though — that field is a snapshot from
+//!   whenever the root was fetched, and a reply created after the fetch stayed
+//!   invisible until something re-fetched the root (pact-m7j.6.1). `br dep list
+//!   <root> --direction up --json` answers the same question as its own fresh
+//!   query, so it is asked every time — one extra subprocess (`dep list` for
+//!   the ids, `show` for the records) in exchange for the same data bd gives,
+//!   from the backend itself rather than from guessing at br's `<id>.<n>` id
+//!   shape.
 
 use std::cmp::Ordering;
 use std::path::Path;
@@ -154,18 +159,17 @@ struct BdIssue {
     /// rather than a `#[serde(default)] Vec` (which would fail on null).
     #[serde(default)]
     labels: Option<Vec<String>>,
-    /// br only, and only from `show`: the beads that point *at* this one. br has
-    /// no `list --parent`, so this is how a thread's replies are found there.
-    #[serde(default)]
-    dependents: Option<Vec<DepRef>>,
 }
 
-/// One edge out of br's `show --json`. bd never emits these; the field is
-/// absent and stays `None`.
+/// One edge from br's `dep list --direction up --json` — the beads that point
+/// *at* the queried one. Field names differ from `show`'s own embedded
+/// `dependents` (`id`/`dependency_type`): `dep list` calls the same two things
+/// `issue_id`/`type` (confirmed against a real `br dep list`, pact-m7j.6.1).
+/// bd never emits these.
 #[derive(Debug, Deserialize)]
-struct DepRef {
-    id: String,
-    #[serde(default)]
+struct DepListItem {
+    issue_id: String,
+    #[serde(default, rename = "type")]
     dependency_type: String,
 }
 
@@ -234,8 +238,10 @@ impl BdIssue {
 ///
 /// Returns one Message per recipient, root first. An empty recipient list is an
 /// error. Not atomic — bd has no transaction across N creates — so a failure
-/// part-way through leaves the earlier recipients' messages sent; the error
-/// says which, and `sent()` lists them, so nobody has to re-send blind.
+/// part-way through leaves the earlier recipients' messages sent; the error is
+/// a [`SendFailure`] naming exactly which (`sent()` also lists them), and a
+/// caller with `--json` can retry with `--skip` for those recipients instead
+/// of re-sending to them blind (pact-m7j.6.5).
 /// Everything about a message except who it goes to.
 ///
 /// A struct rather than four more parameters: `send` was already at the limit,
@@ -248,6 +254,59 @@ pub struct Draft<'a> {
     /// Paths this message is ABOUT, from `--to-owner-of`. Recorded as labels so
     /// delivery can follow the file after the agent it resolved to has exited.
     pub about: &'a [String],
+}
+
+/// `send()` failed partway through a multi-recipient fan-out (pact-m7j.6.5).
+/// `already_sent` is exactly the recipients who already got this message —
+/// re-sending the identical command without `--skip` for them duplicates
+/// delivery, since only the thread ROOT (the first recipient) is protected by
+/// [`idempotency_key`]'s upsert; recipients 2..N are not. Exposed as
+/// `--json`'s error shape so a caller can retry with `--skip <agent>` for each
+/// name here instead of parsing prose, per this session's design decision to
+/// keep messaging's retry story flag-based rather than content-addressed (the
+/// same choice pact-m7j.6.4 made for the single-recipient case).
+///
+/// `reason` is a one-shot text snapshot of the underlying failure, for a
+/// `--json` reader who wants "why" without a second command. It is NOT how the
+/// human-readable path learns that text: `send()` attaches this struct via
+/// `anyhow::Error::context`, not `map_err`, so the original error survives as
+/// this error's source — `{:#}` prints it via the normal chain, and, more
+/// importantly, `output::code_for`'s `downcast_ref::<ExitError>()` still finds
+/// a nested `ExitError` (a bare-repo topology, a missing backend) through that
+/// chain. Replacing the error outright silently downgraded every such failure
+/// to the generic exit code 1, which broke `pact`'s documented exit-code
+/// contract for exactly the callers it exists to help.
+#[derive(Debug, Serialize)]
+pub struct SendFailure {
+    pub already_sent: Vec<String>,
+    pub failed_at: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for SendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.already_sent.is_empty() {
+            write!(f, "sending to {}: nothing was sent", self.failed_at)
+        } else {
+            write!(
+                f,
+                "sending to {}: {} recipient(s) already got this ({}) — replay with \
+                 --skip for them instead of re-sending blind",
+                self.failed_at,
+                self.already_sent.len(),
+                self.already_sent.join(", "),
+            )
+        }
+    }
+}
+
+impl std::error::Error for SendFailure {}
+
+/// If `err` is a [`SendFailure`], its `--json` shape — for a caller that wants
+/// to retry with `--skip` rather than parse the human-readable text. `None`
+/// for every other error, so a generic failure still prints as plain text.
+pub fn json_send_failure(err: &anyhow::Error) -> Option<String> {
+    serde_json::to_string_pretty(err.downcast_ref::<SendFailure>()?).ok()
 }
 
 pub fn send(
@@ -318,7 +377,7 @@ pub fn send(
     let addressing = addressing_mode();
     let is_reply = thread.is_some();
     for recipient in to {
-        let issue = create(
+        let issue = match create(
             cli,
             repo_root,
             agent,
@@ -327,20 +386,22 @@ pub fn send(
             &title,
             body,
             about,
-        )
-        .with_context(|| match messages.len() {
-            0 => format!("sending to {recipient}: nothing was sent"),
-            n => format!(
-                "sending to {recipient}: {n} of {} recipient(s) already got this ({}) — \
-                 do not re-send to them",
-                to.len(),
-                messages
-                    .iter()
-                    .map(|m| m.to.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        })?;
+        ) {
+            Ok(issue) => issue,
+            Err(e) => {
+                // Captured before `e` is moved into `context`: the source
+                // chain still carries this text (and anything under it, like
+                // an `ExitError`'s code), but the JSON shape wants it as a
+                // plain string, not something a reader has to re-derive from
+                // the chain.
+                let reason = format!("{e:#}");
+                return Err(e.context(SendFailure {
+                    already_sent: messages.iter().map(|m| m.to.clone()).collect(),
+                    failed_at: recipient.clone(),
+                    reason,
+                }));
+            }
+        };
         let id = issue.id;
         let thread = thread_id.get_or_insert_with(|| id.clone()).clone();
         messages.push(Message {
@@ -358,7 +419,7 @@ pub fn send(
         // One bead created, so one message sent. Counted here rather than after
         // the loop because a partial fan-out failure returns early, and the
         // recipients who *did* get it are exactly what a sender must not
-        // re-send to (see the with_context above).
+        // re-send to (see `SendFailure::already_sent` above).
         otel::count(
             "pact.msg.sent",
             1,
@@ -809,10 +870,13 @@ pub fn read_thread(
 
 /// The direct replies to `root`, unfiltered by type.
 ///
-/// bd answers this with `list --parent=<id>`. br has no such filter, but its
-/// `show --json` already told us the answer: `dependents` names every bead
-/// hanging off this one, and `parent-child` is the edge `create --parent` makes.
-/// So br needs no extra query to find the children, only one to hydrate them.
+/// bd answers this with a fresh `list --parent=<id>` every time. br has no such
+/// filter; this used to read `show --json`'s own `dependents` field instead —
+/// but that field is a snapshot from whenever `root` was fetched, so a reply
+/// created after that fetch stayed invisible until something re-fetched the
+/// root (pact-m7j.6.1). `br dep list <root> --direction up --json` is br's own
+/// fresh query for exactly this edge, so it is asked here every time, the same
+/// way the bd branch already asks `list --parent=` every time.
 fn replies_of(cli: &BeadsCli, repo_root: &Path, root: &BdIssue) -> Result<Vec<BdIssue>> {
     if !cli.is_br() {
         let parent_arg = format!("--parent={}", root.id);
@@ -822,7 +886,11 @@ fn replies_of(cli: &BeadsCli, repo_root: &Path, root: &BdIssue) -> Result<Vec<Bd
         )?;
         return parse_issues(&out, cli);
     }
-    let children = child_ids(root);
+    let out = cli.run(
+        repo_root,
+        &["dep", "list", &root.id, "--direction", "up", "--json"],
+    )?;
+    let children = parse_child_ids(&out, cli)?;
     if children.is_empty() {
         return Ok(Vec::new());
     }
@@ -830,16 +898,17 @@ fn replies_of(cli: &BeadsCli, repo_root: &Path, root: &BdIssue) -> Result<Vec<Bd
     show_many(cli, repo_root, &ids)
 }
 
-/// br's `parent-child` dependents, in the order br listed them. Any other edge
-/// type (`blocks`, `related`) is a real dependency, not a reply, and must not
-/// be dragged into a conversation.
-fn child_ids(root: &BdIssue) -> Vec<String> {
-    root.dependents
-        .iter()
-        .flatten()
+/// `dep list --direction up --json` -> the ids of `parent-child` edges only, in
+/// the order br listed them. Any other edge type (`blocks`, `related`) is a
+/// real dependency, not a reply, and must not be dragged into a conversation.
+fn parse_child_ids(stdout: &str, cli: &BeadsCli) -> Result<Vec<String>> {
+    let items: Vec<DepListItem> = serde_json::from_str(stdout)
+        .with_context(|| format!("parsing `{} dep list --json` output", cli.binary()))?;
+    Ok(items
+        .into_iter()
         .filter(|d| d.dependency_type == "parent-child")
-        .map(|d| d.id.clone())
-        .collect()
+        .map(|d| d.issue_id)
+        .collect())
 }
 
 /// The one place the `read-by-` label is spelled for writing; `into_message`
@@ -1082,6 +1151,118 @@ mod tests {
     /// they still assert the same thing about the same bytes.
     fn parse_messages(stdout: &str, viewer: Option<&str>) -> Result<Vec<Message>> {
         Ok(to_messages(parse_issues(stdout, &bd())?, viewer))
+    }
+
+    /// A real `br`-initialised repo, for the one test (pact-m7j.6.1) that needs
+    /// actual replies fetched over a live subprocess rather than a JSON
+    /// fixture — `replies_of` and `thread_root` are private, so `tests/cli.rs`
+    /// (which only sees the compiled binary) cannot reach them directly.
+    /// Mirrors `tests/cli.rs`'s `beads_repo`: skip with a reason on stderr
+    /// rather than failing the whole file when `br` is not on PATH.
+    fn br_test_workspace(test: &str) -> Option<tempfile::TempDir> {
+        let on_path = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).any(|d| d.join("br").is_file()))
+            .unwrap_or(false);
+        if !on_path {
+            eprintln!("SKIP {test}: br not found on PATH");
+            return None;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let setup: [&[&str]; 4] = [
+            &["git", "init", "-q", "."],
+            &["git", "config", "user.email", "tests@pact.invalid"],
+            &["git", "config", "user.name", "pact tests"],
+            &["br", "init"],
+        ];
+        for cmd in setup {
+            match std::process::Command::new(cmd[0])
+                .args(&cmd[1..])
+                .current_dir(tmp.path())
+                .output()
+            {
+                Ok(o) if o.status.success() => {}
+                _ => {
+                    eprintln!("SKIP {test}: `{}` failed", cmd.join(" "));
+                    return None;
+                }
+            }
+        }
+        Some(tmp)
+    }
+
+    /// pact-m7j.6.1: `replies_of`'s br branch used to answer from `root`'s own
+    /// `dependents` field — a snapshot from whenever `root` was fetched — so a
+    /// reply created after that fetch stayed invisible to any caller still
+    /// holding the old `root` value. `gather_thread` itself never reuses a
+    /// `root` across two `replies_of` calls (it re-fetches at the top of every
+    /// call, which is why this cannot be reproduced by calling `msg read`
+    /// twice from the shell — confirmed against real `br` 0.2.19), but nothing
+    /// stopped a caller that fetches `root` once from asking twice, and that is
+    /// exactly the shape this test drives directly against the two private
+    /// functions involved.
+    ///
+    /// Causality: with the old code (`child_ids(root)` reading `root.dependents`)
+    /// the second call below returns 1, matching what existed when `root` was
+    /// fetched; with the fix (a fresh `dep list` every call) it returns 2.
+    #[test]
+    fn br_replies_are_queried_fresh_not_read_from_a_stale_root_snapshot() {
+        let Some(tmp) =
+            br_test_workspace("br_replies_are_queried_fresh_not_read_from_a_stale_root_snapshot")
+        else {
+            return;
+        };
+        let cli = br();
+        let root = create(
+            &cli,
+            tmp.path(),
+            "alpha",
+            "bravo",
+            None,
+            "root",
+            "root body",
+            &[],
+        )
+        .expect("create root");
+        create(
+            &cli,
+            tmp.path(),
+            "bravo",
+            "alpha",
+            Some(&root.id),
+            "root",
+            "reply one",
+            &[],
+        )
+        .expect("create reply1");
+
+        // Fetched BEFORE reply2 exists — this is the "earlier show call"
+        // snapshot the bug held onto.
+        let stale_root = thread_root(&cli, tmp.path(), &root.id).expect("thread_root");
+        assert_eq!(
+            replies_of(&cli, tmp.path(), &stale_root).unwrap().len(),
+            1,
+            "only reply1 exists so far"
+        );
+
+        create(
+            &cli,
+            tmp.path(),
+            "bravo",
+            "alpha",
+            Some(&root.id),
+            "root",
+            "reply two",
+            &[],
+        )
+        .expect("create reply2");
+
+        // Same `stale_root` value, reused rather than re-fetched.
+        let replies = replies_of(&cli, tmp.path(), &stale_root).expect("replies_of");
+        assert_eq!(
+            replies.len(),
+            2,
+            "a reply created after root was fetched must still show up: {replies:?}"
+        );
     }
 
     #[test]
@@ -1689,28 +1870,28 @@ mod tests {
         assert_eq!(parse_issues(LIST_JSON, &bd()).unwrap().len(), 4);
     }
 
-    /// pact-l94: br has no `list --parent`, so replies come from the root's
-    /// `dependents`. JSON copied from a real `br show <root> --json`.
+    /// pact-l94/pact-m7j.6.1: br has no `list --parent`, so replies come from
+    /// a fresh `dep list <root> --direction up --json` query — not from
+    /// `show`'s own `dependents` snapshot (see `replies_of`'s doc comment for
+    /// why). JSON copied from a real `br dep list --direction up --json`.
     #[test]
-    fn br_finds_thread_replies_in_the_roots_parent_child_edges() {
-        let root = issue(
-            r#"{"id":"brlab-udp","title":"hello","assignee":"br-dev",
-                "created_at":"2026-08-02T07:23:58Z","issue_type":"message",
-                "dependents":[
-                  {"id":"brlab-udp.1","title":"reply","dependency_type":"parent-child"},
-                  {"id":"brlab-udp.2","title":"r2","dependency_type":"parent-child"},
-                  {"id":"brlab-zzz","title":"a real blocker","dependency_type":"blocks"}
-                ]}"#,
+    fn br_dep_list_parses_parent_child_edges_and_ignores_the_rest() {
+        const DEP_LIST_JSON: &str = r#"[
+          {"issue_id":"brlab-udp.2","depends_on_id":"brlab-udp","type":"parent-child",
+           "title":"r2","status":"open","priority":2},
+          {"issue_id":"brlab-udp.1","depends_on_id":"brlab-udp","type":"parent-child",
+           "title":"reply","status":"open","priority":2},
+          {"issue_id":"brlab-zzz","depends_on_id":"brlab-udp","type":"blocks",
+           "title":"a real blocker","status":"open","priority":2}
+        ]"#;
+        assert_eq!(
+            parse_child_ids(DEP_LIST_JSON, &br()).unwrap(),
+            ["brlab-udp.2", "brlab-udp.1"],
+            "the blocks edge must not be dragged into the conversation"
         );
-        assert_eq!(child_ids(&root), ["brlab-udp.1", "brlab-udp.2"]);
 
-        // A root with no replies, and bd's shape (no `dependents` key at all),
-        // both mean "no children" rather than a parse failure.
-        let lonely = issue(
-            r#"{"id":"brlab-lfx","title":"t2","assignee":"peer",
-                "created_at":"2026-08-02T07:25:23Z","issue_type":"message"}"#,
-        );
-        assert!(child_ids(&lonely).is_empty());
+        // No replies at all: an empty array, not a parse failure.
+        assert!(parse_child_ids("[]", &br()).unwrap().is_empty());
     }
 
     /// pact-aw7.4: the counter that says whether the fleet adopted

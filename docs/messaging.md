@@ -168,7 +168,7 @@ running `br` 0.2.19, not inferred from bd's documentation.
 | list message beads | `list --include-infra --json` | `list --json --type=message` |
 | don't inherit read labels | `--no-inherit-labels` | flag rejected, and unnecessary |
 | shape of `list --json` | a bare array | `{"issues": […], "total": …}` |
-| a message's replies | `list --parent=<id> --include-infra --json` | the root's `parent-child` `dependents` |
+| a message's replies | `list --parent=<id> --include-infra --json` | `dep list <root> --direction up --json` |
 | survive a retried send | `--id=<content hash>` + `--force` on a thread root | no primitive at all — retries still duplicate |
 
 Two of those are worth more than a table row:
@@ -181,10 +181,14 @@ Two of those are worth more than a table row:
 - **`br list` omits `parent` and has no `--parent` filter**, which is the one
   divergence that could have shipped as a quietly half-broken inbox: every reply
   would report itself as its own thread root, and `msg read` would find no
-  replies. `br show --json` does carry `parent`, and a root's `dependents` name
-  its children as `parent-child` edges. So on br every listing is a `list` for
-  the ids plus one `show` to hydrate the records — two subprocesses, but
-  authoritative data. The alternative, deriving parents from br's `<id>.<n>` id
+  replies. `br show --json` does carry `parent`, so a thread's root is found the
+  same way it is on bd. Its replies are a separate, fresh `dep list <root>
+  --direction up --json` query every time — not `show`'s own `dependents`
+  field, which is a snapshot from whenever the root was fetched and stayed
+  wrong about a reply created after that fetch until something re-fetched the
+  root (`pact-m7j.6.1`). So on br every listing is one query for the ids
+  (`dep list`) plus one `show` to hydrate the records — two subprocesses, but
+  always current. The alternative, deriving parents from br's `<id>.<n>` id
   shape, would be pact guessing at another tool's id format.
 
 The retry row is the newest divergence, and the only one where br is left
@@ -320,6 +324,47 @@ reason every `bd create` passes `--force` — it is what makes bd accept an id
 outside its own prefix, and it does nothing else here. Replies still hang off
 the root in bd's own shape, so a thread reads `pact-msg-<hash>`,
 `pact-msg-<hash>.1`, and so on.
+
+## Replaying a fan-out that failed partway: `--skip`
+
+The id trick above only covers a thread's **root** — the first `--to`.
+Recipients 2..N of a fan-out are parented on that root and carry no `--id` of
+their own (see the second limit above), so if `create` fails partway through —
+say, recipient 3 of 4 — an identical retry re-sends to every recipient again,
+duplicating the ones who already got it. The error already names them:
+
+```
+$ pact msg send --to alice --to bob --to carol --json "shared decision"
+error: sending to carol: 2 recipient(s) already got this (alice, bob) — replay
+with --skip for them instead of re-sending blind
+```
+
+With `--json`, that same fact is a structured shape on stderr instead of prose:
+
+```json
+{
+  "already_sent": ["alice", "bob"],
+  "failed_at": "carol",
+  "reason": "br [...] failed (exit status: 1): ..."
+}
+```
+
+Read `already_sent` back and pass each name as `--skip <agent>` (repeatable,
+like `--to`) on the retry — the recipient list stays the same, but pact drops
+the skipped names before sending, so only the recipient that actually failed
+is attempted:
+
+```
+$ pact msg send --to alice --to bob --to carol --skip alice --skip bob "shared decision"
+note: 2 recipient(s) skipped — already sent to them, not re-sending
+sent pact-msg-... to carol (thread pact-msg-...)
+```
+
+This is a **new, opt-in path**, not a change to what an identical replay does:
+run the exact same command again with no `--skip`, and alice/bob still
+duplicate exactly as the second limit above describes. `--skip` exists for the
+sender who already knows, from a failed attempt's own error, which recipients
+not to touch again.
 
 ## Read state: shared labels, not a local file
 
@@ -518,7 +563,7 @@ data point.
 ## Command reference
 
 ```
-pact msg send --to <agent> [--to <agent>...] [--thread <id>] [--subject <text>] (<body> | --body-file <path|->)
+pact msg send --to <agent> [--to <agent>...] [--thread <id>] [--subject <text>] [--skip <agent>...] (<body> | --body-file <path|->)
 pact msg inbox [--unread-only] [--full]
 pact msg sent
 pact msg read <id>
