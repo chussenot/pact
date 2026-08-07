@@ -307,6 +307,15 @@ fn main() {
         // `doctor` on an unhealthy repo is the case (see `run`). Flush first
         // either way.
         Ok(code) => {
+            // A `Placement::LocalFallback` degradation used to be visible only
+            // via a separately-run `pact doctor` — every other command that
+            // resolved the same topology dropped the warning on the floor.
+            // Read once here, regardless of how many times `resolve_topology`
+            // ran inside `run(cli)`, and surface it on the command that
+            // actually hit it.
+            if let Some(w) = repo::take_warning() {
+                output::warn(&w);
+            }
             telemetry.finish(code);
             if code != 0 {
                 std::process::exit(code);
@@ -315,6 +324,9 @@ fn main() {
         Err(e) => {
             output::warn(&format!("error: {e:#}"));
             let code = output::code_for(&e);
+            if let Some(w) = repo::take_warning() {
+                output::warn(&w);
+            }
             // Before the exit, not after: `std::process::exit` skips
             // destructors, so a `Drop`-only flush would export exactly the
             // successful runs and lose every failure worth looking at.

@@ -1,9 +1,34 @@
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::output::exit_with;
+
+thread_local! {
+    /// Set whenever `resolve_topology` falls back to `Placement::LocalFallback`
+    /// and explains why. `main` takes it once, at the same point it flushes
+    /// telemetry, and prints it via `output::warn` — the one fix point that
+    /// covers every `pact_dir`/`pact_dir_path` consumer (lease, msg, agents,
+    /// log, audit, init, whoami) without threading a context object through
+    /// every function signature. Mirrors the span-stack `thread_local!` in
+    /// `otel.rs`, and for the identical reason.
+    ///
+    /// Thread-local rather than a process-wide `OnceLock` (the pattern used
+    /// elsewhere, e.g. `BACKEND_VERSION` in beads.rs): this module's own unit
+    /// tests call `RepoContext::resolve` directly and run concurrently under
+    /// cargo test's default multi-threading, so a shared mutable global would
+    /// risk one test's fallback bleeding into another's assertions.
+    static WARNING: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Take (and clear) the topology-fallback warning recorded on this thread, if
+/// any. Destructive on purpose: `main` calls this exactly once per invocation,
+/// regardless of how many times `resolve_topology` ran inside it.
+pub fn take_warning() -> Option<String> {
+    WARNING.with(|w| w.borrow_mut().take())
+}
 
 /// Walk up from `start` looking for a `.git` entry, returning the containing directory.
 /// Shared by `lease`, `agents_md`, and `doctor` — kept separate from `main.rs` so
@@ -219,7 +244,19 @@ impl RepoContext {
         ctx
     }
 
+    /// Resolve, then record any fallback warning where `take_warning` can find
+    /// it. A thin wrapper rather than inline sets at each fallback site: the
+    /// body below has half a dozen early returns, and a wrapper is one place
+    /// that cannot be missed by a new one.
     fn resolve_topology(worktree_root: &Path) -> Self {
+        let ctx = Self::resolve_topology_uncached(worktree_root);
+        if let Some(w) = &ctx.warning {
+            WARNING.with(|cell| *cell.borrow_mut() = Some(w.clone()));
+        }
+        ctx
+    }
+
+    fn resolve_topology_uncached(worktree_root: &Path) -> Self {
         let worktree_root = worktree_root.to_path_buf();
         let dot_git = worktree_root.join(".git");
 
