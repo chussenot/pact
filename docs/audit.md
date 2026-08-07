@@ -113,12 +113,17 @@ synthesize a best-effort hold for history it cannot reconstruct. A nonzero
 count is normal. This repository's own 8 are all explained, and none is a
 defect:
 
-- **Four are `force-released`.** That event is logged under the agent *doing*
-  the forcing, with the displaced holder named only in the free-text detail —
-  unlike `expired`, which is deliberately logged under the dead holder. So a
-  force-release closes nothing here, and the holder's window runs on until that
-  agent next touches the path, which is why a hold spanning one reads as a
-  single long window rather than two.
+- **Four are `force-released`, from before pact-m7j.2.6.** That event is
+  logged under the agent *doing* the forcing, unlike `expired`, which is
+  deliberately logged under the dead holder — so `reconstruct` looked for an
+  open window under the *forcer's* name, found none, and let the real
+  holder's window run on until they next touched the path (why a hold
+  spanning one used to read as a single long window rather than two). Fixed
+  going forward: `force-released` now also carries `displaced`, the holder's
+  own name, as a structured field, and `reconstruct` closes that agent's
+  window instead. These four predate the field and stay orphaned exactly as
+  before — `displaced` is absent on them, not wrong, and nothing rewrites
+  history — but a force-release logged from here on closes correctly.
 - **Four have an acquire the log never recorded.** `cli-wire` released four
   source files eight minutes into this log's history and no `acquired` for any
   of them appears anywhere in the file: it claimed them before the first line

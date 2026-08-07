@@ -831,6 +831,10 @@ fn log_event(
             ttl_secs: Some(ttl_secs),
             covers_lines: None,
             actor: None,
+            // Every force-released event that needs this bypasses log_event
+            // entirely (see the call site in release_fs) — nothing routed
+            // through here ever has a displaced holder to name.
+            displaced: None,
         },
     );
 }
@@ -1559,6 +1563,10 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                     ttl_secs: None,
                     covers_lines: None,
                     actor: None,
+                    // No agent name survived to report as displaced (see the
+                    // comment above): correctly orphaned, not a bug this
+                    // field is meant to fix (pact-m7j.2.6).
+                    displaced: None,
                 },
             );
             count_transition("force_released");
@@ -1597,13 +1605,24 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
 
     match &displaced {
         Some(holder) => {
-            log_event(
+            // Not `log_event`: `audit::reconstruct` needs the displaced
+            // holder's own name to close THEIR window (pact-m7j.2.6) — this
+            // event's own `agent` is the one who forced it, same asymmetry
+            // as `expired`'s doc comment describes for the opposite case —
+            // and `log_event` has no parameter for a second identity.
+            events::append(
                 repo_root,
-                agent,
-                "force-released",
-                &relative,
-                Some(format!("destroyed live claim of {holder}")),
-                existing.ttl_secs,
+                &events::Event {
+                    at: Utc::now().to_rfc3339(),
+                    agent: agent.to_string(),
+                    kind: "force-released".to_string(),
+                    path: Some(relative.clone()),
+                    detail: Some(format!("destroyed live claim of {holder}")),
+                    ttl_secs: Some(existing.ttl_secs),
+                    covers_lines: None,
+                    actor: None,
+                    displaced: Some(holder.clone()),
+                },
             );
             count_transition("force_released");
             record_hold(&existing, "force_released");
@@ -2732,6 +2751,16 @@ mod tests {
             events[4].detail.as_deref().unwrap().contains("agent-b"),
             "a force-release must name the displaced holder: {:?}",
             events[4].detail
+        );
+        // pact-m7j.2.6: the displaced holder in a structured field too, not
+        // just free text — audit::reconstruct needs this to close THEIR
+        // window, since this event's own `agent` (agent-a) is the one who
+        // forced it, not the one displaced.
+        assert_eq!(
+            events[4].displaced.as_deref(),
+            Some("agent-b"),
+            "force-released must carry the displaced holder as a structured field: {:?}",
+            events[4].displaced
         );
     }
 

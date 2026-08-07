@@ -74,6 +74,19 @@ pub struct Event {
     /// `kind: "annotation"` only — who is asserting the correction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
+    /// `kind: "force-released"` only — the agent whose live claim this event
+    /// destroyed, when a name survived to report one.
+    ///
+    /// Unlike `expired` (see the struct doc above), a force-released event's
+    /// own `agent` is the one who forced it, not the one displaced — so
+    /// `audit::reconstruct` closing a hold with `open.remove(&e.agent)` found
+    /// nothing under the forcer's name and left the real holder's window open
+    /// indefinitely, counting the close as orphaned instead (pact-m7j.2.6).
+    /// `None` when no holder name survived to report one — a corrupt lock
+    /// force-removed, whose `existing.agent` was never readable — where that
+    /// really is the correct, unimprovable outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displaced: Option<String>,
 }
 
 /// For appending: creates `.pact/` if needed.
@@ -495,6 +508,7 @@ mod tests {
             // correction does. See audit::ANNOTATION_KIND.
             covers_lines: None,
             actor: None,
+            displaced: None,
         }
     }
 

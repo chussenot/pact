@@ -383,13 +383,24 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>, usize) 
                     }
                 }
             } else if closes(&e.kind) {
-                if let Some((oline, oat, renewals, ttl, ttl_assumed)) = open.remove(&e.agent) {
+                // A force-released event is filed under the agent who forced
+                // it, not the one displaced — the opposite of `expired`,
+                // which lease.rs deliberately logs under the dead holder's
+                // own name (see the struct doc on `Event`). Without this,
+                // `open.remove(&e.agent)` looked for the FORCER's window,
+                // found none, and let the real holder's window run on
+                // unclosed while counting the close as orphaned instead
+                // (pact-m7j.2.6). `displaced` is `None` on every other kind
+                // and on a force-release with no surviving holder name, so
+                // this falls back to `e.agent` exactly as before there.
+                let holder = e.displaced.as_deref().unwrap_or(e.agent.as_str());
+                if let Some((oline, oat, renewals, ttl, ttl_assumed)) = open.remove(holder) {
                     let held = parse_at(&oat)
                         .zip(parse_at(&e.at))
                         .map(|(a, b)| (b - a).num_seconds());
                     holds.push(Hold {
                         path: path.to_string(),
-                        agent: e.agent.clone(),
+                        agent: holder.to_string(),
                         opened_line: oline,
                         opened_at: oat,
                         closed_line: Some(line),
@@ -1272,6 +1283,61 @@ mod tests {
         let r = run_check(tmp.path(), Check::DoubleWin, None, false).unwrap();
         assert_eq!(r.orphaned_closes, 1);
         assert!(render_check(&r).contains("no matching open"));
+    }
+
+    /// pact-m7j.2.6: `force-released` is filed under the agent who forced it,
+    /// not the one displaced — `open.remove(&e.agent)` used to look for the
+    /// FORCER's window, find nothing, count the close as orphaned, and leave
+    /// the real holder's window running until they next touched the path.
+    /// `displaced` is how the event names who to actually close.
+    #[test]
+    fn a_force_release_with_a_displaced_holder_closes_that_holders_window() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "victim", "acquired", "src/a.rs"),
+            // The forcer's own name ("forcer") never opened anything on this
+            // path, which is exactly why open.remove(&e.agent) found nothing
+            // before this fix.
+            r#"{"at":"2026-08-01T10:05:00Z","agent":"forcer","kind":"force-released","path":"src/a.rs","displaced":"victim"}"#,
+        ]);
+
+        let s = summary(tmp.path(), None, false).unwrap();
+        assert_eq!(
+            s.orphaned_closes, 0,
+            "the displaced holder's window must be found and closed, not orphaned"
+        );
+        assert_eq!(
+            s.hold_secs.unwrap().completed,
+            1,
+            "one closed hold, victim's"
+        );
+
+        let r = run_check(tmp.path(), Check::DoubleWin, None, false).unwrap();
+        assert_eq!(r.orphaned_closes, 0);
+    }
+
+    /// The historical shape (no `displaced` field at all, every event written
+    /// before this fix) must keep behaving exactly as it did — `displaced`
+    /// defaults to `None` and reconstruct falls back to `e.agent`, so a
+    /// force-release with no way to name the real holder stays correctly
+    /// orphaned rather than guessing.
+    #[test]
+    fn a_force_release_with_no_displaced_field_stays_orphaned_like_before() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "victim", "acquired", "src/a.rs"),
+            &ev(
+                "2026-08-01T10:05:00Z",
+                "forcer",
+                "force-released",
+                "src/a.rs",
+            ),
+        ]);
+
+        let s = summary(tmp.path(), None, false).unwrap();
+        assert_eq!(
+            s.orphaned_closes, 1,
+            "a pre-fix log with no displaced field must behave exactly as before"
+        );
+        assert_eq!(s.open_holds, 1, "victim's window is still open, as before");
     }
 
     #[test]
