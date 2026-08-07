@@ -589,6 +589,67 @@ fn a_malformed_git_file_falls_back_locally_with_a_warning() {
     );
 }
 
+/// (h) The bug this covers: a `LocalFallback` degradation used to surface only
+/// through a separately-run `pact doctor`. `lease acquire` is the command that
+/// actually hit the split brain — two worktrees silently NOT sharing leases —
+/// so it must say so on its own stderr, not leave the operator to think to run
+/// `doctor`.
+#[test]
+fn lease_acquire_prints_the_fallback_warning_itself() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+    let (_tmp, main, wt) = repo_with_worktree("feat/degraded", "wt-degraded");
+
+    // The exact trigger named in `RepoContext::resolve_topology`'s
+    // `LocalFallback` arm: an unreadable `commondir` in the linked worktree's
+    // own gitdir. The `.git` pointer itself is untouched and still resolves.
+    let gitdir = main.join(".git/worktrees/wt-degraded");
+    std::fs::remove_file(gitdir.join("commondir"))
+        .expect("commondir must exist right after `git worktree add`");
+
+    let acquired = pact(&wt, "agent-a", &["lease", "acquire", "src/api.ts"]);
+    assert!(
+        acquired.status.success(),
+        "a missing commondir must degrade, not fail: {}",
+        stderr(&acquired)
+    );
+    let err = stderr(&acquired);
+    assert!(
+        err.contains("commondir") && err.contains("NOT be shared"),
+        "the acquire call itself must print the fallback warning, not only a \
+         separately-run `pact doctor`: {err}"
+    );
+}
+
+/// The warning must print exactly once per process no matter how many times a
+/// single command internally re-resolves the topology. `lease acquire` is a
+/// natural case for this: `lock_file_path` resolves it via `pact_dir`, and
+/// `worktree_stamp` resolves it again independently — both inside one
+/// invocation.
+#[test]
+fn the_fallback_warning_prints_only_once_per_invocation() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+    let (_tmp, main, wt) = repo_with_worktree("feat/degraded-once", "wt-degraded-once");
+
+    let gitdir = main.join(".git/worktrees/wt-degraded-once");
+    std::fs::remove_file(gitdir.join("commondir")).unwrap();
+
+    let acquired = pact(&wt, "agent-a", &["lease", "acquire", "src/api.ts"]);
+    assert!(acquired.status.success(), "{}", stderr(&acquired));
+    let err = stderr(&acquired);
+    let occurrences = err.matches("NOT be shared").count();
+    assert_eq!(
+        occurrences, 1,
+        "printed {occurrences} times even though RepoContext::resolve runs more \
+         than once inside one `lease acquire` call: {err}"
+    );
+}
+
 /// The zero-change claim, from the outside: an ordinary checkout reports no
 /// worktree, keeps state at `<root>/.pact`, and writes lock files with no
 /// `branch`/`worktree` keys at all — not null, absent.
