@@ -15,7 +15,7 @@
 //!   * Garbage lines are skipped, not fatal, exactly as `lease::list` skips
 //!     unparsable lock files.
 
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -117,6 +117,35 @@ pub fn unique_temp_name(prefix: &str) -> String {
     )
 }
 
+/// Does `path` exist, have nonzero length, and NOT already end in `\n`?
+///
+/// A `true` here means the last append into this file was torn: it wrote part
+/// of a line and then failed (ENOSPC/EIO/EDQUOT — `writeln!`'s error is
+/// swallowed by [`append`]'s infallible signature, so the file is the only
+/// place this shows up). The next append must not simply continue writing at
+/// that dangling offset, or its well-formed line glues onto the torn prefix
+/// and BOTH become one unparseable line — losing the new event along with the
+/// old one. A missing or empty file is not torn; there is nothing to sever.
+fn ends_without_newline(path: &Path) -> Result<bool> {
+    let len = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading metadata for {}", path.display()))
+        }
+    };
+    if len == 0 {
+        return Ok(false);
+    }
+    let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    f.seek(SeekFrom::End(-1))
+        .with_context(|| format!("seeking {}", path.display()))?;
+    let mut last = [0u8; 1];
+    f.read_exact(&mut last)
+        .with_context(|| format!("reading last byte of {}", path.display()))?;
+    Ok(last[0] != b'\n')
+}
+
 /// Append one event to `.pact/events.jsonl`.
 ///
 /// Infallible by signature: I/O errors are swallowed, because a logging
@@ -127,34 +156,182 @@ pub fn append(repo_root: &Path, ev: &Event) {
 
 /// The fallible body of [`append`], with the cap injected so tests don't have
 /// to write 5000 lines to exercise trimming.
+///
+/// Locking here is shared/exclusive, not "trim-only": a plain append takes a
+/// cheap **shared** lock (any number of appenders hold it at once, so they
+/// never serialize against each other — the common case still pays only one
+/// extra `flock` syscall, not a queue), and the trim's read-modify-rename
+/// takes an **exclusive** one. A first pass guarded only the trim branch, on
+/// the theory that `O_APPEND` writes need no coordination at all — true for
+/// two plain appends racing each other, but not for a plain append racing a
+/// CONCURRENT trim's rename: a write landing in the gap between the trim's
+/// fresh read and its rename goes to the inode the rename is about to orphan,
+/// and is silently gone once the rename swaps the directory entry to the
+/// freshly-written one. A test with real concurrent writers reproduced that
+/// loss reliably even with the trim-only guard, which is what the shared lock
+/// on the plain append actually closes.
 fn append_bounded(repo_root: &Path, ev: &Event, max_lines: usize, keep_lines: usize) -> Result<()> {
     let path = events_file(repo_root)?;
     let line = serde_json::to_string(ev)?;
 
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    writeln!(f, "{line}").with_context(|| format!("appending to {}", path.display()))?;
-    drop(f);
+    {
+        // Shared: blocks only while a trim (below) holds the exclusive lock,
+        // and does not serialize against other appenders holding this same
+        // shared lock.
+        let _guard = EventsFileLock::acquire_shared(&path)?;
+        // The torn-tail check happens under the lock too, so it never reads a
+        // file mid-rewrite by a concurrent trim.
+        let sever_torn_tail = ends_without_newline(&path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        // One `write_all` call, not `writeln!` (which would emit the line and
+        // the trailing newline as two separate `write_str`/`write` calls): a
+        // shared lock deliberately allows other appenders to hold it at the
+        // same time, and `O_APPEND` only makes a SINGLE `write(2)` atomic with
+        // respect to them — two separate writes for one logical line leaves a
+        // window where a concurrent appender's write lands between them,
+        // gluing two events into one unparseable line with no lock able to
+        // prevent it. A leading `\n` (severing a torn tail from a prior
+        // failed write, see `ends_without_newline`) is folded into the same
+        // buffer for the same reason.
+        let mut buf = String::with_capacity(line.len() + 2);
+        if sever_torn_tail {
+            buf.push('\n');
+        }
+        buf.push_str(&line);
+        buf.push('\n');
+        f.write_all(buf.as_bytes())
+            .with_context(|| format!("appending to {}", path.display()))?;
+    }
 
     // Reading the file back on every append is a few hundred microseconds at
     // this cap, and lease operations happen at agent speed, not in a loop.
+    // This is a cheap, UNLOCKED read purely to decide whether trimming is
+    // worth even trying — the exclusive lock below is only taken when it is.
     let contents = std::fs::read_to_string(&path)?;
     if contents.lines().count() > max_lines {
-        let kept: Vec<&str> = contents
-            .lines()
-            .skip(contents.lines().count().saturating_sub(keep_lines))
-            .collect();
-        // Rewrite via temp + rename so a reader never sees a half-trimmed file.
-        // ponytail: an append racing the rename is lost with the old inode.
-        // Acceptable for an advisory feed; needs a lock file if it ever isn't.
-        let tmp = path.with_file_name(unique_temp_name("events.jsonl.tmp"));
-        std::fs::write(&tmp, kept.join("\n") + "\n")?;
-        std::fs::rename(&tmp, &path)?;
+        // Two writers racing this branch used to each snapshot the file, trim
+        // their own stale copy, and rename over each other — the loser's
+        // rename replaced the directory entry with a file built before the
+        // winner's event existed, discarding it with no error and no signal.
+        // The exclusive lock makes the two rewrites mutually exclusive, and
+        // also excludes any plain append from landing mid-rewrite (see the
+        // shared lock above).
+        let _guard = EventsFileLock::acquire_exclusive(&path)?;
+        // Re-read now that we hold the lock: any append that landed between
+        // the unlocked read above and here must be picked up before we decide
+        // what to keep.
+        let fresh = std::fs::read_to_string(&path)?;
+        let fresh_lines = fresh.lines().count();
+        if fresh_lines > max_lines {
+            let kept: Vec<&str> = fresh
+                .lines()
+                .skip(fresh_lines.saturating_sub(keep_lines))
+                .collect();
+            // Rewrite via temp + rename so a reader never sees a half-trimmed
+            // file.
+            let tmp = path.with_file_name(unique_temp_name("events.jsonl.tmp"));
+            std::fs::write(&tmp, kept.join("\n") + "\n")?;
+            std::fs::rename(&tmp, &path)?;
+        }
+        // else: a concurrent trim (seen in the fresh read) already brought the
+        // file back under the cap; nothing left to do.
     }
     Ok(())
+}
+
+/// Guards `append_bounded`'s write path against its own trim: shared while
+/// appending, exclusive while trimming, so the two can never interleave.
+///
+/// A dedicated sidecar file (`events.jsonl.trimlock`), never `events.jsonl`
+/// itself: `flock` exclusivity is per-inode, and the trim branch replaces
+/// `events.jsonl`'s inode via `rename`, so locking the path being renamed
+/// would stop protecting anything the instant the rename happened — a holder
+/// with the old inode open and a newcomer who just opened the new one would
+/// hold unrelated locks. The sidecar's inode never changes, so every caller's
+/// lock is always on the same target.
+///
+/// Deliberately NOT `lease.rs`'s `WriteGuard`, despite being the same
+/// `flock(2)` pattern: importing it here would couple two unrelated
+/// subsystems for the sake of ~15 lines of FFI, and this module already
+/// reaches for a bare `extern "C"` block rather than a dependency for less
+/// than this. The lock file is never deleted, for the identical reason
+/// `WriteGuard`'s guard file never is (see its doc comment in lease.rs):
+/// unlinking a live flock target while another waiter might be about to open
+/// that same name reopens the exact race this exists to prevent.
+struct EventsFileLock {
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+mod events_lock_ffi {
+    use std::os::unix::io::RawFd;
+
+    extern "C" {
+        fn flock(fd: RawFd, operation: i32) -> i32;
+    }
+    pub const LOCK_SH: i32 = 1;
+    pub const LOCK_EX: i32 = 2;
+
+    /// Blocks until the requested lock (`LOCK_SH` or `LOCK_EX`) is granted.
+    /// No timeout and no staleness reclaim, matching `WriteGuard`: every
+    /// critical section held here is a handful of syscalls, and `flock`
+    /// releases automatically the instant a holder's process exits or
+    /// crashes, so there is no "is the holder actually dead" question to
+    /// answer with a guess.
+    pub fn lock(fd: RawFd, operation: i32) -> std::io::Result<()> {
+        if unsafe { flock(fd, operation) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+impl EventsFileLock {
+    #[cfg(unix)]
+    fn acquire(events_path: &Path, operation: i32) -> Result<Self> {
+        let mut lock_name = events_path.as_os_str().to_owned();
+        lock_name.push(".trimlock");
+        let path = PathBuf::from(lock_name);
+        // Never `create_new`: every writer opens this SAME file concurrently
+        // as the normal case — `flock`, not file creation, is what provides
+        // exclusivity. Never truncated or removed either; see the struct doc
+        // comment.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening events lock {}", path.display()))?;
+        use std::os::unix::io::AsRawFd;
+        events_lock_ffi::lock(file.as_raw_fd(), operation)
+            .with_context(|| format!("locking {}", path.display()))?;
+        Ok(Self { _file: file })
+    }
+
+    #[cfg(unix)]
+    fn acquire_shared(events_path: &Path) -> Result<Self> {
+        Self::acquire(events_path, events_lock_ffi::LOCK_SH)
+    }
+
+    #[cfg(unix)]
+    fn acquire_exclusive(events_path: &Path) -> Result<Self> {
+        Self::acquire(events_path, events_lock_ffi::LOCK_EX)
+    }
+
+    #[cfg(not(unix))]
+    fn acquire_shared(_events_path: &Path) -> Result<Self> {
+        compile_error!("EventsFileLock requires flock(2); pact does not build on non-Unix");
+    }
+
+    #[cfg(not(unix))]
+    fn acquire_exclusive(_events_path: &Path) -> Result<Self> {
+        compile_error!("EventsFileLock requires flock(2); pact does not build on non-Unix");
+    }
 }
 
 /// The most recent lease events, oldest-first (so a feed reads top-to-bottom
@@ -412,6 +589,87 @@ mod tests {
             recent(&not_a_dir, 10).is_err(),
             "reading it still reports why"
         );
+    }
+
+    /// A prior failed `write_all` (ENOSPC/EIO/mid-write crash) leaves the file
+    /// ending in a torn line with no trailing newline. The next append must
+    /// not glue its own well-formed line onto that dangling prefix — that
+    /// turns ONE physical line into unparseable garbage, losing the new event
+    /// along with the old one. Fixture built directly, no fault injection
+    /// needed: this is exactly the on-disk shape a torn `write_all` leaves.
+    #[test]
+    fn append_severs_a_torn_tail_instead_of_gluing_onto_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = events_file(tmp.path()).unwrap();
+        std::fs::write(
+            &file,
+            r#"{"at":"2026-08-01T00:00:00Z","agent":"a","kind":"acq"#,
+        )
+        .unwrap();
+
+        append(tmp.path(), &ev("released", "good.rs"));
+
+        let got = recent(tmp.path(), 10).unwrap();
+        assert_eq!(
+            got.len(),
+            1,
+            "the new event must be intact and separately parseable, not glued to the torn prefix"
+        );
+        assert_eq!(got[0].path.as_deref(), Some("good.rs"));
+        assert_eq!(got[0].kind, "released");
+    }
+
+    /// Two-plus writers racing `append_bounded`'s trim branch used to each
+    /// snapshot the file, trim their own stale copy, and rename over each
+    /// other — the loser's rename replaced the directory entry with a file
+    /// built before the winner's event existed, discarding it with no error.
+    ///
+    /// `keep_lines` is set larger than the total number of events this test
+    /// will ever write, so trimming never has a *legitimate* reason to drop
+    /// anything: any event missing at the end is lost to the race, not to the
+    /// bounded-log policy exercised by `trimming_caps_the_file`. `max_lines`
+    /// is set tiny so nearly every append enters the guarded branch.
+    #[test]
+    fn concurrent_trims_never_lose_an_appended_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 40;
+        let max_lines = 2;
+        let keep_lines = THREADS * PER_THREAD + 10;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let path = format!("t{t}-{i}.rs");
+                        append_bounded(&root, &ev("acquired", &path), max_lines, keep_lines)
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let seen: std::collections::HashSet<String> = recent(&root, THREADS * PER_THREAD + 10)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| e.path)
+            .collect();
+
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                let path = format!("t{t}-{i}.rs");
+                assert!(
+                    seen.contains(&path),
+                    "event for {path} was lost to a concurrent trim-rename race"
+                );
+            }
+        }
     }
 
     #[test]
