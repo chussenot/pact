@@ -347,17 +347,22 @@ fn main() {
             }
         }
         Err(e) => {
-            // A partially-failed `msg send` carries a structured shape a
-            // `--json` caller can act on (`already_sent`, for a `--skip`
-            // replay) instead of parsing this same fact out of prose
-            // (pact-m7j.6.5). Every other error still prints as plain text —
-            // `json_send_failure` returns `None` for anything that is not a
-            // `msg::SendFailure`.
-            match msg::json_send_failure(&e).filter(|_| json) {
-                Some(structured) => output::warn(&structured),
-                None => output::warn(&format!("error: {e:#}")),
-            }
             let code = output::code_for(&e);
+            // A `--json` caller gets a single parseable document on stdout
+            // for EVERY failing exit code (pact-m7j.5.1), not only a
+            // partially-failed `msg send`'s already-structured
+            // `already_sent`/`--skip` shape (pact-m7j.6.5) — which this
+            // still prefers verbatim over the generic fallback wherever it
+            // applies, rather than replacing it. Without `--json`, the
+            // human-readable text is unchanged and stays on stderr.
+            if json {
+                match msg::json_send_failure(&e) {
+                    Some(structured) => output::line(&structured),
+                    None => output::emit_error_json(&e, code),
+                }
+            } else {
+                output::warn(&format!("error: {e:#}"));
+            }
             if let Some(w) = repo::take_warning() {
                 output::warn(&w);
             }

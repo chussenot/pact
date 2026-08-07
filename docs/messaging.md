@@ -344,12 +344,14 @@ say, recipient 3 of 4 — an identical retry re-sends to every recipient again,
 duplicating the ones who already got it. The error already names them:
 
 ```
-$ pact msg send --to alice --to bob --to carol --json "shared decision"
+$ pact msg send --to alice --to bob --to carol "shared decision"
 error: sending to carol: 2 recipient(s) already got this (alice, bob) — replay
 with --skip for them instead of re-sending blind
 ```
 
-With `--json`, that same fact is a structured shape on stderr instead of prose:
+With `--json`, that same fact is a structured shape on **stdout** instead of
+prose on stderr (pact-m7j.5.1 widened this to every `--json` failure, not
+just this one — see [cli.md](cli.md#exit-codes)):
 
 ```json
 {

@@ -61,9 +61,16 @@ scripted caller can see whose claim a `--force` destroyed.
 
 A `msg send` to several recipients that fails partway through fails as a
 structured error under `--json` — `{"already_sent": […], "failed_at": …,
-"reason": …}` — so a retry can pass `--skip <agent>` (repeatable) for each
-already-sent name instead of duplicating delivery to them. See
+"reason": …}`, on **stdout** — so a retry can pass `--skip <agent>` (repeatable)
+for each already-sent name instead of duplicating delivery to them. See
 [messaging.md](messaging.md#replaying-a-fan-out-that-failed-partway---skip).
+
+**Every other `--json` failure gets `{"error": …, "exit_code": …}`, also on
+stdout.** Before this, a failure printed only plain text to stderr regardless
+of `--json` — so the single most routine non-zero outcome two agents
+contending on a file will ever produce (a lease conflict, exit 2) gave a
+`--json` caller an empty stdout to parse. Without `--json`, nothing changes:
+the human-readable text is unchanged and still goes to stderr.
 
 ## Exit codes
 

@@ -107,6 +107,39 @@ pub fn code_for(err: &anyhow::Error) -> i32 {
     err.downcast_ref::<ExitError>().map_or(1, |e| e.code)
 }
 
+/// A `--json` caller's error shape when no richer, purpose-built one exists
+/// at the catch site (see `msg::SendFailure` for the one case that has one).
+///
+/// AGENTS.md tells every agent to prefer `--json` over parsing human-
+/// formatted text and to branch on the exit code, not the message — but
+/// every failure used to print only to stderr as plain prose, so a `--json`
+/// caller got nothing to parse on the single most routine non-zero outcome
+/// two agents contending on a file will ever produce (pact-m7j.5.1). This is
+/// deliberately the plain `{error, exit_code}` fallback, not a per-error-kind
+/// shape: extracting structured fields (a lease conflict's holder, age,
+/// remaining) would need the conflict's own catch site to build a typed
+/// error the way `SendFailure` does, which is a larger, case-by-case
+/// commitment this fix does not make.
+#[derive(Serialize)]
+struct ErrorJson {
+    error: String,
+    exit_code: i32,
+}
+
+/// Prints `err` as the fallback JSON shape above, to stdout — the same
+/// stream a successful `--json` run uses, so a caller has exactly one place
+/// to look regardless of whether the command succeeded.
+pub fn emit_error_json(err: &anyhow::Error, code: i32) {
+    let payload = ErrorJson {
+        error: format!("{err:#}"),
+        exit_code: code,
+    };
+    match serde_json::to_string_pretty(&payload) {
+        Ok(s) => line(&s),
+        Err(e) => warn(&format!("failed to serialize error output: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

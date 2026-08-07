@@ -206,6 +206,105 @@ fn acquire_multi_path_conflict_rolls_back_leaving_no_stray_lock() {
     assert_eq!(held["agent"], "agent-a", "peer's lock was modified");
 }
 
+/// pact-m7j.5.1: AGENTS.md tells every agent to prefer `--json` over parsing
+/// human-formatted text and to branch on the exit code, not the message — but
+/// `main`'s single error handler printed only plain text to stderr on EVERY
+/// failure, `--json` or not, so a `--json` caller got an empty stdout on the
+/// single most routine non-zero outcome two agents contending on a file will
+/// ever produce. This must fail against the pre-fix binary (empty stdout).
+#[test]
+fn a_json_acquire_conflict_still_reports_a_parseable_error_on_stdout() {
+    let tmp = init_repo();
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-a",
+        &["lease", "acquire", "contended.txt"],
+    ));
+
+    let out = pact(
+        tmp.path(),
+        "agent-b",
+        &["lease", "acquire", "contended.txt", "--json"],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr_of(&out));
+    let err = json_stdout(&out);
+    assert_eq!(err["exit_code"], 2, "{err}");
+    assert!(
+        err["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("contended.txt") && s.contains("agent-a")),
+        "error text should still name the path and holder: {err}"
+    );
+}
+
+/// Same gap, `renew`'s conflict branch.
+#[test]
+fn a_json_renew_conflict_still_reports_a_parseable_error_on_stdout() {
+    let tmp = init_repo();
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-a",
+        &["lease", "acquire", "s2.txt"],
+    ));
+
+    let out = pact(
+        tmp.path(),
+        "agent-b",
+        &["lease", "renew", "s2.txt", "--json"],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr_of(&out));
+    let err = json_stdout(&out);
+    assert_eq!(err["exit_code"], 2, "{err}");
+    assert!(
+        err["error"].as_str().is_some_and(|s| s.contains("agent-a")),
+        "error text should still name the real holder: {err}"
+    );
+}
+
+/// Same gap, `release`'s conflict branch (a specific path held by another
+/// agent, no `--force`).
+#[test]
+fn a_json_release_conflict_still_reports_a_parseable_error_on_stdout() {
+    let tmp = init_repo();
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-a",
+        &["lease", "acquire", "s3.txt"],
+    ));
+
+    let out = pact(
+        tmp.path(),
+        "agent-b",
+        &["lease", "release", "s3.txt", "--json"],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr_of(&out));
+    let err = json_stdout(&out);
+    assert_eq!(err["exit_code"], 2, "{err}");
+    assert!(
+        err["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("agent-a") && s.contains("--force")),
+        "error text should still name the holder and the override: {err}"
+    );
+}
+
+/// Same gap, `find_repo_root`'s exit-4 path — shared by every subcommand, so
+/// `doctor` stands in for all of them.
+#[test]
+fn a_json_command_outside_any_git_repo_still_reports_a_parseable_error_on_stdout() {
+    let tmp = tempfile::tempdir().unwrap(); // deliberately no .git anywhere in it
+    let out = pact(tmp.path(), "agent-a", &["doctor", "--json"]);
+    assert_eq!(out.status.code(), Some(4), "stderr: {}", stderr_of(&out));
+    let err = json_stdout(&out);
+    assert_eq!(err["exit_code"], 4, "{err}");
+    assert!(
+        err["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("not in a git repository")),
+        "{err}"
+    );
+}
+
 // ------------------------------------------------------------ lease renew
 
 #[test]
@@ -3653,19 +3752,6 @@ fn pact_with_path_prefix(repo: &Path, agent: &str, args: &[&str], path_prefix: &
         .expect("failed to run pact binary")
 }
 
-/// The `--json` error object pact printed on stderr, skipping over whatever
-/// human-readable warnings (an unrecognized recipient, a collapsed duplicate)
-/// were written first — `output::warn` is one funnel for both, so a
-/// structured error is not the only thing on the stream, just the last thing.
-fn json_stderr(out: &Output) -> serde_json::Value {
-    let stderr = stderr_of(out);
-    let start = stderr
-        .find('{')
-        .unwrap_or_else(|| panic!("no JSON object on stderr: {stderr}"));
-    serde_json::from_str(&stderr[start..])
-        .unwrap_or_else(|e| panic!("stderr tail not JSON: {e}\nstderr: {stderr}"))
-}
-
 /// pact-m7j.6.5: replaying a partially-failed multi-recipient send with
 /// `--skip` for the recipients an earlier attempt's `--json` error already
 /// named as sent must not duplicate delivery to them, and must still attempt
@@ -3704,7 +3790,10 @@ fn a_partially_failed_send_replays_safely_with_skip() {
         "a partial failure is still a failure: {}",
         stderr_of(&failed)
     );
-    let err = json_stderr(&failed);
+    // pact-m7j.5.1: this JSON object is on stdout now, not stderr — every
+    // --json failure gets its structured shape on the same stream a
+    // successful --json run uses.
+    let err = json_stdout(&failed);
     let already_sent: Vec<&str> = err["already_sent"]
         .as_array()
         .unwrap_or_else(|| panic!("already_sent missing or not an array: {err}"))
