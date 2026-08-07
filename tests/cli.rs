@@ -3106,6 +3106,36 @@ fn no_backend_on_path_reports_a_check_failure_not_silence() {
     );
 }
 
+/// A repo that has never run `bd`/`br init` at all — no `.beads/`, ever — has
+/// given no signal it intends to use messaging. `lease acquire` has never
+/// depended on the messaging backend for anything else, so surfacing "could
+/// not check for pending messages" on EVERY acquire, forever, for a
+/// lease-only repo would be exactly the noise AGENTS.md's own messaging
+/// discipline warns against — for a check that could not possibly have found
+/// anything anyway. This must stay quiet even with no Beads CLI on PATH,
+/// unlike the sibling test above where `.beads/` genuinely exists.
+#[test]
+fn no_beads_directory_at_all_stays_quiet_even_with_no_backend_on_path() {
+    let tmp = init_repo();
+    assert!(
+        !tmp.path().join(".beads").exists(),
+        "test setup: a plain repo must not have .beads/"
+    );
+
+    let empty_path = tmp.path().join("no-backend-here");
+    std::fs::create_dir(&empty_path).unwrap();
+    let mut cmd = pact_cmd(tmp.path(), &["lease", "acquire", "src/x.rs"]);
+    cmd.env("PACT_AGENT", "lease-only-agent")
+        .env("PATH", &empty_path);
+    let out = cmd.output().expect("failed to run pact binary");
+    assert_ok(&out);
+    let stderr = stderr_of(&out);
+    assert!(
+        !stderr.contains("could not check"),
+        "a repo with no .beads/ at all must not warn about messaging it never set up: {stderr}"
+    );
+}
+
 /// `msg send --to-owner-of` says who the path resolved to. A resolved name
 /// looks like a delivered message and is not — one agent worked around this by
 /// hand-adding `--to human` to every send, and was the only one who thought of

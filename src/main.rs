@@ -1070,7 +1070,22 @@ enum MessageCheck {
 /// Beads CLI could even be located, which is a property of the whole call and
 /// not any one path, so that case reports once for every path named rather
 /// than repeating an identical "not found on PATH" line per path.
+///
+/// Silent (every path `Clean`) when `.beads/` does not exist at all — checked
+/// BEFORE trying to locate a backend or run anything. A repository that has
+/// never run `bd`/`br init` has given no signal it intends to use messaging,
+/// and `lease acquire` has never depended on the messaging backend for
+/// anything; surfacing "could not check for pending messages" on every single
+/// acquire, forever, for a lease-only repo would be exactly the noise
+/// AGENTS.md's own messaging discipline warns against, for a check that could
+/// not possibly have found anything anyway. Once `.beads/` exists, a failure
+/// to check IS worth surfacing (see [`MessageCheck::Failed`]) — something
+/// that was set up is now unreachable.
 fn messages_about(root: &Path, paths: &[String], agent: &str) -> Vec<MessageCheck> {
+    let shared_root = repo::RepoContext::resolve(root).shared_root;
+    if !shared_root.join(".beads").exists() {
+        return paths.iter().map(|_| MessageCheck::Clean).collect();
+    }
     let cli = match beads::BeadsCli::locate() {
         Ok(cli) => cli,
         Err(e) => {
