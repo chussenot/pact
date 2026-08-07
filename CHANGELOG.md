@@ -10,6 +10,50 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.5.2 - 2026-08-07
+#### Bug Fixes
+- **(agents_md)** CAS-guard init's writes and warn on an escaping symlink - (5d950d4) - Clement HUSSENOT-DESENONGES
+- **(audit)** sandbox experiments from real state, and annotate six contaminating events - (cc03417) - Clement HUSSENOT-DESENONGES
+- **(beads)** bound BeadsCli::run with a timeout, and serve MCP requests concurrently - (67d3871) - Clement HUSSENOT-DESENONGES
+- **(beads)** surface a conflicting store on msg commands, not doctor only - (8f19f8d) - Clement HUSSENOT-DESENONGES
+- **(beads)** bound BeadsCli::run with a timeout so a hung backend cannot hang pact - (b2bce30) - Clement HUSSENOT-DESENONGES
+- **(init)** close the read-modify-write race and warn on escaping symlinks - (3517f0e) - Clement HUSSENOT-DESENONGES
+- **(init)** refuse to write through a live lease on a managed file - (29e0bbc) - Clement HUSSENOT-DESENONGES
+- **(lease)** replace WriteGuard's staleness heuristic with a real flock - (14e0a56) - Clement HUSSENOT-DESENONGES
+- **(lease)** serialize takeovers behind a write guard, closing the double-win race - (2bebf0a) - Clement HUSSENOT-DESENONGES
+- **(mcp)** dispatch each request on its own thread so a hung Beads call cannot starve the others - (705ebd5) - Clement HUSSENOT-DESENONGES
+- **(msg)** surface a conflicting Beads store from msg and mcp, not just doctor - (649d087) - Clement HUSSENOT-DESENONGES
+- **(msg)** give bd sends a deterministic id so a retry can't duplicate - (8e15b18) - Clement HUSSENOT-DESENONGES
+- **(msg)** address to human instead of dropping a self-resolved --to-owner-of - (50fd824) - Clement HUSSENOT-DESENONGES
+- **(msg)** attribute mark-read to the reading agent, not the checkout's git user - (6d8b0b3) - Clement HUSSENOT-DESENONGES
+- **(output)** strip terminal escape sequences from all CLI-rendered text - (da1e97d) - Clement HUSSENOT-DESENONGES
+- **(output)** sanitize control characters before writing to the terminal - (7cdb250) - Clement HUSSENOT-DESENONGES
+- **(repo)** surface LocalFallback degradation from the command that hit it - (ba8e7c0) - Clement HUSSENOT-DESENONGES
+- **(repo)** surface a LocalFallback warning on the command that hit it - (f617796) - Clement HUSSENOT-DESENONGES
+- **(repo)** close two split-brain gaps in worktree lease-path identity - (19f10c3) - Clement HUSSENOT-DESENONGES
+- **(scripts)** check an anchor that starts with a hyphen - (769c170) - Clement HUSSENOT-DESENONGES
+#### Continuous Integration
+- **(canary)** assert that bd still performs no git operations in the main worktree - (fa0db29) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- **(leases)** the default TTL is measured, and say what makes it recalibratable - (bb3bb7e) - Clement HUSSENOT-DESENONGES
+- document the 5 merged P1 fixes, and fix a stale MCP tool count - (2434165) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(audit)** analyse pact's own coordination history, and detect the double-win - (836a426) - Clement HUSSENOT-DESENONGES
+- **(init)** preserve the lease audit trail — commit events.jsonl, ignore the rest - (e32b835) - Clement HUSSENOT-DESENONGES
+- **(lease)** record each lease's ttl per event, and calibrate the default from it - (3091fea) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(beads)** close the audit epic - (8f1c3cc) - Clement HUSSENOT-DESENONGES
+- **(beads)** close the sibling-worktree messaging question - (46d3cbd) - Clement HUSSENOT-DESENONGES
+- Add interactions - (ab0df70) - Clement HUSSENOT-DESENONGES
+- Add a tla+ skill - (2ec404f) - Clement HUSSENOT-DESENONGES
+- Add the interactions - (5588d05) - Clement HUSSENOT-DESENONGES
+- Add the interactions - (63a7d82) - Clement HUSSENOT-DESENONGES
+#### Tests
+- **(fleet)** soak pact's primitives at fleet concurrency without LLMs - (3c30852) - Clement HUSSENOT-DESENONGES
+- **(worktree)** stop asserting a topology message that needs a backend to exist - (d9baf1d) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.5.1 - 2026-08-04
 #### Bug Fixes
 - **(mcp)** structuredContent must be an object, not a bare array - (6fbf32b) - Clement HUSSENOT-DESENONGES
