@@ -18,7 +18,7 @@
 #![cfg(feature = "mcp")]
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::SystemTime;
@@ -456,9 +456,19 @@ fn a_parse_error_does_not_end_the_session() {
         .map(|l| serde_json::from_str(l).expect("valid JSON per line"))
         .collect();
     assert_eq!(lines.len(), 2, "{lines:#?}");
-    assert_eq!(lines[0]["error"]["code"], -32700);
-    assert_eq!(lines[0]["id"], Value::Null);
-    assert!(lines[1]["result"]["tools"].is_array());
+    // By id/null, not by position: each line runs on its own thread (see
+    // `Server::run`'s doc comment), so the two responses may legitimately
+    // land in either order.
+    let parse_error = lines
+        .iter()
+        .find(|l| l["id"] == Value::Null)
+        .unwrap_or_else(|| panic!("no null-id response: {lines:#?}"));
+    assert_eq!(parse_error["error"]["code"], -32700);
+    let tools_list = lines
+        .iter()
+        .find(|l| l["id"] == 9)
+        .unwrap_or_else(|| panic!("no response to id 9: {lines:#?}"));
+    assert!(tools_list["result"]["tools"].is_array());
 }
 
 /// Nothing may reach stdout that is not an MCP message — the transport says so
@@ -475,4 +485,122 @@ fn the_startup_banner_goes_to_stderr_not_stdout() {
         stderr.contains("read-only"),
         "the banner should say what this server is: {stderr}"
     );
+}
+
+/// The bug this file exists to guard: one hung Beads call must not starve
+/// every OTHER in-flight tool on the same `pact mcp serve` session — including
+/// `pact_lease_list`, which never touches Beads at all.
+///
+/// Deliberately does not use the `serve` helper above: that one waits for the
+/// whole process to exit (`wait_with_output`), which cannot distinguish "the
+/// second response arrived promptly while the first was still stuck" from
+/// "both eventually returned around the same bounded timeout" — exactly the
+/// distinction this test exists to make. So it reads stdout incrementally
+/// instead, the same real transport `serve()` in production reads.
+#[cfg(unix)]
+#[test]
+fn a_hung_beads_call_does_not_delay_other_in_flight_requests() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = init_repo();
+    let repo = tmp.path();
+
+    // A `.beads/` shaped as a br (SQLite) workspace, so `BeadsCli::locate`
+    // resolves to exactly one binary name with no ambiguity from a real
+    // `bd`/`br` that might also be on this machine's PATH.
+    std::fs::create_dir(repo.join(".beads")).unwrap();
+    std::fs::write(repo.join(".beads/stub.db"), b"").unwrap();
+
+    // A `br` on PATH that never exits — standing in for a wedged backend
+    // (hung on a TTY/credential prompt, an internal bug, a write lock).
+    let bin_dir = tmp.path().join("bin");
+    std::fs::create_dir(&bin_dir).unwrap();
+    let stub = bin_dir.join("br");
+    std::fs::write(&stub, "#!/bin/sh\nsleep 999999\n").unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Prepended, not replacing PATH outright: the stub's own `#!/bin/sh` needs
+    // `sleep` resolvable, and that comes from whatever PATH this test machine
+    // already has.
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pact"))
+        .args(["mcp", "serve"])
+        .current_dir(repo)
+        .env("PACT_AGENT", "observer")
+        .env("PATH", path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pact mcp serve");
+
+    // Streamed on a background thread so the test can assert on arrival
+    // timing rather than on the whole process exiting.
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        // First: a Beads-backed call that will hang behind the stub above.
+        writeln!(
+            stdin,
+            "{}",
+            call(1, "pact_msg_inbox", serde_json::json!({"agent": "someone"}))
+        )
+        .unwrap();
+        // Immediately after: a call that never touches Beads.
+        writeln!(
+            stdin,
+            "{}",
+            call(2, "pact_lease_list", serde_json::json!({}))
+        )
+        .unwrap();
+    }
+
+    // The second response must appear well within a few seconds — long before
+    // the stub could ever exit on its own (it never does) and long before
+    // `pact_msg_inbox`'s own bounded Beads timeout (default 30s) would fire.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut id_2_response = None;
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(line) => {
+                let v: Value = serde_json::from_str(&line).expect("valid JSON line");
+                if v["id"] == 2 {
+                    id_2_response = Some(v);
+                    break;
+                }
+                // id 1 is not expected within this window at all — it is
+                // parked behind the hung stub — but if it somehow arrived
+                // first that would not contradict this test either way.
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    // Clean up before asserting: the hung call is still bound by its own
+    // Beads timeout, which this test has no reason to wait out.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let id_2_response = id_2_response.unwrap_or_else(|| {
+        panic!("pact_lease_list's response never arrived while a Beads call was hung")
+    });
+    assert_eq!(id_2_response["result"]["isError"], false);
+    assert!(id_2_response["result"]["structuredContent"]["leases"].is_array());
 }
