@@ -1597,6 +1597,38 @@ pub fn corrupt_count(repo_root: &Path) -> Result<usize> {
     Ok(count)
 }
 
+/// Count leftover `staging-*`/`tmp-*` files under `.pact/leases/`: the
+/// sibling half of a crash `corrupt_count` cannot see.
+///
+/// `temp_sibling` and `write_lease_atomic` both stage their write beside the
+/// `.lock` file they are about to create/replace, then rename it into place.
+/// A crash between the write and the rename leaves the staging file behind
+/// forever — nothing ever revisits it, because `scan()` and `corrupt_count`
+/// both filter on `path.extension() == Some("lock")`, and a staging file has
+/// no `.lock` extension by construction. Surfaced here so `pact doctor` can
+/// say so instead of the directory silently accumulating debris.
+pub fn orphan_temp_count(repo_root: &Path) -> Result<usize> {
+    let leases_dir = crate::repo::pact_dir_path(repo_root).join("leases");
+    let dir = match std::fs::read_dir(&leases_dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", leases_dir.display())),
+    };
+    let mut count = 0;
+    for entry in dir {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) == Some("lock") {
+            continue;
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1771,6 +1803,29 @@ mod tests {
         // Write a second corrupt lock file.
         std::fs::write(leases_dir.join("also__rs.lock"), b"{}").unwrap();
         assert_eq!(corrupt_count(root).unwrap(), 2);
+    }
+
+    /// pact-m7j.4.1: a crash between `temp_sibling`'s write and its rename into
+    /// place leaves a `staging-*`/`tmp-*` file behind, invisible to `scan()` and
+    /// `corrupt_count` alike because neither looks past the `.lock` extension.
+    #[test]
+    fn orphan_temp_count_detects_leftover_staging_and_tmp_files() {
+        let tmp = repo();
+        let root = tmp.path();
+
+        // No leases dir yet -> 0 orphans.
+        assert_eq!(orphan_temp_count(root).unwrap(), 0);
+
+        // A real lease's `.lock` file is not an orphan.
+        claim(root, "agent-a", "good.rs");
+        assert_eq!(orphan_temp_count(root).unwrap(), 0);
+
+        let leases_dir = crate::repo::pact_dir_path(root).join("leases");
+        std::fs::write(leases_dir.join("staging-123-ThreadId(1)-999"), b"{}").unwrap();
+        assert_eq!(orphan_temp_count(root).unwrap(), 1);
+
+        std::fs::write(leases_dir.join("tmp-456-ThreadId(1)-111"), b"{}").unwrap();
+        assert_eq!(orphan_temp_count(root).unwrap(), 2);
     }
 
     fn repo() -> tempfile::TempDir {

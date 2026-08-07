@@ -133,6 +133,7 @@ here that the CLI does not emit, fails CI:
 | `Beads CLI` | which binary, which version, warning outside the tested range |
 | `stale leases` | how many, without collecting them |
 | `corrupt leases` | lock files pact cannot read, which only a human can clear |
+| `orphaned staging files` | `staging-*`/`tmp-*` debris left by a write that crashed mid-rename |
 
 Lazy-loaded like Messages (only checked once you visit the tab, or press
 `r`), since it shells out to `bd --version` the same way Messages does.
