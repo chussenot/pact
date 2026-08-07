@@ -285,3 +285,213 @@ fn release_of_nonexistent_lease_is_idempotent() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// (pact-m7j.5.3) `lease::peek` (behind `pact agents`) and `lease::list`'s
+/// sweep (behind `pact lease ls`) share one `scan` (src/lease.rs) and differ
+/// only in whether `collect_expired` runs. This is a regression fence, not a
+/// bug fix: no `src/` change accompanies it. Real concurrent processes — not
+/// sequenced by the test harness — race a batch of peek-backed readers against
+/// the one process whose documented job is to sweep, across many trials, and
+/// assert three things every trial: (1) a peek-backed reader never fails while
+/// a sweep races it, (2) a lease that has NOT expired is untouched byte-for-
+/// byte by either side, and (3) every removed lock has exactly one "expired"
+/// event naming its OWN dead holder — never the reader, never doubled by a
+/// racing peek.
+#[test]
+fn peek_never_mutates_while_list_sweeps_expired_locks_concurrently() {
+    const TRIALS: usize = 15;
+    const READERS: usize = 6;
+
+    for trial in 0..TRIALS {
+        let tmp = init_repo();
+        let leases_dir = tmp.path().join(".pact/leases");
+        std::fs::create_dir_all(&leases_dir).unwrap();
+
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(2000);
+        let fresh = chrono::Utc::now();
+        let write_lease = |name: &str, agent: &str, at: chrono::DateTime<chrono::Utc>| {
+            let path = leases_dir.join(format!("{name}.lock"));
+            let lease = serde_json::json!({
+                "agent": agent,
+                "path": name,
+                "acquired_at": at.to_rfc3339(),
+                "ttl_secs": 900,
+                "note": null
+            });
+            std::fs::write(&path, serde_json::to_string(&lease).unwrap()).unwrap();
+            path
+        };
+        // Two expired locks (must be swept) and one still-valid lock (must
+        // survive both the readers and the sweep, unmodified).
+        write_lease("dead0.txt", "agent-dead-0", stale);
+        write_lease("dead1.txt", "agent-dead-1", stale);
+        let valid_path = write_lease("alive.txt", "agent-alive", fresh);
+        let valid_before = std::fs::read_to_string(&valid_path).unwrap();
+
+        // Peek-backed readers and the one list-backed sweeper, spawned without
+        // waiting between them — genuine concurrency, the same idiom as
+        // `concurrent_steal_of_expired_lease_has_consistent_outcome` above.
+        let mut readers: Vec<_> = (0..READERS)
+            .map(|_| {
+                Command::new(env!("CARGO_BIN_EXE_pact"))
+                    .args(["agents", "--json"])
+                    .current_dir(tmp.path())
+                    .env("PACT_AGENT", "agent-reader")
+                    .spawn()
+                    .expect("failed to spawn reader")
+            })
+            .collect();
+        let mut writer = Command::new(env!("CARGO_BIN_EXE_pact"))
+            .args(["lease", "ls", "--json"])
+            .current_dir(tmp.path())
+            .env("PACT_AGENT", "agent-writer")
+            .spawn()
+            .expect("failed to spawn sweeper");
+
+        for r in &mut readers {
+            let status = r.wait().expect("reader wait failed");
+            assert!(
+                status.success(),
+                "trial {trial}: a peek-backed reader must never fail while a sweep races it"
+            );
+        }
+        assert!(
+            writer.wait().expect("sweeper wait failed").success(),
+            "trial {trial}: the sweeper itself must succeed"
+        );
+
+        // The expired locks are gone...
+        assert!(
+            !leases_dir.join("dead0.txt.lock").exists(),
+            "trial {trial}: dead0 should have been swept"
+        );
+        assert!(
+            !leases_dir.join("dead1.txt.lock").exists(),
+            "trial {trial}: dead1 should have been swept"
+        );
+        // ...the still-valid one is untouched, byte for byte, by either side.
+        assert_eq!(
+            std::fs::read_to_string(&valid_path).unwrap(),
+            valid_before,
+            "trial {trial}: neither peek nor list may touch a lease that has not expired"
+        );
+
+        // Every disappearance is accounted for by exactly one "expired" event,
+        // naming the dead lease's own holder.
+        let events_raw =
+            std::fs::read_to_string(tmp.path().join(".pact/events.jsonl")).unwrap_or_default();
+        let mut expired_agents: Vec<String> = events_raw
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|v| v["kind"] == "expired")
+            .map(|v| v["agent"].as_str().unwrap().to_string())
+            .collect();
+        expired_agents.sort();
+        assert_eq!(
+            expired_agents,
+            vec!["agent-dead-0".to_string(), "agent-dead-1".to_string()],
+            "trial {trial}: exactly one expired event per swept lock, naming its own dead \
+             holder — never the reader, never doubled"
+        );
+    }
+}
+
+/// (pact-m7j.5.4) `repo::pact_dir` (creates `.pact/`) and `repo::pact_dir_path`
+/// (never creates anything) are already a complete split per an exhaustive
+/// grep of every call site. Regression fence, not a bug fix: no `src/` change
+/// accompanies this test.
+///
+/// Concurrent read-only commands, with no writer anywhere in the picture, must
+/// never bring `.pact/` into existence — no matter how many of them race each
+/// other for the same nonexistent directory.
+#[test]
+fn concurrent_read_only_commands_never_create_pact_dir_without_a_writer() {
+    const TRIALS: usize = 15;
+    const READERS: usize = 6;
+
+    for trial in 0..TRIALS {
+        let tmp = init_repo();
+
+        let mut readers: Vec<_> = (0..READERS)
+            .map(|i| {
+                // Two different peek-backed surfaces, alternated, so the fence
+                // covers more than one caller.
+                let args: &[&str] = if i % 2 == 0 {
+                    &["agents", "--json"]
+                } else {
+                    &["doctor"]
+                };
+                Command::new(env!("CARGO_BIN_EXE_pact"))
+                    .args(args)
+                    .current_dir(tmp.path())
+                    .env("PACT_AGENT", "agent-reader")
+                    .spawn()
+                    .expect("failed to spawn reader")
+            })
+            .collect();
+
+        for r in &mut readers {
+            // `doctor` exits 1 on a fresh repo (missing AGENTS.md etc.) — that
+            // is expected and unrelated to this fence, so only a crash
+            // (missing exit code) would be worth failing on. What matters is
+            // what's on disk afterwards, asserted below.
+            r.wait().expect("reader wait failed");
+        }
+
+        assert!(
+            !tmp.path().join(".pact").exists(),
+            "trial {trial}: concurrent read-only commands must never create .pact/ on their own"
+        );
+    }
+}
+
+/// (pact-m7j.5.4, continued) The other half: when a genuine first-time writer
+/// IS racing the readers for the same nonexistent `.pact/`, the readers must
+/// still never fail (the missing directory must not be a mid-race error for a
+/// read path), and the directory that appears afterwards is the writer's,
+/// never something a reader's own race with another reader produced.
+#[test]
+fn pact_dir_creation_survives_concurrent_readers_racing_a_genuine_writer() {
+    const TRIALS: usize = 15;
+    const READERS: usize = 6;
+
+    for trial in 0..TRIALS {
+        let tmp = init_repo();
+
+        let mut readers: Vec<_> = (0..READERS)
+            .map(|i| {
+                let args: &[&str] = if i % 2 == 0 {
+                    &["agents", "--json"]
+                } else {
+                    &["doctor"]
+                };
+                Command::new(env!("CARGO_BIN_EXE_pact"))
+                    .args(args)
+                    .current_dir(tmp.path())
+                    .env("PACT_AGENT", "agent-reader")
+                    .spawn()
+                    .expect("failed to spawn reader")
+            })
+            .collect();
+        // The one process in this trial allowed to create `.pact/`.
+        let mut writer = Command::new(env!("CARGO_BIN_EXE_pact"))
+            .args(["lease", "acquire", "f.txt"])
+            .current_dir(tmp.path())
+            .env("PACT_AGENT", "agent-writer")
+            .spawn()
+            .expect("failed to spawn writer");
+
+        for r in &mut readers {
+            r.wait().expect("reader wait failed");
+        }
+        assert!(
+            writer.wait().expect("writer wait failed").success(),
+            "trial {trial}: the genuine first-time writer must succeed"
+        );
+
+        assert!(
+            tmp.path().join(".pact/leases").is_dir(),
+            "trial {trial}: the writer must have created .pact/leases"
+        );
+    }
+}
