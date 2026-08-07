@@ -169,7 +169,7 @@ what the tooling did to it, and require a quoted command as evidence.
 | [leases.md](docs/leases.md) | the lease lifecycle: TTL, grace period, steal vs. expiry, path identity |
 | [messaging.md](docs/messaging.md) | how messages map onto Beads issues, threading, read state, addressing a path |
 | [architecture.md](docs/architecture.md) | how pact, agents and Beads fit together, and the non-goals in full |
-| [mcp.md](docs/mcp.md) | the optional read-only MCP server: the five tools, and why it cannot write |
+| [mcp.md](docs/mcp.md) | the optional read-only MCP server: the six tools, and why it cannot write |
 | [tui.md](docs/tui.md) | `pact ui` — tabs, keybindings, and the `ui` build feature |
 | [telemetry.md](docs/telemetry.md) | the optional OpenTelemetry export: what leaves the machine and what never does |
 | [audit.md](docs/audit.md) | `pact audit`: what each check proves, and what it deliberately cannot see |

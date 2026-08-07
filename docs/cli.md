@@ -66,9 +66,18 @@ scripted caller can see whose claim a `--force` destroyed.
 | 0 | success |
 | 1 | generic error — and `pact audit --check …` found something (a finding is a result, not a fault) |
 | 2 | lease conflict — held by another agent, or you don't hold the one you're releasing, or `init` found one on a file it rewrites |
-| 3 | Beads CLI (`bd` or `br`) not found on `PATH` |
+| 3 | Beads backend unavailable — no `bd`/`br` on `PATH`, or one killed for running past `PACT_BEADS_TIMEOUT_SECS` |
 | 4 | not in a git repository |
 | 5 | usage error — unknown subcommand, bad or missing flag value |
+
+**3 covers both ways the backend can be absent.** A `bd` or `br` that never
+exits — wedged on a credential prompt, a backend write lock, an internal bug —
+used to hang the pact command that called it, and everything built on it,
+forever. That wait is now bounded: past `PACT_BEADS_TIMEOUT_SECS` (default 30
+seconds — `DEFAULT_BEADS_TIMEOUT_SECS` in `src/beads.rs`) the child is killed and
+the error names the variable to raise. A subprocess that never comes back is the
+same class of problem as one that was never there, so it reuses 3 rather than
+adding a code every caller would have to learn.
 
 **5 exists so that 2 means only one thing.** clap emits 2 for any usage error,
 which collided with "lease held by another agent" — and a wrapper branching on 2

@@ -422,6 +422,18 @@ a blank line, or in an indented code block, arrives as written. An all-whitespac
 is the same silent failure this whole area is about. `--body-file` and the
 positional body are mutually exclusive; clap rejects the combination.
 
+**"As written" stops at terminal control bytes.** Every line pact prints goes
+through one writer, and that writer replaces control characters with U+FFFD,
+exempting only `\n` and `\t`. A body carrying a raw ESC sequence is otherwise a
+command to whatever terminal displays it — clear the screen, move the cursor,
+rewrite the line above so a message appears to come from someone else — and that
+was reproduced, not theorised. Multi-line and tab-aligned bodies are unaffected;
+they are content, which is what the two exemptions are for. Substitution rather
+than deletion, so one character in stays one character out and text meant to
+stay apart cannot be silently joined. Lease notes, subjects and every other
+rendered field share that writer, so the narrowing is uniform: byte-faithful
+except for bytes that are terminal commands.
+
 ## Unknown recipients: warn, then send
 
 A `--to` typo used to be invisible. One message addressed to a misspelled name

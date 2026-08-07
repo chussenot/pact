@@ -95,6 +95,29 @@ The check is a peek — `init` reads the leases, it does not take one. A bounded
 rewrite-and-exit does not need a claim of its own, only the courtesy of
 honouring someone else's. `--print` writes nothing, so it is never refused.
 
+**A lease is not the only way two writers collide.** That check covers peers
+following the protocol; `init`'s own read-modify-write covered nothing. Pausing
+pact between reading `AGENTS.md` and renaming the replacement over it —
+reproduced with injected delay, not narrowed from a theory — let an ordinary
+save land in the gap and be completely discarded, with no error, no warning and
+nothing in the event log. Each of those writes is now a compare-and-swap: the
+file is re-read immediately before the rename, and if it no longer matches what
+the new content was computed from, that content is thrown away and recomputed
+against what is actually on disk. After five straight conflicts
+(`MAX_CAS_ATTEMPTS` in `src/agents_md.rs`) `init` gives up with an error naming
+the file, rather than spinning against one under constant writes.
+
+**A managed file that is a symlink out of the repository gets a warning, not a
+refusal.** `init` follows the link and writes through it — replacing the link
+with a regular file would disconnect a `CLAUDE.md` somebody deliberately pointed
+at their dotfiles. But `AGENTS.md -> ../victim.md` has exactly that shape, and
+`init` spliced the protocol block into a file outside the repo at exit 0 with
+nothing in its output saying so. Nothing distinguishes a stray `ln -s`, a bad
+merge or a restored backup from an intended dotfiles layout by location alone,
+so the only safe move is to say it out loud: the warning names both the path
+`init` was asked to write and the path it resolved to, every run. Refusing would
+break the case the symlink-following exists to support.
+
 **Use case:** you set up a new repo for multi-agent work. You run
 `pact init` once and commit the result. From then on, cloning the repo and
 pointing any agent at it is enough; re-running `pact init` after upgrading

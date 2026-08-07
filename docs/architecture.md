@@ -200,9 +200,12 @@ reimplementing):
 
 4. **Anything unparseable** — no `gitdir:` line, a pointer to nowhere, or a
    missing `commondir` on a gitdir that really is under `worktrees/` — falls back
-   to per-worktree state with a warning that `pact doctor` prints. A broken
-   `.git` file is a reason to coordinate less, never a reason for `pact lease
-   acquire` to abort in the middle of a fleet.
+   to per-worktree state with a warning, printed once on stderr by whichever
+   command hit it. A broken `.git` file is a reason to coordinate less, never a
+   reason for `pact lease acquire` to abort in the middle of a fleet — but the
+   fallback used to be announced only by a separately-run `pact doctor`, so the
+   agents being partitioned by it were told nothing by the commands doing the
+   partitioning. `doctor` still reports it as `state placement`.
 
 ### Each submodule is its own coordination space
 
@@ -531,7 +534,7 @@ humans, its exit codes are documented behavior, not incidental:
 | 0 | success |
 | 1 | generic error |
 | 2 | lease held by another agent (or you don't hold the lease you're releasing) |
-| 3 | Beads CLI (`bd` or `br`) not found on `PATH` |
+| 3 | Beads backend unavailable — no `bd`/`br` on `PATH`, or one killed for running past `PACT_BEADS_TIMEOUT_SECS` |
 | 4 | not in a git repository |
 | 5 | usage error — unknown subcommand, bad or missing flag value |
 

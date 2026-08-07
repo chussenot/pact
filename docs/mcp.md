@@ -1,7 +1,7 @@
 # MCP server (read-only)
 
 `pact mcp serve` exposes pact's **observation** surface over the Model Context
-Protocol on stdio. It answers five questions about coordination state and can
+Protocol on stdio. It answers six questions about coordination state and can
 change none of it.
 
 Off by default, twice over: it needs a build with the `mcp` feature, and even
@@ -148,6 +148,14 @@ first — is rejected outright by a client validating against the revision it
 negotiated. An object satisfies both revisions, which is why every tool returns
 one regardless of era.
 
+`pact_msg_inbox` and `pact_msg_thread` add one further key when it applies:
+`store_conflict`, carrying the same sentence `pact doctor` and `pact msg` print
+when `.beads/` holds both a bd and a br store. Simply absent when there is
+nothing to say. These two are the tools that shell out to Beads, and a model
+reading `structuredContent` has no stderr on which to notice a warning — an
+empty inbox caused by a shadowed store would otherwise look exactly like a quiet
+one.
+
 ## What a session looks like
 
 ```json
@@ -190,6 +198,14 @@ lease held:
   }
 ]
 ```
+
+**Responses are matched by `id`, not by arrival order.** Each request line is
+handled on its own thread, so a slow call no longer delays the next one. Before
+that, a single `pact_msg_inbox` blocked on a wedged Beads CLI starved every
+other in-flight call on the same long-lived session — including `pact_doctor`,
+the one an operator would reach for to diagnose exactly that. JSON-RPC keys
+responses by `id`, so out-of-order delivery is protocol-legal; a client pairing
+by position was already wrong.
 
 ## Registering it
 
@@ -283,8 +299,10 @@ condition, because those codes are pact's documented API
 ([cli.md](cli.md#exit-codes)) and an orchestrator should branch on the same
 number either way:
 
-- **exit 3** — no Beads CLI on `PATH`. Only the two message tools need `bd` or
-  `br`; leases, doctor and the event log are plain files and keep working.
+- **exit 3** — the Beads backend is unavailable: no `bd`/`br` on `PATH`, or one
+  killed for running past `PACT_BEADS_TIMEOUT_SECS`. Only the two message tools
+  need Beads at all; leases, doctor and the event log are plain files and keep
+  working — which is now true *during* a hung call as well, not only after it.
 - **exit 4** — not spawned inside a git repository. This one fails at startup,
   before any tool call.
 
@@ -309,7 +327,7 @@ exchange. The spec calls these **legacy** (`2025-11-25` and earlier) and
 | `tools/list` cacheable | no | yes (`ttlMs`, `cacheScope`) |
 
 The era is decided **per request**, because the modern revisions have no session
-for a connection-wide answer to live in. The five tools, their arguments and
+for a connection-wide answer to live in. The six tools, their arguments and
 their JSON are identical either way — all of the difference is envelope, so
 nothing you build against one era needs rewriting for the other.
 

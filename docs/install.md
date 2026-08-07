@@ -180,9 +180,20 @@ then `bd`), and if both stores are present — what one stray `br init` inside a
 alternative, always preferring `br`, would open an empty SQLite database in
 every existing `bd` repo and cheerfully report an empty inbox.
 
-Exit code `3` still means "no usable Beads CLI on `PATH`", and it now names
-*which* one to install and why the other one you already have isn't a
-substitute. Tested ranges are per backend — `bd` `1.1.0 <= v < 1.2.0`, `br`
+`pact doctor` has always warned about that second store. Every `pact msg`
+invocation now prints the same warning on stderr, and the two MCP message tools
+carry it as a `store_conflict` key. Which store gets queried is deliberately
+unchanged — the point is that an agent seeing `inbox empty` in a repo with a
+shadowed store had no hint why, and nobody runs `doctor` about an inbox that
+merely looks quiet.
+
+Exit code `3` means the Beads backend is unavailable. Usually that is no usable
+CLI on `PATH`, and the message names *which* one to install and why the other
+one you already have isn't a substitute; it is also what you get when a
+`bd`/`br` had to be killed for not exiting
+(see [cli.md](cli.md#exit-codes)).
+
+Tested ranges are per backend — `bd` `1.1.0 <= v < 1.2.0`, `br`
 `0.2.0 <= v < 0.3.0` — and outside them everything still runs while `pact
 doctor` adds a warning, since a Beads CLI that changed its output is the
 likeliest cause of a puzzling `msg` failure:
