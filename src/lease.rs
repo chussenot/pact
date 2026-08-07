@@ -365,8 +365,22 @@ fn normalize_path(repo_root: &Path, path: &str) -> String {
         (false, None) => return fold(p).to_string_lossy().into_owned(),
     };
     let folded = fold(&absolute);
+    if let Ok(stripped) = folded.strip_prefix(repo_root) {
+        return stripped.to_string_lossy().into_owned();
+    }
+    // An absolute (or `..`-escaped) path that wasn't spelled from this
+    // process's own root doesn't automatically mean it's outside the repo —
+    // it may have been typed from a *different* worktree sharing this same
+    // coordination space (pact-m7j.8.2), e.g. copy-pasted from `pact lease
+    // ls`'s WHERE output on another checkout. Try the shared coordination
+    // root next before giving up: for the common two-worktree case (typed
+    // from, or as, the main worktree) this recovers the same lock key the
+    // caller's own worktree would have produced. A path spelled from a
+    // THIRD, non-main sibling worktree still falls through unfixed — no code
+    // here enumerates every linked worktree's own checkout root.
+    let shared_root = crate::repo::RepoContext::resolve(repo_root).shared_root;
     folded
-        .strip_prefix(repo_root)
+        .strip_prefix(&shared_root)
         .unwrap_or(&folded)
         .to_string_lossy()
         .into_owned()

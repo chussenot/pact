@@ -48,6 +48,12 @@ pub enum Placement {
     /// submodule and `src/lib.rs` in the superproject are different files and
     /// must not contend for one lock.
     Submodule,
+    /// A linked worktree OF a submodule. State is shared with the submodule's
+    /// own checkout (`<submodule checkout>/.pact/`), the same relationship
+    /// `MainWorktree` has to an ordinary repository's main checkout — not
+    /// `CommonGitdir`, because the submodule's own non-bare checkout is right
+    /// there to hold state, unlike a genuinely bare repository.
+    SubmoduleWorktree,
     /// `PACT_WORKTREE_SCOPE=local` asked for per-worktree isolation.
     ScopedLocal,
     /// `PACT_STATE_DIR` pointed state somewhere explicit. For tests, the fleet
@@ -111,6 +117,7 @@ impl Placement {
             Placement::CommonGitdir => "common-gitdir",
             Placement::LocalFallback => "local-fallback",
             Placement::Submodule => "submodule",
+            Placement::SubmoduleWorktree => "submodule-worktree",
             Placement::StateDirOverride => "state-dir-override",
             Placement::ScopedLocal => "scoped-local",
         }
@@ -185,6 +192,36 @@ fn scope_is_local() -> bool {
 fn parse_gitdir_pointer(contents: &str) -> Option<&str> {
     let value = contents.lines().next()?.strip_prefix("gitdir:")?.trim();
     (!value.is_empty()).then_some(value)
+}
+
+/// A submodule's own checkout, read from `core.worktree` in the submodule's
+/// gitdir `config` file.
+///
+/// `core.worktree` is git's own first-party record of where a non-standard-
+/// location gitdir's working tree lives -- the same field git writes for
+/// every submodule gitdir and reads via `git -C <submodule> config --get
+/// core.worktree` (verified against a real `git submodule add` layout).
+/// Reading it needs no lexical reconstruction of the superproject path: a
+/// worktree-of-a-submodule's `commondir` resolves straight to this file.
+fn submodule_checkout_of(submodule_git_dir: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(submodule_git_dir.join("config")).ok()?;
+    let mut in_core = false;
+    for line in contents.lines() {
+        let line = line.trim();
+        if let Some(section) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_core = section.eq_ignore_ascii_case("core");
+            continue;
+        }
+        if !in_core {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("worktree").map(str::trim_start) {
+            if let Some(value) = value.strip_prefix('=') {
+                return Some(resolve_against(submodule_git_dir, value.trim()));
+            }
+        }
+    }
+    None
 }
 
 /// Resolve `path` against `base` when relative, and normalise it. Falls back to
@@ -383,10 +420,31 @@ impl RepoContext {
         let common_dir = resolve_against(&git_dir, &common);
 
         // The heuristic the spec of this feature names: a common dir called
-        // `.git` is inside a working tree, anything else (`repo.git`) is bare.
+        // `.git` is inside a working tree, anything else (`repo.git`) is bare
+        // -- UNLESS it's a submodule's own gitdir, which is never named `.git`
+        // by construction but has a perfectly ordinary, non-bare checkout
+        // sitting right next to it (pact-m7j.8.3: a worktree OF a submodule).
+        // Checked ahead of the bare-vs-worktree split so that case shares
+        // state with the submodule's checkout instead of landing in the
+        // common gitdir with a "no main checkout" message that does not apply.
+        let submodule_checkout = (classify_git_dir(&common_dir) == GitDirKind::Submodule)
+            .then(|| submodule_checkout_of(&common_dir))
+            .flatten()
+            .filter(|p| p.is_dir());
         let in_a_worktree = common_dir.file_name().map(|n| n == ".git").unwrap_or(false);
-        match (in_a_worktree, common_dir.parent()) {
-            (true, Some(main)) => RepoContext {
+        match (in_a_worktree, common_dir.parent(), submodule_checkout) {
+            (_, _, Some(checkout)) => RepoContext {
+                state_dir: checkout.join(".pact"),
+                shared_root: checkout,
+                git_dir,
+                worktree_root,
+                is_linked_worktree: true,
+                worktree_name,
+                has_worktrees: true,
+                placement: Placement::SubmoduleWorktree,
+                warning: None,
+            },
+            (true, Some(main), None) => RepoContext {
                 state_dir: main.join(".pact"),
                 shared_root: main.to_path_buf(),
                 git_dir,
@@ -401,7 +459,7 @@ impl RepoContext {
             // `.pact/` beside, so it goes inside the common gitdir — which every
             // worktree of the repo can already find, and which is exactly as
             // per-machine as `.pact/` is meant to be.
-            _ => RepoContext {
+            (_, _, None) => RepoContext {
                 state_dir: common_dir.join("pact"),
                 // No main worktree: nothing to point Beads at. `shared_root`
                 // stays this worktree so path handling is unaffected, and
@@ -830,6 +888,55 @@ mod tests {
             ctx.warning.is_none(),
             "bare is a supported topology, not a failure"
         );
+    }
+
+    /// A worktree OF a submodule (row 3 of `classify_git_dir`'s table) must
+    /// share state with the submodule's own checkout, read from `core.worktree`
+    /// in the submodule gitdir's `config` -- not fall into `CommonGitdir` just
+    /// because that gitdir isn't literally named `.git` (pact-m7j.8.3).
+    #[test]
+    fn a_worktree_of_a_submodule_anchors_at_the_submodules_own_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+
+        // The submodule's own checkout: a real, ordinary directory.
+        let checkout = base.join("super/vendor/lib");
+        std::fs::create_dir_all(&checkout).unwrap();
+
+        // The submodule's gitdir, named after its path -- never literally
+        // `.git`, by construction of how git names submodule gitdirs.
+        let sub_gitdir = base.join("super/.git/modules/vendor/lib");
+        std::fs::create_dir_all(&sub_gitdir).unwrap();
+        std::fs::write(
+            sub_gitdir.join("config"),
+            format!(
+                "[core]\n\trepositoryformatversion = 0\n\tworktree = {}\n",
+                checkout.display()
+            ),
+        )
+        .unwrap();
+
+        // A linked worktree OF that submodule.
+        let wt = base.join("lib-wt");
+        let wt_gitdir = sub_gitdir.join("worktrees/lib-wt");
+        std::fs::create_dir_all(&wt_gitdir).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", wt_gitdir.display()),
+        )
+        .unwrap();
+
+        let ctx = RepoContext::resolve(&wt);
+        assert_eq!(ctx.placement, Placement::SubmoduleWorktree);
+        assert!(
+            !ctx.is_bare_topology(),
+            "the submodule's checkout is real and non-bare"
+        );
+        assert_eq!(ctx.shared_root, checkout);
+        assert_eq!(ctx.state_dir, checkout.join(".pact"));
+        assert!(ctx.warning.is_none());
     }
 
     /// Every malformed form degrades to local state with a warning. None panics:

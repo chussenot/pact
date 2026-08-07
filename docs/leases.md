@@ -69,12 +69,30 @@ spelling is normalised before anything else happens:
 | `src/auth.rs` | repo root | `src/auth.rs` |
 | `auth.rs` | `src/` | `src/auth.rs` |
 | `../src/auth.rs` | `tests/` | `src/auth.rs` |
-| `/abs/repo/src/auth.rs` | anywhere | `src/auth.rs` |
+| `/abs/repo/src/auth.rs` | anywhere in that checkout | `src/auth.rs` |
+| `/abs/main/src/auth.rs` | a linked worktree of `/abs/main` | `src/auth.rs` |
 
 A relative path is resolved against your working directory, then `.` and `..`
 are folded **lexically** — never with `canonicalize()`, because leasing a file
 that does not exist yet is a documented workflow (see below) and `canonicalize`
 fails on a missing path.
+
+**Across worktrees, "however you spell it" still has a named gap.** An absolute
+path (or a `..` that escapes your checkout — the same code path, since it is
+made absolute before anything strips it) is matched against your own checkout's
+root first and, failing that, against the shared coordination root, which for a
+linked worktree is the main worktree where `.pact/` lives. Those two cover the
+spelling people actually produce: a path copied out of `lease ls`'s `WHERE`
+column, or out of a peer's message, and pasted from a different checkout. Before
+the second candidate existed, such a path matched neither, was kept whole, and
+became its own lock key — one file, two leases, both holders told they had it,
+which is the exact failure this section exists to prevent.
+
+It is not fully closed. A path spelled from a **third, non-main sibling
+worktree** still matches neither root and still splits, because nothing here
+enumerates every linked worktree's own checkout root (tracked as
+`pact-m7j.8.7`). Until it is, spell paths relative to the checkout you are
+standing in and the question does not arise.
 
 Case is folded only where the filesystem folds it. On macOS's default APFS,
 `src/auth.rs` and `src/Auth.rs` are one file and take one lease; on Linux they
@@ -87,6 +105,9 @@ Only the lock *filename* is folded. `pact lease ls` and every error message show
 the spelling you used.
 
 ### How much atomicity you actually get
+
+All of it is conditional on the two racers having agreed on the lock key: where
+the normalisation gap above bites, there is no race to win, just two locks.
 
 Claiming a **free** path is atomic in both senses that matter. The lease is
 written to a staging file first, then `hard_link`ed into place: the link is

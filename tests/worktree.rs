@@ -198,6 +198,87 @@ fn the_same_path_contends_across_worktrees_and_frees_again() {
     assert!(listed.contains("wt-auth"), "{listed}");
 }
 
+/// An absolute path spelled from the MAIN worktree's root, typed from a
+/// LINKED worktree, must still resolve to the same lock as the relative
+/// spelling — not a second, disjoint lock file for the same real file
+/// (pact-m7j.8.2). This is exactly the shape of copying an absolute path out
+/// of `pact lease ls`'s own WHERE output or a peer's message and pasting it
+/// from a different checkout.
+#[test]
+fn an_absolute_path_from_a_sibling_worktree_is_the_same_lock_as_the_relative_spelling() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+    let (_tmp, main, wt) = repo_with_worktree("feat/auth", "wt-auth");
+
+    let first = pact(
+        &main,
+        "agent-a",
+        &[
+            "lease",
+            "acquire",
+            "src/api.ts",
+            "--note",
+            "editing from main",
+        ],
+    );
+    assert!(first.status.success(), "{}", stderr(&first));
+
+    let absolute = main.join("src/api.ts");
+    let second = pact(
+        &wt,
+        "agent-b",
+        &["lease", "acquire", absolute.to_str().unwrap()],
+    );
+    assert_eq!(
+        second.status.code(),
+        Some(2),
+        "an absolute path rooted in a sibling worktree must alias the same \
+         lock as the relative spelling, not open a second one; stderr: {}",
+        stderr(&second)
+    );
+
+    // Exactly one lock file on disk, not two.
+    let lock_dir = main.join(".pact/leases");
+    assert_eq!(
+        std::fs::read_dir(&lock_dir).unwrap().count(),
+        1,
+        "expected exactly one lock under {}, got a split-brain",
+        lock_dir.display()
+    );
+}
+
+/// The `..`-relative variant of the same bug: `cwd.join()` resolves this to
+/// an absolute path rooted in the sibling worktree before the failing
+/// `strip_prefix` ever runs, so it is the identical code path, not a
+/// separate case (confirmed in the property research's Investigation Log).
+#[test]
+fn a_dotdot_relative_escape_into_a_sibling_worktree_is_the_same_lock() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+    let (_tmp, main, wt) = repo_with_worktree("feat/auth", "wt-auth");
+
+    let first = pact(&main, "agent-a", &["lease", "acquire", "src/api.ts"]);
+    assert!(first.status.success(), "{}", stderr(&first));
+
+    // wt and main are siblings under the same base dir: "../main/src/api.ts"
+    // typed from wt lexically resolves to main's src/api.ts.
+    let escape = format!(
+        "../{}/src/api.ts",
+        main.file_name().unwrap().to_str().unwrap()
+    );
+    let second = pact(&wt, "agent-b", &["lease", "acquire", &escape]);
+    assert_eq!(
+        second.status.code(),
+        Some(2),
+        "a `..`-escape into a sibling worktree must alias the same lock; stderr: {}",
+        stderr(&second)
+    );
+}
+
 /// (d) The same set of leases, seen from either checkout. A dashboard run in the
 /// wrong directory showing an empty board is the failure this prevents.
 #[test]
@@ -709,5 +790,74 @@ fn a_submodule_stays_scoped_while_superproject_worktrees_still_share() {
         board(&wt),
         board(&main),
         "the worktree sees the superproject's"
+    );
+}
+
+/// A linked worktree OF a submodule itself (row 3 of `classify_git_dir`'s
+/// table: `.../modules/vendor/lib/worktrees/wt`) must share state with the
+/// submodule's own checkout, not be stranded in the common gitdir as if the
+/// submodule were a bare repository (pact-m7j.8.3). Before the fix, both
+/// sides reported a healthy topology and each independently "won" a lease on
+/// the same file — a split-brain `doctor` never even warned about.
+#[test]
+fn a_worktree_of_a_submodule_shares_state_with_the_submodules_own_checkout() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+    let (tmp, _main, sub) = repo_with_submodule();
+    let lib_wt = tmp.path().canonicalize().unwrap().join("lib-wt");
+    git_ok(
+        &sub,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat/lib-y",
+            lib_wt.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+
+    // The submodule's own checkout claims lib.rs first.
+    let first = pact(&sub, "agent-a", &["lease", "acquire", "lib.rs"]);
+    assert!(first.status.success(), "{}", stderr(&first));
+
+    // The worktree OF that submodule must see the same lease, not open a
+    // second, disjoint one — this is the split-brain the bug reproduced.
+    let second = pact(&lib_wt, "agent-b", &["lease", "acquire", "lib.rs"]);
+    assert_eq!(
+        second.status.code(),
+        Some(2),
+        "a worktree of a submodule must share the submodule's own coordination \
+         state, not open a second board; stderr: {}",
+        stderr(&second)
+    );
+
+    // doctor must call this what it is, not "worktree of a bare repository".
+    let doc = stdout(&pact(&lib_wt, "agent-b", &["doctor"]));
+    assert!(
+        doc.contains("submodule-worktree"),
+        "expected submodule-worktree placement: {doc}"
+    );
+    assert!(
+        !doc.contains("BARE"),
+        "must not describe a submodule's worktree as bare: {doc}"
+    );
+
+    // One board, one lease, seen from either side.
+    let board = |dir: &Path| -> usize {
+        let out = stdout(&pact(dir, "x", &["lease", "ls", "--json"]));
+        serde_json::from_str::<serde_json::Value>(&out)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    assert_eq!(board(&sub), 1, "submodule's own board");
+    assert_eq!(board(&lib_wt), 1, "the worktree sees the submodule's board");
+    assert!(
+        !lib_wt.join(".pact").exists(),
+        "the worktree of the submodule must not have its own .pact/"
     );
 }

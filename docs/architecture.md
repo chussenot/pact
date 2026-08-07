@@ -169,6 +169,16 @@ reimplementing):
    - Anything else (`repo.git`) → a **bare** repository with worktrees. There is
      no checkout to sit beside, so state is anchored at `<common>/pact/` —
      `pact`, not `.pact`, since nothing there is hidden beside a working tree.
+   - Except when that common dir is a **submodule's gitdir**
+     (`<super>/.git/modules/vendor/lib`), which is never named `.git` by
+     construction and yet has a perfectly ordinary, non-bare checkout of its
+     own. Where that checkout is comes from `core.worktree` in the submodule
+     gitdir's own `config` — git's first-party record of where a gitdir outside
+     its working tree points — and state goes to `<submodule
+     checkout>/.pact/`, the same relationship a linked worktree has to a main
+     checkout. Checked *before* the name heuristic, because the name heuristic
+     gets this one wrong in the dangerous direction — see
+     [below](#each-submodule-is-its-own-coordination-space).
 3. **The gitdir path says which kind of `.git` file it is**, and it has to be
    consulted before `commondir`. A **submodule** also has a `.git` file, pointing
    at `<super>/.git/modules/<path>` — and a submodule gitdir has no `commondir`,
@@ -205,11 +215,24 @@ no `branch`/`worktree` stamps, and lock files byte-identical to any ordinary
 checkout's. `pact doctor` reports `state placement: submodule` as an ok — not a
 warning, because nothing is wrong.
 
-Worktrees *of* a submodule share with each other, under the submodule's gitdir.
+A worktree *of* a submodule joins that submodule's coordination space: same
+`<submodule>/.pact/`, same board, and `pact msg` works there normally, rooted at
+the submodule's checkout. `pact doctor` reports `state placement:
+submodule-worktree`.
+
+It used to report `common-gitdir` and describe the checkout as a "worktree of a
+BARE repository", because the submodule's gitdir is not named `.git` and so fell
+through the bare branch. The wording was the smaller half of the problem: the
+submodule's own checkout did *not* join, so it and its worktree each kept a
+separate `.pact/`, each independently granted a lease on the same file, and
+`doctor` called both sides healthy — a split-brain with no warning anywhere,
+which is the one outcome an advisory lock must never produce. Messaging was
+refused there too, with advice ("add a normal worktree, or use a non-bare
+clone") aimed at a bare repository that was never involved.
 
 ### Known limits of the resolution chain
 
-None of these is worth code; all are worth knowing.
+All are worth knowing. Only the last one is worth code, and it is filed.
 
 - **Mixed scope is invisible across processes.** `PACT_WORKTREE_SCOPE=local` in
   one agent's environment silently partitions it from siblings that believe they
@@ -224,12 +247,13 @@ None of these is worth code; all are worth knowing.
   worktree at `…/foo`. Pathological, and not worth code to detect.
 - **A worktree literally named `modules`** (`.git/worktrees/modules`) classifies as
   a submodule, because the marker scan is lexical. Equally pathological.
-- **A worktree of a submodule reports the bare-repository wording.** Its common
-  dir is the module directory, which is not named `.git`, so it takes the
-  `common-gitdir` branch and `doctor` says "worktree of a BARE repository". The
-  *placement* is right — all worktrees of that submodule share
-  `<module-dir>/pact/` — but the explanation names the wrong reason, and that
-  submodule's own main checkout does not join them.
+- **An absolute path spelled from a third worktree still splits its lease.**
+  Lock keys are repo-root-relative, and an absolute path is matched against your
+  own checkout's root and then the shared coordination root. A path typed from
+  some *other* linked worktree matches neither, so it keys its own lock: one
+  file, two leases. The common two-worktree case is covered; enumerating every
+  sibling's checkout root to close the rest is `pact-m7j.8.7`. See
+  [leases.md](leases.md#one-file-is-one-lease-however-you-spell-the-path).
 
 Every one of those decisions is reported by `pact doctor` (`worktree`,
 `coordination scope`, `state placement`, `state dir writable`), because a

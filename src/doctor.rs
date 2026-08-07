@@ -419,6 +419,15 @@ fn worktree_checks(ctx: &repo::RepoContext, checks: &mut Vec<DoctorCheck>) {
                 ctx.placement.as_str(),
                 ctx.state_dir.display()
             ),
+            // Not `CommonGitdir`: the submodule's own checkout is a real,
+            // non-bare working tree, so unlike a genuinely bare repo's
+            // worktree there IS a main checkout to hold state and run Beads.
+            repo::Placement::SubmoduleWorktree => format!(
+                "{} — a linked worktree of a submodule; state is shared with that submodule's own \
+                 checkout at {}, the same relationship an ordinary worktree has to its main checkout.",
+                ctx.placement.as_str(),
+                ctx.shared_root.display()
+            ),
             repo::Placement::LocalFallback => format!(
                 "{} — could not follow this worktree's .git; state is local at {}",
                 ctx.placement.as_str(),
