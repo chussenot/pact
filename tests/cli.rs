@@ -2613,6 +2613,70 @@ fn a_message_about_a_path_is_delivered_to_whoever_leases_it_next() {
     );
 }
 
+/// pact-m7j.4.7: `about_path` used to fetch every message bead in the repo and
+/// filter client-side for the one label it wanted. Proves the end behaviour
+/// survives a store with plenty of unrelated traffic: the one message about
+/// the target path is still the only one surfaced, regardless of how much
+/// noise sits alongside it.
+#[test]
+fn about_path_surfaces_only_the_message_about_the_target_path_among_unrelated_traffic() {
+    let Some(tmp) = bd_repo("about_path_surfaces_only_the_message_about_the_target_path") else {
+        return;
+    };
+
+    // N messages with nothing to do with the target path.
+    for i in 0..5 {
+        assert_ok(&pact(
+            tmp.path(),
+            "chatter",
+            &[
+                "msg",
+                "send",
+                "--to",
+                &format!("bystander-{i}"),
+                &format!("unrelated chatter number {i}"),
+            ],
+        ));
+    }
+
+    // The one message that IS about the target path.
+    assert_ok(&pact(
+        tmp.path(),
+        "owner-agent",
+        &["lease", "acquire", "src/target.rs"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "owner-agent",
+        &["lease", "release", "--all"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "second-agent",
+        &[
+            "msg",
+            "send",
+            "--to-owner-of",
+            "src/target.rs",
+            "--subject",
+            "the one that matters",
+            "body",
+        ],
+    ));
+
+    let out = pact(
+        tmp.path(),
+        "third-agent",
+        &["lease", "acquire", "src/target.rs"],
+    );
+    assert_ok(&out);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("1 unread message") && stderr.contains("the one that matters"),
+        "must surface exactly the one message about this path, not the unrelated noise: {stderr}"
+    );
+}
+
 /// Advisory, and quiet when it has nothing to say: a path with no messages
 /// about it must not grow a line, or the signal is lost in ceremony.
 #[test]
