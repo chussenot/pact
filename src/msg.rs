@@ -47,11 +47,16 @@
 //!   returns a bare array — hence [`parse_issues`] accepts either.
 //! - `br list --json` omits `parent`, and `br list` has no `--parent` filter, so
 //!   neither the thread column nor `read_thread`'s reply fetch can come from it.
-//!   `br show <id>… --json` *does* carry `parent`, and a root's `dependents`
-//!   name its children as `parent-child` edges. So on br every listing is
-//!   `list` (for the ids) followed by one `show` (for the records): two
-//!   subprocesses instead of one, in exchange for the same data bd gives, from
-//!   the backend itself rather than from guessing at br's `<id>.<n>` id shape.
+//!   `br show <id>… --json` *does* carry `parent`, so a thread's root is found
+//!   the same way bd finds it. Its replies are NOT read from that same `show`
+//!   response's `dependents` field, though — that field is a snapshot from
+//!   whenever the root was fetched, and a reply created after the fetch stayed
+//!   invisible until something re-fetched the root (pact-m7j.6.1). `br dep list
+//!   <root> --direction up --json` answers the same question as its own fresh
+//!   query, so it is asked every time — one extra subprocess (`dep list` for
+//!   the ids, `show` for the records) in exchange for the same data bd gives,
+//!   from the backend itself rather than from guessing at br's `<id>.<n>` id
+//!   shape.
 
 use std::cmp::Ordering;
 use std::path::Path;
@@ -130,18 +135,17 @@ struct BdIssue {
     /// rather than a `#[serde(default)] Vec` (which would fail on null).
     #[serde(default)]
     labels: Option<Vec<String>>,
-    /// br only, and only from `show`: the beads that point *at* this one. br has
-    /// no `list --parent`, so this is how a thread's replies are found there.
-    #[serde(default)]
-    dependents: Option<Vec<DepRef>>,
 }
 
-/// One edge out of br's `show --json`. bd never emits these; the field is
-/// absent and stays `None`.
+/// One edge from br's `dep list --direction up --json` — the beads that point
+/// *at* the queried one. Field names differ from `show`'s own embedded
+/// `dependents` (`id`/`dependency_type`): `dep list` calls the same two things
+/// `issue_id`/`type` (confirmed against a real `br dep list`, pact-m7j.6.1).
+/// bd never emits these.
 #[derive(Debug, Deserialize)]
-struct DepRef {
-    id: String,
-    #[serde(default)]
+struct DepListItem {
+    issue_id: String,
+    #[serde(default, rename = "type")]
     dependency_type: String,
 }
 
@@ -751,10 +755,13 @@ pub fn read_thread(
 
 /// The direct replies to `root`, unfiltered by type.
 ///
-/// bd answers this with `list --parent=<id>`. br has no such filter, but its
-/// `show --json` already told us the answer: `dependents` names every bead
-/// hanging off this one, and `parent-child` is the edge `create --parent` makes.
-/// So br needs no extra query to find the children, only one to hydrate them.
+/// bd answers this with a fresh `list --parent=<id>` every time. br has no such
+/// filter; this used to read `show --json`'s own `dependents` field instead —
+/// but that field is a snapshot from whenever `root` was fetched, so a reply
+/// created after that fetch stayed invisible until something re-fetched the
+/// root (pact-m7j.6.1). `br dep list <root> --direction up --json` is br's own
+/// fresh query for exactly this edge, so it is asked here every time, the same
+/// way the bd branch already asks `list --parent=` every time.
 fn replies_of(cli: &BeadsCli, repo_root: &Path, root: &BdIssue) -> Result<Vec<BdIssue>> {
     if !cli.is_br() {
         let parent_arg = format!("--parent={}", root.id);
@@ -764,7 +771,11 @@ fn replies_of(cli: &BeadsCli, repo_root: &Path, root: &BdIssue) -> Result<Vec<Bd
         )?;
         return parse_issues(&out, cli);
     }
-    let children = child_ids(root);
+    let out = cli.run(
+        repo_root,
+        &["dep", "list", &root.id, "--direction", "up", "--json"],
+    )?;
+    let children = parse_child_ids(&out, cli)?;
     if children.is_empty() {
         return Ok(Vec::new());
     }
@@ -772,16 +783,17 @@ fn replies_of(cli: &BeadsCli, repo_root: &Path, root: &BdIssue) -> Result<Vec<Bd
     show_many(cli, repo_root, &ids)
 }
 
-/// br's `parent-child` dependents, in the order br listed them. Any other edge
-/// type (`blocks`, `related`) is a real dependency, not a reply, and must not
-/// be dragged into a conversation.
-fn child_ids(root: &BdIssue) -> Vec<String> {
-    root.dependents
-        .iter()
-        .flatten()
+/// `dep list --direction up --json` -> the ids of `parent-child` edges only, in
+/// the order br listed them. Any other edge type (`blocks`, `related`) is a
+/// real dependency, not a reply, and must not be dragged into a conversation.
+fn parse_child_ids(stdout: &str, cli: &BeadsCli) -> Result<Vec<String>> {
+    let items: Vec<DepListItem> = serde_json::from_str(stdout)
+        .with_context(|| format!("parsing `{} dep list --json` output", cli.binary()))?;
+    Ok(items
+        .into_iter()
         .filter(|d| d.dependency_type == "parent-child")
-        .map(|d| d.id.clone())
-        .collect()
+        .map(|d| d.issue_id)
+        .collect())
 }
 
 /// The one place the `read-by-` label is spelled for writing; `into_message`
@@ -1024,6 +1036,115 @@ mod tests {
     /// they still assert the same thing about the same bytes.
     fn parse_messages(stdout: &str, viewer: Option<&str>) -> Result<Vec<Message>> {
         Ok(to_messages(parse_issues(stdout, &bd())?, viewer))
+    }
+
+    /// A real `br`-initialised repo, for the one test (pact-m7j.6.1) that needs
+    /// actual replies fetched over a live subprocess rather than a JSON
+    /// fixture — `replies_of` and `thread_root` are private, so `tests/cli.rs`
+    /// (which only sees the compiled binary) cannot reach them directly.
+    /// Mirrors `tests/cli.rs`'s `beads_repo`: skip with a reason on stderr
+    /// rather than failing the whole file when `br` is not on PATH.
+    fn br_test_workspace(test: &str) -> Option<tempfile::TempDir> {
+        let on_path = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).any(|d| d.join("br").is_file()))
+            .unwrap_or(false);
+        if !on_path {
+            eprintln!("SKIP {test}: br not found on PATH");
+            return None;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let setup: [&[&str]; 4] = [
+            &["git", "init", "-q", "."],
+            &["git", "config", "user.email", "tests@pact.invalid"],
+            &["git", "config", "user.name", "pact tests"],
+            &["br", "init"],
+        ];
+        for cmd in setup {
+            match std::process::Command::new(cmd[0])
+                .args(&cmd[1..])
+                .current_dir(tmp.path())
+                .output()
+            {
+                Ok(o) if o.status.success() => {}
+                _ => {
+                    eprintln!("SKIP {test}: `{}` failed", cmd.join(" "));
+                    return None;
+                }
+            }
+        }
+        Some(tmp)
+    }
+
+    /// pact-m7j.6.1: `replies_of`'s br branch used to answer from `root`'s own
+    /// `dependents` field — a snapshot from whenever `root` was fetched — so a
+    /// reply created after that fetch stayed invisible to any caller still
+    /// holding the old `root` value. `gather_thread` itself never reuses a
+    /// `root` across two `replies_of` calls (it re-fetches at the top of every
+    /// call, which is why this cannot be reproduced by calling `msg read`
+    /// twice from the shell — confirmed against real `br` 0.2.19), but nothing
+    /// stopped a caller that fetches `root` once from asking twice, and that is
+    /// exactly the shape this test drives directly against the two private
+    /// functions involved.
+    ///
+    /// Causality: with the old code (`child_ids(root)` reading `root.dependents`)
+    /// the second call below returns 1, matching what existed when `root` was
+    /// fetched; with the fix (a fresh `dep list` every call) it returns 2.
+    #[test]
+    fn br_replies_are_queried_fresh_not_read_from_a_stale_root_snapshot() {
+        let Some(tmp) =
+            br_test_workspace("br_replies_are_queried_fresh_not_read_from_a_stale_root_snapshot")
+        else {
+            return;
+        };
+        let cli = br();
+        let root = create(
+            &cli,
+            tmp.path(),
+            "alpha",
+            "bravo",
+            None,
+            "root",
+            "root body",
+        )
+        .expect("create root");
+        create(
+            &cli,
+            tmp.path(),
+            "bravo",
+            "alpha",
+            Some(&root.id),
+            "root",
+            "reply one",
+        )
+        .expect("create reply1");
+
+        // Fetched BEFORE reply2 exists — this is the "earlier show call"
+        // snapshot the bug held onto.
+        let stale_root = thread_root(&cli, tmp.path(), &root.id).expect("thread_root");
+        assert_eq!(
+            replies_of(&cli, tmp.path(), &stale_root).unwrap().len(),
+            1,
+            "only reply1 exists so far"
+        );
+
+        create(
+            &cli,
+            tmp.path(),
+            "bravo",
+            "alpha",
+            Some(&root.id),
+            "root",
+            "reply two",
+        )
+        .expect("create reply2");
+
+        // Same `stale_root` value, reused rather than re-fetched.
+        let replies = replies_of(&cli, tmp.path(), &stale_root).expect("replies_of");
+        assert_eq!(
+            replies.len(),
+            2,
+            "a reply created after root was fetched must still show up: {replies:?}"
+        );
     }
 
     #[test]
@@ -1478,28 +1599,28 @@ mod tests {
         assert_eq!(parse_issues(LIST_JSON, &bd()).unwrap().len(), 4);
     }
 
-    /// pact-l94: br has no `list --parent`, so replies come from the root's
-    /// `dependents`. JSON copied from a real `br show <root> --json`.
+    /// pact-l94/pact-m7j.6.1: br has no `list --parent`, so replies come from
+    /// a fresh `dep list <root> --direction up --json` query — not from
+    /// `show`'s own `dependents` snapshot (see `replies_of`'s doc comment for
+    /// why). JSON copied from a real `br dep list --direction up --json`.
     #[test]
-    fn br_finds_thread_replies_in_the_roots_parent_child_edges() {
-        let root = issue(
-            r#"{"id":"brlab-udp","title":"hello","assignee":"br-dev",
-                "created_at":"2026-08-02T07:23:58Z","issue_type":"message",
-                "dependents":[
-                  {"id":"brlab-udp.1","title":"reply","dependency_type":"parent-child"},
-                  {"id":"brlab-udp.2","title":"r2","dependency_type":"parent-child"},
-                  {"id":"brlab-zzz","title":"a real blocker","dependency_type":"blocks"}
-                ]}"#,
+    fn br_dep_list_parses_parent_child_edges_and_ignores_the_rest() {
+        const DEP_LIST_JSON: &str = r#"[
+          {"issue_id":"brlab-udp.2","depends_on_id":"brlab-udp","type":"parent-child",
+           "title":"r2","status":"open","priority":2},
+          {"issue_id":"brlab-udp.1","depends_on_id":"brlab-udp","type":"parent-child",
+           "title":"reply","status":"open","priority":2},
+          {"issue_id":"brlab-zzz","depends_on_id":"brlab-udp","type":"blocks",
+           "title":"a real blocker","status":"open","priority":2}
+        ]"#;
+        assert_eq!(
+            parse_child_ids(DEP_LIST_JSON, &br()).unwrap(),
+            ["brlab-udp.2", "brlab-udp.1"],
+            "the blocks edge must not be dragged into the conversation"
         );
-        assert_eq!(child_ids(&root), ["brlab-udp.1", "brlab-udp.2"]);
 
-        // A root with no replies, and bd's shape (no `dependents` key at all),
-        // both mean "no children" rather than a parse failure.
-        let lonely = issue(
-            r#"{"id":"brlab-lfx","title":"t2","assignee":"peer",
-                "created_at":"2026-08-02T07:25:23Z","issue_type":"message"}"#,
-        );
-        assert!(child_ids(&lonely).is_empty());
+        // No replies at all: an empty array, not a parse failure.
+        assert!(parse_child_ids("[]", &br()).unwrap().is_empty());
     }
 
     /// pact-aw7.4: the counter that says whether the fleet adopted

@@ -168,7 +168,7 @@ running `br` 0.2.19, not inferred from bd's documentation.
 | list message beads | `list --include-infra --json` | `list --json --type=message` |
 | don't inherit read labels | `--no-inherit-labels` | flag rejected, and unnecessary |
 | shape of `list --json` | a bare array | `{"issues": […], "total": …}` |
-| a message's replies | `list --parent=<id> --include-infra --json` | the root's `parent-child` `dependents` |
+| a message's replies | `list --parent=<id> --include-infra --json` | `dep list <root> --direction up --json` |
 | survive a retried send | `--id=<content hash>` + `--force` on a thread root | no primitive at all — retries still duplicate |
 
 Two of those are worth more than a table row:
@@ -181,10 +181,14 @@ Two of those are worth more than a table row:
 - **`br list` omits `parent` and has no `--parent` filter**, which is the one
   divergence that could have shipped as a quietly half-broken inbox: every reply
   would report itself as its own thread root, and `msg read` would find no
-  replies. `br show --json` does carry `parent`, and a root's `dependents` name
-  its children as `parent-child` edges. So on br every listing is a `list` for
-  the ids plus one `show` to hydrate the records — two subprocesses, but
-  authoritative data. The alternative, deriving parents from br's `<id>.<n>` id
+  replies. `br show --json` does carry `parent`, so a thread's root is found the
+  same way it is on bd. Its replies are a separate, fresh `dep list <root>
+  --direction up --json` query every time — not `show`'s own `dependents`
+  field, which is a snapshot from whenever the root was fetched and stayed
+  wrong about a reply created after that fetch until something re-fetched the
+  root (`pact-m7j.6.1`). So on br every listing is one query for the ids
+  (`dep list`) plus one `show` to hydrate the records — two subprocesses, but
+  always current. The alternative, deriving parents from br's `<id>.<n>` id
   shape, would be pact guessing at another tool's id format.
 
 The retry row is the newest divergence, and the only one where br is left
