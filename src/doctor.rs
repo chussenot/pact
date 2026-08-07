@@ -305,6 +305,37 @@ pub fn checks(root: &Path) -> DoctorReport {
         }),
     }
 
+    // A crash between `temp_sibling`'s write and its rename into place leaves
+    // a `staging-*`/`tmp-*` file behind that `corrupt leases` above cannot
+    // see — that check only looks at `.lock` files, and these never got that
+    // extension in the first place. Same shape as `corrupt leases` because
+    // it is the same kind of debris: not an active hold, but noise nothing
+    // else will ever surface.
+    match lease::orphan_temp_count(root) {
+        Ok(0) => checks.push(DoctorCheck {
+            name: "orphaned staging files",
+            ok: true,
+            warn: false,
+            detail: "none".to_string(),
+        }),
+        Ok(n) => checks.push(DoctorCheck {
+            name: "orphaned staging files",
+            ok: false,
+            warn: false,
+            detail: format!(
+                "{n} leftover staging file{} from an interrupted write (remove manually from \
+                 .pact/leases/)",
+                if n == 1 { "" } else { "s" }
+            ),
+        }),
+        Err(e) => checks.push(DoctorCheck {
+            name: "orphaned staging files",
+            ok: false,
+            warn: false,
+            detail: format!("{e:#}"),
+        }),
+    }
+
     let healthy = checks.iter().all(|c| c.ok);
     export(&checks);
     DoctorReport { healthy, checks }
@@ -707,6 +738,33 @@ mod tests {
             .expect("doctor must say whether telemetry is actually exporting");
         assert!(c.ok, "an otel check must not move doctor's exit code");
         assert!(!c.detail.is_empty());
+    }
+
+    /// pact-m7j.4.1: a crash between a lease write's staging file and its
+    /// rename into place left `staging-*`/`tmp-*` debris in `.pact/leases/`
+    /// that the `corrupt leases` check cannot see (it only looks at `.lock`
+    /// files) and nothing else ever revisits.
+    #[test]
+    fn doctor_surfaces_orphaned_staging_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let leases_dir = repo::pact_dir_path(root).join("leases");
+        std::fs::create_dir_all(&leases_dir).unwrap();
+        std::fs::write(leases_dir.join("staging-1-ThreadId(1)-1"), b"{}").unwrap();
+        std::fs::write(leases_dir.join("tmp-2-ThreadId(1)-2"), b"{}").unwrap();
+
+        let report = checks(root);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "orphaned staging files")
+            .expect("doctor must report orphaned staging files");
+        assert!(
+            !c.ok,
+            "two leftover staging files must not pass: {}",
+            c.detail
+        );
+        assert!(c.detail.contains('2'), "{}", c.detail);
     }
 
     fn check(ok: bool, warn: bool) -> DoctorCheck {

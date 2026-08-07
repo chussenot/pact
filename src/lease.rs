@@ -1101,6 +1101,30 @@ fn acquire_inner(
 
     match claimed {
         Ok(()) => {
+            // pact-m7j.9.1: an empty `.pact/leases/` — a fresh clone, or the
+            // very recovery `pact doctor` prescribes for a corrupt lock —
+            // looks identical, locally, to a path nobody has ever touched.
+            // But the SHARED `events.jsonl` might still show a prior
+            // "acquired" for this path with no later released/expired/
+            // stolen/force-released row: a claim nothing ever closed out.
+            // Cheap because it reuses the same log scan `events::owner_of`
+            // already does (bounded to events.jsonl's own line cap), not
+            // `audit::reconstruct`'s full-log walk, which answers a broader
+            // question at a much higher cost. A warning, not a refusal — a
+            // doctor-prescribed manual `leases/` wipe produces this exact
+            // shape and is a legitimate recovery, so blocking here would
+            // misfire on precisely the case doctor tells people to run.
+            if let Ok(Some(prior)) = events::owner_of(repo_root, &relative) {
+                if prior.kind == "acquired" {
+                    crate::output::warn(&format!(
+                        "warning: the shared event log's last word on {relative} is an \
+                         unresolved acquire by {} at {} (no later release/expiry/steal on \
+                         record) — .pact/leases/ has no matching lock locally, so this acquire \
+                         is proceeding, but that prior claim was never closed out",
+                        prior.agent, prior.at
+                    ));
+                }
+            }
             log_event(
                 repo_root,
                 agent,
@@ -1121,7 +1145,41 @@ fn acquire_inner(
             // through the write that acts on that decision, so a second racer
             // can never read the same pre-mutation `existing` we did.
             let _guard = WriteGuard::acquire(&lock_path)?;
-            let existing = read_lease(&lock_path)?;
+            let existing = match read_lease(&lock_path) {
+                Ok(existing) => existing,
+                // A lock file whose JSON cannot be parsed used to fail EVERY
+                // acquire attempt here, `--steal` included — even though
+                // overriding a problematic existing claim is the entire
+                // reason `--steal` exists. Ownership cannot be determined
+                // from unparsable content, so treat it the same as an
+                // expired lease: reclaimable, but only under `--steal`,
+                // which is the caller explicitly asking to override
+                // whatever is there.
+                Err(read_err) if steal => {
+                    crate::output::warn(&format!(
+                        "warning: lock file for {relative} is corrupt ({read_err:#}); \
+                         recovering it via --steal"
+                    ));
+                    write_lease_atomic(&lock_path, &new_lease)?;
+                    verify_own_lease(&lock_path, agent)?;
+                    log_event(
+                        repo_root,
+                        agent,
+                        "stolen",
+                        &relative,
+                        Some(format!(
+                            "recovered a corrupt lock file via --steal ({read_err:#})"
+                        )),
+                        new_lease.ttl_secs,
+                    );
+                    count_transition("stolen");
+                    return Ok(AcquireOutcome {
+                        lease: new_lease,
+                        stolen: true,
+                    });
+                }
+                Err(read_err) => return Err(read_err),
+            };
 
             if is_expired(&existing, now) {
                 write_lease_atomic(&lock_path, &new_lease)?;
@@ -1411,7 +1469,56 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
         Ok(lease) => lease,
         // Released by a peer while we waited for the guard.
         Err(_) if !lock_path.exists() => return Ok(None),
-        Err(e) => return Err(e),
+        // Corrupt content means ownership cannot be checked (`existing.agent
+        // == agent` below has no `existing.agent` to compare), so a plain
+        // release must refuse rather than guess. `--force` is the same
+        // override lever every other conflict in this function already uses,
+        // not a new concept (pact-m7j.4.2).
+        Err(e) if !force => {
+            count_transition("conflicted");
+            sp.fail("corrupt");
+            return Err(exit_with(
+                2,
+                format!(
+                    "lock file for {relative} is corrupt and its holder cannot be verified \
+                     ({e:#}); use --force to remove it"
+                ),
+            ));
+        }
+        Err(e) => {
+            crate::output::warn(&format!(
+                "warning: force-removing corrupt lock file for {relative} ({e:#}); its holder \
+                 could not be verified, so no one is named as displaced"
+            ));
+            match std::fs::remove_file(&lock_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("removing {}", lock_path.display()));
+                }
+            }
+            // Not `log_event`: its `ttl_secs: u64` would have to invent a
+            // number for a lease whose real TTL was never readable, and
+            // `Event::ttl_secs` exists specifically so "unknown" can be
+            // represented as `None` rather than a fabricated value (see its
+            // doc comment). `--force` removed *something*, but no agent name
+            // survives to report as displaced.
+            events::append(
+                repo_root,
+                &events::Event {
+                    at: Utc::now().to_rfc3339(),
+                    agent: agent.to_string(),
+                    kind: "force-released".to_string(),
+                    path: Some(relative.clone()),
+                    detail: Some(format!("removed a corrupt lock file via --force ({e:#})")),
+                    ttl_secs: None,
+                    covers_lines: None,
+                    actor: None,
+                },
+            );
+            count_transition("force_released");
+            return Ok(None);
+        }
     };
 
     let displaced = if existing.agent == agent {
@@ -1581,7 +1688,19 @@ fn renew_fs(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
     // never received it, so a concurrent steal's write could land between this
     // read and the write below with nothing to catch it.
     let _guard = WriteGuard::acquire(&lock_path)?;
-    let existing = read_lease(&lock_path)?;
+    let existing = read_lease(&lock_path).map_err(|e| {
+        // Ownership can't be checked from unparsable content, so renewing it
+        // is not safe — but the error must point somewhere, not just repeat
+        // `serde_json`'s parse failure back at the caller. `--steal` is
+        // exactly the recovery path built for a corrupt lock (pact-m7j.4.2).
+        exit_with(
+            1,
+            format!(
+                "lock file for {relative} is corrupt and cannot be renewed ({e:#}); \
+                 use `pact lease acquire {relative} --steal` to recover it"
+            ),
+        )
+    })?;
     if existing.agent != agent {
         count_transition("conflicted");
         return Err(exit_with(
@@ -1744,6 +1863,38 @@ pub fn corrupt_count(repo_root: &Path) -> Result<usize> {
         if serde_json::from_str::<LeaseInfo>(&contents).is_err() {
             count += 1;
         }
+    }
+    Ok(count)
+}
+
+/// Count leftover `staging-*`/`tmp-*` files under `.pact/leases/`: the
+/// sibling half of a crash `corrupt_count` cannot see.
+///
+/// `temp_sibling` and `write_lease_atomic` both stage their write beside the
+/// `.lock` file they are about to create/replace, then rename it into place.
+/// A crash between the write and the rename leaves the staging file behind
+/// forever — nothing ever revisits it, because `scan()` and `corrupt_count`
+/// both filter on `path.extension() == Some("lock")`, and a staging file has
+/// no `.lock` extension by construction. Surfaced here so `pact doctor` can
+/// say so instead of the directory silently accumulating debris.
+pub fn orphan_temp_count(repo_root: &Path) -> Result<usize> {
+    let leases_dir = crate::repo::pact_dir_path(repo_root).join("leases");
+    let dir = match std::fs::read_dir(&leases_dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", leases_dir.display())),
+    };
+    let mut count = 0;
+    for entry in dir {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) == Some("lock") {
+            continue;
+        }
+        count += 1;
     }
     Ok(count)
 }
@@ -1949,6 +2100,29 @@ mod tests {
         // Write a second corrupt lock file.
         std::fs::write(leases_dir.join("also__rs.lock"), b"{}").unwrap();
         assert_eq!(corrupt_count(root).unwrap(), 2);
+    }
+
+    /// pact-m7j.4.1: a crash between `temp_sibling`'s write and its rename into
+    /// place leaves a `staging-*`/`tmp-*` file behind, invisible to `scan()` and
+    /// `corrupt_count` alike because neither looks past the `.lock` extension.
+    #[test]
+    fn orphan_temp_count_detects_leftover_staging_and_tmp_files() {
+        let tmp = repo();
+        let root = tmp.path();
+
+        // No leases dir yet -> 0 orphans.
+        assert_eq!(orphan_temp_count(root).unwrap(), 0);
+
+        // A real lease's `.lock` file is not an orphan.
+        claim(root, "agent-a", "good.rs");
+        assert_eq!(orphan_temp_count(root).unwrap(), 0);
+
+        let leases_dir = crate::repo::pact_dir_path(root).join("leases");
+        std::fs::write(leases_dir.join("staging-123-ThreadId(1)-999"), b"{}").unwrap();
+        assert_eq!(orphan_temp_count(root).unwrap(), 1);
+
+        std::fs::write(leases_dir.join("tmp-456-ThreadId(1)-111"), b"{}").unwrap();
+        assert_eq!(orphan_temp_count(root).unwrap(), 2);
     }
 
     fn repo() -> tempfile::TempDir {

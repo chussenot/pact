@@ -358,6 +358,171 @@ fn release_all_of_only_expired_leases_says_it_held_none() {
     assert!(!lock_path(tmp.path(), "old.txt").exists());
 }
 
+// ------------------------------------------------ corrupt lock recovery
+
+/// pact-m7j.4.2: a lock file whose JSON cannot be parsed used to make
+/// `read_lease`'s `?` propagate a raw parse error from EVERY acquire attempt
+/// on that path — `--steal` included, even though overriding a problematic
+/// existing claim is the entire reason `--steal` exists. Before the fix this
+/// exited 1 with a `serde_json` parse error instead of recovering the lease.
+#[test]
+fn steal_recovers_a_lease_behind_a_corrupt_lock_file() {
+    let tmp = init_repo();
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-a",
+        &["lease", "acquire", "corrupt.rs"],
+    ));
+
+    // Hand-corrupt the lock file's bytes: no longer valid JSON.
+    std::fs::write(lock_path(tmp.path(), "corrupt.rs"), b"not json at all").unwrap();
+
+    // Without --steal, a corrupt lock must still block a plain acquire —
+    // ownership cannot be verified, so this must not become a silent
+    // takeover of whatever is sitting behind unreadable bytes.
+    let plain = pact(tmp.path(), "agent-b", &["lease", "acquire", "corrupt.rs"]);
+    assert_ne!(
+        plain.status.code(),
+        Some(0),
+        "a corrupt lock must not be silently claimable without --steal"
+    );
+
+    let out = pact(
+        tmp.path(),
+        "agent-b",
+        &["lease", "acquire", "corrupt.rs", "--steal", "--json"],
+    );
+    assert_ok(&out);
+    let v = json_stdout(&out);
+    assert_eq!(v["lease"]["agent"], "agent-b");
+    assert_eq!(v["stolen"], true);
+}
+
+/// Same fix, applied to `renew` for consistency: ownership can't be checked
+/// against unparsable content, so renewing must fail — but with a message
+/// that names the recovery path instead of echoing a raw parse error.
+#[test]
+fn renew_of_a_corrupt_lock_points_at_steal_instead_of_a_raw_parse_error() {
+    let tmp = init_repo();
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-a",
+        &["lease", "acquire", "corrupt2.rs"],
+    ));
+    std::fs::write(lock_path(tmp.path(), "corrupt2.rs"), b"not json at all").unwrap();
+
+    let out = pact(tmp.path(), "agent-a", &["lease", "renew", "corrupt2.rs"]);
+    assert_ne!(out.status.code(), Some(0));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("--steal"),
+        "must point at the recovery path: {stderr}"
+    );
+}
+
+/// And on `release`: ownership can't be verified from unparsable content
+/// either, so a plain release must refuse, and only `--force` removes it.
+#[test]
+fn release_of_a_corrupt_lock_requires_force() {
+    let tmp = init_repo();
+    assert_ok(&pact(
+        tmp.path(),
+        "agent-a",
+        &["lease", "acquire", "corrupt3.rs"],
+    ));
+    std::fs::write(lock_path(tmp.path(), "corrupt3.rs"), b"not json at all").unwrap();
+
+    let plain = pact(tmp.path(), "agent-a", &["lease", "release", "corrupt3.rs"]);
+    assert_ne!(plain.status.code(), Some(0));
+    assert!(
+        lock_path(tmp.path(), "corrupt3.rs").exists(),
+        "a plain release must refuse, not silently remove a corrupt lock"
+    );
+    assert!(
+        stderr_of(&plain).contains("--force"),
+        "{}",
+        stderr_of(&plain)
+    );
+
+    let forced = pact(
+        tmp.path(),
+        "agent-a",
+        &["lease", "release", "corrupt3.rs", "--force"],
+    );
+    assert_ok(&forced);
+    assert!(!lock_path(tmp.path(), "corrupt3.rs").exists());
+}
+
+// ------------------------------------------ unresolved prior claim (9.1)
+
+/// pact-m7j.9.1: an empty `.pact/leases/` — a fresh clone, or the manual
+/// reset `pact doctor` itself prescribes for a corrupt lock — looks, locally,
+/// exactly like a path nobody has ever touched. But the SHARED
+/// `events.jsonl` can still carry an unmatched "acquired" for it, with no
+/// later release/expiry/steal. Before the fix, a fresh acquire from a
+/// different agent against that shape succeeded with zero mention of the
+/// unresolved prior claim.
+#[test]
+fn acquiring_a_path_with_an_unresolved_prior_acquire_in_the_shared_log_warns() {
+    let tmp = init_repo();
+    let pact_dir = tmp.path().join(".pact");
+    std::fs::create_dir_all(&pact_dir).unwrap();
+    // No `.pact/leases/` at all: the fresh-clone/reset shape this bug is
+    // about. The log alone remembers agent-a's claim, and nothing ever
+    // closed it out.
+    std::fs::write(
+        pact_dir.join("events.jsonl"),
+        "{\"at\":\"2026-08-01T00:00:00+00:00\",\"agent\":\"agent-a\",\"kind\":\"acquired\",\
+         \"path\":\"shared.rs\",\"detail\":null}\n",
+    )
+    .unwrap();
+
+    let out = pact(tmp.path(), "agent-b", &["lease", "acquire", "shared.rs"]);
+    assert_ok(&out);
+    assert!(
+        lock_path(tmp.path(), "shared.rs").exists(),
+        "the acquire must still succeed, not just warn"
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("agent-a"),
+        "must name the unresolved prior holder: {stderr}"
+    );
+    assert!(
+        stderr.contains("never closed out") || stderr.contains("unresolved"),
+        "must say the prior claim was never resolved: {stderr}"
+    );
+}
+
+/// The negative control: when the log's last word on a path IS a resolution
+/// (released, here), a fresh acquire against an empty `.pact/leases/` is the
+/// ordinary case and must stay quiet — nothing was left unresolved.
+#[test]
+fn acquiring_a_path_whose_prior_claim_was_released_stays_quiet() {
+    let tmp = init_repo();
+    let pact_dir = tmp.path().join(".pact");
+    std::fs::create_dir_all(&pact_dir).unwrap();
+    std::fs::write(
+        pact_dir.join("events.jsonl"),
+        "{\"at\":\"2026-08-01T00:00:00+00:00\",\"agent\":\"agent-a\",\"kind\":\"acquired\",\
+         \"path\":\"shared.rs\",\"detail\":null}\n\
+         {\"at\":\"2026-08-01T00:05:00+00:00\",\"agent\":\"agent-a\",\"kind\":\"released\",\
+         \"path\":\"shared.rs\",\"detail\":null}\n",
+    )
+    .unwrap();
+
+    let out = pact(tmp.path(), "agent-b", &["lease", "acquire", "shared.rs"]);
+    assert_ok(&out);
+    // A different, pre-existing advisory ("last released by agent-a...") is
+    // expected here and is not what this test is about; only the new
+    // unresolved-claim wording must stay silent for a path that WAS resolved.
+    let stderr = stderr_of(&out);
+    assert!(
+        !stderr.contains("never closed out") && !stderr.contains("unresolved acquire"),
+        "a properly released prior claim must not be reported as unresolved: {stderr}"
+    );
+}
+
 // --------------------------------------------------------------- lease ls
 
 /// The whitespace-separated cells of the row for `path`. Column *positions* are
@@ -2797,6 +2962,70 @@ fn a_message_about_a_path_is_delivered_to_whoever_leases_it_next_on_br() {
     assert!(
         stderr.contains("unread message") && stderr.contains("BLOCKER: flush"),
         "the message must follow the file to its next holder on br too: {stderr}"
+    );
+}
+
+/// pact-m7j.4.7: `about_path` used to fetch every message bead in the repo and
+/// filter client-side for the one label it wanted. Proves the end behaviour
+/// survives a store with plenty of unrelated traffic: the one message about
+/// the target path is still the only one surfaced, regardless of how much
+/// noise sits alongside it.
+#[test]
+fn about_path_surfaces_only_the_message_about_the_target_path_among_unrelated_traffic() {
+    let Some(tmp) = bd_repo("about_path_surfaces_only_the_message_about_the_target_path") else {
+        return;
+    };
+
+    // N messages with nothing to do with the target path.
+    for i in 0..5 {
+        assert_ok(&pact(
+            tmp.path(),
+            "chatter",
+            &[
+                "msg",
+                "send",
+                "--to",
+                &format!("bystander-{i}"),
+                &format!("unrelated chatter number {i}"),
+            ],
+        ));
+    }
+
+    // The one message that IS about the target path.
+    assert_ok(&pact(
+        tmp.path(),
+        "owner-agent",
+        &["lease", "acquire", "src/target.rs"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "owner-agent",
+        &["lease", "release", "--all"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "second-agent",
+        &[
+            "msg",
+            "send",
+            "--to-owner-of",
+            "src/target.rs",
+            "--subject",
+            "the one that matters",
+            "body",
+        ],
+    ));
+
+    let out = pact(
+        tmp.path(),
+        "third-agent",
+        &["lease", "acquire", "src/target.rs"],
+    );
+    assert_ok(&out);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("1 unread message") && stderr.contains("the one that matters"),
+        "must surface exactly the one message about this path, not the unrelated noise: {stderr}"
     );
 }
 

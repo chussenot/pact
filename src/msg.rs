@@ -383,20 +383,17 @@ pub fn send(
 /// the point is that a message about `src/otel.rs` reaches whoever picks up
 /// `src/otel.rs`, even — especially — when the agent it was addressed to has
 /// exited. Reading it is the recipient's job; noticing it is the file's.
+///
+/// Filtered server-side via `--label=`, not fetched whole and filtered here
+/// (pact-m7j.4.7): this used to call `list_issues` unfiltered and then keep
+/// only the one label it wanted, so every message bead in the repo — every
+/// other path's traffic, every thread, everything — was fetched (and, on br,
+/// individually `show`n) just to throw almost all of it away. Both backends
+/// bound `list --json` to one label directly; see `list_issues`.
 pub fn about_path(cli: &BeadsCli, repo_root: &Path, path: &str) -> Result<Vec<Message>> {
     let label = format!("{ABOUT}{}", encode_path(path));
-    let issues = list_issues(cli, repo_root, None)?;
-    let matching: Vec<BdIssue> = issues
-        .into_iter()
-        .filter(|i| {
-            i.labels
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .any(|l| l == &label)
-        })
-        .collect();
-    Ok(to_messages(matching, None))
+    let issues = list_issues(cli, repo_root, None, Some(&label))?;
+    Ok(to_messages(issues, None))
 }
 
 /// FNV-1a, 64-bit: a fixed-seed, non-cryptographic hash, deliberately NOT
@@ -563,7 +560,7 @@ pub fn inbox(
     agent: &str,
     unread_only: bool,
 ) -> Result<Vec<Message>> {
-    let issues = list_issues(cli, repo_root, Some(agent))?;
+    let issues = list_issues(cli, repo_root, Some(agent), None)?;
     let mut messages = to_messages(issues, Some(agent));
 
     // Before the filter, so `--unread-only` and a plain listing report the same
@@ -577,24 +574,55 @@ pub fn inbox(
     Ok(messages)
 }
 
-/// Every message bead the backend will admit to, optionally narrowed to one
-/// assignee. The one place the two backends' listing argv differ.
-///
-/// br's `list --json` omits `parent` and it has no `--include-infra`, so there
-/// the listing is only good for ids and a second `show` fetches the records —
-/// see the module docs. Doing it in one place keeps `inbox`, `sent` and the TUI
-/// from each growing their own half-right version.
-fn list_issues(cli: &BeadsCli, repo_root: &Path, assignee: Option<&str>) -> Result<Vec<BdIssue>> {
-    let assignee_arg = assignee.map(|a| format!("--assignee={a}"));
-    let mut args: Vec<&str> = if cli.is_br() {
-        vec!["list", "--json", "--type=message"]
+/// The exact argv [`list_issues`] hands to the backend, factored out so the
+/// filters it decides to send are unit-testable without a real subprocess
+/// (pact-m7j.4.7) — the same reasoning [`create_args`] is split out for.
+fn list_args(is_br: bool, assignee: Option<&str>, label: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = if is_br {
+        vec!["list".into(), "--json".into(), "--type=message".into()]
     } else {
-        vec!["list", "--include-infra", "--json"]
+        vec!["list".into(), "--include-infra".into(), "--json".into()]
     };
-    if let Some(a) = &assignee_arg {
-        args.push(a);
+    if let Some(a) = assignee {
+        args.push(format!("--assignee={a}"));
     }
-    let issues = parse_issues(&cli.run(repo_root, &args)?, cli)?;
+    if let Some(l) = label {
+        args.push(format!("--label={l}"));
+    }
+    args
+}
+
+/// Every message bead the backend will admit to, optionally narrowed to one
+/// assignee and/or one label. The one place the two backends' listing argv
+/// differ.
+///
+/// `label` is passed straight through as `--label=`, not applied after the
+/// fact (pact-m7j.4.7): `about_path` used to fetch every message bead here and
+/// filter client-side for the one label it wanted, paying for every OTHER
+/// path's traffic too. Both bd 1.1.2 and br 0.2.19 support `-l/--label` as an
+/// exact-match filter (`bd list --help`: "Filter by labels (AND: must have
+/// ALL)"; `br list --help`: "Filter by label (AND logic..)"), so bounding the
+/// query there bounds the response, and — on br — bounds the id set the `show`
+/// fan-out below walks.
+///
+/// br's `list --json` omits `parent` even when `--label` narrows the result to
+/// one bead — checked directly: a labelled reply's `list --json` entry still
+/// carries no `parent`, only `dependency_count`. So the id-then-show fan-out
+/// below still runs on br regardless of `label`; skipping it would silently
+/// drop thread linkage for exactly the messages this filter exists to find.
+/// (This corrects an assumption in the original bead that a label-filtered
+/// `br list --json` already returns full record data — it does not, for
+/// `parent` specifically.) `sent` and the TUI still call this with
+/// `label: None`, unaffected.
+fn list_issues(
+    cli: &BeadsCli,
+    repo_root: &Path,
+    assignee: Option<&str>,
+    label: Option<&str>,
+) -> Result<Vec<BdIssue>> {
+    let args = list_args(cli.is_br(), assignee, label);
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    let issues = parse_issues(&cli.run(repo_root, &borrowed)?, cli)?;
     if !cli.is_br() {
         return Ok(issues);
     }
@@ -879,7 +907,7 @@ fn actor_arg(agent: &str) -> String {
 /// There is no querying agent here, so `read` is resolved against each
 /// message's own recipient.
 pub fn all_messages(cli: &BeadsCli, repo_root: &Path) -> Result<Vec<Message>> {
-    Ok(to_messages(list_issues(cli, repo_root, None)?, None))
+    Ok(to_messages(list_issues(cli, repo_root, None, None)?, None))
 }
 
 /// `list --json` output -> issues. bd emits a bare array, br an envelope.
@@ -1314,6 +1342,54 @@ mod tests {
                 .iter()
                 .any(|a| a.starts_with("--id=") || a == "--force"),
             "br has no --id/--force primitive: {br_args:?}"
+        );
+    }
+
+    /// pact-m7j.4.7: `about_path` used to fetch every message bead unfiltered
+    /// and filter client-side for the one label it wanted. The label must
+    /// reach the backend's own argv — on both backends, since both support
+    /// `--label` — not just pact's post-filter.
+    #[test]
+    fn list_args_passes_the_label_filter_through_to_both_backends() {
+        let label = "about-src__foo.rs";
+        for is_br in [false, true] {
+            let args = list_args(is_br, None, Some(label));
+            assert!(
+                args.contains(&format!("--label={label}")),
+                "backend (is_br={is_br}) must receive the label filter server-side: {args:?}"
+            );
+        }
+    }
+
+    /// `inbox` and `all_messages` call this with `label: None` and must not
+    /// start silently narrowing their listing to one label.
+    #[test]
+    fn list_args_has_no_label_filter_when_none_is_given() {
+        for is_br in [false, true] {
+            let args = list_args(is_br, None, None);
+            assert!(
+                !args.iter().any(|a| a.starts_with("--label=")),
+                "no label requested, none should be sent: {args:?}"
+            );
+        }
+    }
+
+    /// The bd branch needs `--include-infra` (message beads are otherwise
+    /// hidden) and the br branch needs `--type=message` (bd has no such
+    /// filter and does it client-side) — a label filter must not replace
+    /// either.
+    #[test]
+    fn list_args_keeps_the_backend_specific_message_filter_alongside_a_label() {
+        let bd_args = list_args(false, None, Some("about-x"));
+        assert!(
+            bd_args.contains(&"--include-infra".to_string()),
+            "{bd_args:?}"
+        );
+
+        let br_args = list_args(true, None, Some("about-x"));
+        assert!(
+            br_args.contains(&"--type=message".to_string()),
+            "{br_args:?}"
         );
     }
 
