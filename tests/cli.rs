@@ -2724,6 +2724,47 @@ fn a_repeated_recipient_is_delivered_once() {
     );
 }
 
+/// pact-m7j.6.4, reproduced in production: a sender that could not confirm a
+/// send re-sends it (`sent()`'s own documented policy), and without an
+/// idempotency key that retry mints a second, near-identical bead. `bd`'s
+/// `--id`/`--force` upsert now makes an identical retry land on the same
+/// bead. bd-only: `br` has no equivalent primitive, so this is `bd_repo`,
+/// not both backends.
+#[test]
+fn a_retried_identical_send_does_not_duplicate_on_bd() {
+    let Some(tmp) = bd_repo("a_retried_identical_send_does_not_duplicate") else {
+        return;
+    };
+    let send = || {
+        pact(
+            tmp.path(),
+            "sender",
+            &[
+                "msg",
+                "send",
+                "--to",
+                "recipient",
+                "--subject",
+                "long send",
+                "the harness dropped stdout before I saw the exit code",
+            ],
+        )
+    };
+    assert_ok(&send());
+    // The retry: same agent, same recipient, same subject and body — exactly
+    // what a sender unsure whether the first one landed would re-run.
+    assert_ok(&send());
+
+    let inbox = pact(tmp.path(), "recipient", &["msg", "inbox", "--json"]);
+    assert_ok(&inbox);
+    assert_eq!(
+        json_stdout(&inbox).as_array().map(Vec::len),
+        Some(1),
+        "a retried identical send must land on one bead, not two: {}",
+        stdout_of(&inbox)
+    );
+}
+
 /// Deduping must not reorder a genuine fan-out: the thread root is the first
 /// distinct recipient, and dropping a later duplicate must not move it.
 #[test]

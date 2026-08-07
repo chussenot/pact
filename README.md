@@ -78,10 +78,13 @@ defect in someone else's file. pact does not run a message store: a message is a
 One less thing to keep consistent, and the messages live where the project's
 other work items already do.
 
-Two properties came from watching this fail. Read state is shared rather than
+Three properties came from watching this fail. Read state is shared rather than
 local, because a sender who cannot see whether a decision landed re-sends it.
-And a message can be addressed to a *path* rather than a name, because names
-belong to processes that exit while the work stays.
+A message can be addressed to a *path* rather than a name, because names belong
+to processes that exit while the work stays. And since that first property
+invites a re-send, a new thread's id is derived from its own content on `bd`, so
+the retry lands on the message it is repeating instead of minting a second one —
+advice that manufactures duplicates is worse than no advice.
 
 → [docs/messaging.md](docs/messaging.md)
 

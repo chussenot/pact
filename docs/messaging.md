@@ -59,6 +59,10 @@ Every `bd create` pact runs passes `--no-inherit-labels`. Without it a child
 inherits its parent's labels, so a reply to a message you had already read would
 be born carrying your own `read-by-` label and arrive pre-read. (br doesn't have
 the flag and doesn't need it — see [Two backends, two argv](#two-backends-two-argv).)
+Every `bd create` also passes `--force`, which sounds alarming and isn't: its
+only effect is to accept an id that doesn't start with this project's bd prefix,
+which pact's message ids deliberately don't — see
+[A retried send lands on the same bead](#a-retried-send-lands-on-the-same-bead).
 
 ### The `from` field
 
@@ -165,6 +169,7 @@ running `br` 0.2.19, not inferred from bd's documentation.
 | don't inherit read labels | `--no-inherit-labels` | flag rejected, and unnecessary |
 | shape of `list --json` | a bare array | `{"issues": […], "total": …}` |
 | a message's replies | `list --parent=<id> --include-infra --json` | the root's `parent-child` `dependents` |
+| survive a retried send | `--id=<content hash>` + `--force` on a thread root | no primitive at all — retries still duplicate |
 
 Two of those are worth more than a table row:
 
@@ -181,6 +186,10 @@ Two of those are worth more than a table row:
   the ids plus one `show` to hydrate the records — two subprocesses, but
   authoritative data. The alternative, deriving parents from br's `<id>.<n>` id
   shape, would be pact guessing at another tool's id format.
+
+The retry row is the newest divergence, and the only one where br is left
+materially worse off rather than merely different — it gets
+[its own section](#a-retried-send-lands-on-the-same-bead).
 
 `--type` is the one place br is *ahead*: the filter bd lacks, so on br the
 message-bead filter happens in the backend rather than in pact.
@@ -206,9 +215,9 @@ returns the whole announcement:
 
 ```
 $ pact msg send --to cli-wire --to human --subject probe --body-file -
-sent 2 message(s) in thread pact-wisp-8mz
-  pact-wisp-8mz → cli-wire
-  pact-wisp-8mz.1 → human
+sent 2 message(s) in thread pact-msg-6e5c288cf14ce99c
+  pact-msg-6e5c288cf14ce99c → cli-wire
+  pact-msg-6e5c288cf14ce99c.1 → human
 ```
 
 The thread id is printed **once**, because that is the point: one decision to
@@ -234,7 +243,7 @@ collapse is reported rather than swallowed:
 ```
 $ pact msg send --to reviewer --to reviewer "ready for review"
 note: 1 duplicate recipient(s) collapsed — sending one message per distinct agent
-sent pact-wisp-7ll to reviewer (thread pact-wisp-7ll)
+sent pact-msg-56c4a11ee7379cee to reviewer (thread pact-msg-56c4a11ee7379cee)
 ```
 
 The realistic caller is not somebody typing the flag twice. The protocol tells
@@ -244,6 +253,73 @@ repeat a name without anyone noticing — and `pact msg sent` exists precisely
 because an earlier fleet produced duplicate messages, so a single command that
 manufactures them would work against the tool's own advice. It is said out loud
 because a caller that repeated a name probably built the list wrongly.
+
+## A retried send lands on the same bead
+
+`pact msg sent` exists so a sender can check rather than guess. But when the
+outcome of a send is genuinely unknowable, pact's advice is to send it again —
+and until this fix that advice manufactured the duplicate it was meant to
+prevent. `bd create` mints a fresh id on every call, so a retry was a second,
+distinct bead with identical content, and neither `inbox` nor `sent` flagged it.
+
+Not hypothetical. In one fleet run a sender's long send came back with no output
+and an exit code it could not trust — its own harness had dropped stdout, no
+fault of pact's — so it re-sent. Both beads are still in that store: same author,
+same recipient, byte-identical subject, 16 minutes apart. The recipient's inbox
+listed both, and it had to diff two walls of prose by eye to establish they were
+one announcement (`pact-m7j.6.4`).
+
+So on `bd` a **thread root's id is derived from its own content** — a fixed-seed
+hash of sender, recipient, subject and body, passed as `--id=pact-msg-<16 hex>`.
+A byte-identical retry computes the same id and upserts the same bead:
+
+```
+$ pact --agent sender msg send --to recipient --subject "long send" "the harness dropped stdout before I saw the exit code"
+sent pact-msg-bf787ceef4d8f3d3 to recipient (thread pact-msg-bf787ceef4d8f3d3)
+$ pact --agent sender msg send --to recipient --subject "long send" "the harness dropped stdout before I saw the exit code"
+sent pact-msg-bf787ceef4d8f3d3 to recipient (thread pact-msg-bf787ceef4d8f3d3)
+$ pact --agent recipient msg inbox
+ID                            FROM    SUBJECT    BODY
+pact-msg-bf787ceef4d8f3d3  *  sender  long send  the harness dropped stdout before I saw the exit code
+
+1 message(s), 1 unread (*) — `pact msg read <id>` for the full text
+```
+
+The seed being *fixed* is the whole trick, and is the one line of this worth
+guarding in review: a randomly seeded hash — Rust's default — would give the
+retry a different id from the original and protect nothing.
+
+A replay is not a reset. The `read-by-` labels a recipient already added survive
+it, so re-sending something that has already been read does not make it unread,
+and `pact msg sent` goes on saying the recipient has seen it.
+
+Three limits, all of them permanent rather than pending:
+
+- **`bd` only.** `br` has no equivalent primitive on `create` — no `--id`, no
+  `--dedupe`, and its one lever (`--slug`) still appends a uniquifying hash on
+  every call. A `br` retry duplicates exactly as it always did, and nothing on
+  pact's side can emulate the missing flag.
+- **Thread roots only, even on bd.** `bd create` refuses `--id` and `--parent`
+  together outright (`cannot specify both --id and --parent flags`), because it
+  derives a reply's id from its parent — `<root>.1`, `.2`. So a reply carries no
+  key, and neither do recipients 2..N of a fan-out, which are parented on the
+  root. Narrower than "every send is safe to retry", and deliberately so: the
+  incident was a single long send, and covering replies would mean a second
+  subprocess on *every* reply to protect the rarer case.
+- **Two deliberately identical sends collide into one.** Same sender, same
+  recipient, byte-identical subject and body, no thread — pact cannot tell that
+  from a retry, because the key is a pure function of the send's own arguments
+  and nothing is written under `.pact/` to distinguish them. Keeping the
+  messaging layer stateless is worth more than the distinction, given how
+  rarely two real messages are identical to the byte.
+
+One visible consequence: **a message id no longer looks like your other Beads
+ids.** Every id bd mints carries this project's own bd prefix; a pact thread
+root is `pact-msg-<hash>` whatever that prefix is. That mismatch is the entire
+reason every `bd create` passes `--force` — it is what makes bd accept an id
+outside its own prefix, and it does nothing else here. Replies still hang off
+the root in bd's own shape, so a thread reads `pact-msg-<hash>`,
+`pact-msg-<hash>.1`, and so on.
 
 ## Read state: shared labels, not a local file
 
@@ -276,9 +352,9 @@ asked for.
 subject, and the head of the body:
 
 ```
-ID                FROM       SUBJECT                                          BODY
-pact-wisp-06l  *  lease-fix  src/lease.rs is ready to wire (rnc.8/9/10/11)    src/lease.rs done, contract exactly as frozen. To wire: lea…
-pact-wisp-6jz     msg-fix    src/msg.rs ready: Message.from + all_messages()  src/msg.rs is done and compiles clean on its own. Contract …
+ID                            FROM       SUBJECT                                          BODY
+pact-msg-d42443f0467ab2aa  *  lease-fix  src/lease.rs is ready to wire (rnc.8/9/10/11)    src/lease.rs done, contract exactly as frozen. To wire: lea…
+pact-msg-9c4b3064b6844eb5     msg-fix    src/msg.rs ready: Message.from + all_messages()  src/msg.rs is done and compiles clean on its own. Contract …
 
 2 message(s), 1 unread (*) — `pact msg read <id>` for the full text
 ```
@@ -294,9 +370,9 @@ splits. The footer restores the two-step: scan, then read what matters.
 throw away:
 
 ```
-[pact-wisp-6jz] from: msg-fix  to: docs-writer
+[pact-msg-9c4b3064b6844eb5] from: msg-fix  to: docs-writer
 subject: src/msg.rs ready: Message.from + all_messages()
-at: 2026-07-31T09:01:12Z  thread: pact-wisp-6jz
+at: 2026-08-07T09:42:43Z  thread: pact-msg-9c4b3064b6844eb5
 
 src/msg.rs is done and compiles clean on its own. Contract exactly as frozen.
 ```
@@ -313,9 +389,9 @@ asking) and `read_by` (everyone who has read it).
 
 ```
 $ pact msg sent
-ID                TO         SUBJECT                                          BODY
-pact-wisp-mbw  *  human      docs-writer done: docs match the binary          docs updated from the built binary, not the…
-pact-wisp-8mz     cli-wire   probe                                            probe body with a table…
+ID                            TO        SUBJECT                                  BODY
+pact-msg-6e5c288cf14ce99c     cli-wire  probe                                    probe body with a table
+pact-msg-3b0b1318d30abf13  *  human     docs-writer done: docs match the binary  docs updated from the built binary, not the changelog.
 
 2 message(s), 1 not read yet (*) by the recipient
 ```
@@ -360,7 +436,7 @@ substring, or one edit away):
 $ pact msg send --to tuidev "..."
 warning: no agent named "tuidev" has acted in this repo (no lease, no message
 sent) — did you mean tui-dev? (sending anyway)
-sent pact-wisp-tdv
+sent pact-msg-0169b2cf6f0e68f7 to tuidev (thread pact-msg-0169b2cf6f0e68f7)
 ```
 
 **It warns and still sends, and still exits 0.** pact is advisory here for the
@@ -472,7 +548,7 @@ unread message about a path you are taking:
 $ pact lease acquire src/otel.rs
 acquired lease on src/otel.rs for third-agent
 note: 1 unread message(s) about src/otel.rs, oldest from second-agent —
-"BLOCKER: flush is broken". Read it before you edit: `pact msg read bd_…-wisp-xnp`
+"BLOCKER: flush is broken". Read it before you edit: `pact msg read pact-msg-870672baca8f64d8`
 ```
 
 The third agent was never the addressee and had read nothing. It gets the
@@ -511,7 +587,7 @@ falls back to [`human`](#unknown-recipients-warn-then-send), warns, and sends:
 $ pact msg send --to-owner-of src/otel.rs "flush is broken; I took the file over"
 note: you are yourself the last agent to work on src/otel.rs; not adding a recipient
 note: every --to-owner-of path resolves to you; addressing to human so the note still reaches whoever leases it next
-sent pact-wisp-20i to human (thread pact-wisp-20i)
+sent pact-msg-1b4f0ac0372a1dd2 to human (thread pact-msg-1b4f0ac0372a1dd2)
 ```
 
 The fallback recipient is not the delivery. `about-<path>` is attached to every

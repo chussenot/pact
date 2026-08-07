@@ -392,6 +392,63 @@ pub fn about_path(cli: &BeadsCli, repo_root: &Path, path: &str) -> Result<Vec<Me
     Ok(to_messages(matching, None))
 }
 
+/// FNV-1a, 64-bit: a fixed-seed, non-cryptographic hash, deliberately NOT
+/// `std::collections::hash_map::DefaultHasher` — that one's `RandomState` seed
+/// is randomized per PROCESS, so the same content would hash differently on
+/// the retry than it did on the original send, defeating the entire point of
+/// [`idempotency_key`]. FNV-1a needs no dependency for a few lines of stable,
+/// deterministic mixing, and cryptographic strength buys nothing here: the
+/// risk this key accepts is two DELIBERATELY identical messages colliding
+/// (see `idempotency_key`'s own doc comment), not an adversary finding one.
+fn fnv1a64(parts: &[&str]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for part in parts {
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        // A separator between parts, so ("ab", "c") and ("a", "bc") — which
+        // would otherwise concatenate to the same byte stream — hash
+        // differently.
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// A deterministic id for bd's `--id`/`--force` upsert, so a retried `create`
+/// after an ambiguous outcome (process killed after bd committed but before
+/// returning, a hung subprocess, a harness that dropped stdout — all three
+/// hit in production, see pact-m7j.6.4) lands on the SAME bead instead of a
+/// second, near-identical one. `sent()`'s own doc comment tells a sender that
+/// cannot confirm a send to re-send it; without this, that documented policy
+/// is what mints the duplicate.
+///
+/// Deliberately a pure function of the send's own arguments — no counter, no
+/// nonce, nothing written to `.pact/` — because pact's messaging layer keeps
+/// zero local state by design and this key must not become the first
+/// exception. That purity is also the accepted trade-off: two SEPARATE,
+/// genuinely identical sends (same agent, same recipient, same thread
+/// context, byte-identical title and body) collide into one bead rather than
+/// two, same as a real retry would. For the routine, mostly-unique text real
+/// messages carry, that is a good bargain against a duplicate that already
+/// happened in production; it is not a content-addressed store's collision
+/// resistance, and was not asked to be.
+///
+/// bd-only: `br` has no equivalent primitive on `create` at all (confirmed
+/// against `br --help` and a real create-twice run — no `--id`, no
+/// `--dedupe`; the only lever, a slug, still gets a random uniquifying
+/// suffix every call), so a `br` retry is unprotected until `br` grows one.
+///
+/// Root messages only, even on bd: see [`create_args`] for why a reply
+/// cannot carry this key alongside `--parent`.
+fn idempotency_key(agent: &str, to: &str, parent: Option<&str>, title: &str, body: &str) -> String {
+    let hash = fnv1a64(&[agent, to, parent.unwrap_or(""), title, body]);
+    format!("pact-msg-{hash:016x}")
+}
+
 /// `create` args for one message bead. Owned Strings because they are all
 /// interpolated; see the module docs for why `--no-inherit-labels` is not
 /// optional on bd — and why br neither accepts nor needs it.
@@ -413,6 +470,32 @@ fn create_args(
         // would be born already "read" by whoever read the message above it.
         // br rejects the flag outright and does not inherit labels anyway.
         args.push("--no-inherit-labels".to_string());
+        // `--force` bypasses bd's project-prefix guard (confirmed against
+        // `bd create --help` and a real scratch run). Needed unconditionally,
+        // not just alongside `--id`: bd auto-derives a REPLY's id from its
+        // parent (`<parent-id>.1`, `.2`, ...), and once the root carries our
+        // synthetic `pact-msg-` id, every child's auto-derived id fails the
+        // same prefix check even though the reply itself never passes `--id`
+        // — confirmed by reproducing the exact "prefix mismatch" error on a
+        // plain `--parent=pact-msg-...` create with no `--id` at all.
+        args.push("--force".to_string());
+        // Idempotency key: root messages only. `bd create` rejects `--id`
+        // together with `--parent` outright ("cannot specify both --id and
+        // --parent flags", confirmed against a real scratch run) — bd derives
+        // a child's id from its parent, and an explicit id conflicts with
+        // that. So a reply, or recipients 2..N of a fan-out, are unprotected
+        // by this key; only the first create in a `send()` call (thread root,
+        // no parent yet) gets one. Narrower than every create being safe to
+        // retry, but it is the shape the reported incident actually was — a
+        // single long send, not a reply — and reparenting after an id-only
+        // create would double the subprocess calls on the common path
+        // (every reply) to protect the uncommon one.
+        if parent.is_none() {
+            args.push(format!(
+                "--id={}",
+                idempotency_key(agent, to, parent, title, body)
+            ));
+        }
     }
     args.extend([
         format!("--title={title}"),
@@ -1133,6 +1216,96 @@ mod tests {
         }
     }
 
+    /// pact-m7j.6.4: a retried `create` with identical arguments must produce
+    /// the identical `--id`, or the whole point of the upsert is lost.
+    #[test]
+    fn idempotency_key_is_stable_across_repeated_calls() {
+        let a = idempotency_key("animator", "mascot-dev", None, "Alarmed loops", "body");
+        let b = idempotency_key("animator", "mascot-dev", None, "Alarmed loops", "body");
+        assert_eq!(a, b);
+        assert!(a.starts_with("pact-msg-"));
+    }
+
+    /// Anything that changes what the message actually says or who it is
+    /// between must not collide — that would silently merge two distinct
+    /// messages into one bead, which is the one thing this key must not do.
+    #[test]
+    fn idempotency_key_differs_when_any_input_differs() {
+        let base = idempotency_key("animator", "mascot-dev", None, "subject", "body");
+        let variants = [
+            idempotency_key("tui-dev", "mascot-dev", None, "subject", "body"),
+            idempotency_key("animator", "docs-writer", None, "subject", "body"),
+            idempotency_key(
+                "animator",
+                "mascot-dev",
+                Some("pact-wisp-a2u"),
+                "subject",
+                "body",
+            ),
+            idempotency_key("animator", "mascot-dev", None, "other subject", "body"),
+            idempotency_key("animator", "mascot-dev", None, "subject", "other body"),
+            // Concatenation ambiguity: "sub" + "ject" must not equal "subj" + "ect".
+            idempotency_key("animator", "mascot-dev", None, "subj", "ectbody"),
+        ];
+        for v in variants {
+            assert_ne!(base, v, "distinct inputs collided: {base} == {v}");
+        }
+    }
+
+    /// `create_args` wires the key through with `--force`, and only for bd —
+    /// br has no equivalent primitive (module docs) and would reject
+    /// `--no-inherit-labels`-adjacent bd-only flags outright.
+    #[test]
+    fn create_args_passes_a_deterministic_id_and_force_on_bd_only() {
+        let bd_args = create_args(false, "mascot-dev", None, "animator", "subject", "body");
+        let expected_id = format!(
+            "--id={}",
+            idempotency_key("animator", "mascot-dev", None, "subject", "body")
+        );
+        assert!(
+            bd_args.contains(&expected_id),
+            "expected {expected_id} in {bd_args:?}"
+        );
+        assert!(bd_args.contains(&"--force".to_string()));
+
+        let br_args = create_args(true, "mascot-dev", None, "animator", "subject", "body");
+        assert!(
+            !br_args
+                .iter()
+                .any(|a| a.starts_with("--id=") || a == "--force"),
+            "br has no --id/--force primitive: {br_args:?}"
+        );
+    }
+
+    /// `bd create` rejects `--id` together with `--parent` outright — a reply
+    /// (or recipients 2..N of a fan-out) must not carry the idempotency key,
+    /// or every reply in a thread would fail outright. `--force` is still
+    /// needed: bd auto-derives a reply's id from its parent
+    /// (`<parent-id>.1`), and once the parent carries our synthetic id, the
+    /// derived child id fails bd's prefix check too — confirmed by
+    /// reproducing the exact error against a real scratch store.
+    #[test]
+    fn create_args_omits_the_idempotency_key_but_keeps_force_when_there_is_a_parent() {
+        let reply = create_args(
+            false,
+            "tui-dev",
+            Some("pact-wisp-a2u"),
+            "animator",
+            "subject",
+            "body",
+        );
+        assert!(
+            !reply.iter().any(|a| a.starts_with("--id=")),
+            "a reply must not carry --id alongside --parent: {reply:?}"
+        );
+        assert!(
+            reply.contains(&"--force".to_string()),
+            "a reply still needs --force, since its auto-derived id inherits \
+             the parent's prefix mismatch: {reply:?}"
+        );
+        assert!(reply.contains(&"--parent=pact-wisp-a2u".to_string()));
+    }
+
     fn issue(json: &str) -> BdIssue {
         serde_json::from_str(json).unwrap()
     }
@@ -1265,8 +1438,10 @@ mod tests {
             assert!(brs.contains(&expected.to_string()), "missing {expected}");
         }
 
-        // bd keeps the flag, and every other argument is byte-identical, so the
-        // shipped backend cannot regress on the way past.
+        // bd keeps the flag, plus its own `--id`/`--force` idempotency pair
+        // (pact-m7j.6.4 — br has no equivalent primitive to give the same
+        // one), and every OTHER argument is byte-identical, so the shipped
+        // backend cannot regress on the way past.
         let bds = create_args(
             false,
             "docs-writer",
@@ -1275,7 +1450,10 @@ mod tests {
             "subj",
             "b",
         );
-        let without: Vec<&String> = bds.iter().filter(|a| *a != "--no-inherit-labels").collect();
+        let without: Vec<&String> = bds
+            .iter()
+            .filter(|a| *a != "--no-inherit-labels" && *a != "--force" && !a.starts_with("--id="))
+            .collect();
         assert_eq!(without, brs.iter().collect::<Vec<_>>());
     }
 
