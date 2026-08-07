@@ -78,10 +78,34 @@ const READ_BY: &str = "read-by-";
 /// the agent who had just released it (pact-4tj).
 const ABOUT: &str = "about-";
 
-/// A path as a label-safe token: `/` to `__`, the same encoding lease lock
-/// files already use, so one path has one spelling across the whole tool.
+/// A path as a label-safe token: `/` to `__`, the same convention lease lock
+/// files use — but, unlike a lock filename, this token is never written to a
+/// filesystem, only compared against itself inside a bd/br label. So it goes
+/// one step further: every byte outside `[A-Za-z0-9_:-]` (that still leaves
+/// `/`, just replaced above) becomes `-`. Confirmed necessary against a real
+/// br 0.2.19 store: `br create --labels`/`br label add` both reject a `.` with
+/// "invalid characters (only alphanumeric, hyphen, underscore, colon
+/// allowed)" — exit 4 — which meant every real file path (anything with an
+/// extension) silently failed to tag on br, before this. bd tolerates the
+/// original punctuation fine, so this narrower charset is a bd-compatible
+/// subset, not a second encoding to keep in sync.
+///
+/// Not reversible, and does not need to be: nothing ever decodes a label back
+/// into a path, only re-encodes a query path the same way and compares. Two
+/// distinct paths differing only in the punctuation this collapses (`a.b` and
+/// `a-b`, say) would produce the same label — the same class of accepted
+/// collision the `/` → `__` step already carries, and unlikely in a real tree.
 fn encode_path(path: &str) -> String {
     path.replace('/', "__")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// How far [`walk_to_root`] follows `parent` links before giving up. pact only
@@ -289,7 +313,6 @@ pub fn send(
         None => None,
     };
     let mut messages: Vec<Message> = Vec::with_capacity(to.len());
-    let mut ids: Vec<String> = Vec::with_capacity(to.len());
     // Read once, not per recipient: it is a property of the command line, and
     // every bead this send creates was addressed the same way.
     let addressing = addressing_mode();
@@ -303,6 +326,7 @@ pub fn send(
             thread_id.as_deref(),
             &title,
             body,
+            about,
         )
         .with_context(|| match messages.len() {
             0 => format!("sending to {recipient}: nothing was sent"),
@@ -319,7 +343,6 @@ pub fn send(
         })?;
         let id = issue.id;
         let thread = thread_id.get_or_insert_with(|| id.clone()).clone();
-        ids.push(id.clone());
         messages.push(Message {
             id,
             thread,
@@ -346,26 +369,10 @@ pub fn send(
         );
     }
 
-    // Tag every bead with the paths it is ABOUT, so `lease acquire` can deliver
-    // it to whoever picks the file up next. Best-effort on purpose: the message
-    // has already been sent and the sender has already been told so, and this
-    // module's whole reason for putting read state in bd is that a send whose
-    // bookkeeping failed must not look like a send that did not happen.
-    if !about.is_empty() && !ids.is_empty() {
-        let labels: Vec<String> = about
-            .iter()
-            .map(|p| format!("{ABOUT}{}", encode_path(p)))
-            .collect();
-        let mut args: Vec<&str> = vec!["label", "add"];
-        args.extend(ids.iter().map(String::as_str));
-        args.extend(labels.iter().map(String::as_str));
-        if let Err(e) = cli.run(repo_root, &args) {
-            crate::output::warn(&format!(
-                "warning: sent, but could not tag it with the path it is about \
-                 ({e:#}) — it will not be surfaced to whoever leases that path next"
-            ));
-        }
-    }
+    // The about-<path> labels are already on every bead above: create_args
+    // folds them into the same `create` call (pact-m7j.10.1), so there is no
+    // second, separate tagging step left here to fail — and so no window in
+    // which a bead exists but `about_path` cannot see what it is about yet.
     Ok(messages)
 }
 
@@ -452,6 +459,15 @@ fn idempotency_key(agent: &str, to: &str, parent: Option<&str>, title: &str, bod
 /// `create` args for one message bead. Owned Strings because they are all
 /// interpolated; see the module docs for why `--no-inherit-labels` is not
 /// optional on bd — and why br neither accepts nor needs it.
+///
+/// `about` is passed through to `--labels` so a bead is born already tagged
+/// with the paths it is about (pact-m7j.10.1): both bd and br accept `-l` /
+/// `--labels` at create time, and doing it here — rather than a second
+/// `label add` after the bead exists — closes the window in which the bead is
+/// visible to `about_path` without its label. `--no-inherit-labels` (bd-only,
+/// above) does not fight this: it only suppresses labels inherited from
+/// `--parent`, and an explicit `--labels` list is unaffected by it either way
+/// — confirmed against a real bd store with both flags on the same call.
 fn create_args(
     is_br: bool,
     to: &str,
@@ -459,6 +475,7 @@ fn create_args(
     agent: &str,
     title: &str,
     body: &str,
+    about: &[String],
 ) -> Vec<String> {
     let mut args = vec![
         "create".to_string(),
@@ -508,9 +525,21 @@ fn create_args(
     if let Some(p) = parent {
         args.push(format!("--parent={p}"));
     }
+    if !about.is_empty() {
+        let labels: Vec<String> = about
+            .iter()
+            .map(|p| format!("{ABOUT}{}", encode_path(p)))
+            .collect();
+        args.push(format!("--labels={}", labels.join(",")));
+    }
     args
 }
 
+// One more argument than clippy's default likes, all of them genuinely
+// distinct pieces of one bead (who it is to/from/about and what it says) —
+// bundling them into a struct here would trade a lint suppression for a type
+// with exactly one caller.
+#[allow(clippy::too_many_arguments)]
 fn create(
     cli: &BeadsCli,
     repo_root: &Path,
@@ -519,8 +548,9 @@ fn create(
     parent: Option<&str>,
     title: &str,
     body: &str,
+    about: &[String],
 ) -> Result<BdIssue> {
-    let args = create_args(cli.is_br(), to, parent, agent, title, body);
+    let args = create_args(cli.is_br(), to, parent, agent, title, body, about);
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
     let stdout = cli.run(repo_root, &borrowed)?;
     serde_json::from_str(&stdout)
@@ -1187,6 +1217,7 @@ mod tests {
             "animator",
             "Alarmed loops",
             "body",
+            &[],
         );
         assert!(
             !root.iter().any(|a| a.starts_with("--parent=")),
@@ -1203,6 +1234,7 @@ mod tests {
             "animator",
             "Alarmed loops",
             "body",
+            &[],
         );
         assert!(child.contains(&"--parent=pact-wisp-a2u".to_string()));
         assert!(child.contains(&"--assignee=tui-dev".to_string()));
@@ -1257,7 +1289,15 @@ mod tests {
     /// `--no-inherit-labels`-adjacent bd-only flags outright.
     #[test]
     fn create_args_passes_a_deterministic_id_and_force_on_bd_only() {
-        let bd_args = create_args(false, "mascot-dev", None, "animator", "subject", "body");
+        let bd_args = create_args(
+            false,
+            "mascot-dev",
+            None,
+            "animator",
+            "subject",
+            "body",
+            &[],
+        );
         let expected_id = format!(
             "--id={}",
             idempotency_key("animator", "mascot-dev", None, "subject", "body")
@@ -1268,7 +1308,7 @@ mod tests {
         );
         assert!(bd_args.contains(&"--force".to_string()));
 
-        let br_args = create_args(true, "mascot-dev", None, "animator", "subject", "body");
+        let br_args = create_args(true, "mascot-dev", None, "animator", "subject", "body", &[]);
         assert!(
             !br_args
                 .iter()
@@ -1293,6 +1333,7 @@ mod tests {
             "animator",
             "subject",
             "body",
+            &[],
         );
         assert!(
             !reply.iter().any(|a| a.starts_with("--id=")),
@@ -1304,6 +1345,98 @@ mod tests {
              the parent's prefix mismatch: {reply:?}"
         );
         assert!(reply.contains(&"--parent=pact-wisp-a2u".to_string()));
+    }
+
+    /// pact-m7j.10.1: the about-<path> labels must ride the SAME `create` call
+    /// as the bead itself — one argv, one subprocess — so there is no window
+    /// between "bead exists" and "bead is tagged" for a concurrent
+    /// `about_path` read to land in. Before this fix, `send()` created the
+    /// bead here and only tagged it in a second `label add` call after the
+    /// whole recipient loop finished.
+    #[test]
+    fn create_args_folds_about_labels_into_the_same_create_call() {
+        let about = vec!["src/msg.rs".to_string(), "src/main.rs".to_string()];
+        let args = create_args(
+            false,
+            "mascot-dev",
+            None,
+            "animator",
+            "subject",
+            "body",
+            &about,
+        );
+        assert!(
+            args.contains(&"--labels=about-src__msg-rs,about-src__main-rs".to_string()),
+            "expected a single --labels flag carrying both paths: {args:?}"
+        );
+        // No separate tagging call exists any more — create_args builds one
+        // argv and that argv is everything `create()` runs.
+        assert!(!args.iter().any(|a| a == "label" || a == "add"));
+
+        // br takes the same flag as bd, unconditionally.
+        let br_args = create_args(
+            true,
+            "mascot-dev",
+            None,
+            "animator",
+            "subject",
+            "body",
+            &about,
+        );
+        assert!(
+            br_args.contains(&"--labels=about-src__msg-rs,about-src__main-rs".to_string()),
+            "{br_args:?}"
+        );
+    }
+
+    /// The common case (no `--to-owner-of`) must not grow a `--labels` flag it
+    /// has nothing to put in — an empty `--labels=` would be a label named "".
+    #[test]
+    fn create_args_omits_labels_flag_when_about_is_empty() {
+        let args = create_args(
+            false,
+            "mascot-dev",
+            None,
+            "animator",
+            "subject",
+            "body",
+            &[],
+        );
+        assert!(!args.iter().any(|a| a.starts_with("--labels=")), "{args:?}");
+    }
+
+    /// bd's `--no-inherit-labels` only suppresses labels inherited FROM THE
+    /// PARENT — it must not also eat an explicit `--labels` list handed to the
+    /// same `create` call, or a reply that is about a path would be tagged on
+    /// bd's own root message but silently lose the tag on a reply. Verified
+    /// empirically against a real bd 1.1.0 store (see [`encode_path`]'s doc
+    /// comment for the br side of this verification).
+    #[test]
+    fn no_inherit_labels_and_an_explicit_labels_list_coexist_on_bd() {
+        let reply = create_args(
+            false,
+            "tui-dev",
+            Some("pact-wisp-a2u"),
+            "animator",
+            "subject",
+            "body",
+            &["src/x.rs".to_string()],
+        );
+        assert!(reply.contains(&"--no-inherit-labels".to_string()));
+        assert!(reply.contains(&"--labels=about-src__x-rs".to_string()));
+    }
+
+    /// br rejects a label containing `.` outright ("invalid characters (only
+    /// alphanumeric, hyphen, underscore, colon allowed)", exit 4 — confirmed
+    /// against a real br 0.2.19 store). Every real file path has one, so this
+    /// must not reach br's argv unescaped.
+    #[test]
+    fn encode_path_sanitizes_characters_br_labels_reject() {
+        assert_eq!(encode_path("src/otel.rs"), "src__otel-rs");
+        assert_eq!(encode_path("a/b/c"), "a__b__c");
+        assert_eq!(encode_path("plain"), "plain");
+        // The allowed set survives untouched.
+        assert_eq!(encode_path("a-b_c:d"), "a-b_c:d");
     }
 
     fn issue(json: &str) -> BdIssue {
@@ -1418,6 +1551,7 @@ mod tests {
             "br-dev",
             "subj",
             "b",
+            &[],
         );
         assert!(
             !brs.contains(&"--no-inherit-labels".to_string()),
@@ -1449,6 +1583,7 @@ mod tests {
             "br-dev",
             "subj",
             "b",
+            &[],
         );
         let without: Vec<&String> = bds
             .iter()

@@ -2613,6 +2613,63 @@ fn a_message_about_a_path_is_delivered_to_whoever_leases_it_next() {
     );
 }
 
+/// br twin of the test above (pact-m7j.10.1). Doubles as the end-to-end proof
+/// for `encode_path`'s charset fix: `src/otel.rs` contains a `.`, which a real
+/// br 0.2.19 store rejects outright in a label ("invalid characters", exit 4)
+/// — before that fix AND before 10.1's atomic `--labels` (which turns a
+/// rejected label from a swallowed warning into a hard `msg send` failure),
+/// this exact scenario either silently failed to tag the bead or failed to
+/// send at all. If it did, `third-agent`'s acquire below would see nothing.
+#[test]
+fn a_message_about_a_path_is_delivered_to_whoever_leases_it_next_on_br() {
+    let Some(tmp) = br_repo("a_message_about_a_path_is_delivered_on_br") else {
+        return;
+    };
+    assert_ok(&pact(
+        tmp.path(),
+        "first-owner",
+        &["lease", "acquire", "src/otel.rs"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "first-owner",
+        &["lease", "release", "--all"],
+    ));
+
+    let sent = pact(
+        tmp.path(),
+        "second-agent",
+        &[
+            "msg",
+            "send",
+            "--to-owner-of",
+            "src/otel.rs",
+            "--subject",
+            "BLOCKER: flush",
+            "spans never sent",
+        ],
+    );
+    assert_ok(&sent);
+    assert!(
+        !stderr_of(&sent).contains("could not tag"),
+        "the label must land in the same create call, not a separate one that \
+         can fail: {}",
+        stderr_of(&sent)
+    );
+
+    let out = pact(
+        tmp.path(),
+        "third-agent",
+        &["lease", "acquire", "src/otel.rs"],
+    );
+    assert_ok(&out);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("unread message") && stderr.contains("BLOCKER: flush"),
+        "the message must follow the file to its next holder on br too: {stderr}"
+    );
+}
+
 /// Advisory, and quiet when it has nothing to say: a path with no messages
 /// about it must not grow a line, or the signal is lost in ceremony.
 #[test]
