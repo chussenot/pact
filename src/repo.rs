@@ -556,10 +556,33 @@ fn has_linked_worktrees(git_dir: &Path) -> bool {
 /// through one process.
 pub fn pact_dir(repo_root: &Path) -> Result<PathBuf> {
     let dir = RepoContext::resolve(repo_root).state_dir;
+    // Checked before creating anything: `SCHEMA` is stamped only the instant
+    // `.pact/` is BORN, never backfilled onto one that already existed. An
+    // existing, unmarked directory is exactly the signal the "worktree schema
+    // marker" doctor check exists to keep surfacing (pact-m7j.9.7) — a
+    // pre-worktree-sharing binary elsewhere on PATH has no such code compiled
+    // in at all, so it silently resolves its own separate, unmarked `.pact/`
+    // for the same repository. Backfilling the marker on next touch would
+    // erase that signal instead of fixing the problem it points at.
+    let is_new = !dir.exists();
     std::fs::create_dir_all(dir.join("leases"))
         .with_context(|| format!("creating {}", dir.display()))?;
+    if is_new {
+        // Best-effort: a diagnostic marker only `pact doctor` ever reads must
+        // not fail the caller's real operation (a lease acquire, a message
+        // send) if the write happens to lose a race or hit a read-only mount.
+        let _ = std::fs::write(dir.join(SCHEMA_FILE), env!("CARGO_PKG_VERSION"));
+    }
     Ok(dir)
 }
+
+/// Filename of the version marker [`pact_dir`] stamps into `.pact/` the
+/// moment it creates the directory for the first time (pact-m7j.9.7). Not a
+/// full fix — an old binary built before cross-worktree sharing existed
+/// cannot be patched retroactively — just a forward-looking fingerprint: its
+/// presence means at least one worktree-aware pact has touched this
+/// directory since it was created.
+pub const SCHEMA_FILE: &str = "SCHEMA";
 
 /// Where the state directory would be, without creating anything. Read-only
 /// callers use this: asking a question must not leave a directory behind
@@ -857,6 +880,30 @@ mod tests {
         assert_eq!(ctx.worktree_name, None);
         assert!(ctx.warning.is_none());
         assert_eq!(pact_dir_path(&root), root.join(".pact"));
+    }
+
+    /// The marker is stamped the instant `.pact/` is born, and never
+    /// backfilled onto one that already exists — an existing, unmarked
+    /// directory is exactly what the "worktree schema marker" doctor check
+    /// exists to keep finding (pact-m7j.9.7); silently curing it on the next
+    /// touch would erase that signal instead of the problem it points at.
+    #[test]
+    fn pact_dir_stamps_the_schema_marker_only_on_first_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let dir = pact_dir(root).unwrap();
+        assert!(
+            dir.join(SCHEMA_FILE).is_file(),
+            "a freshly created .pact/ must carry the marker"
+        );
+
+        std::fs::remove_file(dir.join(SCHEMA_FILE)).unwrap();
+        pact_dir(root).unwrap();
+        assert!(
+            !dir.join(SCHEMA_FILE).is_file(),
+            "an already-existing .pact/ must not be backfilled with the marker"
+        );
     }
 
     /// `git worktree prune` leaves an empty `worktrees/` behind. Treating that as

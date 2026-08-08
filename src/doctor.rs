@@ -189,6 +189,35 @@ pub fn checks(root: &Path) -> DoctorReport {
         },
     });
 
+    // `pact init` already warns about this on stderr at write time (see
+    // `agents_md::resolve_write_target`), but only when a write actually
+    // happens — a repo nobody has re-run `init` in stays silent about an
+    // escaping symlink indefinitely. This asks the same question without
+    // writing anything (pact-m7j.9.12).
+    let escaping = agents_md::escaping_write_set_symlinks(root);
+    checks.push(DoctorCheck {
+        name: "write-set symlinks",
+        ok: true,
+        warn: !escaping.is_empty(),
+        detail: if escaping.is_empty() {
+            "no managed file is a symlink escaping the repository".to_string()
+        } else {
+            format!(
+                "escapes the repository via a symlink — deliberate for a dotfiles-style layout, \
+                 but worth confirming: {}",
+                escaping
+                    .iter()
+                    .map(|(p, target)| format!(
+                        "{} -> {}",
+                        p.strip_prefix(root).unwrap_or(p).display(),
+                        target.display()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+    });
+
     // Built in, configured, and exporting are three different things, and the
     // gap between the last two is silent by construction: pact speaks http/json
     // over http:// only, so `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` (the
@@ -332,6 +361,37 @@ pub fn checks(root: &Path) -> DoctorReport {
         }),
         Err(e) => checks.push(DoctorCheck {
             name: "orphaned staging files",
+            ok: false,
+            warn: false,
+            detail: format!("{e:#}"),
+        }),
+    }
+
+    // Pure visibility, not a failure: a wait marker is only collected by the
+    // same agent retrying the same path or by that agent's own `release
+    // --all`, and AGENTS.md tells a blocked agent to do neither ("message
+    // them and pick up something else"). So a nonzero count here is ordinary
+    // fleet behaviour, not damage — there is no ceiling to invent, only a
+    // number worth knowing (pact-m7j.4.6).
+    match lease::marker_count(root) {
+        Ok(0) => checks.push(DoctorCheck {
+            name: "stale wait markers",
+            ok: true,
+            warn: false,
+            detail: "none".to_string(),
+        }),
+        Ok(n) => checks.push(DoctorCheck {
+            name: "stale wait markers",
+            ok: true,
+            warn: true,
+            detail: format!(
+                "{n} marker{} in .pact/waits/ from a conflict nobody retried or swept with \
+                 `lease release --all` — harmless, informational only",
+                if n == 1 { "" } else { "s" }
+            ),
+        }),
+        Err(e) => checks.push(DoctorCheck {
+            name: "stale wait markers",
             ok: false,
             warn: false,
             detail: format!("{e:#}"),
@@ -535,6 +595,41 @@ fn worktree_checks(ctx: &repo::RepoContext, checks: &mut Vec<DoctorCheck>) {
                 foreign.join(", ")
             ),
             _ => "PACT_STATE_DIR is not set — not applicable".to_string(),
+        },
+    });
+
+    // Emitted unconditionally, same reasoning as `state dir isolation` above:
+    // findable before it ever fires. Meaningful only where `.pact/` is
+    // actually shared across worktrees (`has_worktrees` covers both
+    // directions — the main worktree with siblings, and a linked worktree
+    // resolving to the main one) — a solo checkout has no sibling binary that
+    // could be resolving a different, unmarked directory for the same repo.
+    //
+    // A pre-worktree-sharing binary has this feature simply absent from its
+    // compiled code, not disabled by a setting, so it cannot be taught to
+    // write the marker retroactively — this can only warn that the
+    // possibility exists, not rule it out (pact-m7j.9.7).
+    let marker_present = ctx.state_dir.join(repo::SCHEMA_FILE).is_file();
+    checks.push(DoctorCheck {
+        name: "worktree schema marker",
+        ok: true,
+        warn: ctx.has_worktrees && !marker_present,
+        detail: if !ctx.has_worktrees {
+            "no worktrees here — not applicable".to_string()
+        } else if marker_present {
+            format!(
+                "{} carries the schema marker — a worktree-aware pact has touched it",
+                ctx.state_dir.display()
+            )
+        } else {
+            format!(
+                "{} was never touched by a worktree-aware pact — if an older binary (built \
+                 before cross-worktree sharing existed) still runs anywhere against this \
+                 repository, it resolves its own separate, unmarked .pact/ instead of this one, \
+                 with no visibility into this one's leases. Not fixable retroactively; the \
+                 mitigation is rebuilding every binary that touches this repository.",
+                ctx.state_dir.display()
+            )
         },
     });
 }
@@ -766,6 +861,88 @@ mod tests {
             "two leftover staging files must not pass: {}",
             c.detail
         );
+        assert!(c.detail.contains('2'), "{}", c.detail);
+    }
+
+    /// A genuine linked worktree is more than a unit test needs to prove this
+    /// check works: `has_worktrees` is decided purely by `.git/worktrees/`
+    /// having an entry (see `an_empty_worktrees_dir_does_not_count` in
+    /// repo.rs), so a hand-built minimal fixture exercises the same code path
+    /// a real one would. `.pact/` is hand-created without calling
+    /// `repo::pact_dir` — the function that stamps the marker — to simulate a
+    /// directory that predates pact-m7j.9.7 (pact-m7j.9.7's own scope note:
+    /// a real cross-worktree fixture is not required).
+    #[test]
+    fn doctor_warns_about_an_unmarked_pact_dir_in_a_worktree_shared_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git").join("worktrees").join("wt")).unwrap();
+        std::fs::create_dir_all(root.join(".pact")).unwrap();
+
+        let report = checks(root);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "worktree schema marker")
+            .expect("doctor must report the worktree schema marker");
+        assert!(c.ok, "a missing marker warns, it does not fail doctor");
+        assert!(c.warn, "{}", c.detail);
+        assert!(c.detail.contains("never touched"), "{}", c.detail);
+    }
+
+    /// `pact init` only warns about an escaping symlink at write time
+    /// (`agents_md::resolve_write_target`); this is the same question asked
+    /// without writing anything, so a repo nobody has re-run `init` in is not
+    /// silent about it (pact-m7j.9.12).
+    #[cfg(unix)]
+    #[test]
+    fn doctor_names_a_managed_file_that_symlinks_outside_the_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("victim-outside-repo.md");
+        std::fs::write(&outside, "not part of this repo\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("AGENTS.md")).unwrap();
+
+        let report = checks(root);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "write-set symlinks")
+            .expect("doctor must report escaping write-set symlinks");
+        assert!(c.ok, "an escaping symlink warns, it does not fail doctor");
+        assert!(c.warn, "{}", c.detail);
+        assert!(c.detail.contains("AGENTS.md"), "{}", c.detail);
+        assert!(c.detail.contains("victim-outside-repo.md"), "{}", c.detail);
+    }
+
+    /// Two agents blocked on two different paths, neither ever retried nor
+    /// released with `--all` — the shape AGENTS.md's own protocol leaves
+    /// behind. `#[cfg(feature = "otel")]` because `lease::mark_conflict` only
+    /// writes `.pact/waits/` markers in an otel build (pact-m7j.4.6); see
+    /// `the_default_build_does_no_telemetry_filesystem_work` in lease.rs for
+    /// why the default build must create none at all.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn doctor_reports_stale_wait_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        lease::acquire(root, "agent-a", "hot.rs", 900, false, None).unwrap();
+        assert!(lease::acquire(root, "agent-b", "hot.rs", 900, false, None).is_err());
+        lease::acquire(root, "agent-x", "warm.rs", 900, false, None).unwrap();
+        assert!(lease::acquire(root, "agent-y", "warm.rs", 900, false, None).is_err());
+
+        assert_eq!(lease::marker_count(root).unwrap(), 2);
+
+        let report = checks(root);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "stale wait markers")
+            .expect("doctor must report stale wait markers");
+        assert!(c.ok, "pure visibility must never fail doctor's exit code");
+        assert!(c.warn, "a nonzero count is worth knowing");
         assert!(c.detail.contains('2'), "{}", c.detail);
     }
 

@@ -745,9 +745,11 @@ Both the directory and the markers are created only in an `otel` build —
 telemetry compiled out means no filesystem work at all. `release --all` sweeps
 any markers you left behind, because a conflict you never retried would
 otherwise leak one small file per `(agent, path)` forever — and not retrying is
-exactly what the protocol tells a blocked agent to do. `lease ls` and
-`pact doctor` do not see these files: both look inside `.pact/leases/`, and
-`.pact/waits/` is a sibling directory neither reads.
+exactly what the protocol tells a blocked agent to do. `lease ls` still does
+not see these files — it only looks inside `.pact/leases/`. `pact doctor`'s
+**stale wait markers** check does count them, purely for visibility: a nonzero
+count is the normal residue of a fleet that followed the protocol, not damage,
+so it warns without ever failing the check.
 
 ## Why advisory, not mandatory
 

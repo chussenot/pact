@@ -125,9 +125,11 @@ here that the CLI does not emit, fails CI:
 | `event log survives a clone` | is `.pact/events.jsonl` tracked; warns (`!`) when it is ignored, because the history dies at the next clone |
 | `state dir writable` | can pact actually write there — the shared directory of a linked worktree may not be yours |
 | `state dir isolation` | only meaningful under `PACT_STATE_DIR`; warns (`!`) when leases there look like they came from a different repository |
+| `worktree schema marker` | only meaningful with linked worktrees; warns (`!`) when the shared `.pact/` has never been touched by a worktree-aware pact, so an older binary elsewhere on PATH may still be treating it as private state |
 | `AGENTS.md block current` | does the managed block match this pact version |
 | `CLAUDE.md reaches the protocol` | Claude Code loads `CLAUDE.md`, never `AGENTS.md` |
 | `other instruction files current` | `GEMINI.md` and friends, same staleness question |
+| `write-set symlinks` | warns (`!`) when a managed file is a symlink resolving outside the repository |
 | `protocol files reach a clone` | warns (`!`) when they are gitignored |
 | `otel export` | built in? configured? actually exporting? warns (`!`) when the answer to the last one is no |
 | `one Beads store` | warns (`!`) when `.beads/` holds two backends' stores |
@@ -135,6 +137,7 @@ here that the CLI does not emit, fails CI:
 | `stale leases` | how many, without collecting them |
 | `corrupt leases` | lock files pact cannot read, which only a human can clear |
 | `orphaned staging files` | `staging-*`/`tmp-*` debris left by a write that crashed mid-rename |
+| `stale wait markers` | `.pact/waits/` markers a conflict left behind that nobody retried or swept — informational only, never a failure |
 
 Lazy-loaded like Messages (only checked once you visit the tab, or press
 `r`), since it shells out to `bd --version` the same way Messages does.

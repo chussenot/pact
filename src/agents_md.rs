@@ -589,6 +589,45 @@ fn resolve_write_target(path: &Path, repo_root: &Path) -> PathBuf {
     resolved
 }
 
+/// The read-only half of the check [`resolve_write_target`] performs before
+/// writing: is `path` a symlink whose target resolves outside `repo_root`,
+/// and if so, where does it point?
+///
+/// Split out so `pact doctor` can ask the same question `pact init` warns
+/// about at write time, without running `init` and without printing anything
+/// itself (pact-m7j.9.12) — `init`'s warning only ever fires mid-write, so a
+/// repo nobody has re-run `init` in stayed silent about an escaping symlink
+/// until the next write happened to touch it.
+fn escaping_symlink(path: &Path, repo_root: &Path) -> Option<PathBuf> {
+    let is_symlink = std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_symlink {
+        return None;
+    }
+    let resolved = std::fs::canonicalize(path).ok()?;
+    let root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    (!resolved.starts_with(&root)).then_some(resolved)
+}
+
+/// Every managed write-set file that is a symlink resolving outside
+/// `repo_root` — every instruction file [`managed_instruction_files`] tracks,
+/// plus `AGENTS.md`, `CLAUDE.md`, `.gitignore` and `.gitattributes`, the four
+/// files pact writes directly rather than through [`present_targets`]. Paired
+/// with the resolved target, so `pact doctor` can name both halves the same
+/// way `init`'s own warning does (pact-m7j.9.12).
+pub fn escaping_write_set_symlinks(repo_root: &Path) -> Vec<(PathBuf, PathBuf)> {
+    managed_instruction_files(repo_root)
+        .into_iter()
+        .chain(
+            ["AGENTS.md", "CLAUDE.md", ".gitignore", ".gitattributes"]
+                .iter()
+                .map(|f| repo_root.join(f)),
+        )
+        .filter_map(|p| escaping_symlink(&p, repo_root).map(|target| (p, target)))
+        .collect()
+}
+
 /// Bounded attempts for [`write_atomic_cas`]'s retry loop, after which it
 /// fails loudly rather than spinning forever against a file under constant
 /// writes.
