@@ -516,7 +516,7 @@ swallowed — a warning must never break a send that would otherwise succeed.
 The warning fires on *every* send to an unseen name, including when nobody at
 all has been seen yet; it doesn't go quiet after the first time.
 
-Two things the warning deliberately does not treat as "known":
+Three things the warning deliberately does not treat as "known":
 
 - **Having only ever received mail.** That proves somebody typed the name, which
   is precisely what a typo looks like. `pact agents` marks such names with `?`
@@ -524,6 +524,11 @@ Two things the warning deliberately does not treat as "known":
 - **`human`.** Reserved by the protocol block as the operator's mailbox. A human
   reads pact's output but never runs commands as `human`, so "never acted" is
   normal there.
+- **A name that fails pact's own identity grammar**, even one with real message
+  traffic. `from`/`to` come back from bd/br, not from this command's own check,
+  so a name planted straight into the shared store by something other than pact
+  can still show up there — `pact agents` marks it `[INVALID]` rather than
+  listing it as an agent, since no `pact` process could ever have sent under it.
 
 One case *is* a hard error rather than a warning: a recipient that violates
 pact's identity grammar (`[a-z0-9][a-z0-9-]{1,31}`). No process could ever run

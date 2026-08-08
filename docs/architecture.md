@@ -394,6 +394,15 @@ That derivation is also why `pact agents` distinguishes an identity that has
 — the latter is what a typo leaves behind, and the command marks it `?` rather
 than confirming it as an agent.
 
+The derivation cuts the other way too: `from`/`to` on a message come back from
+bd/br, not from pact's own `--to` check, so a name that violates pact's
+identity grammar (`[a-z0-9][a-z0-9-]{1,31}`) can still show up in that traffic
+— planted by a human running `bd create`, another tool, or an older pact build
+with a looser check. `pact agents` flags such a name `[INVALID]` rather than
+listing it like a real one, and `is_known`/`suggest` never treat it as known or
+offer it as a correction, because no `pact` process could ever have run under
+it in the first place.
+
 `pact log` follows the same rule from the other direction: it *reads* the two
 places the facts already are (`.pact/events.jsonl` and `bd`) and merges them on
 parsed instants, keeping no third copy and no index.
