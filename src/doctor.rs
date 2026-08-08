@@ -328,6 +328,64 @@ pub fn checks(root: &Path) -> DoctorReport {
         },
     });
 
+    // pact-juz.2/pact-juz.4: the check above confirms the BINARY supports
+    // --actor, not that anything is actually using it for the commands an
+    // agent runs directly (`bd update --claim`, `bd close`, ...) — those
+    // never pass through pact at all. Confirmed on a real 15-agent build:
+    // 16 distinct pact agent identities in `.pact/events.jsonl`, and every
+    // one of 16 `.beads/interactions.jsonl` entries attributed to the
+    // operator's own git identity instead. This detects that symptom
+    // automatically in case pact-juz.2's `BEADS_ACTOR` guidance is missed,
+    // skipped, or a future backend stops honoring the env var.
+    let pact_agents: std::collections::BTreeSet<String> = crate::events::recent(root, usize::MAX)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.agent)
+        .collect();
+    checks.push(match beads::interaction_actors(root) {
+        // Absence is read as "not applicable" — whether `br` writes this
+        // same file is unconfirmed, so a `br`-only repo where it does not
+        // exist must not be told its attribution is broken.
+        None => DoctorCheck {
+            name: "Beads actor attribution",
+            ok: true,
+            warn: false,
+            detail: "no .beads/interactions.jsonl — not applicable".to_string(),
+        },
+        Some(bd_actors) => {
+            let bd_actors: std::collections::BTreeSet<String> = bd_actors.into_iter().collect();
+            // The signal is MULTIPLE pact identities collapsing to a
+            // disjoint set of bd actors, not merely zero overlap — a solo
+            // session legitimately has one identity everywhere, and that is
+            // not suspicious.
+            let suspicious = pact_agents.len() > 1
+                && !bd_actors.is_empty()
+                && pact_agents.is_disjoint(&bd_actors);
+            DoctorCheck {
+                name: "Beads actor attribution",
+                ok: true,
+                warn: suspicious,
+                detail: if suspicious {
+                    format!(
+                        "{} pact agent identities acted, but none of the {} Beads actor(s) \
+                         recorded in .beads/interactions.jsonl match any of them — direct `bd`/`br` \
+                         commands are not attributed to the agent that ran them. Run `pact whoami` \
+                         and export the `BEADS_ACTOR` line it prints.",
+                        pact_agents.len(),
+                        bd_actors.len()
+                    )
+                } else {
+                    format!(
+                        "{} pact agent identities, {} Beads actor(s) recorded — no attribution \
+                         gap detected",
+                        pact_agents.len(),
+                        bd_actors.len()
+                    )
+                },
+            }
+        }
+    });
+
     // peek, not list: a diagnostic that mutates is not a diagnostic — running
     // doctor twice used to give two different stale counts because the first run
     // unlinked the locks it was reporting (pact-rnc.19). `pact lease ls` still
@@ -1008,6 +1066,99 @@ mod tests {
             .iter()
             .find(|c| c.name == "no duplicated instruction blocks")
             .expect("doctor must report the new check");
+        assert!(c.ok && !c.warn, "{}", c.detail);
+    }
+
+    /// pact-juz.4: the field-observed shape — several distinct pact agent
+    /// identities in `.pact/events.jsonl`, but every `.beads/interactions.jsonl`
+    /// entry attributed to a name none of them share, because the agents ran
+    /// `bd` directly without `BEADS_ACTOR` set.
+    #[test]
+    fn doctor_warns_when_multiple_pact_agents_never_appear_as_a_beads_actor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        lease::acquire(root, "agent-a", "a.rs", 900, false, None).unwrap();
+        lease::acquire(root, "agent-b", "b.rs", 900, false, None).unwrap();
+        let beads = root.join(".beads");
+        std::fs::create_dir_all(&beads).unwrap();
+        std::fs::write(
+            beads.join("interactions.jsonl"),
+            "{\"actor\":\"Some Human\"}\n",
+        )
+        .unwrap();
+
+        let report = checks(root);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "Beads actor attribution")
+            .expect("doctor must report Beads actor attribution");
+        assert!(c.ok, "pure visibility must never fail doctor's exit code");
+        assert!(c.warn, "{}", c.detail);
+        assert!(c.detail.contains("BEADS_ACTOR"), "{}", c.detail);
+    }
+
+    #[test]
+    fn doctor_is_clean_when_a_beads_actor_matches_a_pact_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        lease::acquire(root, "agent-a", "a.rs", 900, false, None).unwrap();
+        lease::acquire(root, "agent-b", "b.rs", 900, false, None).unwrap();
+        let beads = root.join(".beads");
+        std::fs::create_dir_all(&beads).unwrap();
+        std::fs::write(
+            beads.join("interactions.jsonl"),
+            "{\"actor\":\"agent-a\"}\n",
+        )
+        .unwrap();
+
+        let report = checks(root);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "Beads actor attribution")
+            .expect("doctor must report Beads actor attribution");
+        assert!(c.ok && !c.warn, "{}", c.detail);
+    }
+
+    #[test]
+    fn doctor_treats_a_missing_interactions_file_as_not_applicable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        lease::acquire(root, "agent-a", "a.rs", 900, false, None).unwrap();
+        lease::acquire(root, "agent-b", "b.rs", 900, false, None).unwrap();
+
+        let report = checks(root);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "Beads actor attribution")
+            .expect("doctor must report Beads actor attribution");
+        assert!(c.ok && !c.warn, "{}", c.detail);
+        assert!(c.detail.contains("not applicable"), "{}", c.detail);
+    }
+
+    /// A solo session legitimately collapses to one identity everywhere —
+    /// that is not the attribution gap this check exists to catch.
+    #[test]
+    fn doctor_does_not_warn_for_a_single_pact_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        lease::acquire(root, "agent-a", "a.rs", 900, false, None).unwrap();
+        let beads = root.join(".beads");
+        std::fs::create_dir_all(&beads).unwrap();
+        std::fs::write(
+            beads.join("interactions.jsonl"),
+            "{\"actor\":\"Some Human\"}\n",
+        )
+        .unwrap();
+
+        let report = checks(root);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "Beads actor attribution")
+            .expect("doctor must report Beads actor attribution");
         assert!(c.ok && !c.warn, "{}", c.detail);
     }
 

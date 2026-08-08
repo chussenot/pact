@@ -521,6 +521,38 @@ pub fn conflict_warning(repo_root: &Path) -> Option<String> {
     ))
 }
 
+/// Every distinct, non-empty `actor` recorded in `.beads/interactions.jsonl`
+/// (pact-juz.4), or `None` if the file does not exist at all — distinct from
+/// an empty `Vec`, which means the file exists but recorded nobody.
+///
+/// A plain file read, not a bypass of "never touch the Beads DB directly"
+/// (CLAUDE.md): that rule is about live transactional state (message
+/// read-labels, issue status) that must only ever be asked through `bd`/`br`
+/// so a concurrent writer is never missed. `interactions.jsonl` is the
+/// opposite shape — an append-only, already-committed audit log
+/// (docs/architecture.md documents its exact JSON), the same kind of file
+/// `.pact/events.jsonl` is on pact's own side. Reading it is a diagnostic
+/// question, not a state mutation, and it is read here rather than through a
+/// `bd`/`br` subprocess because neither CLI exposes "list every actor that
+/// has ever acted" as a query — this is the one source that has it.
+///
+/// Whether `br` writes this same file has not been confirmed (the bead this
+/// exists for only had a `bd` repo to check against) — absence is read as
+/// "not applicable", never as "zero actors", so a `br`-only repo where this
+/// file simply does not exist reports cleanly rather than falsely.
+pub fn interaction_actors(repo_root: &Path) -> Option<Vec<String>> {
+    let contents = std::fs::read_to_string(repo_root.join(".beads/interactions.jsonl")).ok()?;
+    let mut actors: Vec<String> = contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|v| v.get("actor")?.as_str().map(str::to_string))
+        .filter(|a| !a.is_empty())
+        .collect();
+    actors.sort();
+    actors.dedup();
+    Some(actors)
+}
+
 fn sqlite_db(beads_dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(beads_dir)
         .ok()?
@@ -770,6 +802,29 @@ mod tests {
         assert!(bd.starts_with("bd (beads) not found") && bd.contains("br cannot read"));
         let br = missing_backend_message(Workspace::Br);
         assert!(br.starts_with("br (beads-rust) not found") && br.contains("bd cannot read"));
+    }
+
+    #[test]
+    fn interaction_actors_is_none_without_the_file_and_deduped_sorted_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(interaction_actors(tmp.path()), None);
+
+        let beads = tmp.path().join(".beads");
+        std::fs::create_dir_all(&beads).unwrap();
+        std::fs::write(
+            beads.join("interactions.jsonl"),
+            "{\"actor\":\"agent-b\"}\n\
+             not json\n\
+             {\"actor\":\"agent-a\"}\n\
+             {\"actor\":\"agent-b\"}\n\
+             {\"actor\":\"\"}\n\
+             {\"no_actor_field\":true}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            interaction_actors(tmp.path()),
+            Some(vec!["agent-a".to_string(), "agent-b".to_string()])
+        );
     }
 
     /// A plain `.git/` directory is all `beads_root` needs to treat a temp dir
