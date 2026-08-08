@@ -7,6 +7,7 @@ Offline analysis of a repository's coordination history, from
 pact audit                          # summary
 pact audit --check double-win       # exit 1 if two agents ever held one path
 pact audit --check stale-holds      # exit 1 on holds past TTL with no renew
+pact audit --check chain-integrity  # exit 1 if a chain-tracked line was edited
 pact audit --since 7d --json        # narrow the window, machine-readable
 ```
 
@@ -94,6 +95,48 @@ paths. The output says so rather than reporting a distinct-incident count,
 because grouping them would need a timestamp tolerance — one `acquire` writes one
 row per path, microseconds apart — and a number that depends on an arbitrary
 tolerance is worse than no number.
+
+### `--check chain-integrity`
+
+Every event pact appends carries `chain_hash`: a hash of the line's own content
+mixed with the `chain_hash` of the line physically before it (or a fixed
+`"genesis"` value, for the first line ever tracked). Edit a chain-tracked line
+after the fact — by hand, or by anything other than `pact` itself — and its
+recorded hash no longer matches what this check recomputes from its neighbour.
+This is a different failure mode from a torn append (a truncated final line,
+already covered by `unparseable_lines`): a torn line fails to *parse* at all,
+where a tampered one parses fine and reads as ordinary history unless something
+recomputes its hash.
+
+This is **strictly additive, not a change in what pact trusts**. `owner_of`,
+`actors`, `audit::summary` and every other existing reader still trust every
+line exactly as they did before this field existed — this check is a new,
+separate surface, not a new gate in front of an old one. That scope is
+deliberate: making the chain the thing those consumers trust would change what
+"the log is authoritative" means for all of them, which is a maintainer
+decision this feature does not make on anyone's behalf.
+
+A line with **no** `chain_hash` is not a finding. It is counted and reported —
+"N line(s) predate chain tracking or were not written by pact" — but never
+flagged as tampered, because every line written before this shipped has no
+`chain_hash`, including this repository's own committed history. Treating an
+absent field as evidence of tampering would flag every pre-existing repository
+the moment this check landed. What the check actually flags is narrower and
+stronger: a line that DOES carry a `chain_hash`, but the wrong one — which is
+exactly the shape a hand-edit or forgery leaves, since nothing except
+`pact`'s own append path can compute one that verifies.
+
+Chain continuity resets to `"genesis"` after any untracked line, rather than
+reaching back through it for an earlier tracked ancestor. That is what lets a
+log that is part pre-existing history and part chain-tracked (the shape every
+real repository has, indefinitely, from the moment this shipped) verify
+cleanly: a tracked line only ever answers for the line immediately before it.
+
+Unlike the other two checks, this one reads the **raw, unfiltered** log —
+`--since` and `--include-annotated` do not apply to it. The chain is a
+property of physical line adjacency as written; an annotation line and
+whatever it covers are still real entries the writer's hash chain ran
+through, whatever a lease-history statistic later excludes them from.
 
 ## Closes with nothing open
 

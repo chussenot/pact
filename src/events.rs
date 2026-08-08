@@ -33,6 +33,14 @@ use crate::repo::pact_dir;
 const MAX_LINES: usize = 5000;
 const KEEP_LINES: usize = 4000;
 
+/// The chain point a chain-tracked line binds to when no preceding line has
+/// one to offer — the first line ever tracked, or the first tracked line
+/// after a run of untracked ones (pact-m7j.2.5). A plain string rather than
+/// `Option::None` threaded through the mix function: it is itself an input to
+/// the hash, and "no prior chain" has to hash to something stable, not to the
+/// absence of a byte.
+pub const CHAIN_GENESIS: &str = "genesis";
+
 /// One lease-lifecycle event. `kind` is one of the strings emitted by
 /// `lease.rs`: `"acquired"`, `"renewed"`, `"released"`, `"stolen"`,
 /// `"force-released"`, `"expired"`, `"restored"`. Kept as a plain `String`
@@ -87,6 +95,31 @@ pub struct Event {
     /// really is the correct, unimprovable outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub displaced: Option<String>,
+    /// A hash binding this event to the one physically before it in the file,
+    /// so a hand-edited or forged line breaks the chain instead of reading
+    /// identically to a pact-authored one.
+    ///
+    /// Strictly additive and opt-in-to-check (pact-m7j.2.5): `None` on every
+    /// line written before this field existed — including this repository's
+    /// own committed history — and `owner_of`/`actors`/`audit::summary` keep
+    /// trusting every line exactly as they did before this existed. Changing
+    /// what those consumers trust is the maintainer call the bead that asked
+    /// for this explicitly flagged as unresolved; this field only feeds a new,
+    /// separate `pact audit --check chain-integrity`, which never fails a line
+    /// for lacking it, only counts it as predating the chain (or not written
+    /// by pact).
+    ///
+    /// Computed by `append_bounded` as a hash of this event's own canonical
+    /// JSON (itself serialized with this field cleared, so the hash never
+    /// includes itself) mixed with the chain point it binds to: the nearest
+    /// preceding line's `chain_hash` if that line parses and has one, or
+    /// [`CHAIN_GENESIS`] otherwise. That "nearest preceding line" rule, not a
+    /// running accumulator, is what lets a log with chain-tracked lines mixed
+    /// among untracked ones (the shape every real repo has, forever, once this
+    /// lands) verify cleanly: each tracked line only ever answers for the line
+    /// immediately before it, never for history before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_hash: Option<String>,
 }
 
 /// For appending: creates `.pact/` if needed.
@@ -159,6 +192,141 @@ fn ends_without_newline(path: &Path) -> Result<bool> {
     Ok(last[0] != b'\n')
 }
 
+/// Non-cryptographic FNV-1a 64-bit mix of a chain point and one event's
+/// canonical JSON, hex-encoded. Same algorithm as `msg.rs`'s `fnv1a64` (see
+/// its doc comment for why FNV-1a and not `DefaultHasher` or a crypto hash:
+/// deterministic across runs, no dependency, and the threat model this and
+/// that hash both accept is naive/accidental collision, not an adversary
+/// searching for one). Duplicated rather than imported: `msg.rs`'s version is
+/// private to that module and mixes a different shape of input for a
+/// different purpose (message dedup, not log tamper-evidence); sharing it
+/// would couple two unrelated subsystems for a dozen lines of arithmetic.
+fn chain_hash_of(prev_chain_point: &str, event_json_without_chain_hash: &str) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for part in [prev_chain_point, event_json_without_chain_hash] {
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        // Separator between the two parts, same reasoning as `msg.rs`: without
+        // it, a chain point and a JSON body that concatenate to the same bytes
+        // as a different pair would hash identically.
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+/// What `ev`'s `chain_hash` should be, given the chain point it binds to.
+///
+/// The ONE place this computation happens — [`append_bounded`] calls it to
+/// write a new line's hash, and `audit::run_check`'s chain-integrity check
+/// (via [`verify_chain`]) calls it again to recompute what an existing line's
+/// hash should have been. Two implementations of this one rule could drift
+/// apart silently; one function cannot (pact-m7j.2.5).
+fn expected_chain_hash(prev_chain_point: &str, ev: &Event) -> Result<String> {
+    // Cleared, not merely ignored: `ev` may already carry a `chain_hash` (an
+    // event read back from the log, in `verify_chain`'s case), and hashing
+    // over a value that includes itself would make the hash a function of
+    // whatever happened to be there rather than of the event's real content.
+    let mut cleared = ev.clone();
+    cleared.chain_hash = None;
+    let canonical = serde_json::to_string(&cleared)?;
+    Ok(chain_hash_of(prev_chain_point, &canonical))
+}
+
+/// The chain point the NEXT append should bind to: the nearest line at the
+/// end of the file that parses as an `Event`, and that line's own
+/// `chain_hash` if it has one, or [`CHAIN_GENESIS`] if it does not (an empty
+/// file, one with no chain-tracked lines yet, or whose most recent parseable
+/// line predates chain tracking).
+///
+/// Deliberately does NOT search further back past that nearest parseable line
+/// for an earlier line that DOES have a `chain_hash`: a torn tail or garbage
+/// line is skipped (it never parses), but a well-formed, untracked line
+/// resets the chain to [`CHAIN_GENESIS`] for whatever comes after it. That
+/// matches how a mixed-age log actually reads: an untracked line is real
+/// history this feature knows nothing about, not a gap to see through.
+fn last_chain_point(path: &Path) -> Result<String> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(CHAIN_GENESIS.to_string()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    Ok(contents
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<Event>(l).ok())
+        .and_then(|e| e.chain_hash)
+        .unwrap_or_else(|| CHAIN_GENESIS.to_string()))
+}
+
+/// One line whose `chain_hash` does not match what [`expected_chain_hash`]
+/// says it should be, given the chain point the line before it offers.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainMismatch {
+    pub line: usize,
+    pub agent: String,
+    pub kind: String,
+    pub at: String,
+    pub expected: String,
+    pub found: String,
+}
+
+/// Walk the whole numbered log and check every chain-tracked line against
+/// [`expected_chain_hash`], returning the mismatches plus how many lines were
+/// tracked at all versus not.
+///
+/// Takes the RAW numbered log — `audit::load`'s annotation-filtered,
+/// `--since`-narrowed view is the wrong input here: the chain is a property of
+/// PHYSICAL line adjacency in the file as written, and an annotation line is
+/// still a real physical entry the writer's hash chain ran through, whatever
+/// a lease-history statistic later decides to exclude it from.
+///
+/// A line with no `chain_hash` is counted in `untracked` and otherwise
+/// ignored — not flagged, not skipped when it comes to being the reference
+/// point for the line after it (see [`last_chain_point`]'s doc comment for why
+/// that "reset to genesis" rule is right). This is what keeps a log with NO
+/// chain-tracked lines anywhere — every log that predates pact-m7j.2.5,
+/// including this repository's own committed history — reporting cleanly:
+/// zero tracked, zero mismatches, never "tampered".
+pub fn verify_chain(numbered: &[(usize, Event)]) -> (Vec<ChainMismatch>, usize, usize) {
+    let mut mismatches = Vec::new();
+    let mut tracked = 0usize;
+    let mut untracked = 0usize;
+    // `None` here means "the nearest preceding line parsed but had no
+    // chain_hash", i.e. CHAIN_GENESIS — matching `last_chain_point`'s
+    // write-time rule exactly, one line at a time as we walk forward.
+    let mut chain_point: Option<String> = None;
+    for (line, e) in numbered {
+        match &e.chain_hash {
+            Some(actual) => {
+                tracked += 1;
+                let prev = chain_point.as_deref().unwrap_or(CHAIN_GENESIS);
+                let expected = expected_chain_hash(prev, e).unwrap_or_default();
+                if &expected != actual {
+                    mismatches.push(ChainMismatch {
+                        line: *line,
+                        agent: e.agent.clone(),
+                        kind: e.kind.clone(),
+                        at: e.at.clone(),
+                        expected,
+                        found: actual.clone(),
+                    });
+                }
+                chain_point = Some(actual.clone());
+            }
+            None => {
+                untracked += 1;
+                chain_point = None;
+            }
+        }
+    }
+    (mismatches, tracked, untracked)
+}
+
 /// Append one event to `.pact/events.jsonl`.
 ///
 /// Infallible by signature: I/O errors are swallowed, because a logging
@@ -185,7 +353,6 @@ pub fn append(repo_root: &Path, ev: &Event) {
 /// on the plain append actually closes.
 fn append_bounded(repo_root: &Path, ev: &Event, max_lines: usize, keep_lines: usize) -> Result<()> {
     let path = events_file(repo_root)?;
-    let line = serde_json::to_string(ev)?;
 
     {
         // Shared: blocks only while a trim (below) holds the exclusive lock,
@@ -195,6 +362,25 @@ fn append_bounded(repo_root: &Path, ev: &Event, max_lines: usize, keep_lines: us
         // The torn-tail check happens under the lock too, so it never reads a
         // file mid-rewrite by a concurrent trim.
         let sever_torn_tail = ends_without_newline(&path)?;
+        // ponytail: read under the SHARED lock, so this still races another
+        // appender that is also (legitimately) holding a shared lock at the
+        // same instant — shared locks don't serialize against each other by
+        // design, see above. Two truly simultaneous appends can each read the
+        // same prior chain point and both chain from it, which
+        // `audit::verify_chain` then reads as a broken link on one of them
+        // even though both writes are genuine. Closing it means computing the
+        // chain point under the EXCLUSIVE lock instead, which would serialize
+        // every append and undo the throughput property the shared lock above
+        // exists to provide — not a trade worth making for an
+        // informational-only check (pact-m7j.2.5) against a race that needs
+        // two writers hitting the very same repo in the very same instant,
+        // which real pact usage does not do (lease ops run at agent speed,
+        // not in a tight loop). Upgrade path if that ever stops being true:
+        // fold this read into the exclusive-lock section below.
+        let prev_chain_point = last_chain_point(&path)?;
+        let mut chained = ev.clone();
+        chained.chain_hash = Some(expected_chain_hash(&prev_chain_point, ev)?);
+        let line = serde_json::to_string(&chained)?;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -509,6 +695,9 @@ mod tests {
             covers_lines: None,
             actor: None,
             displaced: None,
+            // append() computes this; a hand-built fixture leaves it unset,
+            // same as every event this test module writes before append().
+            chain_hash: None,
         }
     }
 
@@ -702,5 +891,113 @@ mod tests {
         let got = recent(tmp.path(), 100).unwrap();
         assert_eq!(got.last().unwrap().path.as_deref(), Some("f11.rs"));
         assert_eq!(got.len(), lines);
+    }
+
+    // --------------------------------------------------------- chain hashing
+
+    #[test]
+    fn the_first_appended_event_ever_chains_from_genesis() {
+        let tmp = tempfile::tempdir().unwrap();
+        append(tmp.path(), &ev("acquired", "a.rs"));
+
+        let got = recent(tmp.path(), 1).unwrap();
+        let mut without_hash = got[0].clone();
+        without_hash.chain_hash = None;
+        assert_eq!(
+            got[0].chain_hash.as_deref(),
+            Some(
+                expected_chain_hash(CHAIN_GENESIS, &without_hash)
+                    .unwrap()
+                    .as_str()
+            ),
+            "the very first line has nothing to chain from but genesis"
+        );
+    }
+
+    #[test]
+    fn a_second_appended_event_chains_from_the_first_ones_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        append(tmp.path(), &ev("acquired", "a.rs"));
+        append(tmp.path(), &ev("released", "a.rs"));
+
+        let got = recent(tmp.path(), 2).unwrap();
+        let first_hash = got[0].chain_hash.clone().expect("first line is tracked");
+        let mut second_without_hash = got[1].clone();
+        second_without_hash.chain_hash = None;
+        assert_eq!(
+            got[1].chain_hash.as_deref(),
+            Some(
+                expected_chain_hash(&first_hash, &second_without_hash)
+                    .unwrap()
+                    .as_str()
+            ),
+            "the second line must bind to the FIRST line's hash, not to genesis again"
+        );
+    }
+
+    /// A line written before this feature existed has no `chain_hash`. The
+    /// next append must not treat that gap as if there were nothing before
+    /// it — genesis on purpose, per `last_chain_point`'s doc comment, but a
+    /// FRESH genesis for this new run, not a silent reuse of the old line's
+    /// (nonexistent) hash.
+    #[test]
+    fn an_append_after_a_pre_chain_tracking_line_restarts_from_genesis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = events_file(tmp.path()).unwrap();
+        std::fs::write(
+            &file,
+            format!(
+                "{}\n",
+                serde_json::to_string(&ev("acquired", "old.rs")).unwrap()
+            ),
+        )
+        .unwrap();
+
+        append(tmp.path(), &ev("released", "old.rs"));
+
+        let got = recent(tmp.path(), 2).unwrap();
+        assert!(
+            got[0].chain_hash.is_none(),
+            "the pre-existing line is untouched"
+        );
+        let mut without_hash = got[1].clone();
+        without_hash.chain_hash = None;
+        assert_eq!(
+            got[1].chain_hash.as_deref(),
+            Some(
+                expected_chain_hash(CHAIN_GENESIS, &without_hash)
+                    .unwrap()
+                    .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn verify_chain_reports_zero_tracked_on_a_log_with_no_chain_hash_anywhere() {
+        let numbered = vec![(1, ev("acquired", "a.rs")), (2, ev("released", "a.rs"))];
+        let (mismatches, tracked, untracked) = verify_chain(&numbered);
+        assert!(mismatches.is_empty());
+        assert_eq!(tracked, 0);
+        assert_eq!(untracked, 2);
+    }
+
+    /// The property the whole feature exists for: a line whose recorded
+    /// `chain_hash` does not match what it should be, given the line before
+    /// it, must be reported — and reported ALONE, not the untampered line
+    /// next to it.
+    #[test]
+    fn verify_chain_flags_a_hand_edited_chain_hash_and_only_that_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        append(tmp.path(), &ev("acquired", "a.rs"));
+        append(tmp.path(), &ev("released", "a.rs"));
+        let (mut all, unparseable) = numbered(tmp.path()).unwrap();
+        assert_eq!(unparseable, 0);
+        all[1].1.chain_hash = Some("0000000000000000".to_string());
+
+        let (mismatches, tracked, untracked) = verify_chain(&all);
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(mismatches[0].line, 2);
+        assert_eq!(tracked, 2);
+        assert_eq!(untracked, 0);
     }
 }

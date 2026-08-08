@@ -42,7 +42,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
-use crate::events::Event;
+use crate::events::{ChainMismatch, Event};
 use crate::identity;
 use crate::lease::{ttl_as_i64, DEFAULT_TTL_SECS};
 
@@ -93,6 +93,12 @@ pub const ANNOTATION_KIND: &str = "annotation";
 pub enum Check {
     DoubleWin,
     StaleHolds,
+    /// pact-m7j.2.5: does every chain-tracked line's `chain_hash` match what
+    /// it should be, given the line before it? Separate from the other two
+    /// checks on purpose — this one is about the log's own physical
+    /// integrity, not about lease behaviour, and a line with no `chain_hash`
+    /// is not a finding here (see `Event::chain_hash`'s doc comment).
+    ChainIntegrity,
 }
 
 impl Check {
@@ -100,8 +106,9 @@ impl Check {
         match s {
             "double-win" => Ok(Check::DoubleWin),
             "stale-holds" => Ok(Check::StaleHolds),
+            "chain-integrity" => Ok(Check::ChainIntegrity),
             other => Err(anyhow::anyhow!(
-                "unknown check \"{other}\"; expected double-win or stale-holds"
+                "unknown check \"{other}\"; expected double-win, stale-holds or chain-integrity"
             )),
         }
     }
@@ -221,6 +228,17 @@ pub struct CheckReport {
     pub orphaned_closes: usize,
     pub double_wins: Vec<DoubleWin>,
     pub stale_holds: Vec<Hold>,
+    /// `Check::ChainIntegrity` only: lines whose `chain_hash` did not match
+    /// what it should be, given the line before it.
+    pub chain_breaks: Vec<ChainMismatch>,
+    /// `Check::ChainIntegrity` only: how many lines carried a `chain_hash` at
+    /// all. Not a finding either way — context for `chain_untracked`.
+    pub chain_tracked: usize,
+    /// `Check::ChainIntegrity` only: lines with no `chain_hash` — predating
+    /// chain tracking, or not written by pact. Reported, never flagged: see
+    /// `Event::chain_hash`'s doc comment for why a missing hash must not read
+    /// as tampering.
+    pub chain_untracked: usize,
     /// The **current** default TTL, for context only — *not* the threshold any
     /// finding was judged against. Each `Hold` carries its own `ttl_secs`, read from
     /// the event, so this field must never be used to re-derive a verdict: it moves
@@ -230,7 +248,7 @@ pub struct CheckReport {
 
 impl CheckReport {
     pub fn findings(&self) -> usize {
-        self.double_wins.len() + self.stale_holds.len()
+        self.double_wins.len() + self.stale_holds.len() + self.chain_breaks.len()
     }
 }
 
@@ -651,6 +669,7 @@ pub fn run_check(
         check: match check {
             Check::DoubleWin => "double-win",
             Check::StaleHolds => "stale-holds",
+            Check::ChainIntegrity => "chain-integrity",
         },
         events_scanned: events.len(),
         excluded_by_annotation: loaded.excluded,
@@ -658,6 +677,9 @@ pub fn run_check(
         orphaned_closes,
         double_wins: Vec::new(),
         stale_holds: Vec::new(),
+        chain_breaks: Vec::new(),
+        chain_tracked: 0,
+        chain_untracked: 0,
         ttl_secs: None,
     };
 
@@ -688,6 +710,26 @@ pub fn run_check(
             report
                 .stale_holds
                 .sort_by_key(|h| std::cmp::Reverse(h.held_secs));
+        }
+        Check::ChainIntegrity => {
+            // The chain is a property of PHYSICAL line adjacency in the raw
+            // file, not of `load`'s annotation-filtered, `--since`-narrowed
+            // view: an annotation line and anything it covers are still real
+            // entries the writer's hash chain ran through. Reads the log a
+            // second time rather than reusing `events` above for exactly that
+            // reason — `--since`/`--include-annotated` apply to every other
+            // check but must not apply to this one.
+            let (raw, _) = crate::events::numbered(repo_root)?;
+            let (mismatches, tracked, untracked) = crate::events::verify_chain(&raw);
+            report.events_scanned = raw.len();
+            // These two describe the lease-hold reconstruction this check
+            // does not perform; zeroed rather than left showing the filtered
+            // view's numbers, which would describe a scan this check never ran.
+            report.excluded_by_annotation = 0;
+            report.orphaned_closes = 0;
+            report.chain_breaks = mismatches;
+            report.chain_tracked = tracked;
+            report.chain_untracked = untracked;
         }
     }
     Ok(report)
@@ -829,10 +871,27 @@ pub fn render_check(r: &CheckReport) -> String {
         ));
     }
 
+    if r.check == "chain-integrity" {
+        // Informational regardless of findings: a reader needs to know how
+        // much of the log this check could even speak to before it says
+        // whether that portion is intact — see `Event::chain_hash`'s doc
+        // comment on why an untracked line is not itself a finding.
+        out.push(format!(
+            "  {} line(s) chain-tracked, {} line(s) predate chain tracking or were not written \
+             by pact",
+            r.chain_tracked, r.chain_untracked
+        ));
+    }
+
     if r.findings() == 0 {
         out.push(match r.check {
             "double-win" => {
                 "no overlapping hold windows — no two agents ever held one path at once".to_string()
+            }
+            "chain-integrity" => {
+                "every chain-tracked line matches the line before it — no gap, edit or forgery \
+                 detected in the tracked portion of the log"
+                    .to_string()
             }
             _ => "no holds ran past their own recorded TTL without a renew".to_string(),
         });
@@ -906,6 +965,28 @@ pub fn render_check(r: &CheckReport) -> String {
              a path its holder still believed it owned. (The current default is {}.)",
             r.stale_holds.len(),
             secs(ttl_as_i64(r.ttl_secs.unwrap_or(DEFAULT_TTL_SECS)))
+        ));
+    }
+
+    for m in &r.chain_breaks {
+        out.push(String::new());
+        out.push(format!("CHAIN BREAK at line {}", m.line));
+        out.push(format!("  {} {} at {}", m.agent, m.kind, m.at));
+        out.push(format!(
+            "  expected chain_hash {}, found {}",
+            m.expected, m.found
+        ));
+    }
+    if !r.chain_breaks.is_empty() {
+        out.push(String::new());
+        out.push(format!(
+            "{} line(s) whose chain_hash does not match the line before it — a hand-edited or\n\
+             forged line, or the file was altered outside pact. This is about the log's own\n\
+             physical integrity and is unrelated to {} line(s) elsewhere that simply predate\n\
+             chain tracking or were not written by pact; those are not evidence of tampering by\n\
+             themselves.",
+            r.chain_breaks.len(),
+            r.chain_untracked
         ));
     }
 
@@ -1597,5 +1678,119 @@ mod tests {
         // `{}` fails to deserialize (no required fields) and the blank line is
         // skipped without counting.
         assert_eq!(s.unparseable_lines, 2);
+    }
+
+    // ----------------------------------------------------------- chain-integrity
+
+    /// A real, chain-hashed `Event`, built through the same struct pact itself
+    /// writes rather than through `ev()`'s bare JSON — `chain_hash` is computed
+    /// by `events::append`, so the fixture must go through it to get one at all.
+    fn chain_event(agent: &str, kind: &str, path: &str) -> Event {
+        Event {
+            at: Utc::now().to_rfc3339(),
+            agent: agent.to_string(),
+            kind: kind.to_string(),
+            path: Some(path.to_string()),
+            detail: None,
+            ttl_secs: None,
+            covers_lines: None,
+            actor: None,
+            displaced: None,
+            chain_hash: None,
+        }
+    }
+
+    /// pact-m7j.2.5's acceptance criteria: a hand-edited `chain_hash` — the
+    /// shape a forged or tampered line actually takes on disk, since nobody but
+    /// `append_bounded` can compute one that verifies — must be flagged, and
+    /// flagged distinctly from the genuine lines around it.
+    #[test]
+    fn a_hand_edited_chain_hash_is_flagged_distinctly_from_genuine_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        crate::events::append(tmp.path(), &chain_event("agent-a", "acquired", "src/a.rs"));
+        crate::events::append(tmp.path(), &chain_event("agent-a", "released", "src/a.rs"));
+
+        let log_path = tmp.path().join(".pact").join("events.jsonl");
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let mut lines: Vec<String> = contents.lines().map(str::to_string).collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "fixture must have written exactly two lines"
+        );
+        let mut tampered: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        tampered["chain_hash"] = serde_json::Value::String("0000000000000000".to_string());
+        lines[1] = tampered.to_string();
+        std::fs::write(&log_path, lines.join("\n") + "\n").unwrap();
+
+        let r = run_check(tmp.path(), Check::ChainIntegrity, None, false).unwrap();
+        assert_eq!(r.findings(), 1, "exactly the tampered line, nothing else");
+        assert_eq!(r.chain_breaks[0].line, 2);
+        assert_eq!(r.chain_tracked, 2, "both lines still carry SOME chain_hash");
+        assert_eq!(r.chain_untracked, 0);
+
+        let text = render_check(&r);
+        assert!(text.contains("CHAIN BREAK"), "{text}");
+        assert!(text.contains("line 2"), "{text}");
+    }
+
+    /// The other half of the same acceptance criteria: a log with NO
+    /// `chain_hash` anywhere — every log written before pact-m7j.2.5, including
+    /// this repository's own committed history — must report cleanly. A missing
+    /// field is not evidence of tampering; treating it as such would flag every
+    /// pre-existing repository the moment this shipped.
+    #[test]
+    fn a_pre_existing_history_log_with_no_chain_hash_anywhere_reports_cleanly() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "agent-a", "acquired", "src/a.rs"),
+            &ev("2026-08-01T10:05:00Z", "agent-a", "released", "src/a.rs"),
+        ]);
+        let r = run_check(tmp.path(), Check::ChainIntegrity, None, false).unwrap();
+        assert_eq!(
+            r.findings(),
+            0,
+            "no chain_hash anywhere must not read as tampering"
+        );
+        assert_eq!(r.chain_tracked, 0);
+        assert_eq!(r.chain_untracked, 2);
+
+        let text = render_check(&r);
+        assert!(!text.contains("CHAIN BREAK"), "{text}");
+        assert!(text.contains("predate chain tracking"), "{text}");
+    }
+
+    /// A forged line appended with no `chain_hash` of its own — the bead's other
+    /// named scenario — is not a mismatch (there is nothing on it to mismatch),
+    /// but it must show up as untracked rather than silently extending the
+    /// tracked run, so a reader can see tracking stopped where it should not
+    /// have.
+    #[test]
+    fn a_forged_line_with_no_chain_hash_after_a_real_chain_counts_as_untracked_not_a_break() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        crate::events::append(tmp.path(), &chain_event("agent-a", "acquired", "shared.rs"));
+
+        // Hand-appended: a forged "released" for a path a peer still holds,
+        // with no chain_hash field at all — exactly what appending via a text
+        // editor rather than `pact` produces.
+        let log_path = tmp.path().join(".pact").join("events.jsonl");
+        let mut forged = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        writeln!(
+            forged,
+            "{}",
+            ev("2026-08-06T00:00:00Z", "attacker", "released", "shared.rs")
+        )
+        .unwrap();
+        drop(forged);
+
+        let r = run_check(tmp.path(), Check::ChainIntegrity, None, false).unwrap();
+        assert_eq!(r.findings(), 0, "a missing hash is not a mismatch");
+        assert_eq!(r.chain_tracked, 1);
+        assert_eq!(r.chain_untracked, 1);
     }
 }

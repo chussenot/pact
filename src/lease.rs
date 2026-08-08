@@ -835,6 +835,9 @@ fn log_event(
             // entirely (see the call site in release_fs) — nothing routed
             // through here ever has a displaced holder to name.
             displaced: None,
+            // append() computes the real value from the log; see
+            // Event::chain_hash (pact-m7j.2.5).
+            chain_hash: None,
         },
     );
 }
@@ -1567,6 +1570,9 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                     // comment above): correctly orphaned, not a bug this
                     // field is meant to fix (pact-m7j.2.6).
                     displaced: None,
+                    // append() computes the real value; see
+                    // Event::chain_hash (pact-m7j.2.5).
+                    chain_hash: None,
                 },
             );
             count_transition("force_released");
@@ -1622,6 +1628,9 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                     covers_lines: None,
                     actor: None,
                     displaced: Some(holder.clone()),
+                    // append() computes the real value; see
+                    // Event::chain_hash (pact-m7j.2.5).
+                    chain_hash: None,
                 },
             );
             count_transition("force_released");
