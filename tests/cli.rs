@@ -860,6 +860,57 @@ fn log_reports_a_collected_lease_as_expired_against_the_agent_whose_claim_lapsed
     );
 }
 
+/// pact-juz.1: before this, a denied acquire left nothing in `pact log` at
+/// all — reproduced live on a real 15-agent build where paths with 6-8
+/// distinct holders showed zero contention in the log, because there was
+/// nothing to show either way. `refused` closes that blind spot.
+#[test]
+fn log_shows_a_refused_acquire_naming_the_holder() {
+    let tmp = init_repo();
+    assert_ok(&pact(
+        tmp.path(),
+        "holder",
+        &["lease", "acquire", "contended.rs"],
+    ));
+    let denied = pact(tmp.path(), "loser", &["lease", "acquire", "contended.rs"]);
+    assert_eq!(denied.status.code(), Some(2), "{}", stderr_of(&denied));
+
+    let log = pact(tmp.path(), "carol", &["log", "--json"]);
+    assert_ok(&log);
+    let feed = json_stdout(&log);
+    let lease_rows: Vec<&serde_json::Value> = feed
+        .as_array()
+        .expect("feed is an array")
+        .iter()
+        .filter(|e| e["kind"] != "message")
+        .collect();
+    let kinds: Vec<&str> = lease_rows
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(kinds, ["acquired", "refused"], "{feed}");
+    let refused = lease_rows[1];
+    assert_eq!(
+        refused["agent"], "loser",
+        "logged under the requester, not the holder: {refused}"
+    );
+    assert!(
+        refused["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("holder")),
+        "must name the holder in detail: {refused}"
+    );
+
+    // And in the human feed an operator actually reads.
+    let human = pact(tmp.path(), "carol", &["log"]);
+    assert_ok(&human);
+    let rendered = stdout_of(&human);
+    assert!(
+        rendered.contains("refused") && rendered.contains("loser") && rendered.contains("holder"),
+        "{rendered}"
+    );
+}
+
 // ------------------------------------------------------------------ EPIPE
 
 /// Enough lock files that `lease ls` writes more than any pipe buffer can hold.

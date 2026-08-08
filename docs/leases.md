@@ -671,9 +671,9 @@ after the fix, calling them garbage-collected would have been a lie.
 ## The event log
 
 `.pact/events.jsonl` records one JSON line per lease transition — `acquired`,
-`renewed`, `released`, `stolen`, `force-released`, `expired` — with the agent,
-the path, and a free-text detail (the `--note`, or the displaced holder's name).
-`pact log` reads it.
+`renewed`, `released`, `stolen`, `force-released`, `expired`, `refused` — with
+the agent, the path, and a free-text detail (the `--note`, or the displaced
+holder's name). `pact log` reads it.
 
 It exists because lease history genuinely cannot be derived: `lease ls` shows
 only the instantaneous set, and **releasing a lease deletes the only record of
@@ -696,6 +696,20 @@ The `expired` event is the one whose `agent` didn't run the command that wrote
 it: a lapse is noticed by whoever collects the lock, and the event belongs to the
 holder whose claim ended. Without it, the feed's last word on a dead agent was
 `acquired` — naming it as current holder of a file whose lock was already gone.
+
+A denied acquire logs `refused`, under the agent who was refused (not the
+holder — the holder's name and remaining TTL go in `detail` instead, the same
+shape `--note` uses). Before this, a conflict left nothing in the event log at
+all: `.pact/waits/`'s marker file is deliberately excluded from `pact audit`'s
+history ("telemetry, not history"), and the OTEL contention counter compiles
+out entirely without `--features otel` — so `pact log`/`pact audit` had no way
+to show that a path was ever contended, only that it was eventually acquired.
+Reproduced live on a real fleet run: paths with 6-8 distinct holders over one
+build showed zero contention in the log, because there was nothing to show
+either way, whether or not any agent had actually been turned away. `refused`
+opens nothing and closes nothing in `reconstruct`'s hold-window math — see
+[audit.md](audit.md#--check-double-win) — so its presence in a log never skews
+an existing hold's duration or trips a false double-win.
 
 ## What lease telemetry measures
 

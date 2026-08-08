@@ -1423,6 +1423,38 @@ fn acquire_inner(
                 // finally succeeds is a different process and this is the only
                 // record that the agent was ever locked out.
                 mark_conflict(repo_root, agent, &relative, &existing.agent);
+                // pact-juz.1: `.pact/waits/` markers are excluded from `pact
+                // audit`'s history by design (telemetry, not history — see
+                // docs/audit.md), and the OTEL counter above is compiled out
+                // entirely without --features otel. Before this, a denied
+                // acquire left NOTHING in .pact/events.jsonl: reproduced live
+                // on a real 15-agent build where paths with 6-8 distinct
+                // holders showed zero contention in `pact log`/`pact audit`,
+                // because there was nothing to show regardless of whether any
+                // real refusal ever happened. Logged under the REQUESTER (the
+                // one refused), matching every other kind's convention that
+                // `agent` is whose row this is; the holder's identity and
+                // remaining TTL go in `detail`. Neither an open nor a close in
+                // `audit::reconstruct` — same neutral shape as "renewed"/
+                // "restored" — so existing hold-duration and double-win math
+                // is unaffected by this kind existing in a log.
+                let note_suffix = new_lease
+                    .note
+                    .as_deref()
+                    .map(|n| format!(" — my note: {n}"))
+                    .unwrap_or_default();
+                log_event(
+                    repo_root,
+                    agent,
+                    "refused",
+                    &relative,
+                    Some(format!(
+                        "held by {} ({age}s old, {remaining}s remaining), use --steal to \
+                         override{note_suffix}",
+                        holder_location(&existing)
+                    )),
+                    ttl_secs,
+                );
                 // The holder's LOCATION, not just their name. A peer in another
                 // worktree is editing a checkout this reader cannot see, so
                 // "held by agent-a" alone invites them to inspect their own copy,
@@ -2895,6 +2927,10 @@ mod tests {
                 ("acquired".to_string(), "src/mine.rs".to_string()),
                 ("acquired".to_string(), "src/theirs.rs".to_string()),
                 ("renewed".to_string(), "src/mine.rs".to_string()),
+                // pact-juz.1: the batch's second path was refused (agent-b
+                // already holds it), which is what triggers the rollback
+                // below.
+                ("refused".to_string(), "src/theirs.rs".to_string()),
                 ("restored".to_string(), "src/mine.rs".to_string()),
             ],
             "the refresh's renewed event must be followed by a restored event, \
@@ -2996,6 +3032,56 @@ mod tests {
             Some("agent-b"),
             "force-released must carry the displaced holder as a structured field: {:?}",
             events[4].displaced
+        );
+    }
+
+    /// pact-juz.1: a denied acquire used to leave nothing in
+    /// `.pact/events.jsonl` at all — only a throwaway `.pact/waits/` marker
+    /// (excluded from `pact audit`'s history by design) and an OTEL counter
+    /// compiled out entirely without `--features otel`. Reproduced live on a
+    /// real 15-agent build where paths with 6-8 distinct holders showed zero
+    /// contention in `pact log`, because there was nothing to show either
+    /// way. `refused` closes that gap without opening or closing any hold
+    /// window — see `audit::tests` for the reconstruct-side half of this.
+    #[test]
+    fn a_denied_acquire_logs_a_refused_event_naming_the_holder() {
+        let tmp = repo();
+        let root = tmp.path();
+
+        acquire(root, "agent-a", "hot.rs", 900, false, None).unwrap();
+        let denied = acquire(
+            root,
+            "agent-b",
+            "hot.rs",
+            900,
+            false,
+            Some("my turn".into()),
+        );
+        assert!(denied.is_err(), "a live, non-expired lease must refuse");
+
+        assert_eq!(
+            event_kinds(root),
+            vec![
+                ("acquired".to_string(), "hot.rs".to_string()),
+                ("refused".to_string(), "hot.rs".to_string()),
+            ]
+        );
+
+        let events = crate::events::recent(root, 100).unwrap();
+        let refused = &events[1];
+        assert_eq!(
+            refused.agent, "agent-b",
+            "logged under the requester, matching every other kind's convention"
+        );
+        let detail = refused.detail.as_deref().unwrap();
+        assert!(detail.contains("agent-a"), "must name the holder: {detail}");
+        assert!(
+            detail.contains("remaining"),
+            "must carry the holder's remaining TTL: {detail}"
+        );
+        assert!(
+            detail.contains("my turn"),
+            "must carry the requester's own note, if given: {detail}"
         );
     }
 

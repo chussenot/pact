@@ -1176,6 +1176,32 @@ mod tests {
         );
     }
 
+    /// pact-juz.1: `refused` (a denied acquire, logged under the requester)
+    /// must stay neutral in `reconstruct` — same shape as `renewed`/
+    /// `restored` — so a run full of contention that never once succeeded a
+    /// steal doesn't skew hold-duration or double-win math for the agent who
+    /// actually holds the path.
+    #[test]
+    fn a_refused_event_neither_opens_nor_closes_a_hold_window() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "holder", "acquired", "src/a.rs"),
+            &ev("2026-08-01T10:00:30Z", "loser", "refused", "src/a.rs"),
+            &ev("2026-08-01T10:01:00Z", "holder", "released", "src/a.rs"),
+        ]);
+        let s = summary(tmp.path(), None, false).unwrap();
+        assert_eq!(s.by_kind.get("refused"), Some(&1));
+        // The holder's window closes cleanly at 30s, not skewed by the
+        // refusal in between — "refused" is neither an open nor a close.
+        assert_eq!(s.hold_secs.unwrap().completed, 1);
+        assert_eq!(
+            run_check(tmp.path(), Check::DoubleWin, None, false)
+                .unwrap()
+                .findings(),
+            0,
+            "a refused acquire must never itself read as a double-win"
+        );
+    }
+
     #[test]
     fn stale_holds_reports_long_unrenewed_holds_only() {
         let tmp = with_log(&[
