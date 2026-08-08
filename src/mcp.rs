@@ -839,6 +839,12 @@ fn tool_error(message: &str, exit_code: i32) -> Value {
             "text": format!("{message}\n\n(pact would exit {exit_code} for this; \
                  3 means no Beads CLI on PATH, 4 not a git repository)"),
         }],
+        // pact-m7j.5.2: additive, alongside the prose above rather than instead
+        // of it — an orchestrator polling several pact-backed repos needs to
+        // branch on the same exit code a shell would see, without regexing a
+        // sentence that carries no compatibility guarantee. The text is left
+        // byte-for-byte in case some existing client already parses it.
+        "structuredContent": { "exitCode": exit_code, "message": message },
         "isError": true,
     })
 }
@@ -1229,9 +1235,11 @@ mod tests {
     #[test]
     fn every_tool_returns_an_object_as_structured_content() {
         // Arguments good enough to reach the dispatch for each tool. The two
-        // Beads-backed ones fail without `bd`, and a tool ERROR carries no
-        // structuredContent at all, so they are checked for the shape only when
-        // they succeed — the point is that nothing ever answers with an array.
+        // Beads-backed ones fail without `bd`, and a tool ERROR's
+        // structuredContent has its own fixed shape (pact-m7j.5.2: `exitCode`/
+        // `message`), not the "one named collection key" shape asserted below,
+        // so they are checked for that shape only when they succeed — the point
+        // here is that nothing ever answers with an array.
         let calls = [
             ("pact_lease_list", json!({})),
             ("pact_doctor", json!({})),
