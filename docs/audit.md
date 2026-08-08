@@ -4,11 +4,12 @@ Offline analysis of a repository's coordination history, from
 `.pact/events.jsonl`.
 
 ```bash
-pact audit                          # summary
-pact audit --check double-win       # exit 1 if two agents ever held one path
-pact audit --check stale-holds      # exit 1 on holds past TTL with no renew
-pact audit --check chain-integrity  # exit 1 if a chain-tracked line was edited
-pact audit --since 7d --json        # narrow the window, machine-readable
+pact audit                            # summary
+pact audit --check double-win         # exit 1 if two agents ever held one path
+pact audit --check stale-holds        # exit 1 on holds past TTL with no renew
+pact audit --check chain-integrity    # exit 1 if a chain-tracked line was edited
+pact audit --check commit-correlation # exit 1 on a real concurrent write or a commit with no lease
+pact audit --since 7d --json          # narrow the window, machine-readable
 ```
 
 Exit **0** clean, **1** findings. Those are the documented codes reused, not
@@ -139,6 +140,61 @@ Unlike the other two checks, this one reads the **raw, unfiltered** log —
 property of physical line adjacency as written; an annotation line and
 whatever it covers are still real entries the writer's hash chain ran
 through, whatever a lease-history statistic later excludes them from.
+
+### `--check commit-correlation`
+
+The other three checks only ever look at `.pact/events.jsonl` — this one asks
+whether real git history backs up what that log claims, by shelling out to
+`git log` (`git_history.rs`), the same way `repo.rs` and `doctor.rs` already
+shell out to `git` for other checks. It reports three things, only two of
+which are findings:
+
+- **A hold with no commit anywhere in its own window** — informational only,
+  never a finding. A read-only lease (research, review, a task that turned up
+  nothing to change) closes exactly like this, and flagging every one would
+  train a reader to ignore the check. `--json`'s `holds_with_no_commit`.
+- **A concurrent write** — two holds of the same path with overlapping
+  windows where **two or more real commits**, not just the lease events,
+  landed during the overlap. Stronger evidence than `--check double-win`,
+  which only proves the *lease* events overlapped: this proves work actually
+  landed more than once during the disputed period. It does not try to
+  attribute which commit belongs to which hold by matching commit author
+  against agent name — that correlation is exactly as unreliable as the one
+  `pact doctor`'s "Beads actor attribution" check exists to flag (a shared
+  checkout collapses every agent's commits to one git identity) — so it
+  reports every commit found in the overlap and leaves attribution to a
+  human. `--json`'s `concurrent_writes`.
+- **An uncovered commit** — a commit touching a path with no hold covering
+  its author date at all: work done with no lease, which the whole protocol
+  exists to prevent. Scoped to paths that were leased at *some* point in the
+  window audited — a path nobody has ever leased is a different question
+  ("is this file even under pact's protocol") this check does not try to
+  answer, since most of a real repository is never leased at any given
+  moment and flagging all of it would be pure noise. `--json`'s
+  `uncovered_commits`.
+
+**Degrades cleanly when git can't answer.** A brand-new repository with zero
+commits, a `git` that fails to run, or a `.pact/` whose `.git` is not
+actually a readable repository all read as "no commit history to correlate
+against" rather than crashing or reporting a false blanket set of findings —
+`--json`'s `git_unavailable` names the reason when `git` itself could not be
+run at all.
+
+Two known gaps, both cheaper to document than to close:
+
+- **Merge commits carry no file list** from a plain `git log --name-only`,
+  so a merge that brought in changes to a leased path is invisible here.
+  Findings degrade to "no commit seen" — the same shape as a read-only
+  lease, never a false positive.
+- **A rename is two identities.** No `--follow` is passed, so a lease taken
+  under one name only correlates against commits recorded under that same
+  name; a renamed file's history before the rename does not connect.
+
+This is the one check where widening scope past `.pact/` was a conscious
+call, not an oversight — see
+[What audit deliberately cannot see](#what-audit-deliberately-cannot-see)
+below for why that does not touch the Beads-store invariant the rest of this
+page rests on.
 
 ## Closes with nothing open
 
@@ -281,14 +337,22 @@ botched write nobody has seen is not history.
 
 ## What audit deliberately cannot see
 
-**The Beads side.** Audit reads `.pact/` and nothing else — never `.beads/`, a
-Dolt directory, a SQLite file or a JSONL export. pact's whole messaging design
-rests on "never touch the backend store directly, only the CLI", and an analytics
-command is exactly where that would be convenient to break, because the data is
-right there in a file. Messages, read state, claim discipline and bead provenance
+**The Beads side.** Audit never opens `.beads/`, a Dolt directory, a SQLite
+file or a JSONL export. pact's whole messaging design rests on "never touch
+the backend store directly, only the CLI", and an analytics command is
+exactly where that would be convenient to break, because the data is right
+there in a file. Messages, read state, claim discipline and bead provenance
 are therefore **not** audit's subject; they live in
 [`scripts/beads-retro.sh`](../scripts/beads-retro.sh), which is best-effort,
 jq-based, and says so in its own header.
+
+This is a different invariant from `--check commit-correlation` reading git
+history directly (above). `git` is a hard requirement of running pact at
+all — not a store pact promises to only ever touch through an indirection
+layer — so reading its history breaks nothing the Beads rule protects.
+`repo.rs` and `doctor.rs` already shell out to `git` directly for other
+checks; commit-correlation is the same read, applied to history instead of
+working-tree state.
 
 **Anything before the history was preserved.** `.pact/` used to be gitignored
 wholesale, so every clone started with an empty log

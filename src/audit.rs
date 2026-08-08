@@ -18,17 +18,26 @@
 //!
 //! ## Scope, which is narrow on purpose
 //!
-//! Audit reads **`.pact/` and nothing else**. It never opens `.beads/`, a Dolt
-//! directory, a SQLite file or a JSONL export, because "pact never touches the
-//! Beads store directly, only the CLI" is an invariant the whole messaging design
-//! rests on, and an analytics command is exactly where it would be convenient to
-//! break it. Beads-side questions live in `scripts/beads-retro.sh`, which is
-//! best-effort, jq-based, and says so in its header.
+//! Audit never opens `.beads/`, a Dolt directory, a SQLite file or a JSONL
+//! export, because "pact never touches the Beads store directly, only the
+//! CLI" is an invariant the whole messaging design rests on, and an analytics
+//! command is exactly where it would be convenient to break it. Beads-side
+//! questions live in `scripts/beads-retro.sh`, which is best-effort,
+//! jq-based, and says so in its header.
 //!
-//! No new dependencies: line-by-line `serde_json` over the log, tolerant of
-//! unknown event kinds (a `kind` is a `String`, so a future one parses) and of a
-//! truncated final line (an append-only log gets cut mid-write, which is expected
-//! rather than corrupt — the count is reported).
+//! `.pact/events.jsonl` is not the *only* thing audit reads, though — as of
+//! `Check::CommitCorrelation` (pact-1l8.1) it also shells out to `git log`
+//! (`git_history.rs`), the same way `repo.rs` and `doctor.rs` already do for
+//! other checks. That is not the same invariant as the Beads one above: `git`
+//! is a hard requirement of running pact at all, not a store pact promises to
+//! only ever touch through an indirection layer, so reading its history
+//! directly breaks nothing that invariant protects.
+//!
+//! No new dependencies otherwise: line-by-line `serde_json` over the log,
+//! tolerant of unknown event kinds (a `kind` is a `String`, so a future one
+//! parses) and of a truncated final line (an append-only log gets cut
+//! mid-write, which is expected rather than corrupt — the count is
+//! reported).
 //!
 //! ## Exit codes
 //!
@@ -99,6 +108,15 @@ pub enum Check {
     /// integrity, not about lease behaviour, and a line with no `chain_hash`
     /// is not a finding here (see `Event::chain_hash`'s doc comment).
     ChainIntegrity,
+    /// pact-1l8.1: does real git history back up what the lease log claims?
+    /// Widens audit's stated "`.pact/` and nothing else" scope for the first
+    /// time — deliberately: the invariant that section actually protects is
+    /// "never touch the Beads store directly, only its CLI", not "never read
+    /// anything outside `.pact/`". `git` is already a hard requirement (pact
+    /// only runs inside a git repository) and doctor.rs/repo.rs already shell
+    /// out to it directly for other checks; this is the same read, applied
+    /// to history instead of working-tree state. See `git_history.rs`.
+    CommitCorrelation,
 }
 
 impl Check {
@@ -107,8 +125,10 @@ impl Check {
             "double-win" => Ok(Check::DoubleWin),
             "stale-holds" => Ok(Check::StaleHolds),
             "chain-integrity" => Ok(Check::ChainIntegrity),
+            "commit-correlation" => Ok(Check::CommitCorrelation),
             other => Err(anyhow::anyhow!(
-                "unknown check \"{other}\"; expected double-win, stale-holds or chain-integrity"
+                "unknown check \"{other}\"; expected double-win, stale-holds, chain-integrity or \
+                 commit-correlation"
             )),
         }
     }
@@ -164,6 +184,72 @@ pub struct Contended {
     pub path: String,
     pub holds: usize,
     pub distinct_agents: usize,
+}
+
+/// `Check::CommitCorrelation`: a closed hold with no commit landing anywhere
+/// inside its own window.
+///
+/// Informational, never a finding that fails the check — see
+/// `CheckReport::findings`'s doc comment. A read-only lease (research,
+/// reviewing, waiting on something) closes exactly like this, and treating
+/// every one as a defect would train readers to ignore the check.
+#[derive(Debug, Clone, Serialize)]
+pub struct UncommittedHold {
+    pub path: String,
+    pub agent: String,
+    pub opened_at: String,
+    pub closed_at: Option<String>,
+}
+
+/// `Check::CommitCorrelation`: one commit that landed while a path was held.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitTouch {
+    pub hash: String,
+    pub author: String,
+    pub at: String,
+}
+
+/// `Check::CommitCorrelation`: two holds of the same path with overlapping
+/// windows where real commits — not just the lease events — actually landed
+/// during the overlap.
+///
+/// Stronger evidence than `DoubleWin`, which only proves the *lease* events
+/// overlapped. This proves work was actually written more than once during
+/// the disputed period. Deliberately does not try to attribute which commit
+/// belongs to which hold by matching commit author against agent name — that
+/// correlation is exactly as unreliable as the one `doctor::checks`'s "Beads
+/// actor attribution" check exists to flag (a shared checkout collapses every
+/// agent's commits to one git identity) — so this reports every commit found
+/// in the overlap and lets a human attribute them.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConcurrentWrite {
+    pub path: String,
+    pub first_agent: String,
+    pub first_opened_at: String,
+    pub first_closed_at: String,
+    pub second_agent: String,
+    pub second_opened_at: String,
+    pub second_closed_at: String,
+    pub overlap_start: String,
+    pub overlap_end: String,
+    /// Always 2 or more — that is what makes this "concurrent" rather than
+    /// merely "both holds happened to eventually touch the file".
+    pub commits_in_overlap: Vec<CommitTouch>,
+}
+
+/// `Check::CommitCorrelation`: a commit touching a path with no hold covering
+/// its author date at all — work done with no lease, the thing the whole
+/// protocol exists to prevent. Scoped to paths that were leased at *some*
+/// point in the window audited; a path nobody has ever leased is a different
+/// question ("is this file even under pact's protocol") that this check does
+/// not try to answer, since most of a real repository is never leased at any
+/// given moment and flagging all of it would be pure noise.
+#[derive(Debug, Clone, Serialize)]
+pub struct UncoveredCommit {
+    pub path: String,
+    pub hash: String,
+    pub author: String,
+    pub at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -244,11 +330,27 @@ pub struct CheckReport {
     /// the event, so this field must never be used to re-derive a verdict: it moves
     /// when the default is recalibrated and the findings do not.
     pub ttl_secs: Option<u64>,
+    /// `Check::CommitCorrelation` only: `Some(reason)` when `git log` could
+    /// not be read at all — missing binary, or an I/O error running it. The
+    /// three commit-based fields below are then always empty, which must
+    /// read as "this check could not run", never as "nothing found".
+    pub git_unavailable: Option<String>,
+    /// `Check::CommitCorrelation` only. See `UncommittedHold`'s doc comment
+    /// for why this is informational and excluded from `findings()`.
+    pub holds_with_no_commit: Vec<UncommittedHold>,
+    /// `Check::CommitCorrelation` only.
+    pub concurrent_writes: Vec<ConcurrentWrite>,
+    /// `Check::CommitCorrelation` only.
+    pub uncovered_commits: Vec<UncoveredCommit>,
 }
 
 impl CheckReport {
     pub fn findings(&self) -> usize {
-        self.double_wins.len() + self.stale_holds.len() + self.chain_breaks.len()
+        self.double_wins.len()
+            + self.stale_holds.len()
+            + self.chain_breaks.len()
+            + self.concurrent_writes.len()
+            + self.uncovered_commits.len()
     }
 }
 
@@ -670,6 +772,7 @@ pub fn run_check(
             Check::DoubleWin => "double-win",
             Check::StaleHolds => "stale-holds",
             Check::ChainIntegrity => "chain-integrity",
+            Check::CommitCorrelation => "commit-correlation",
         },
         events_scanned: events.len(),
         excluded_by_annotation: loaded.excluded,
@@ -681,6 +784,10 @@ pub fn run_check(
         chain_tracked: 0,
         chain_untracked: 0,
         ttl_secs: None,
+        git_unavailable: None,
+        holds_with_no_commit: Vec::new(),
+        concurrent_writes: Vec::new(),
+        uncovered_commits: Vec::new(),
     };
 
     match check {
@@ -731,8 +838,150 @@ pub fn run_check(
             report.chain_tracked = tracked;
             report.chain_untracked = untracked;
         }
+        Check::CommitCorrelation => correlate_commits(repo_root, &events, &holds, &mut report),
     }
     Ok(report)
+}
+
+/// The body of `Check::CommitCorrelation`, split out because it is the one
+/// check whose findings depend on something other than `.pact/events.jsonl`
+/// — see the module doc comment on why that is a deliberate, narrow widening
+/// rather than a break of audit's Beads-store invariant.
+fn correlate_commits(
+    repo_root: &std::path::Path,
+    events: &[(usize, Event)],
+    holds: &[Hold],
+    report: &mut CheckReport,
+) {
+    let earliest = events.first().and_then(|(_, e)| parse_at(&e.at));
+    let commits = match crate::git_history::commits_since(repo_root, earliest) {
+        Ok(c) => c,
+        Err(e) => {
+            report.git_unavailable = Some(format!("{e:#}"));
+            return;
+        }
+    };
+
+    let mut by_path: BTreeMap<&str, Vec<&crate::git_history::Commit>> = BTreeMap::new();
+    for c in &commits {
+        for p in &c.paths {
+            by_path.entry(p.as_str()).or_default().push(c);
+        }
+    }
+    for v in by_path.values_mut() {
+        v.sort_by_key(|c| c.at);
+    }
+
+    // Closed holds only: an open hold has not finished, so judging whether it
+    // ever produced a commit would be premature.
+    for h in holds {
+        let (Some(open), Some(close)) = (
+            parse_at(&h.opened_at),
+            h.closed_at.as_deref().and_then(parse_at),
+        ) else {
+            continue;
+        };
+        let has_commit = by_path
+            .get(h.path.as_str())
+            .is_some_and(|v| v.iter().any(|c| c.at >= open && c.at <= close));
+        if !has_commit {
+            report.holds_with_no_commit.push(UncommittedHold {
+                path: h.path.clone(),
+                agent: h.agent.clone(),
+                opened_at: h.opened_at.clone(),
+                closed_at: h.closed_at.clone(),
+            });
+        }
+    }
+
+    let mut by_hold_path: BTreeMap<&str, Vec<&Hold>> = BTreeMap::new();
+    for h in holds {
+        if h.closed_at.is_some() {
+            by_hold_path.entry(h.path.as_str()).or_default().push(h);
+        }
+    }
+    for (path, hs) in &by_hold_path {
+        for i in 0..hs.len() {
+            for j in (i + 1)..hs.len() {
+                let (a, b) = (hs[i], hs[j]);
+                let (Some(a_open), Some(a_close), Some(b_open), Some(b_close)) = (
+                    parse_at(&a.opened_at),
+                    a.closed_at.as_deref().and_then(parse_at),
+                    parse_at(&b.opened_at),
+                    b.closed_at.as_deref().and_then(parse_at),
+                ) else {
+                    continue;
+                };
+                let overlap_start = a_open.max(b_open);
+                let overlap_end = a_close.min(b_close);
+                if overlap_start > overlap_end {
+                    continue;
+                }
+                let commits_in_overlap: Vec<CommitTouch> = by_path
+                    .get(path)
+                    .map(|v| {
+                        v.iter()
+                            .filter(|c| c.at >= overlap_start && c.at <= overlap_end)
+                            .map(|c| CommitTouch {
+                                hash: c.hash.clone(),
+                                author: c.author.clone(),
+                                at: c.at.to_rfc3339(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Two or more, not one: a single commit in the overlap only
+                // proves one hold's tenant wrote once, which the lease system
+                // already allows for its own holder. Two is the shape that
+                // needs a real write from more than one side.
+                if commits_in_overlap.len() >= 2 {
+                    report.concurrent_writes.push(ConcurrentWrite {
+                        path: path.to_string(),
+                        first_agent: a.agent.clone(),
+                        first_opened_at: a.opened_at.clone(),
+                        first_closed_at: a.closed_at.clone().unwrap_or_default(),
+                        second_agent: b.agent.clone(),
+                        second_opened_at: b.opened_at.clone(),
+                        second_closed_at: b.closed_at.clone().unwrap_or_default(),
+                        overlap_start: overlap_start.to_rfc3339(),
+                        overlap_end: overlap_end.to_rfc3339(),
+                        commits_in_overlap,
+                    });
+                }
+            }
+        }
+    }
+
+    // Scoped to paths leased at some point in this window — see
+    // `UncoveredCommit`'s doc comment for why the rest of the tree is out of
+    // scope.
+    let leased_paths: BTreeSet<&str> = holds.iter().map(|h| h.path.as_str()).collect();
+    for path in &leased_paths {
+        let Some(touches) = by_path.get(path) else {
+            continue;
+        };
+        let windows: Vec<(DateTime<Utc>, Option<DateTime<Utc>>)> = holds
+            .iter()
+            .filter(|h| h.path == *path)
+            .filter_map(|h| {
+                parse_at(&h.opened_at).map(|o| (o, h.closed_at.as_deref().and_then(parse_at)))
+            })
+            .collect();
+        for c in touches {
+            let covered = windows
+                .iter()
+                .any(|(open, close)| *open <= c.at && close.is_none_or(|cl| cl >= c.at));
+            if !covered {
+                report.uncovered_commits.push(UncoveredCommit {
+                    path: path.to_string(),
+                    hash: c.hash.clone(),
+                    author: c.author.clone(),
+                    at: c.at.to_rfc3339(),
+                });
+            }
+        }
+    }
+    report.uncovered_commits.sort_by(|a, b| a.at.cmp(&b.at));
 }
 
 // --------------------------------------------------------------- rendering
@@ -883,6 +1132,15 @@ pub fn render_check(r: &CheckReport) -> String {
         ));
     }
 
+    if r.check == "commit-correlation" {
+        if let Some(reason) = &r.git_unavailable {
+            out.push(format!(
+                "  git history unavailable ({reason}) — commit-correlation could not run"
+            ));
+            return out.join("\n");
+        }
+    }
+
     if r.findings() == 0 {
         out.push(match r.check {
             "double-win" => {
@@ -893,9 +1151,17 @@ pub fn render_check(r: &CheckReport) -> String {
                  detected in the tracked portion of the log"
                     .to_string()
             }
+            "commit-correlation" => {
+                "no concurrent write landed, and no commit fell outside every hold's window"
+                    .to_string()
+            }
             _ => "no holds ran past their own recorded TTL without a renew".to_string(),
         });
-        return out.join("\n");
+        // commit-correlation still has informational rows to print (holds
+        // with no commit at all) even with zero fail-worthy findings.
+        if r.check != "commit-correlation" {
+            return out.join("\n");
+        }
     }
 
     for d in &r.double_wins {
@@ -988,6 +1254,78 @@ pub fn render_check(r: &CheckReport) -> String {
             r.chain_breaks.len(),
             r.chain_untracked
         ));
+    }
+
+    for w in &r.concurrent_writes {
+        out.push(String::new());
+        out.push(format!("CONCURRENT WRITE on {}", w.path));
+        out.push(format!(
+            "  {} held {} -> {}",
+            w.first_agent, w.first_opened_at, w.first_closed_at
+        ));
+        out.push(format!(
+            "  {} held {} -> {}",
+            w.second_agent, w.second_opened_at, w.second_closed_at
+        ));
+        out.push(format!(
+            "  {} commit(s) landed in the overlap ({} -> {}):",
+            w.commits_in_overlap.len(),
+            w.overlap_start,
+            w.overlap_end
+        ));
+        for c in &w.commits_in_overlap {
+            out.push(format!(
+                "    {} by {} at {}",
+                &c.hash[..c.hash.len().min(12)],
+                c.author,
+                c.at
+            ));
+        }
+    }
+    if !r.concurrent_writes.is_empty() {
+        out.push(String::new());
+        out.push(
+            "This is stronger evidence than --check double-win: real commits landed from more\n\
+             than one side during the overlap, not just overlapping lease events."
+                .to_string(),
+        );
+    }
+
+    for u in &r.uncovered_commits {
+        out.push(String::new());
+        out.push(format!(
+            "UNCOVERED COMMIT on {}: {} by {} at {} — no hold on this path covered that moment",
+            u.path,
+            &u.hash[..u.hash.len().min(12)],
+            u.author,
+            u.at
+        ));
+    }
+    if !r.uncovered_commits.is_empty() {
+        out.push(String::new());
+        out.push(format!(
+            "{} commit(s) touched a leased path outside every recorded hold for it — work done \
+             with no lease, which the protocol exists to prevent.",
+            r.uncovered_commits.len()
+        ));
+    }
+
+    if !r.holds_with_no_commit.is_empty() {
+        out.push(String::new());
+        out.push(format!(
+            "{} hold(s) closed with no commit landing in their window (informational, not \
+             counted as a finding — a read-only lease produces no commit):",
+            r.holds_with_no_commit.len()
+        ));
+        for h in &r.holds_with_no_commit {
+            out.push(format!(
+                "  {:<40} {:<16} {} -> {}",
+                h.path,
+                h.agent,
+                h.opened_at,
+                h.closed_at.as_deref().unwrap_or("(open)")
+            ));
+        }
     }
 
     out.join("\n")
@@ -1818,5 +2156,203 @@ mod tests {
         assert_eq!(r.findings(), 0, "a missing hash is not a mismatch");
         assert_eq!(r.chain_tracked, 1);
         assert_eq!(r.chain_untracked, 1);
+    }
+
+    // ------------------------------------------------- commit-correlation
+    //
+    // `with_log`'s `.git` is a bare, empty directory — enough to satisfy
+    // `find_repo_root`, but not a real git repository `git log` can read.
+    // `Check::CommitCorrelation` needs a REAL repository, so these tests get
+    // their own fixture that actually runs `git init` and `git commit`.
+
+    fn with_git_log(lines: &[&str]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+        let pact = tmp.path().join(".pact");
+        std::fs::create_dir_all(&pact).unwrap();
+        std::fs::write(pact.join("events.jsonl"), lines.join("\n")).unwrap();
+        tmp
+    }
+
+    /// Writes (or rewrites) `file` and commits it under `at`, an RFC3339
+    /// timestamp shared by author and committer date so the fixture's
+    /// commits line up exactly with the hand-written event timestamps above
+    /// them.
+    fn git_commit(repo: &std::path::Path, file: &str, at: &str) {
+        std::fs::write(repo.join(file), at).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "tester")
+                .env("GIT_AUTHOR_EMAIL", "tester@example.com")
+                .env("GIT_AUTHOR_DATE", at)
+                .env("GIT_COMMITTER_NAME", "tester")
+                .env("GIT_COMMITTER_EMAIL", "tester@example.com")
+                .env("GIT_COMMITTER_DATE", at)
+                .status()
+                .unwrap()
+        };
+        assert!(run(&["add", file]).success());
+        assert!(run(&["commit", "--quiet", "-m", &format!("touch {file}")]).success());
+    }
+
+    #[test]
+    fn a_hold_with_a_commit_inside_its_window_is_not_reported() {
+        let tmp = with_git_log(&[
+            &ev("2026-08-01T10:00:00Z", "agent-a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:02:00Z", "agent-a", "released", "a.rs"),
+        ]);
+        git_commit(tmp.path(), "a.rs", "2026-08-01T10:01:00+00:00");
+
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert!(r.git_unavailable.is_none(), "{:?}", r.git_unavailable);
+        assert_eq!(r.findings(), 0);
+        assert!(
+            r.holds_with_no_commit.is_empty(),
+            "a commit landed inside the window: {:?}",
+            r.holds_with_no_commit
+        );
+    }
+
+    /// Informational only — read-only work (research, review, a lease taken
+    /// and then released with nothing to show for it) is a legitimate
+    /// outcome, not a defect, so this must never move the exit code.
+    #[test]
+    fn a_hold_with_no_commit_at_all_is_reported_but_is_not_a_finding() {
+        let tmp = with_git_log(&[
+            &ev("2026-08-01T10:00:00Z", "agent-a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:02:00Z", "agent-a", "released", "a.rs"),
+        ]);
+        // Not one line of history exists for a.rs at all — the "read-only
+        // lease" shape, distinct from a commit landing outside the window
+        // (that is `uncovered_commits`'s job, covered separately below).
+        git_commit(tmp.path(), "unrelated.rs", "2026-08-01T10:01:00+00:00");
+
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert_eq!(
+            r.findings(),
+            0,
+            "an uncommitted hold must not fail the check"
+        );
+        assert_eq!(r.holds_with_no_commit.len(), 1);
+        assert_eq!(r.holds_with_no_commit[0].path, "a.rs");
+        assert_eq!(r.holds_with_no_commit[0].agent, "agent-a");
+        let text = render_check(&r);
+        assert!(text.contains("informational"), "{text}");
+        assert!(text.contains("a.rs"), "{text}");
+    }
+
+    /// The finding this check exists for: not just overlapping lease
+    /// events (already `--check double-win`'s job) but real commits landing
+    /// from both sides during the overlap.
+    #[test]
+    fn two_holds_with_commits_landing_in_their_overlap_are_flagged() {
+        let tmp = with_git_log(&[
+            &ev("2026-08-01T10:00:00Z", "agent-a", "acquired", "a.rs"),
+            // agent-b's acquire overlaps agent-a's still-open hold.
+            &ev("2026-08-01T10:01:00Z", "agent-b", "acquired", "a.rs"),
+            &ev("2026-08-01T10:02:00Z", "agent-a", "released", "a.rs"),
+            &ev("2026-08-01T10:03:00Z", "agent-b", "released", "a.rs"),
+        ]);
+        // Both commits fall inside the overlap window [10:01, 10:02].
+        git_commit(tmp.path(), "a.rs", "2026-08-01T10:01:10+00:00");
+        // A second, distinct commit needs a real change to land in history —
+        // git commits a no-op tree change once, so touch a second file to
+        // force a second commit at the timestamp that matters.
+        std::fs::write(tmp.path().join(".marker"), "2").unwrap();
+        let run = |args: &[&str], at: &str| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "tester")
+                .env("GIT_AUTHOR_EMAIL", "tester@example.com")
+                .env("GIT_AUTHOR_DATE", at)
+                .env("GIT_COMMITTER_NAME", "tester")
+                .env("GIT_COMMITTER_EMAIL", "tester@example.com")
+                .env("GIT_COMMITTER_DATE", at)
+                .status()
+                .unwrap()
+        };
+        let at = "2026-08-01T10:01:20+00:00";
+        std::fs::write(tmp.path().join("a.rs"), "second write").unwrap();
+        assert!(run(&["add", "a.rs"], at).success());
+        assert!(run(&["commit", "--quiet", "-m", "second touch"], at).success());
+
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert_eq!(r.findings(), 1, "the concurrent write is a real finding");
+        assert_eq!(r.concurrent_writes.len(), 1);
+        let w = &r.concurrent_writes[0];
+        assert_eq!(w.path, "a.rs");
+        assert_eq!(w.commits_in_overlap.len(), 2);
+        assert!([&w.first_agent, &w.second_agent].contains(&&"agent-a".to_string()));
+        assert!([&w.first_agent, &w.second_agent].contains(&&"agent-b".to_string()));
+        let text = render_check(&r);
+        assert!(text.contains("CONCURRENT WRITE"), "{text}");
+        assert!(text.contains("double-win"), "{text}");
+    }
+
+    /// The commit-correlation counterpart to "did anyone hold this path" —
+    /// did anyone hold it AT THE TIME this commit landed. A commit outside
+    /// every recorded window for a path pact does otherwise coordinate is
+    /// work done with no lease at all.
+    #[test]
+    fn a_commit_outside_every_hold_for_a_leased_path_is_uncovered() {
+        let tmp = with_git_log(&[
+            &ev("2026-08-01T10:00:00Z", "agent-a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:02:00Z", "agent-a", "released", "a.rs"),
+        ]);
+        // Outside the [10:00, 10:02] window, with nothing else leasing it.
+        git_commit(tmp.path(), "a.rs", "2026-08-01T12:00:00+00:00");
+
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert_eq!(r.findings(), 1);
+        assert_eq!(r.uncovered_commits.len(), 1);
+        assert_eq!(r.uncovered_commits[0].path, "a.rs");
+        let text = render_check(&r);
+        assert!(text.contains("UNCOVERED COMMIT"), "{text}");
+    }
+
+    /// A path nobody ever leased is a different question this check does not
+    /// try to answer — most of a real repository is never leased at any
+    /// given moment, and flagging all of it would be pure noise.
+    #[test]
+    fn a_commit_to_a_never_leased_path_is_never_flagged() {
+        let tmp = with_git_log(&[
+            &ev("2026-08-01T10:00:00Z", "agent-a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:02:00Z", "agent-a", "released", "a.rs"),
+        ]);
+        git_commit(tmp.path(), "a.rs", "2026-08-01T10:01:00+00:00");
+        // README.md is never leased by anyone in this log.
+        git_commit(tmp.path(), "README.md", "2026-08-01T13:00:00+00:00");
+
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert_eq!(r.findings(), 0);
+        assert!(r.uncovered_commits.is_empty());
+    }
+
+    /// `with_log`'s `.git` is a bare directory, not a real repository — the
+    /// shape this check must degrade cleanly against rather than panicking
+    /// or reporting a false, blanket set of findings.
+    #[test]
+    fn a_repository_git_cannot_actually_read_degrades_without_crashing() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "agent-a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:02:00Z", "agent-a", "released", "a.rs"),
+        ]);
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert_eq!(
+            r.findings(),
+            0,
+            "no git history to correlate against must never itself be a finding"
+        );
     }
 }
