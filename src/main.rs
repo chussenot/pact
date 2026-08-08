@@ -117,7 +117,7 @@ enum Command {
     /// if and only if a double-win appears in a real events log". If this check
     /// ever exits 1, that output IS the evidence that bead is waiting for.
     Audit {
-        /// `double-win`, `stale-holds` or `chain-integrity`. Omit for a summary.
+        /// `double-win` or `stale-holds`. Omit for a summary.
         #[arg(long)]
         check: Option<String>,
         /// Only events at or after this point: RFC3339, or a duration back from
@@ -408,7 +408,6 @@ fn subcommand_name(command: &Command) -> &'static str {
         Command::Audit { check, .. } => match check.as_deref() {
             Some("double-win") => "audit double-win",
             Some("stale-holds") => "audit stale-holds",
-            Some("chain-integrity") => "audit chain-integrity",
             // One literal for anything else, including a bad value: the argument
             // is user text and must never reach a span name.
             Some(_) => "audit other",
