@@ -1013,7 +1013,13 @@ fn run_agents(cwd: &Path, json: bool, for_path: Option<&str>) -> Result<()> {
                 // AGENTS.md tells agents to check a recipient with this command,
                 // so a name that has only ever been addressed must not read as
                 // an agent — otherwise the check confirms typos (pact-rnc.5).
-                if a.answers() {
+                // A grammar-invalid name gets a distinct flag rather than the
+                // same "?": it is not a typo of something real, it is a string
+                // no `pact` process could ever run under — planted straight
+                // into bd/br by something other than pact (pact-m7j.6.3).
+                if !a.name_valid {
+                    format!("{} [INVALID]", a.name)
+                } else if a.answers() {
                     a.name.clone()
                 } else {
                     format!("{} ?", a.name)
@@ -1025,7 +1031,13 @@ fn run_agents(cwd: &Path, json: bool, for_path: Option<&str>) -> Result<()> {
             ]
         }));
         let mut out = table(&rows);
-        if found.iter().any(|a| !a.answers()) {
+        if found.iter().any(|a| !a.name_valid) {
+            out.push_str(
+                "\n\n[INVALID] fails pact's identity grammar [a-z0-9][a-z0-9-]{1,31} — written \
+                 straight into the shared store, not through pact; never a real identity",
+            );
+        }
+        if found.iter().any(|a| a.name_valid && !a.answers()) {
             out.push_str(
                 "\n\n? addressed but never seen acting — nobody has ever run pact under \
                  that name, so nobody is reading its mail (usually a typo'd --to)",
@@ -2187,6 +2199,7 @@ mod tests {
             lease_events: 0,
             messages_sent: sent,
             messages_received: received,
+            name_valid: true,
         }
     }
 

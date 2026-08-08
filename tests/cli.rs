@@ -2298,6 +2298,11 @@ fn json_shapes_of_every_command_that_needs_no_beads_backend() {
             "lease_events",
             "messages_sent",
             "messages_received",
+            // Added by pact-m7j.6.3: whether `name` passes `identity::validate`,
+            // so a name planted straight into bd/br (never through pact's own
+            // `--to` check) is distinguishable from a real identity by callers
+            // parsing this JSON, not just by the table's own footnote.
+            "name_valid",
         ],
     );
 

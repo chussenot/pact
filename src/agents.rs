@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::beads::BeadsCli;
-use crate::{lease, msg};
+use crate::{identity, lease, msg};
 
 #[derive(Debug, Serialize)]
 pub struct AgentInfo {
@@ -28,6 +28,15 @@ pub struct AgentInfo {
     pub lease_events: usize,
     pub messages_sent: usize,
     pub messages_received: usize,
+    /// Does `name` pass `identity::validate`? `check_recipient` only enforces
+    /// the grammar on the literal `--to` argument at send time — a `from`/`to`
+    /// string read back from bd/br is never re-checked, so anything with write
+    /// access to the shared store (a human running `bd create`, another tool,
+    /// a looser pact build) can plant a name no real `pact` process could ever
+    /// hold (pact-m7j.6.3). `false` here is what lets `is_known`/`suggest` and
+    /// the `pact agents` table flag such an entry instead of rendering it
+    /// indistinguishably from a real identity.
+    pub name_valid: bool,
 }
 
 /// The operator's mailbox, reserved by the protocol block itself
@@ -146,8 +155,15 @@ fn sort_by_recency(agents: &mut [AgentInfo]) {
 /// counting recipients made every typo self-certifying — one send to `tuidev`
 /// registered `tuidev`, and every later send to it, from any agent, was silent
 /// (pact-rnc.5). `human` is known before it has any traffic at all.
+///
+/// `name_valid` is checked too: a name that fails `identity::validate` cannot
+/// be what any `pact` process actually ran as, however much lease or message
+/// traffic bd shows for it (pact-m7j.6.3).
 pub fn is_known(agents: &[AgentInfo], name: &str) -> bool {
-    name == HUMAN || agents.iter().any(|a| a.name == name && a.answers())
+    name == HUMAN
+        || agents
+            .iter()
+            .any(|a| a.name == name && a.answers() && a.name_valid)
 }
 
 /// Up to 3 plausible corrections for a possibly-typo'd name, best tier first:
@@ -186,7 +202,9 @@ fn suggest_at(agents: &[AgentInfo], name: &str, now: DateTime<Utc>) -> Vec<Strin
     for matches in tiers {
         for agent in agents
             .iter()
-            .filter(|a| a.answers() && !a.is_stale_for_suggestion(now))
+            // Grammar-invalid names are excluded too: a forged identity is not
+            // a plausible correction for a typo (pact-m7j.6.3).
+            .filter(|a| a.answers() && a.name_valid && !a.is_stale_for_suggestion(now))
         {
             if agent.name == name || out.contains(&agent.name) {
                 continue; // never suggest the queried name itself
@@ -210,6 +228,13 @@ fn observe<'a>(
     // bd reports no creator for some beads, and an unassigned message has no
     // recipient; "" is not an identity.
     let key = if name.is_empty() { "(unknown)" } else { name };
+    // Checked once, at the single point every source (lease files, event log,
+    // bd/br message traffic) funnels into the roster — the same grammar
+    // `check_recipient` enforces on `--to` at send time, applied here on read
+    // (pact-m7j.6.3). "(unknown)" itself never matches it, which is fine: it
+    // is a placeholder, not a claimed identity, and was never going to be
+    // offered as one.
+    let name_valid = identity::validate(key).is_ok();
     let info = seen.entry(key.to_string()).or_insert_with(|| AgentInfo {
         name: key.to_string(),
         last_seen: at.to_string(),
@@ -217,6 +242,7 @@ fn observe<'a>(
         lease_events: 0,
         messages_sent: 0,
         messages_received: 0,
+        name_valid,
     });
     if parse_ts(at) > parse_ts(&info.last_seen) {
         info.last_seen = at.to_string();
@@ -294,6 +320,7 @@ mod tests {
             lease_events: 0,
             messages_sent: 0,
             messages_received: 0,
+            name_valid: true,
         }
     }
 
@@ -306,6 +333,7 @@ mod tests {
             lease_events: 0,
             messages_sent: 0,
             messages_received: 2,
+            name_valid: true,
         }
     }
 
@@ -395,6 +423,38 @@ mod tests {
         assert!(is_known(&[], HUMAN), "known before any traffic at all");
         // Ghosts are still listed, so `pact agents` can show them as ghosts.
         assert_eq!(agents.len(), 4);
+    }
+
+    /// pact-m7j.6.3: `observe` is the one point where `from`/`to` strings read
+    /// back from bd/br enter the roster, and until now nothing there matched
+    /// `check_recipient`'s grammar check on the literal `--to` at send time.
+    /// A name planted straight into the shared store — by a human running `bd
+    /// create`, another tool, or a looser pact build — used to fold in and
+    /// render exactly like a real identity.
+    #[test]
+    fn a_grammar_invalid_name_is_flagged_not_treated_as_a_real_agent() {
+        let mut seen = BTreeMap::new();
+        // Uppercase and an underscore are both outside [a-z0-9][a-z0-9-]{1,31}.
+        observe(&mut seen, "Attacker_Admin", "2026-07-30T09:00:00Z").messages_sent += 1;
+        observe(&mut seen, "tui-dev", "2026-07-30T09:00:00Z").leases_held += 1;
+        let agents: Vec<AgentInfo> = seen.into_values().collect();
+
+        let bad = find(&agents, "Attacker_Admin");
+        assert!(!bad.name_valid, "a grammar-invalid name must be flagged");
+        assert!(
+            !is_known(&agents, "Attacker_Admin"),
+            "no traffic volume makes a forged identity a real one"
+        );
+        assert!(
+            suggest_at(&agents, "attacker_adnin", fixture_now()).is_empty(),
+            "must never be offered as a did-you-mean correction either"
+        );
+        assert!(
+            find(&agents, "tui-dev").name_valid,
+            "a real name is unaffected"
+        );
+        // Flagged, not dropped: an operator can still see the forged traffic.
+        assert_eq!(agents.len(), 2);
     }
 
     /// The horizon itself: a name that has not acted in a day is not what you
