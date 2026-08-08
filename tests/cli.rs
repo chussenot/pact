@@ -135,6 +135,42 @@ fn whoami_without_an_identity_exits_0_and_still_reports_paths() {
     assert!(!tmp.path().join(".pact").exists(), "whoami created .pact/");
 }
 
+/// pact-juz.2: pact's own `--actor=<agent>` attribution never reaches `bd`
+/// commands an agent runs directly (`bd update --claim`, `bd close`, ...) —
+/// confirmed on a real 15-agent build where 16/16 Beads interactions
+/// attributed to the operator's own git identity, none to any of the 16
+/// distinct pact agent identities that acted. `whoami` prints the exact
+/// `BEADS_ACTOR` export line so an agent that already has an identity can fix
+/// this for its own shell.
+#[test]
+fn whoami_hints_the_beads_actor_export_when_beads_is_in_use() {
+    let Some(tmp) = bd_repo("whoami_hints_the_beads_actor_export") else {
+        return;
+    };
+    let out = pact(tmp.path(), "agent-a", &["whoami"]);
+    assert_ok(&out);
+    assert!(
+        stdout_of(&out).contains("export BEADS_ACTOR=agent-a"),
+        "{}",
+        stdout_of(&out)
+    );
+}
+
+/// The hint must not fire for a repo that never opted into Beads at all —
+/// same reasoning as the messaging-check noise fix: telling a lease-only user
+/// to configure an env var for a system they don't use is noise, not help.
+#[test]
+fn whoami_stays_quiet_about_beads_actor_when_beads_was_never_set_up() {
+    let tmp = init_repo();
+    let out = pact(tmp.path(), "agent-a", &["whoami"]);
+    assert_ok(&out);
+    assert!(
+        !stdout_of(&out).contains("BEADS_ACTOR"),
+        "{}",
+        stdout_of(&out)
+    );
+}
+
 // ---------------------------------------------------------- lease acquire
 
 #[test]

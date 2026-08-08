@@ -134,6 +134,19 @@ that works everywhere beats two that have to be kept in step. `pact doctor`'s
 question gets asked when a trail already looks wrong, and an absent line answers
 nothing.
 
+**This only covers calls pact itself makes.** `bd ready`/`bd update --claim`/
+`bd close` — the commands AGENTS.md's own Quick Reference tells an agent to
+run directly for task tracking — never pass through pact at all, so none of
+them carry `--actor`. Confirmed on a real 15-agent build (pact-juz.2): every
+one of 16 `.beads/interactions.jsonl` entries attributed to the operator's own
+`git user.name`, none to any of the 16 distinct pact agent identities that
+`.pact/events.jsonl` correctly tracked for the same run — because nothing set
+`$BEADS_ACTOR`, so every direct `bd` call fell through past it to the next
+tier. `pact whoami` prints `export BEADS_ACTOR=<agent>` whenever an agent
+identity is resolved and `.beads/` exists, so setting it once per shell fixes
+attribution for every direct `bd` command that follows, without needing
+`--actor` typed on each one.
+
 What this is **not** doing: setting `git config user.name`. That would mutate a
 checkout other agents share in order to fake attribution for one of them, which
 is the opposite of an audit trail — and in a worktree fleet the checkout being

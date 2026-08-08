@@ -19,6 +19,14 @@ this protocol whenever you touch shared files or hand off work to others.
   variable (or `--agent <name>`). Set one before running pact commands; pact
   never guesses an identity. `pact whoami` shows the identity and paths it
   resolved.
+- **Also export `BEADS_ACTOR=$PACT_AGENT`, once, in the same shell.** pact's
+  own `--actor=<agent>` attribution only covers bd calls pact itself makes —
+  it never reaches `bd ready`/`bd update --claim`/`bd close`, which you run
+  directly. Without this, every one of those commands falls through to bd's
+  own next attribution tier — your shared checkout's `git user.name` — so a
+  15-agent fleet's entire task-tracking history can attribute to one identity
+  while `.pact/events.jsonl` correctly shows sixteen. `pact whoami` prints the
+  exact line to run.
 - **Announce intent before you research, not just before you write.** Your
   first pact commands come *before* you read the first file: `pact msg inbox`
   and `pact lease ls` to see what is already claimed and by whom, then

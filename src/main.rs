@@ -800,6 +800,29 @@ struct Whoami {
     problems: Vec<String>,
 }
 
+/// `pact-juz.2`: `pact`'s own `--actor=<agent>` attribution (docs/messaging.md)
+/// only covers bd calls pact itself makes — `lease`/`msg`'s own mutations. It
+/// never reaches `bd ready`/`bd update --claim`/`bd close`, which AGENTS.md's
+/// managed Quick Reference tells every agent to run directly. Confirmed on a
+/// real 15-agent build: every one of 16 `.beads/interactions.jsonl` entries
+/// attributed to the operator's own `git user.name`, none to any of the 16
+/// distinct `agent-*` identities `.pact/events.jsonl` correctly tracked for
+/// the same run — because none of those direct `bd` calls carried `--actor`
+/// or had `BEADS_ACTOR` set, so bd fell through to its own next precedence
+/// tier. `--actor` > `$BEADS_ACTOR` > `git user.name` > `$USER` is bd's own
+/// documented order (docs/messaging.md); this is the copy-pasteable fix for
+/// the middle tier, not a new mechanism pact invented.
+fn beads_actor_hint(agent: Option<&str>, repo_root: Option<&Path>) -> Option<String> {
+    let agent = agent?;
+    // Gated on .beads/ existing, same reasoning as the messaging-check noise
+    // fix: a repo that never opted into Beads task tracking should not be
+    // told to configure an env var for a system it does not use.
+    if !repo_root.is_some_and(|r| r.join(".beads").exists()) {
+        return None;
+    }
+    Some(format!("export BEADS_ACTOR={agent}"))
+}
+
 fn run_whoami(cwd: &Path, agent_flag: Option<&str>, json: bool) -> Result<()> {
     let mut problems: Vec<String> = Vec::new();
 
@@ -849,6 +872,11 @@ fn run_whoami(cwd: &Path, agent_flag: Option<&str>, json: bool) -> Result<()> {
         }
     };
 
+    // Computed before `agent`/`root` move into `info`, and deliberately not a
+    // Whoami field: it's a ready-to-run shell line, not new data — anything
+    // scripting against --json already has `agent` and can build it itself.
+    let actor_hint = beads_actor_hint(agent.as_deref(), root.as_deref());
+
     let info = Whoami {
         agent,
         agent_source,
@@ -863,7 +891,7 @@ fn run_whoami(cwd: &Path, agent_flag: Option<&str>, json: bool) -> Result<()> {
     };
 
     let dir_missing = pact_dir.map(|p| !p.exists()).unwrap_or(false);
-    output::emit(json, &info, |i: &Whoami| {
+    output::emit(json, &info, move |i: &Whoami| {
         let mut rows = vec![vec![
             "agent".to_string(),
             match &i.agent {
@@ -896,6 +924,12 @@ fn run_whoami(cwd: &Path, agent_flag: Option<&str>, json: bool) -> Result<()> {
             },
         ]);
         let mut out = table(&rows);
+        if let Some(hint) = &actor_hint {
+            out.push_str(&format!(
+                "\n\n{hint}  — so bd commands you run directly (bd update --claim, \
+                 bd close, ...) attribute to you, not whoever's git identity owns this checkout"
+            ));
+        }
         for p in &i.problems {
             out.push_str(&format!("\n! {p}"));
         }
