@@ -10,6 +10,76 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.6.0 - 2026-08-08
+#### Bug Fixes
+- **(agents)** re-validate identity grammar on names read back from bd - (b94a419) - Clement HUSSENOT-DESENONGES
+- **(agents_md)** skip instruction targets aliased to each other - (53dc216) - Clement HUSSENOT-DESENONGES
+- **(agents_md)** skip instruction targets aliased to each other, not just to AGENTS.md - (ad3bc2f) - Clement HUSSENOT-DESENONGES
+- **(audit)** flag annotation actors that fail identity validation - (91f3848) - Clement HUSSENOT-DESENONGES
+- **(audit)** count close events with no matching open as orphaned - (948224f) - Clement HUSSENOT-DESENONGES
+- **(audit)** flag annotation actors that fail identity validation - (d4eb611) - Clement HUSSENOT-DESENONGES
+- **(beads)** correct br's dead GitHub repo slug - (0fbaa96) - Clement HUSSENOT-DESENONGES
+- **(beads)** stop caching supports_actor for the process lifetime - (6ec5149) - Clement HUSSENOT-DESENONGES
+- **(beads,msg)** correct br's dead repo slug, fold tested-range hint into parse failures; ci(canary): add a br leg alongside bd's - (aae76da) - Clement HUSSENOT-DESENONGES
+- **(doctor)** point corrupt-lock advice at --steal/--force, not just manual deletion - (911bba9) - Clement HUSSENOT-DESENONGES
+- **(doctor)** surface orphaned staging files left by a crashed lease write - (721b438) - Clement HUSSENOT-DESENONGES
+- **(doctor)** flag a PACT_STATE_DIR shared with an unrelated repository - (036e696) - Clement HUSSENOT-DESENONGES
+- **(doctor,beads)** re-derive --actor support per call, detect PACT_STATE_DIR collisions - (3bedf29) - Clement HUSSENOT-DESENONGES
+- **(doctor,lease,msg)** surface orphaned staging files, recover corrupt locks via --steal, filter about_path server-side, warn on unresolved prior acquires - (cc6020b) - Clement HUSSENOT-DESENONGES
+- **(events)** lock the trim rewrite and sever a torn tail before appending - (9fdb747) - Clement HUSSENOT-DESENONGES
+- **(events,audit)** give force-released a displaced field so reconstruct can close the right window - (8040926) - Clement HUSSENOT-DESENONGES
+- **(events,audit)** lock the trim rewrite, sever torn tails, count orphaned closes - (babd459) - Clement HUSSENOT-DESENONGES
+- **(init)** route ensure_gitignore/ensure_gitattributes through the CAS write - (2609ab5) - Clement HUSSENOT-DESENONGES
+- **(lease)** drop an unrelated chain-integrity edit pulled in by mistake - (25e7085) - Clement HUSSENOT-DESENONGES
+- **(lease)** probe the other scope/topology candidate on a release/renew miss, and preserve unknown lease fields across rewrites - (8ff0ff3) - Clement HUSSENOT-DESENONGES
+- **(lease)** cover a third, non-main worktree in normalize_path's fallback - (2438e1b) - Clement HUSSENOT-DESENONGES
+- **(lease)** saturate ttl_secs to i64 instead of bit-reinterpreting it - (08820e8) - Clement HUSSENOT-DESENONGES
+- **(lease)** exit 2 on a corrupt lock, not the generic 1 - (8982109) - Clement HUSSENOT-DESENONGES
+- **(lease)** protect expiry math against wall-clock jumps - (2669877) - Clement HUSSENOT-DESENONGES
+- **(lease)** recover a corrupt lock via --steal, and warn on an unresolved prior claim - (247916d) - Clement HUSSENOT-DESENONGES
+- **(lease)** distinguish a failed message check from a clean one - (c78a5a7) - Clement HUSSENOT-DESENONGES
+- **(lease)** stop verify_own_lease blaming an agent's own identity - (9f3bce6) - Clement HUSSENOT-DESENONGES
+- **(lease)** protect expiry math against wall-clock jumps - (710025b) - Clement HUSSENOT-DESENONGES
+- **(lease,audit)** log rollback restorations and stop verify_own_lease blaming an agent's own identity - (9865a34) - Clement HUSSENOT-DESENONGES
+- **(lease,audit)** log rollback restorations and stop them faking a renewal - (a157786) - Clement HUSSENOT-DESENONGES
+- **(lease,msg)** route prior-owner, about-tag, and --to-owner-of lookups through normalize_path - (b0df4f4) - Clement HUSSENOT-DESENONGES
+- **(mcp)** put the exit code in structuredContent on tool_error, not just prose - (d0efda9) - Clement HUSSENOT-DESENONGES
+- **(msg)** fall back to the pre-narrowing encoding when an about-tag query misses - (59bb36a) - Clement HUSSENOT-DESENONGES
+- **(msg)** re-verify a read-by label actually landed after label add - (99767a9) - Clement HUSSENOT-DESENONGES
+- **(msg)** re-read created_at from bd show after an --id/--force create - (70a6d39) - Clement HUSSENOT-DESENONGES
+- **(msg)** stay quiet about pending-message checks when .beads/ never existed - (6af583a) - Clement HUSSENOT-DESENONGES
+- **(msg)** query br thread replies fresh, let a replayed send skip already-sent recipients - (c7474ba) - Clement HUSSENOT-DESENONGES
+- **(msg)** tag about-<path> labels atomically, distinguish failed message checks from clean ones - (6efc338) - Clement HUSSENOT-DESENONGES
+- **(msg)** let a replayed multi-recipient send skip already-sent recipients - (32276fe) - Clement HUSSENOT-DESENONGES
+- **(msg)** filter about_path's message lookup server-side by label - (cae9f78) - Clement HUSSENOT-DESENONGES
+- **(msg)** query br thread replies fresh instead of a stale root snapshot - (04df488) - Clement HUSSENOT-DESENONGES
+- **(msg)** tag about-<path> labels atomically at create time - (efbe5c1) - Clement HUSSENOT-DESENONGES
+- **(msg)** fold the tested-range hint into parse_issues failures - (4a2df82) - Clement HUSSENOT-DESENONGES
+- **(output)** give every --json failure a parseable stdout document - (de70e04) - Clement HUSSENOT-DESENONGES
+#### Continuous Integration
+- **(canary)** add a br canary leg alongside bd's - (63c7dae) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- **(audit,leases,messaging)** document the P2 phase's user-visible changes - (277b4c4) - Clement HUSSENOT-DESENONGES
+- **(lease)** document the PACT_AGENT trust boundary in re-entrant refresh - (6cabc57) - Clement HUSSENOT-DESENONGES
+- **(lease)** document the trust boundary in re-entrant refresh (pact-m7j.7.1) - (7f38a56) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(doctor)** surface three more silent gaps as visibility-only checks - (3e12648) - Clement HUSSENOT-DESENONGES
+- **(events,audit)** hash-chain events.jsonl so a hand-edited line is detectable - (97c6022) - Clement HUSSENOT-DESENONGES
+- **(msg)** add a WHEN column to pact msg inbox - (42f2336) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- Add interactions - (21b8e26) - Clement HUSSENOT-DESENONGES
+- Add interactions - (a03f9d3) - Clement HUSSENOT-DESENONGES
+- Add interactions - (b8efd06) - Clement HUSSENOT-DESENONGES
+- Add interactions - (8c90da7) - Clement HUSSENOT-DESENONGES
+#### Tests
+- **(lease)** fuzz parse_acquired's corrupt-timestamp fallback - (d9628ff) - Clement HUSSENOT-DESENONGES
+- **(lease)** fence peek/list GC split and .pact/ creation under real races - (ed87f0e) - Clement HUSSENOT-DESENONGES
+- **(lease,worktree)** fence peek/list, pact_dir, and submodule isolation under real concurrency - (1ced714) - Clement HUSSENOT-DESENONGES
+- **(msg)** pin --steal/--force's no-auth, no-auto-notify contract - (4c665a2) - Clement HUSSENOT-DESENONGES
+- **(worktree)** fence submodule/superproject lease isolation under contention - (1c7342c) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.5.2 - 2026-08-07
 #### Bug Fixes
 - **(agents_md)** CAS-guard init's writes and warn on an escaping symlink - (5d950d4) - Clement HUSSENOT-DESENONGES
