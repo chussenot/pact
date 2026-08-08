@@ -114,6 +114,46 @@ pub fn checks(root: &Path) -> DoctorReport {
         },
     });
 
+    // pact-juz.3: not a pact bug when this fires — pact's own managed block
+    // is exactly what the check above already polices. This catches a
+    // DIFFERENT tool (confirmed in the field: `bd init` and `bd setup codex`,
+    // each writing its own "Quick Reference" section unaware of the other)
+    // duplicating ITS OWN content. Advisory only; pact does not own this
+    // text and must never offer to touch it.
+    let duplicate_headings = std::fs::read_to_string(root.join("AGENTS.md"))
+        .map(|content| {
+            agents_md::duplicated_headings_outside_managed_block(&content)
+                .into_iter()
+                .map(|(text, lines)| {
+                    let located: Vec<String> = lines
+                        .iter()
+                        .map(
+                            |&line| match agents_md::nearest_preceding_marker(&content, line) {
+                                Some(marker) => format!("line {line} (near {marker})"),
+                                None => format!("line {line}"),
+                            },
+                        )
+                        .collect();
+                    format!(
+                        "{text:?} appears {} times: {}",
+                        lines.len(),
+                        located.join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    checks.push(DoctorCheck {
+        name: "no duplicated instruction blocks",
+        ok: true,
+        warn: !duplicate_headings.is_empty(),
+        detail: if duplicate_headings.is_empty() {
+            "no repeated heading found outside pact's own block".to_string()
+        } else {
+            duplicate_headings.join("; ")
+        },
+    });
+
     // AGENTS.md being current is not enough: Claude Code loads CLAUDE.md and
     // never AGENTS.md, so a repo can pass every other check and still run a
     // Claude fleet that has never seen the protocol.
@@ -915,6 +955,60 @@ mod tests {
         assert!(c.warn, "{}", c.detail);
         assert!(c.detail.contains("AGENTS.md"), "{}", c.detail);
         assert!(c.detail.contains("victim-outside-repo.md"), "{}", c.detail);
+    }
+
+    /// pact-juz.3: reproduces the field-observed shape — two SEPARATE tools
+    /// (`bd init`, `bd setup codex`) each writing their own "Quick Reference"
+    /// heading, entirely before pact's own managed block, unaware of the
+    /// other. Not a pact bug — pact's own block is what the sibling
+    /// "AGENTS.md block current" check already polices — but pact is already
+    /// the tool walking this exact file, so it surfaces the duplication.
+    #[test]
+    fn doctor_names_duplicated_headings_written_by_other_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join("AGENTS.md"),
+            "# Agent Instructions\n\n\
+             <!-- BEGIN BEADS INTEGRATION -->\n## Quick Reference\nbd ready\n<!-- END BEADS INTEGRATION -->\n\n\
+             <!-- BEGIN BEADS CODEX SETUP -->\n## Quick Reference\nbd ready\n<!-- END BEADS CODEX SETUP -->\n",
+        )
+        .unwrap();
+
+        let report = checks(root);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "no duplicated instruction blocks")
+            .expect("doctor must report the new check");
+        assert!(c.ok, "advisory only — it must not fail doctor");
+        assert!(c.warn, "{}", c.detail);
+        assert!(c.detail.contains("Quick Reference"), "{}", c.detail);
+        assert!(
+            c.detail.contains("BEADS CODEX SETUP"),
+            "must name a surrounding marker for context: {}",
+            c.detail
+        );
+    }
+
+    /// A repo whose AGENTS.md only carries pact's own block (the common
+    /// case) must report clean — this check must never re-flag pact's own
+    /// heading as a duplicate of itself.
+    #[test]
+    fn doctor_reports_no_duplicates_when_only_pacts_own_block_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        agents_md::apply(root).unwrap();
+
+        let report = checks(root);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "no duplicated instruction blocks")
+            .expect("doctor must report the new check");
+        assert!(c.ok && !c.warn, "{}", c.detail);
     }
 
     /// Two agents blocked on two different paths, neither ever retried nor

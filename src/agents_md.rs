@@ -731,6 +731,58 @@ fn find_block_bounds(content: &str) -> Option<(usize, usize)> {
     Some((begin, end))
 }
 
+/// Heading text (leading `#`s and whitespace stripped) mapped to every
+/// 1-based line number it appears on, for headings appearing more than once
+/// OUTSIDE pact's own managed block (pact-juz.3).
+///
+/// Not a pact bug when this returns anything — it means some OTHER tool
+/// wrote its own section into this file more than once, unaware of the
+/// other (e.g. `bd init` and `bd setup codex` each writing their own
+/// independent "Quick Reference"). Confirmed by direct inspection that
+/// pact's own `agents_md.rs` never writes that heading text at all — this
+/// exists because pact is already the tool walking and understanding this
+/// exact file, not because pact caused what it finds. Matched on text alone,
+/// not heading level, since the real duplication observed in the field used
+/// two different levels (`## Quick Reference` and `### Quick Reference`) for
+/// the identical wording.
+pub fn duplicated_headings_outside_managed_block(content: &str) -> Vec<(String, Vec<usize>)> {
+    let managed = find_block_bounds(content);
+    let mut by_text: std::collections::BTreeMap<String, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    let mut offset = 0usize;
+    for (i, line) in content.lines().enumerate() {
+        let start = offset;
+        offset += line.len() + 1;
+        if managed.is_some_and(|(b, e)| start >= b && start < e) {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            let text = trimmed.trim_start_matches('#').trim();
+            if !text.is_empty() {
+                by_text.entry(text.to_string()).or_default().push(i + 1);
+            }
+        }
+    }
+    by_text
+        .into_iter()
+        .filter(|(_, lines)| lines.len() > 1)
+        .collect()
+}
+
+/// The nearest `<!-- ... -->` comment at or before 1-based `line`, if any —
+/// context for [`duplicated_headings_outside_managed_block`]'s doctor check,
+/// so a human can tell which two tools wrote the duplicates without
+/// grepping by hand.
+pub fn nearest_preceding_marker(content: &str, line: usize) -> Option<String> {
+    let preceding: Vec<&str> = content.lines().take(line).collect();
+    preceding
+        .iter()
+        .rev()
+        .find(|l| l.trim_start().starts_with("<!--"))
+        .map(|l| l.trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1141,6 +1193,67 @@ mod tests {
             .replace("coordination protocol", "COORDINATION PROTOCOL (edited)");
         std::fs::write(&path, stale).unwrap();
         assert!(!is_current(tmp.path()).unwrap());
+    }
+
+    /// pact-juz.3: reproduces the exact shape found in the field — two
+    /// SEPARATE tools (`bd init`, `bd setup codex`) each writing their own
+    /// "Quick Reference" heading at a different level, unaware of the other,
+    /// entirely before pact's own managed block. Matched on text, not level,
+    /// since that is exactly what differed in the real case.
+    #[test]
+    fn duplicated_headings_outside_the_managed_block_are_found() {
+        let content = "\
+# Agent Instructions
+
+## Quick Reference
+
+bd ready
+
+<!-- BEGIN BEADS INTEGRATION -->
+## Beads Issue Tracker
+
+### Quick Reference
+
+bd ready
+<!-- END BEADS INTEGRATION -->
+
+<!-- BEGIN BEADS CODEX SETUP -->
+## Beads Issue Tracker
+
+### Quick Reference
+<!-- END BEADS CODEX SETUP -->
+";
+        let found = duplicated_headings_outside_managed_block(content);
+        let texts: Vec<&str> = found.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(texts.contains(&"Quick Reference"), "{found:?}");
+        assert!(texts.contains(&"Beads Issue Tracker"), "{found:?}");
+
+        let (_, quick_ref_lines) = found.iter().find(|(t, _)| t == "Quick Reference").unwrap();
+        assert_eq!(
+            quick_ref_lines.len(),
+            3,
+            "all three occurrences, regardless of heading level: {quick_ref_lines:?}"
+        );
+
+        assert_eq!(
+            nearest_preceding_marker(content, quick_ref_lines[1]).as_deref(),
+            Some("<!-- BEGIN BEADS INTEGRATION -->"),
+            "must name which marked block the second occurrence sits inside"
+        );
+    }
+
+    /// pact's own managed block is exactly what `is_current` already
+    /// polices — this check must never re-flag pact's own heading, which
+    /// would be a duplicate warning about a duplicate that doesn't exist.
+    #[test]
+    fn a_file_with_only_pacts_own_block_reports_no_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        apply(tmp.path()).unwrap();
+        let content = std::fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+        assert!(
+            duplicated_headings_outside_managed_block(&content).is_empty(),
+            "pact's own freshly-applied block must never trip this check"
+        );
     }
 
     /// The rule from pact-4zx: manage what is already there, invent nothing.
