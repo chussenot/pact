@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::{agents_md, beads, lease, otel, repo};
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct DoctorCheck {
     pub name: &'static str,
     /// Does this check pass? A warning passes: `warn` is a louder `ok`, not a
@@ -22,7 +22,7 @@ pub struct DoctorCheck {
     pub detail: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct DoctorReport {
     pub healthy: bool,
     pub checks: Vec<DoctorCheck>,

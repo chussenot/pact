@@ -27,7 +27,7 @@ pact msg sent
 pact msg read <id>
 pact log [-n | --limit <count>]
 pact doctor
-pact audit [--check <double-win|stale-holds|chain-integrity|commit-correlation>] [--since <rfc3339|duration>] [--include-annotated]
+pact audit [--check <double-win|stale-holds|chain-integrity|commit-correlation>] [--since <rfc3339|duration>] [--include-annotated] [--export <path>]
 pact ui
 pact mcp serve
 ```
@@ -71,6 +71,14 @@ of `--json` — so the single most routine non-zero outcome two agents
 contending on a file will ever produce (a lease conflict, exit 2) gave a
 `--json` caller an empty stdout to parse. Without `--json`, nothing changes:
 the human-readable text is unchanged and still goes to stderr.
+
+`audit --export <path>` writes one combined JSON snapshot — the summary,
+every named check and `pact doctor`'s checks — to a file, orthogonal to
+whatever `--check`/no-`--check` and `--json` decide for stdout: pass it
+alongside either. Under `--json` its own confirmation is skipped rather than
+printed as a second top-level object, so stdout stays the one parseable value
+every other command promises; in human mode it prints the path it wrote. See
+[audit.md](audit.md#--export).
 
 ## Exit codes
 

@@ -196,6 +196,37 @@ call, not an oversight — see
 below for why that does not touch the Beads-store invariant the rest of this
 page rests on.
 
+## `--export`
+
+```bash
+pact audit --export report.json                      # summary + every check + doctor, as one file
+pact audit --check double-win --export report.json    # --export rides along with any --check
+pact audit --export report.json --since 7d --json     # combines with every other flag
+```
+
+One JSON file bundling `summary`, `double_win`, `stale_holds`,
+`chain_integrity`, `commit_correlation` and `doctor` (`pact doctor`'s own
+checks) — the exact set of things a real field audit (pact-juz) had to
+assemble by hand: a separate `pact doctor`, a separate `pact audit` per
+named check, and a raw grep of `.pact/events.jsonl`. Meant to be read
+directly by a human, or handed to another agent session asking "how is pact
+actually being used, and where does it fall down".
+
+A top-level `observations` array pulls out short, human-readable highlights
+— a nonzero finding count from any check, or a `doctor` check that is not a
+clean `ok`/no-`warn` — so a reader does not have to re-derive "is this worth
+looking at" from raw counts and thresholds. An empty list means nothing rose
+to that bar; the structured fields above it are always the complete data
+regardless of what lands there.
+
+**Orthogonal to `--check` and `--json`.** `--export` only ever adds a file;
+it never changes what prints to stdout or which exit code a `--check` or
+plain summary produces — pass it alongside either, or alone. Under `--json`
+its own confirmation is skipped rather than printed as a second top-level
+object on stdout: every other command's `--json` promises exactly one
+parseable value, and a caller piping through `jq` would break on two. In
+human mode it prints the path it wrote.
+
 ## Closes with nothing open
 
 Reconstruction pairs every `released` / `force-released` / `expired` with the

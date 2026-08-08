@@ -4536,3 +4536,103 @@ fn init_warns_when_a_write_target_symlinks_outside_the_repo() {
         "warning must name the resolved outside-repo target:\n{stderr}"
     );
 }
+
+/// pact-1l8.2: `--export` writes one combined JSON snapshot — summary, every
+/// named check and `pact doctor`'s checks — orthogonal to whatever `--check`
+/// still decides for stdout and the exit code.
+#[test]
+fn audit_export_writes_a_combined_report_alongside_the_normal_check_output() {
+    let tmp = init_repo();
+    assert_ok(&pact(tmp.path(), "agent-a", &["lease", "acquire", "a.rs"]));
+    assert_ok(&pact(tmp.path(), "agent-a", &["lease", "release", "a.rs"]));
+
+    let export_path = tmp.path().join("report.json");
+    let out = pact(
+        tmp.path(),
+        "agent-a",
+        &[
+            "audit",
+            "--check",
+            "double-win",
+            "--export",
+            export_path.to_str().unwrap(),
+        ],
+    );
+    assert_ok(&out);
+    // The normal `--check` contract is untouched by `--export` riding along.
+    assert!(
+        stdout_of(&out).contains("no overlapping hold windows"),
+        "{}",
+        stdout_of(&out)
+    );
+
+    let text = std::fs::read_to_string(&export_path).expect("--export must write the file");
+    let report: serde_json::Value = serde_json::from_str(&text).expect("export must be valid JSON");
+    for key in [
+        "summary",
+        "double_win",
+        "stale_holds",
+        "chain_integrity",
+        "commit_correlation",
+        "doctor",
+        "observations",
+    ] {
+        assert!(
+            report.get(key).is_some(),
+            "exported report missing {key}: {report}"
+        );
+    }
+    assert_eq!(report["summary"]["events"], 2);
+    assert_eq!(report["double_win"]["check"], "double-win");
+    assert!(
+        report["doctor"]["checks"]
+            .as_array()
+            .is_some_and(|c| !c.is_empty()),
+        "{report}"
+    );
+}
+
+/// `--export` alone (no `--check`) still falls back to the plain summary on
+/// stdout — the flag adds a file, it does not require naming a check.
+#[test]
+fn audit_export_works_without_a_check_and_confirms_the_path_written() {
+    let tmp = init_repo();
+    let export_path = tmp.path().join("nested").join("report.json");
+    std::fs::create_dir_all(export_path.parent().unwrap()).unwrap();
+
+    let out = pact(
+        tmp.path(),
+        "agent-a",
+        &["audit", "--export", export_path.to_str().unwrap()],
+    );
+    assert_ok(&out);
+    assert!(
+        stdout_of(&out).contains(&export_path.display().to_string()),
+        "human mode must confirm the path it wrote: {}",
+        stdout_of(&out)
+    );
+    assert!(
+        stdout_of(&out).contains("no coordination history"),
+        "the plain summary must still print with no --check given: {}",
+        stdout_of(&out)
+    );
+    assert!(export_path.exists(), "the file must actually be written");
+
+    // Under --json, stdout must stay exactly the summary's one parseable
+    // value — a second top-level object here would break `| jq` for a
+    // caller of every other command's single-JSON-value contract.
+    let export_path2 = tmp.path().join("report2.json");
+    let out_json = pact(
+        tmp.path(),
+        "agent-a",
+        &[
+            "audit",
+            "--export",
+            export_path2.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_ok(&out_json);
+    let _ = json_stdout(&out_json); // panics with the raw stdout if not exactly one value
+    assert!(export_path2.exists());
+}

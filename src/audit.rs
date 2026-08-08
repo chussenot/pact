@@ -843,6 +843,105 @@ pub fn run_check(
     Ok(report)
 }
 
+/// `pact audit --export` (pact-1l8.2): one self-contained snapshot bundling
+/// the summary, every named check and `pact doctor`'s checks — the exact set
+/// of things the arkanoid field audit (pact-juz) had to assemble by hand,
+/// from a separate `pact doctor`, a separate `pact audit` per check, and a
+/// raw grep of `.pact/events.jsonl`. Meant to be read directly by a human, or
+/// handed to another agent session asking "how is pact actually being used,
+/// and where does it fall down" — the same question that produced pact-juz.
+#[derive(Debug, Serialize)]
+pub struct ExportReport {
+    pub summary: Summary,
+    pub double_win: CheckReport,
+    pub stale_holds: CheckReport,
+    pub chain_integrity: CheckReport,
+    pub commit_correlation: CheckReport,
+    pub doctor: crate::doctor::DoctorReport,
+    /// Short, human-readable highlights pulled out of the structured fields
+    /// above, so a reader does not have to re-derive "is this worth looking
+    /// at" from raw counts and thresholds. Empty means nothing here rose to
+    /// that bar — not that nothing was checked; the structured fields are
+    /// always the full data regardless of what lands here.
+    pub observations: Vec<String>,
+}
+
+pub fn export(
+    repo_root: &std::path::Path,
+    since: Option<DateTime<Utc>>,
+    include_annotated: bool,
+) -> Result<ExportReport> {
+    let summary_report = summary(repo_root, since, include_annotated)?;
+    let double_win = run_check(repo_root, Check::DoubleWin, since, include_annotated)?;
+    let stale_holds = run_check(repo_root, Check::StaleHolds, since, include_annotated)?;
+    let chain_integrity = run_check(repo_root, Check::ChainIntegrity, since, include_annotated)?;
+    let commit_correlation = run_check(
+        repo_root,
+        Check::CommitCorrelation,
+        since,
+        include_annotated,
+    )?;
+    let doctor = crate::doctor::checks(repo_root);
+
+    let mut observations = Vec::new();
+    if double_win.findings() > 0 {
+        observations.push(format!(
+            "{} double-win(s): two agents held one path at the same time — see pact-ehi.",
+            double_win.findings()
+        ));
+    }
+    if stale_holds.findings() > 0 {
+        observations.push(format!(
+            "{} stale hold(s): ran past their own recorded TTL with no renew.",
+            stale_holds.findings()
+        ));
+    }
+    if chain_integrity.findings() > 0 {
+        observations.push(format!(
+            "{} chain-integrity break(s): a chain-tracked line does not match its recorded hash.",
+            chain_integrity.findings()
+        ));
+    }
+    match &commit_correlation.git_unavailable {
+        Some(reason) => observations.push(format!("commit-correlation could not run: {reason}")),
+        None => {
+            if !commit_correlation.concurrent_writes.is_empty() {
+                observations.push(format!(
+                    "{} concurrent write(s): real commits landed from both sides of an \
+                     overlapping hold.",
+                    commit_correlation.concurrent_writes.len()
+                ));
+            }
+            if !commit_correlation.uncovered_commits.is_empty() {
+                observations.push(format!(
+                    "{} commit(s) landed on a leased path with no hold covering them.",
+                    commit_correlation.uncovered_commits.len()
+                ));
+            }
+        }
+    }
+    for c in &doctor.checks {
+        if !c.ok || c.warn {
+            observations.push(format!(
+                "doctor: {} {} — {}",
+                if c.ok { "warn" } else { "FAIL" },
+                c.name,
+                c.detail
+            ));
+        }
+    }
+
+    Ok(ExportReport {
+        summary: summary_report,
+        double_win,
+        stale_holds,
+        chain_integrity,
+        commit_correlation,
+        doctor,
+        observations,
+    })
+}
+
 /// The body of `Check::CommitCorrelation`, split out because it is the one
 /// check whose findings depend on something other than `.pact/events.jsonl`
 /// — see the module doc comment on why that is a deliberate, narrow widening
@@ -2353,6 +2452,84 @@ mod tests {
             r.findings(),
             0,
             "no git history to correlate against must never itself be a finding"
+        );
+    }
+
+    // ------------------------------------------------------------- export
+
+    #[test]
+    fn export_combines_the_summary_every_check_and_doctor() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "agent-a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:02:00Z", "agent-a", "released", "a.rs"),
+        ]);
+        let report = export(tmp.path(), None, false).unwrap();
+        assert_eq!(report.summary.events, 2);
+        assert_eq!(report.double_win.check, "double-win");
+        assert_eq!(report.stale_holds.check, "stale-holds");
+        assert_eq!(report.chain_integrity.check, "chain-integrity");
+        assert_eq!(report.commit_correlation.check, "commit-correlation");
+        assert!(
+            !report.doctor.checks.is_empty(),
+            "doctor's checks must ride along, not just its healthy flag"
+        );
+
+        // The whole point is a file another agent session can read directly —
+        // pin that it actually round-trips through serde as one JSON object,
+        // not just that the Rust struct is well-formed.
+        let json = serde_json::to_value(&report).unwrap();
+        for key in [
+            "summary",
+            "double_win",
+            "stale_holds",
+            "chain_integrity",
+            "commit_correlation",
+            "doctor",
+            "observations",
+        ] {
+            assert!(json.get(key).is_some(), "missing {key} in exported JSON");
+        }
+    }
+
+    /// The `observations` list is what saves a reader from re-deriving
+    /// "worth a look" from raw counts — a stale hold must actually show up
+    /// there, in a form that names what it is.
+    #[test]
+    fn export_observations_name_a_real_stale_hold() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "slow", "acquired", "src/slow.rs"),
+            &ev("2026-08-01T12:00:00Z", "slow", "released", "src/slow.rs"),
+        ]);
+        let report = export(tmp.path(), None, false).unwrap();
+        assert_eq!(report.stale_holds.findings(), 1);
+        assert!(
+            report.observations.iter().any(|o| o.contains("stale hold")),
+            "{:?}",
+            report.observations
+        );
+    }
+
+    /// A clean lease/commit history must not manufacture an audit-side
+    /// observation when nothing rose to that bar — only `doctor`'s own
+    /// checks (a separate concern, covered by its own test suite) may still
+    /// contribute to the list for this fixture.
+    #[test]
+    fn export_adds_no_audit_observation_when_the_history_is_clean() {
+        let tmp = with_git_log(&[
+            &ev("2026-08-01T10:00:00Z", "agent-a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:01:00Z", "agent-a", "released", "a.rs"),
+        ]);
+        git_commit(tmp.path(), "a.rs", "2026-08-01T10:00:30+00:00");
+
+        let report = export(tmp.path(), None, false).unwrap();
+        assert_eq!(report.double_win.findings(), 0);
+        assert_eq!(report.stale_holds.findings(), 0);
+        assert_eq!(report.chain_integrity.findings(), 0);
+        assert_eq!(report.commit_correlation.findings(), 0);
+        assert!(
+            report.observations.iter().all(|o| o.starts_with("doctor:")),
+            "a clean history must not add any non-doctor observation: {:?}",
+            report.observations
         );
     }
 }

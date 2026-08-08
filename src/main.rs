@@ -110,8 +110,9 @@ enum Command {
     Doctor,
     /// Analyse this repo's coordination history in `.pact/events.jsonl`.
     ///
-    /// Reads only `.pact/` — never the Beads store. Exits 1 when a check finds
-    /// something, 0 when it does not.
+    /// Reads `.pact/` and, for `--check commit-correlation` or `--export`,
+    /// this repository's own git history — never the Beads store. Exits 1
+    /// when a check finds something, 0 when it does not.
     ///
     /// `--check double-win` is the detector for the guard-file backlog item
     /// (pact-ehi), whose written trigger condition is "implement the guard file
@@ -134,6 +135,16 @@ enum Command {
         /// is always reported. Pass this to see the raw log as written.
         #[arg(long)]
         include_annotated: bool,
+        /// Write the summary, every named check and `pact doctor`'s checks —
+        /// combined into one JSON file — to this path.
+        ///
+        /// Orthogonal to `--check`/`--json`, which still control only what
+        /// prints to stdout: pass this alongside either, or alone. Meant to
+        /// turn a by-hand field audit (grep the event log, run doctor and
+        /// audit separately, write up what stood out) into one command whose
+        /// output a human — or another agent session — can read directly.
+        #[arg(long)]
+        export: Option<PathBuf>,
     },
     /// Interactive terminal dashboard over leases, messages, and doctor status.
     #[cfg(feature = "ui")]
@@ -486,7 +497,8 @@ fn run(cli: Cli) -> Result<i32> {
             check,
             since,
             include_annotated,
-        } => run_audit(&cwd, cli.json, check, since, include_annotated),
+            export,
+        } => run_audit(&cwd, cli.json, check, since, include_annotated, export),
         #[cfg(feature = "ui")]
         Command::Ui => {
             let root = repo::find_repo_root(&cwd)?;
@@ -503,25 +515,47 @@ fn run(cli: Cli) -> Result<i32> {
     }
 }
 
-/// `pact audit`: the summary, or one named check.
+/// `pact audit`: the summary, or one named check, plus an optional `--export`.
 ///
 /// Returns the process exit code rather than raising, in the same shape as
 /// `doctor`: a finding is a *result*, not an error, so it must not print
 /// `error:` and must not be confusable with a usage failure. 1 means "the check
 /// found something", which is the documented generic-failure code reused rather
-/// than a new one invented.
+/// than a new one invented. `--export` never changes this: writing the file
+/// is orthogonal to what `--check`/no-`--check` decide for stdout and the
+/// exit code.
 fn run_audit(
     cwd: &Path,
     json: bool,
     check: Option<String>,
     since: Option<String>,
     include_annotated: bool,
+    export: Option<PathBuf>,
 ) -> Result<i32> {
     let root = repo::find_repo_root(cwd)?;
     let since = match since {
         Some(s) => Some(audit::parse_since(&s)?),
         None => None,
     };
+
+    if let Some(path) = export {
+        let report = audit::export(&root, since, include_annotated)?;
+        let text = serde_json::to_string_pretty(&report)
+            .context("serializing the self-improvement report")?;
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+        // Human mode only: under `--json`, stdout must stay exactly the one
+        // parseable value every other command promises (the check result or
+        // the summary, printed below) — a second top-level JSON object here
+        // would break that contract for a caller doing `| jq`. The file on
+        // disk, at the path the caller just gave, is confirmation enough for
+        // a machine consumer.
+        if !json {
+            output::line(&format!(
+                "wrote self-improvement report to {}",
+                path.display()
+            ));
+        }
+    }
 
     match check {
         None => {
