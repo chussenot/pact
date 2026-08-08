@@ -3486,6 +3486,49 @@ fn prior_owner_and_to_owner_of_agree_across_cwd_relative_spellings() {
     );
 }
 
+/// pact-m7j.10.8: `encode_path`'s charset was narrowed after `br` was found
+/// to reject a `.` outright. A message tagged with the OLDER, wider encoding
+/// — the shape a live `bd` store could genuinely hold from before that fix —
+/// must still be found by `about_path`'s query, via the legacy-encoding
+/// fallback, not silently stop matching just because the current encoding
+/// changed. Bypasses pact's own `msg send` (which always tags with the
+/// CURRENT encoding) and creates the label directly via `bd`, the only way
+/// to reproduce the pre-fix on-disk shape.
+#[test]
+fn an_about_tag_using_the_pre_charset_fix_encoding_is_still_found() {
+    let Some(tmp) = bd_repo("an_about_tag_using_the_pre_charset_fix_encoding") else {
+        return;
+    };
+
+    // The legacy encoding for src/foo.rs: only "/" became "__", so the "."
+    // survives — exactly what pact would have written before pact-m7j.10.1
+    // narrowed the charset, and exactly what br's own label validator
+    // rejects today (this label only ever existed on a live bd store).
+    let created = Command::new("bd")
+        .args([
+            "create",
+            "--type=message",
+            "--title=heads up",
+            "--description=old encoding",
+            "--assignee=recipient",
+            "--actor=sender",
+            "--labels=about-src__foo.rs",
+            "--json",
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("bd create");
+    assert!(created.status.success(), "{}", stderr_of(&created));
+
+    let checked = pact(tmp.path(), "recipient", &["lease", "acquire", "src/foo.rs"]);
+    assert_ok(&checked);
+    assert!(
+        stderr_of(&checked).contains("unread message"),
+        "a legacy-encoded about-tag must still be found via the fallback query: {}",
+        stderr_of(&checked)
+    );
+}
+
 /// A refused acquire named the victim and never the holder, so the
 /// who-blocks-whom edge existed only in `pact log`. The holder belongs on the
 /// SPAN and not on a metric — an agent name is unbounded and would mint a

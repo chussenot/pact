@@ -113,6 +113,18 @@ fn encode_path(path: &str) -> String {
         .collect()
 }
 
+/// [`encode_path`]'s charset before it was narrowed (pact-m7j.10.1/6efc338):
+/// `/` to `__`, nothing else touched. A message tagged on a live `bd` store
+/// before that fix used this wider encoding — `about_path` querying only the
+/// current, narrower encoding would never find it again for a path
+/// containing any of the punctuation the narrowing now collapses
+/// (pact-m7j.10.8). `br` never had this problem: the same punctuation was
+/// already rejected outright there, so nothing was ever tagged with it on
+/// `br` to begin with.
+fn encode_path_legacy(path: &str) -> String {
+    path.replace('/', "__")
+}
+
 /// How far [`walk_to_root`] follows `parent` links before giving up. pact only
 /// ever creates depth-1 threads; the cap exists so hand-edited or cyclic parent
 /// data cannot spin forever, not because deep threads are expected.
@@ -459,8 +471,25 @@ pub fn about_path(cli: &BeadsCli, repo_root: &Path, path: &str) -> Result<Vec<Me
     // its own `about` list the same way (see `send`). One file must produce
     // one label however either command line spelled it.
     let relative = crate::lease::normalize_path(repo_root, path);
-    let label = format!("{ABOUT}{}", encode_path(&relative));
+    let current = encode_path(&relative);
+    let label = format!("{ABOUT}{current}");
     let issues = list_issues(cli, repo_root, None, Some(&label))?;
+    if !issues.is_empty() {
+        return Ok(to_messages(issues, None));
+    }
+    // pact-m7j.10.8: a message tagged before the charset narrowing used the
+    // wider, legacy encoding. Only worth a second call when that encoding
+    // would actually differ — most paths have no punctuation the narrowing
+    // touches, so `legacy == current` and this never fires — and only after
+    // the current encoding's query already came back empty, so a path with
+    // genuine current-encoding traffic never pays for a query it doesn't
+    // need.
+    let legacy = encode_path_legacy(&relative);
+    if legacy == current {
+        return Ok(Vec::new());
+    }
+    let legacy_label = format!("{ABOUT}{legacy}");
+    let issues = list_issues(cli, repo_root, None, Some(&legacy_label))?;
     Ok(to_messages(issues, None))
 }
 

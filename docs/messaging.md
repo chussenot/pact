@@ -664,6 +664,19 @@ set, so the narrow encoding is a subset that works on both rather than a second
 scheme to keep in sync. It is one-way: nothing decodes a label back to a path,
 it only re-encodes the path being queried and compares.
 
+Narrowing it changed what a query for the same path produces — a message
+tagged on a live `bd` store before the narrowing landed used the wider
+encoding, and a fresh query using only the current one would never find it
+again. `about_path` falls back to the pre-narrowing encoding (`/` to `__`,
+nothing else touched) whenever the two differ *and* the current encoding's
+query comes back empty — zero extra cost for the common case (most paths
+have no punctuation the narrowing touches, so the two encodings are
+identical and only one query ever runs), and one extra query only for a
+path that genuinely might still be carrying an old-style tag
+(pact-m7j.10.8). `br` never needed this: the punctuation this fallback
+covers was already rejected outright there, so nothing was ever tagged with
+it on `br` to begin with.
+
 ### When that check can't run, it says so
 
 The check runs against a backend that may be absent, wedged, or never installed
