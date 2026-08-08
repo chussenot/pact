@@ -283,8 +283,8 @@ sent pact-msg-bf787ceef4d8f3d3 to recipient (thread pact-msg-bf787ceef4d8f3d3)
 $ pact --agent sender msg send --to recipient --subject "long send" "the harness dropped stdout before I saw the exit code"
 sent pact-msg-bf787ceef4d8f3d3 to recipient (thread pact-msg-bf787ceef4d8f3d3)
 $ pact --agent recipient msg inbox
-ID                            FROM    SUBJECT    BODY
-pact-msg-bf787ceef4d8f3d3  *  sender  long send  the harness dropped stdout before I saw the exit code
+ID                            FROM    WHEN     SUBJECT    BODY
+pact-msg-bf787ceef4d8f3d3  *  sender  45s ago  long send  the harness dropped stdout before I saw the exit code
 
 1 message(s), 1 unread (*) — `pact msg read <id>` for the full text
 ```
@@ -406,12 +406,12 @@ asked for.
 ## Reading your mail: one line each, full text on demand
 
 `pact msg inbox` prints one row per message — id, an unread marker, sender,
-subject, and the head of the body:
+how long ago it arrived, subject, and the head of the body:
 
 ```
-ID                            FROM       SUBJECT                                          BODY
-pact-msg-d42443f0467ab2aa  *  lease-fix  src/lease.rs is ready to wire (rnc.8/9/10/11)    src/lease.rs done, contract exactly as frozen. To wire: lea…
-pact-msg-9c4b3064b6844eb5     msg-fix    src/msg.rs ready: Message.from + all_messages()  src/msg.rs is done and compiles clean on its own. Contract …
+ID                            FROM       WHEN         SUBJECT                                          BODY
+pact-msg-d42443f0467ab2aa  *  lease-fix  12m ago      src/lease.rs is ready to wire (rnc.8/9/10/11)    src/lease.rs done, contract exactly as frozen. To wire: lea…
+pact-msg-9c4b3064b6844eb5     msg-fix    1h4m ago     src/msg.rs ready: Message.from + all_messages()  src/msg.rs is done and compiles clean on its own. Contract …
 
 2 message(s), 1 unread (*) — `pact msg read <id>` for the full text
 ```

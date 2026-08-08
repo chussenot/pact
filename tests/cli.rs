@@ -1417,6 +1417,31 @@ fn escape_sequences_in_a_message_body_never_reach_the_terminal() {
     );
 }
 
+/// pact-m7j.12.3: an agent deciding whether an unread message is worth a
+/// context switch had no way to see how stale it was without running `msg
+/// read` first. `WHEN` reuses `pact log`'s own `since()` formatter ("Xs/Xm
+/// ago"), not a new mechanism — `Message.created_at` was already there.
+#[test]
+fn msg_inbox_shows_a_when_column() {
+    let Some(tmp) = bd_repo("msg_inbox_shows_a_when_column") else {
+        return;
+    };
+    assert_ok(&pact(
+        tmp.path(),
+        "sender-agent",
+        &["msg", "send", "--to", "reader-agent", "body"],
+    ));
+
+    let inbox = pact(tmp.path(), "reader-agent", &["msg", "inbox"]);
+    assert_ok(&inbox);
+    let out = stdout_of(&inbox);
+    assert!(out.contains("WHEN"), "header must name the column: {out}");
+    assert!(
+        out.contains("s ago") || out.contains("m ago") || out.contains("h ago"),
+        "a just-sent message's row must show a compact age: {out}"
+    );
+}
+
 /// `-V` is the machine-facing form and must stay the bare `pact <semver>` line;
 /// `--version` carries the build stamp. Guarding both together is the point —
 /// the value of the stamp is answering "is the binary on PATH the one I built?",

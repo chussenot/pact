@@ -1900,11 +1900,19 @@ fn read_by_recipient(m: &msg::Message) -> bool {
 /// pact-rnc.1 + pact-rnc.2: one line per message with the sender and an unread
 /// marker. Seven messages used to print ~9KB of full bodies, which burned an
 /// agent's context on every check and made `msg read` pointless.
+///
+/// `WHEN` (pact-m7j.12.3): named in both real fleet retrospectives and
+/// `sut-analysis.md` as a missing at-a-glance signal — an agent deciding
+/// whether an unread message is worth a context switch had to run `msg read`
+/// just to see how stale it was. `Message.created_at` was already carried
+/// end to end; this is `pact log`'s own `since()` reused for the same
+/// column, not a new mechanism.
 fn render_inbox(messages: &[msg::Message]) -> String {
     let mut rows = vec![vec![
         "ID".to_string(),
         String::new(), // unread marker; a header would be wider than the column
         "FROM".to_string(),
+        "WHEN".to_string(),
         "SUBJECT".to_string(),
         "BODY".to_string(),
     ]];
@@ -1913,6 +1921,7 @@ fn render_inbox(messages: &[msg::Message]) -> String {
             m.id.clone(),
             if m.read { " " } else { "*" }.to_string(),
             if m.from.is_empty() { "?" } else { &m.from }.to_string(),
+            since(&m.created_at),
             one_line(m.subject.as_deref().unwrap_or(""), 50),
             one_line(&m.body, 60),
         ]
