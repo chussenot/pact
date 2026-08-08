@@ -249,6 +249,70 @@ fn an_absolute_path_from_a_sibling_worktree_is_the_same_lock_as_the_relative_spe
     );
 }
 
+/// The same alias has to hold for a THIRD, non-main linked worktree — not
+/// just the main root (pact-m7j.8.7). Running from `wt_b`, a path spelled
+/// absolute from `wt_c` matches neither of the two candidates `wt_b`'s own
+/// resolution already had (its own root, the shared/main root), so it needs
+/// `linked_worktree_roots` enumerating every sibling to recover the alias.
+#[test]
+fn an_absolute_path_from_a_third_non_main_worktree_is_the_same_lock() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+    let (_tmp, main, wt_b) = repo_with_worktree("feat/auth", "wt-b");
+    let wt_c = main.parent().unwrap().join("wt-c");
+    git_ok(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat/other",
+            wt_c.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+
+    let first = pact(
+        &main,
+        "agent-a",
+        &[
+            "lease",
+            "acquire",
+            "src/api.ts",
+            "--note",
+            "editing from main",
+        ],
+    );
+    assert!(first.status.success(), "{}", stderr(&first));
+
+    // pact runs FROM wt_b, but the path is spelled absolute rooted in wt_c —
+    // the third worktree, neither wt_b's own root nor the main/shared root.
+    let absolute = wt_c.join("src/api.ts");
+    let second = pact(
+        &wt_b,
+        "agent-b",
+        &["lease", "acquire", absolute.to_str().unwrap()],
+    );
+    assert_eq!(
+        second.status.code(),
+        Some(2),
+        "an absolute path rooted in a third sibling worktree must alias the \
+         same lock as the relative spelling, not open a second one; stderr: {}",
+        stderr(&second)
+    );
+
+    // Exactly one lock file on disk, not two.
+    let lock_dir = main.join(".pact/leases");
+    assert_eq!(
+        std::fs::read_dir(&lock_dir).unwrap().count(),
+        1,
+        "expected exactly one lock under {}, got a split-brain",
+        lock_dir.display()
+    );
+}
+
 /// The `..`-relative variant of the same bug: `cwd.join()` resolves this to
 /// an absolute path rooted in the sibling worktree before the failing
 /// `strip_prefix` ever runs, so it is the identical code path, not a

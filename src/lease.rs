@@ -440,15 +440,23 @@ pub(crate) fn normalize_path(repo_root: &Path, path: &str) -> String {
     // ls`'s WHERE output on another checkout. Try the shared coordination
     // root next before giving up: for the common two-worktree case (typed
     // from, or as, the main worktree) this recovers the same lock key the
-    // caller's own worktree would have produced. A path spelled from a
-    // THIRD, non-main sibling worktree still falls through unfixed — no code
-    // here enumerates every linked worktree's own checkout root.
+    // caller's own worktree would have produced.
     let shared_root = crate::repo::RepoContext::resolve(repo_root).shared_root;
-    folded
-        .strip_prefix(&shared_root)
-        .unwrap_or(&folded)
-        .to_string_lossy()
-        .into_owned()
+    if let Ok(stripped) = folded.strip_prefix(&shared_root) {
+        return stripped.to_string_lossy().into_owned();
+    }
+    // Still no match: the path may have been spelled from a THIRD, non-main
+    // linked worktree — neither this process's own root nor the shared/main
+    // root (pact-m7j.8.7). `linked_worktree_roots` reads the same kind of
+    // plain gitdir-pointer files already used above, so trying every sibling
+    // costs no subprocess; it only runs here, once both cheaper candidates
+    // have already missed.
+    for root in crate::repo::linked_worktree_roots(&shared_root) {
+        if let Ok(stripped) = folded.strip_prefix(&root) {
+            return stripped.to_string_lossy().into_owned();
+        }
+    }
+    folded.to_string_lossy().into_owned()
 }
 
 /// Fold `.` and `..` textually. No filesystem access, so it works on a path

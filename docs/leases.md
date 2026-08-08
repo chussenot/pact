@@ -85,22 +85,22 @@ are folded **lexically** — never with `canonicalize()`, because leasing a file
 that does not exist yet is a documented workflow (see below) and `canonicalize`
 fails on a missing path.
 
-**Across worktrees, "however you spell it" still has a named gap.** An absolute
-path (or a `..` that escapes your checkout — the same code path, since it is
-made absolute before anything strips it) is matched against your own checkout's
-root first and, failing that, against the shared coordination root, which for a
-linked worktree is the main worktree where `.pact/` lives. Those two cover the
-spelling people actually produce: a path copied out of `lease ls`'s `WHERE`
-column, or out of a peer's message, and pasted from a different checkout. Before
-the second candidate existed, such a path matched neither, was kept whole, and
-became its own lock key — one file, two leases, both holders told they had it,
-which is the exact failure this section exists to prevent.
-
-It is not fully closed. A path spelled from a **third, non-main sibling
-worktree** still matches neither root and still splits, because nothing here
-enumerates every linked worktree's own checkout root (tracked as
-`pact-m7j.8.7`). Until it is, spell paths relative to the checkout you are
-standing in and the question does not arise.
+**Across worktrees, "however you spell it" is covered by three candidates, tried
+in order of how cheap they are to compute.** An absolute path (or a `..` that
+escapes your checkout — the same code path, since it is made absolute before
+anything strips it) is matched against your own checkout's root first; failing
+that, against the shared coordination root, which for a linked worktree is the
+main worktree where `.pact/` lives; failing that, against every OTHER linked
+worktree's own checkout root, read straight from the plain gitdir-pointer files
+git already writes under the main worktree's `.git/worktrees/` (no `git`
+subprocess, so the third candidate costs nothing until it is actually needed).
+That covers every spelling people actually produce: a path copied out of `lease
+ls`'s `WHERE` column, or out of a peer's message, and pasted from any other
+checkout of the same repository — including a THIRD, non-main sibling worktree
+(`pact-m7j.8.7`). Before the second candidate existed, such a path matched
+nothing, was kept whole, and became its own lock key — one file, two leases,
+both holders told they had it, which is the exact failure this section exists
+to prevent.
 
 Case is folded only where the filesystem folds it. On macOS's default APFS,
 `src/auth.rs` and `src/Auth.rs` are one file and take one lease; on Linux they

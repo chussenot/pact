@@ -235,7 +235,13 @@ clone") aimed at a bare repository that was never involved.
 
 ### Known limits of the resolution chain
 
-All are worth knowing. Only the last one is worth code, and it is filed.
+All are worth knowing. None is worth code — the one that was (an absolute path
+spelled from a third, non-main worktree splitting its lease, `pact-m7j.8.7`)
+got its fix instead: `normalize_path`'s fallback now also tries every OTHER
+linked worktree's checkout root, read from the same plain gitdir-pointer files
+git already writes rather than a `git worktree list` subprocess, so the added
+cost lands only on the rare path that needed a third candidate at all. See
+[leases.md](leases.md#one-file-is-one-lease-however-you-spell-the-path).
 
 - **Mixed scope is invisible across processes.** `PACT_WORKTREE_SCOPE=local` in
   one agent's environment silently partitions it from siblings that believe they
@@ -250,13 +256,6 @@ All are worth knowing. Only the last one is worth code, and it is filed.
   worktree at `…/foo`. Pathological, and not worth code to detect.
 - **A worktree literally named `modules`** (`.git/worktrees/modules`) classifies as
   a submodule, because the marker scan is lexical. Equally pathological.
-- **An absolute path spelled from a third worktree still splits its lease.**
-  Lock keys are repo-root-relative, and an absolute path is matched against your
-  own checkout's root and then the shared coordination root. A path typed from
-  some *other* linked worktree matches neither, so it keys its own lock: one
-  file, two leases. The common two-worktree case is covered; enumerating every
-  sibling's checkout root to close the rest is `pact-m7j.8.7`. See
-  [leases.md](leases.md#one-file-is-one-lease-however-you-spell-the-path).
 
 Every one of those decisions is reported by `pact doctor` (`worktree`,
 `coordination scope`, `state placement`, `state dir writable`, `worktree

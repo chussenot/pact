@@ -551,6 +551,40 @@ fn has_linked_worktrees(git_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Every linked worktree's own checkout root, for `normalize_path`'s
+/// third-worktree fallback (pact-m7j.8.7).
+///
+/// `resolve_topology_uncached` already walks `<linked worktree>/.git` ->
+/// `commondir` to find the ONE main root from inside a linked worktree. This
+/// is the reverse hop, walking outward from the main root to find ALL of
+/// them: `<shared_root>/.git/worktrees/<name>/gitdir` is git's own reverse
+/// pointer, holding the path back to `<that worktree>/.git` (verified against
+/// a real `git worktree add` layout — it has no leading `gitdir:` tag, unlike
+/// the pointer files `parse_gitdir_pointer` reads, so it is read as a raw
+/// path instead). Same "plain file reads, no `git` subprocess" mechanism the
+/// rest of this module already commits to, so this candidate is cheap enough
+/// to compute even though it is only ever consulted after two faster
+/// candidates have already missed.
+///
+/// Returns an empty list for anything that is not an ordinary checkout with a
+/// `.git` directory (a bare `CommonGitdir` topology, or a repo with no
+/// worktrees at all) rather than erroring — the caller already has two
+/// candidates that may have matched before this one is even consulted.
+pub(crate) fn linked_worktree_roots(shared_root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(shared_root.join(".git").join("worktrees")) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter_map(|entry| {
+            let contents = std::fs::read_to_string(entry.path().join("gitdir")).ok()?;
+            resolve_against(&entry.path(), contents.trim())
+                .parent()
+                .map(Path::to_path_buf)
+        })
+        .collect()
+}
+
 /// pact's state directory, creating it (and `leases/`) if absent.
 ///
 /// Takes the worktree root every caller already has and resolves the shared
