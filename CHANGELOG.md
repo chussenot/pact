@@ -10,6 +10,17 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.6.1 - 2026-08-08
+#### Features
+- **(doctor)** warn when Beads actors never overlap pact's agent roster - (0cac756) - Clement HUSSENOT-DESENONGES
+- **(doctor)** flag duplicated instruction headings from other tools - (941a0e3) - Clement HUSSENOT-DESENONGES
+- **(lease,audit)** log a refused event on every denied acquire - (08d30a6) - Clement HUSSENOT-DESENONGES
+- **(whoami,init)** tell agents to export BEADS_ACTOR for direct bd calls - (d75c0fa) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- Add - (f943139) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.6.0 - 2026-08-08
 #### Bug Fixes
 - **(agents)** re-validate identity grammar on names read back from bd - (b94a419) - Clement HUSSENOT-DESENONGES
