@@ -297,7 +297,10 @@ than a JSON-RPC error, so the client hands the text to the model and it can
 recover. The text names the exit code the CLI would have produced for the same
 condition, because those codes are pact's documented API
 ([cli.md](cli.md#exit-codes)) and an orchestrator should branch on the same
-number either way:
+number either way. The same code also lands in `structuredContent.exitCode`
+alongside `structuredContent.message`, so a script-driven client can branch on
+it without regexing the sentence below — which carries no compatibility
+guarantee of its own:
 
 - **exit 3** — the Beads backend is unavailable: no `bd`/`br` on `PATH`, or one
   killed for running past `PACT_BEADS_TIMEOUT_SECS`. Only the two message tools

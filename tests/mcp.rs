@@ -338,6 +338,15 @@ fn a_missing_beads_cli_is_a_tool_error_not_a_crash() {
             text.contains("exit 3"),
             "the error should mirror exit code 3's meaning: {text}"
         );
+        // pact-m7j.5.2: the exit code must also be machine-readable, not just
+        // embedded in a sentence with no compatibility guarantee — an
+        // orchestrator polling several pact-backed repos needs to branch on
+        // the same number a shell would have gotten from the CLI.
+        assert!(
+            r["result"]["structuredContent"].is_object(),
+            "a tool error should carry structuredContent too: {r:#?}"
+        );
+        assert_eq!(r["result"]["structuredContent"]["exitCode"], 3, "{r:#?}");
     }
     assert!(responses
         .iter()
