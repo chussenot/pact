@@ -465,6 +465,60 @@ fn scope_local_restores_per_worktree_isolation() {
     );
 }
 
+/// pact-m7j.9.6: `RepoContext::resolve` re-derives the state directory from
+/// scratch on every invocation, with nothing to detect that
+/// `PACT_WORKTREE_SCOPE` differs between the call that acquired a lease and a
+/// later call trying to release it. Before this fix, `release_fs` treated the
+/// resulting miss as ordinary idempotent "nothing to release" —
+/// indistinguishable from having genuinely already released it, while the
+/// real lock sat live in the other, un-probed directory until its TTL lapsed.
+#[test]
+fn release_after_a_scope_change_names_the_other_candidate_directory() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+    let (_tmp, main, wt) = repo_with_worktree("feat/drift", "wt-drift");
+
+    // Acquired from the linked worktree with the default (shared) scope:
+    // state lands under the MAIN worktree.
+    let acquired = pact(&wt, "agent-a", &["lease", "acquire", "src/api.ts"]);
+    assert!(acquired.status.success(), "{}", stderr(&acquired));
+    let shared_leases = main.join(".pact/leases");
+    assert_eq!(std::fs::read_dir(&shared_leases).unwrap().count(), 1);
+
+    // Released from the SAME worktree and path, but with scope=local: resolves
+    // to wt/.pact instead, which has never held anything.
+    let released = pact_scoped(
+        &wt,
+        "agent-a",
+        &["lease", "release", "src/api.ts"],
+        Some("local"),
+    );
+    assert!(
+        released.status.success(),
+        "release stays idempotent-success, not a hard failure: {}",
+        stderr(&released)
+    );
+    let warning = stderr(&released);
+    assert!(
+        warning.contains(main.join(".pact").to_str().unwrap()),
+        "must name the other candidate directory where the real lock is sitting: {warning}"
+    );
+    assert!(
+        warning.contains("PACT_WORKTREE_SCOPE"),
+        "must point at the mechanism that could have changed: {warning}"
+    );
+
+    // And the real lock is still there, live — the whole point of the bug:
+    // a naive fix must not go on to actually delete it either.
+    assert_eq!(
+        std::fs::read_dir(&shared_leases).unwrap().count(),
+        1,
+        "the real lock must not have been silently dropped"
+    );
+}
+
 /// (f) Bare repository plus worktrees: leases anchor inside the common gitdir,
 /// and messaging refuses instead of creating a store somewhere nobody will find.
 #[test]

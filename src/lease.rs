@@ -1,6 +1,7 @@
 //! Advisory file leases: atomic lock files under `.pact/leases/`, with TTL,
 //! steal, and re-entrant-refresh semantics. See docs/leases.md.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -105,6 +106,20 @@ pub struct LeaseInfo {
     pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<String>,
+    /// Any field a NEWER lock file has that this compiled struct does not know
+    /// about — the mirror image of `branch`/`worktree`'s `default`.
+    ///
+    /// Forward compat (a future field parses fine on an old binary) was
+    /// already free from `#[serde(default)]` on every named field. Backward
+    /// compat was not: an OLD binary's `LeaseInfo` has no such field at all,
+    /// so any read-modify-write it performs (`renew_fs`, `acquire_inner`'s
+    /// `--steal`/expired-reclaim takeover) necessarily reserializes a value
+    /// that never carried it — silently dropping it from disk. `flatten`
+    /// catches every unrecognized key into this map on read and re-emits it
+    /// on write, so a rewrite by a binary that predates a field still
+    /// preserves it (pact-m7j.9.8).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// The branch/worktree pair to stamp on a new lease, empty unless this
@@ -460,6 +475,47 @@ fn lock_file_path(repo_root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(dir
         .join("leases")
         .join(format!("{}.lock", encode_path(relative))))
+}
+
+/// The other well-known lock-file location a lease might actually be sitting
+/// in, when a lookup at the normally-resolved directory misses (pact-m7j.9.6).
+///
+/// `RepoContext::resolve` has no cross-invocation memory: nothing detects that
+/// `PACT_WORKTREE_SCOPE` or this repository's worktree topology differ now
+/// from what they were when the lease was acquired, so a miss here is
+/// consistent with either "genuinely nothing to release" or "it's in the
+/// other directory a different scope/topology would have produced" — and
+/// those look identical from a bare `!lock_path.exists()`.
+///
+/// Only two shapes are worth probing: `RepoContext::resolve_topology` ignores
+/// both env vars and always lands on the topology's own answer (shared root
+/// for a linked worktree, `worktree_root` otherwise), and
+/// `PACT_WORKTREE_SCOPE=local` always redirects to `worktree_root.join(".pact")`
+/// regardless of topology. Those are the only two directories scope/topology
+/// drift between one pact invocation and the next can produce. An arbitrary
+/// `PACT_STATE_DIR` value is a third, unrelated drift mechanism deliberately
+/// left out: probing it would mean guessing at an operator-chosen path with no
+/// finite candidate set, a bigger question the bead this fixes calls out as
+/// needing a human decision, not a cheap probe. Skipped whenever
+/// `PACT_STATE_DIR` is set, so a deliberate override (repo.rs's own test
+/// isolation depends on one) never trips a false-positive warning.
+fn other_candidate_lock_path(repo_root: &Path, relative: &str) -> Option<PathBuf> {
+    if std::env::var_os("PACT_STATE_DIR").is_some() {
+        return None;
+    }
+    let resolved = crate::repo::pact_dir_path(repo_root);
+    let local_shape = repo_root.join(".pact");
+    let shared_shape = crate::repo::RepoContext::resolve_topology(repo_root).state_dir;
+    let other = if resolved == local_shape {
+        shared_shape
+    } else {
+        local_shape
+    };
+    (other != resolved).then(|| {
+        other
+            .join("leases")
+            .join(format!("{}.lock", encode_path(relative)))
+    })
 }
 
 fn parse_acquired_raw(lease: &LeaseInfo) -> Option<DateTime<Utc>> {
@@ -1101,7 +1157,12 @@ fn acquire_inner(
     // `effective_now`'s doc comment.
     let now = effective_now(repo_root);
     let (branch, worktree) = worktree_stamp(repo_root);
-    let new_lease = LeaseInfo {
+    // Mutable so the expired-reclaim and --steal branches below can copy
+    // `existing.extra` onto it before writing (pact-m7j.9.8) — everything
+    // else about this lease (agent, note, branch/worktree) is already
+    // deliberately fresh, never inherited, so `extra` starts the same way and
+    // only the two takeover branches override it.
+    let mut new_lease = LeaseInfo {
         agent: agent.to_string(),
         path: relative.clone(),
         acquired_at: now.to_rfc3339(),
@@ -1109,6 +1170,7 @@ fn acquire_inner(
         note,
         branch,
         worktree,
+        extra: BTreeMap::new(),
     };
 
     // Claim the path with a LINK, not with create_new + write.
@@ -1234,6 +1296,11 @@ fn acquire_inner(
             };
 
             if is_expired(&existing, now) {
+                // A takeover, not a fresh claim: whatever a newer/older binary
+                // stamped on the dead holder's lease survives the reclaim
+                // (pact-m7j.9.8), unlike the re-entrant-refresh branch below,
+                // which deliberately starts every field fresh.
+                new_lease.extra = existing.extra.clone();
                 write_lease_atomic(&lock_path, &new_lease)?;
                 verify_own_lease(&lock_path, agent)?;
                 // The previous claim ended here, and this is the only moment
@@ -1319,6 +1386,9 @@ fn acquire_inner(
                     "warning: stealing non-expired lease on {relative} held by {} (advisory override via --steal)",
                     holder_location(&existing)
                 ));
+                // Same takeover reasoning as the expired-reclaim branch above:
+                // preserve the displaced lease's unknown fields (pact-m7j.9.8).
+                new_lease.extra = existing.extra.clone();
                 write_lease_atomic(&lock_path, &new_lease)?;
                 verify_own_lease(&lock_path, agent)?;
                 log_event(
@@ -1510,6 +1580,23 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
     sp.set("pact.path", relative.clone());
 
     if !lock_path.exists() {
+        // pact-m7j.9.6: a miss here is indistinguishable from "already
+        // released" — but it is also exactly what a scope/topology change
+        // since acquire time looks like, and that case has a real lock
+        // sitting unreleased in the OTHER directory. Warn rather than stay
+        // silent; still `Ok(None)`, because a plain miss really is
+        // idempotent and this is advisory, not a reason to fail the call.
+        if let Some(other) = other_candidate_lock_path(repo_root, &relative) {
+            if other.exists() {
+                crate::output::warn(&format!(
+                    "warning: no lease found at {}, but one exists at {}; did \
+                     PACT_WORKTREE_SCOPE or this repository's worktree topology \
+                     change since this lease was acquired?",
+                    lock_path.display(),
+                    other.display()
+                ));
+            }
+        }
         return Ok(None); // idempotent: nothing to release
     }
     // release_fs had no verify guard at all (pact-m7j.1.5): without it, a
@@ -1755,6 +1842,22 @@ fn renew_fs(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
     let lock_path = lock_file_path(repo_root, &relative)?;
 
     if !lock_path.exists() {
+        // pact-m7j.9.6: same probe as release_fs's miss — a scope/topology
+        // change since acquire time can make a live lease resolve somewhere
+        // else entirely, which looks identical to "never acquired" from here.
+        // Still an error either way: renew's contract is that it never
+        // creates a lease, so a genuine miss must fail regardless.
+        if let Some(other) = other_candidate_lock_path(repo_root, &relative) {
+            if other.exists() {
+                anyhow::bail!(
+                    "no lease on {relative} to renew at {}, but one exists at {}; did \
+                     PACT_WORKTREE_SCOPE or this repository's worktree topology change \
+                     since this lease was acquired?",
+                    lock_path.display(),
+                    other.display()
+                );
+            }
+        }
         anyhow::bail!("no lease on {relative} to renew (use `pact lease acquire` to claim it)");
     }
     // Same guard as acquire_inner's takeover branches (pact-m7j.1.6): renew
@@ -2066,6 +2169,7 @@ mod tests {
                 note: None,
                 branch: None,
                 worktree: None,
+                extra: BTreeMap::new(),
             },
             now,
         )
@@ -2143,6 +2247,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            extra: BTreeMap::new(),
         };
         assert!(
             is_expired(&corrupt, Utc::now()),
@@ -2183,6 +2288,7 @@ mod tests {
                 note: None,
                 branch: None,
                 worktree: None,
+                extra: BTreeMap::new(),
             };
             assert_eq!(
                 parse_acquired(&lease),
@@ -2243,6 +2349,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            extra: BTreeMap::new(),
         };
         // Years past ttl+grace, not just minutes: a forward jump, not a slow
         // overrun.
@@ -2382,6 +2489,49 @@ mod tests {
         );
     }
 
+    /// pact-m7j.9.8: `renew_fs` reads a lease, re-stamps three fields
+    /// (`acquired_at`, `branch`, `worktree`), and writes the whole struct
+    /// back. A lock file written by a NEWER binary can carry a field this
+    /// compiled `LeaseInfo` has never heard of — the same shape a pre-0.5.0
+    /// binary's lock file has relative to today's `branch`/`worktree`, just
+    /// one field further in the future. Without a catch-all, that
+    /// read-modify-write silently drops it; `#[serde(flatten)] extra` must
+    /// carry it through untouched.
+    #[test]
+    fn renew_preserves_a_field_the_current_struct_does_not_declare() {
+        let tmp = repo();
+        let root = tmp.path();
+        let lock_path = lock_file_path(root, "f.rs").unwrap();
+
+        // A lock file shaped like a lease written by a binary newer than this
+        // one: everything `renew_fs` knows about, plus a field it does not.
+        let raw = serde_json::json!({
+            "agent": "agent-a",
+            "path": "f.rs",
+            "acquired_at": (Utc::now() - Duration::seconds(10)).to_rfc3339(),
+            "ttl_secs": 900,
+            "note": null,
+            "branch": "feat/x",
+            "worktree": "wt-auth",
+            "future_field": "some-value",
+        });
+        std::fs::write(&lock_path, serde_json::to_string(&raw).unwrap()).unwrap();
+
+        let renewed = renew(root, "agent-a", "f.rs").unwrap();
+        assert_eq!(
+            renewed.extra.get("future_field"),
+            Some(&serde_json::Value::String("some-value".into())),
+            "renew must not silently drop a field it doesn't declare"
+        );
+
+        let on_disk = read_lease(&lock_path).unwrap();
+        assert_eq!(
+            on_disk.extra.get("future_field"),
+            Some(&serde_json::Value::String("some-value".into())),
+            "the unknown field must survive on disk, not just on the in-memory value"
+        );
+    }
+
     #[test]
     fn renew_without_an_existing_lease_errors() {
         let tmp = repo();
@@ -2492,6 +2642,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            extra: BTreeMap::new(),
         };
         write_lease_atomic(&lock_file_path(root, path).unwrap(), &lease).unwrap();
     }
@@ -3124,6 +3275,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            extra: BTreeMap::new(),
         };
         write_lease_atomic(&lock_path, &other).unwrap();
 
@@ -3291,6 +3443,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            extra: BTreeMap::new(),
         };
         write_lease_atomic(&lock_path, &thief).unwrap();
 
@@ -3321,6 +3474,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            extra: BTreeMap::new(),
         };
         write_lease_atomic(&lock_path2, &thief2).unwrap();
 
@@ -3366,6 +3520,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            extra: BTreeMap::new(),
         };
         write_lease_atomic(&lock_path, &winner).unwrap();
 

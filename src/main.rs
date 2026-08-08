@@ -2039,6 +2039,7 @@ mod tests {
                 note: Some("wiring the CLI".to_string()),
                 branch: None,
                 worktree: None,
+                extra: Default::default(),
             },
             age_secs: age,
             remaining_secs: remaining,

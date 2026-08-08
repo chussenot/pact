@@ -321,7 +321,12 @@ impl RepoContext {
     /// it. A thin wrapper rather than inline sets at each fallback site: the
     /// body below has half a dozen early returns, and a wrapper is one place
     /// that cannot be missed by a new one.
-    fn resolve_topology(worktree_root: &Path) -> Self {
+    ///
+    /// `pub(crate)`, not private: `lease.rs` calls this directly — ignoring
+    /// both `PACT_STATE_DIR` and `PACT_WORKTREE_SCOPE`, unlike [`resolve`] —
+    /// to compute the "other" state directory a lease might be sitting in
+    /// after scope or topology drift (pact-m7j.9.6).
+    pub(crate) fn resolve_topology(worktree_root: &Path) -> Self {
         let ctx = Self::resolve_topology_uncached(worktree_root);
         if let Some(w) = &ctx.warning {
             WARNING.with(|cell| *cell.borrow_mut() = Some(w.clone()));
