@@ -57,6 +57,14 @@ untouched, and concludes the lease is stale. See
 [architecture.md](architecture.md#one-coordination-space-per-repository-not-per-checkout)
 for how the shared directory is resolved.
 
+Any key a given binary doesn't recognize — a field a newer release adds the
+same way `branch`/`worktree` were, or one an older release simply predates —
+round-trips unchanged through every operation that reads a lease and writes it
+back (`renew`, and `acquire --steal`/its expired-reclaim takeover). A mixed
+fleet where one machine hasn't upgraded yet is the ordinary way this happens,
+not an edge case: without it, the older binary's renew would silently erase
+whatever the newer one had stamped.
+
 ### One file is one lease, however you spell the path
 
 The lock name has to be a *canonical* answer to "which file is this", because
