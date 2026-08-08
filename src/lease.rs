@@ -1966,6 +1966,34 @@ pub fn orphan_temp_count(repo_root: &Path) -> Result<usize> {
     Ok(count)
 }
 
+/// Count `.pact/waits/*.wait` markers ([`mark_conflict`]'s breadcrumbs) that
+/// nothing has swept yet.
+///
+/// A marker is only ever collected two ways: the same agent re-acquiring the
+/// same path, or that agent's own `release --all` (see [`sweep_wait_markers`]).
+/// AGENTS.md tells a blocked agent to do neither — "message them and pick up
+/// something else" — so a marker left by a conflict nobody retried survives
+/// forever with nothing else to revisit it (pact-m7j.4.6). This is pure
+/// counting, not a judgment: unlike `corrupt_count`, a nonzero result here is
+/// normal fleet behaviour, not damage, so `pact doctor` reports the number and
+/// stops there rather than inventing a ceiling nobody has asked for.
+///
+/// Read-only, like `corrupt_count`: `pact_dir_path` never creates `.pact/`, so
+/// asking this question on a repo with no state yet costs nothing and leaves
+/// nothing behind.
+pub fn marker_count(repo_root: &Path) -> Result<usize> {
+    let waits_dir = crate::repo::pact_dir_path(repo_root).join("waits");
+    let dir = match std::fs::read_dir(&waits_dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", waits_dir.display())),
+    };
+    Ok(dir
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("wait"))
+        .count())
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3027,6 +3055,24 @@ mod tests {
 
         assert!(!mine.exists(), "release --all left {mine:?} behind");
         assert!(theirs.exists(), "swept another agent's marker");
+    }
+
+    /// Two agents' worth of conflicts, neither ever retried nor swept by
+    /// `release --all` — the exact shape AGENTS.md's own protocol leaves
+    /// behind ("message them and pick up something else"), and what `pact
+    /// doctor`'s "stale wait markers" check exists to count (pact-m7j.4.6).
+    #[cfg(feature = "otel")]
+    #[test]
+    fn marker_count_counts_conflicts_nobody_retried_or_swept() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim(root, "agent-a", "hot.rs");
+        assert!(acquire(root, "agent-b", "hot.rs", 900, false, None).is_err());
+
+        claim(root, "agent-x", "warm.rs");
+        assert!(acquire(root, "agent-y", "warm.rs", 900, false, None).is_err());
+
+        assert_eq!(marker_count(root).unwrap(), 2);
     }
 
     /// The markers live beside the locks and must stay invisible to everything

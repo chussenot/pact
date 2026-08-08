@@ -259,8 +259,9 @@ All are worth knowing. Only the last one is worth code, and it is filed.
   [leases.md](leases.md#one-file-is-one-lease-however-you-spell-the-path).
 
 Every one of those decisions is reported by `pact doctor` (`worktree`,
-`coordination scope`, `state placement`, `state dir writable`), because a
-surprising answer should be explainable without reading `.git` files by hand.
+`coordination scope`, `state placement`, `state dir writable`, `worktree
+schema marker`), because a surprising answer should be explainable without
+reading `.git` files by hand.
 
 Lock keys were already repo-root-relative, so `src/api.ts` from either checkout
 is the same lock file with no encoding change. Leases additionally carry
@@ -313,6 +314,20 @@ before a user does.
 rare case where two worktrees are deliberately unrelated projects, and `pact
 doctor` warns whenever it is in effect in a repository that has worktrees,
 because the leases it produces advise nobody.
+
+**A binary older than worktree sharing is not a setting that got left off — the
+code simply is not there.** A pact built before this feature landed has no
+concept of a shared `.pact/`, so it resolves its own per-worktree directory,
+same as any ordinary checkout — and a current binary in a sibling worktree
+resolving the real shared directory has no way to know that is happening.
+Both report success on the same logical path with zero visibility into each
+other. Not fixable after the fact, so pact ships a forward-looking marker
+instead: the moment `.pact/` is first created, `repo::pact_dir` stamps a
+`SCHEMA` file into it, never backfilled onto a directory that already existed.
+`pact doctor`'s `worktree schema marker` check reads it back — present means
+at least one worktree-aware pact has touched this directory since it was
+created; absent, in a repository with linked worktrees, means it might still
+be resolved as private state by a binary that predates all of this.
 
 ### `.pact/events.jsonl`: the one thing pact stores that it can't derive
 

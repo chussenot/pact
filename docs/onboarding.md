@@ -118,6 +118,10 @@ so the only safe move is to say it out loud: the warning names both the path
 `init` was asked to write and the path it resolved to, every run. Refusing would
 break the case the symlink-following exists to support.
 
+`pact doctor`'s **write-set symlinks** check asks the same question without
+running `init` at all, so a repo nobody has re-run `init` in since the symlink
+appeared is not silent about it.
+
 **Use case:** you set up a new repo for multi-agent work. You run
 `pact init` once and commit the result. From then on, cloning the repo and
 pointing any agent at it is enough; re-running `pact init` after upgrading
