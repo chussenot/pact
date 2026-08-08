@@ -10,6 +10,15 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.7.0 - 2026-08-08
+#### Features
+- **(audit)** add --export for a combined self-improvement report - (ce3b451) - Clement HUSSENOT-DESENONGES
+- **(audit)** correlate lease holds against real git commits - (0221aaf) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- Add interactions - (3686926) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.6.1 - 2026-08-08
 #### Features
 - **(doctor)** warn when Beads actors never overlap pact's agent roster - (0cac756) - Clement HUSSENOT-DESENONGES
