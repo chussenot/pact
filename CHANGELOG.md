@@ -10,6 +10,20 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.7.5 - 2026-08-09
+#### Bug Fixes
+- **(audit)** a mid-run pact upgrade is not a protocol change - (ecf73f4) - Clement HUSSENOT-DESENONGES
+- **(watch)** raise the diff cap to 1000 lines, from measurement - (721bd80) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- **(audit)** claim adherence is measurable; the correction was wrong - (cdbb0fd) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(events)** record HEAD at a hold's boundaries - (9989b40) - Clement HUSSENOT-DESENONGES
+- **(watch)** tell a subscriber how to reply, not just how to leave - (34a5823) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- Add interactions - (c6da810) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.7.4 - 2026-08-09
 #### Documentation
 - bring the docs back in step with the implementation - (e0c2e5f) - Clement HUSSENOT-DESENONGES
