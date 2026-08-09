@@ -196,6 +196,47 @@ call, not an oversight — see
 below for why that does not touch the Beads-store invariant the rest of this
 page rests on.
 
+## Where the run actually happened
+
+The summary counts events by the worktree pact was invoked from, so "did this
+fleet use the topology I asked for" has an answer:
+
+```
+  run in 31 from main, 12 from wt-render
+```
+
+Events written before pact recorded this are counted as **predating context
+stamping** and never dressed up as a topology — every log that exists today is
+in that state, and a check that guessed would be worse than one that abstains.
+See [leases.md](leases.md#every-event-records-where-pact-was-invoked-from) for
+the fields themselves.
+
+One note fires, and only on unambiguous evidence — the repository has linked
+worktrees *right now*, at least one event is context-stamped, and not one names
+a worktree:
+
+```
+  note   this repository has linked worktrees, but no event was invoked from one
+         — agents may be editing in worktrees while running pact from the main
+         checkout, in which case the lease/edit binding rests on convention and
+         cannot be verified from this log
+```
+
+That is the shape a real 20-agent run had: one git worktree per agent, and
+every `pact lease` run from the main checkout. It is not a defect — repo-
+relative lock keys mean the shared namespace still worked — but it is the
+difference between a binding that was verified and one that was assumed.
+
+**Deliberately not inferred from merge commits.** That was the obvious
+heuristic and it is a bad one: a repo merging ordinary feature branches has
+exactly the same commit shape, so the hint would fire nearly everywhere and
+mean nothing — the same failure this page already records under
+[Worked example](#worked-example-measuring-the-things-that-motivated-this),
+where a metric returned the same answer regardless of the behaviour it claimed
+to measure. `has_worktrees` is a fact about the repository, so this cannot
+false-positive. Its one blind spot is honest: worktrees deleted after the run
+leave nothing to detect.
+
 ## `--export`
 
 ```bash

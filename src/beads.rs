@@ -948,8 +948,20 @@ mod tests {
         // in for a `bd`/`br` upgrade or PATH change during a long-lived
         // `pact mcp serve`/`pact ui` session.
         write_stub("#!/bin/sh\necho 'usage: create [--actor ACTOR] [--json]'\n");
+        // Retried, because `supports_actor` folds a spawn failure into `false`
+        // deliberately (see its doc comment: understate rather than promise
+        // attribution pact cannot deliver) — and under the fully parallel test
+        // suite spawning transiently fails, which is indistinguishable from a
+        // cached answer at this assertion. Observed three times in
+        // `mise run check` on unrelated changes, never once in isolation
+        // (pact-vn9).
+        //
+        // This cannot mask the bug the test exists for: a genuinely cached
+        // answer returns `false` on every attempt, so the assertion still
+        // fails. Only a transient failure is absorbed.
+        let re_derived = (0..5).any(|_| cli.supports_actor(repo.path()));
         assert!(
-            cli.supports_actor(repo.path()),
+            re_derived,
             "a cached answer would still report false here; it must be re-derived per call"
         );
     }

@@ -1241,3 +1241,51 @@ fn the_effective_scope_is_recorded_not_the_raw_env_var() {
     assert_eq!(scope_of("agent-local"), "local");
     assert_eq!(scope_of("agent-bogus"), "shared");
 }
+
+/// pact-ler.2: the megablast shape as a diagnosis. A repo that HAS linked
+/// worktrees, where every lease was nonetheless taken from the main checkout,
+/// is the case where the lease/edit binding rests on convention — so the
+/// summary says so out loud instead of leaving it to be inferred.
+#[test]
+fn audit_flags_worktrees_that_no_lease_was_ever_taken_from() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+    let (_tmp, main, wt) = repo_with_worktree("feat/topo", "wt-topo");
+
+    // Every lease from main, while a linked worktree exists.
+    assert!(pact(&main, "agent-a", &["lease", "acquire", "a.rs"])
+        .status
+        .success());
+    assert!(pact(&main, "agent-a", &["lease", "release", "a.rs"])
+        .status
+        .success());
+
+    let report = |dir: &Path| -> serde_json::Value {
+        serde_json::from_str(&stdout(&pact(dir, "reader", &["audit", "--json"]))).unwrap()
+    };
+
+    let s = report(&main);
+    assert_eq!(s["by_invoked_from"]["main"], 2, "{s}");
+    let note = s["topology_note"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a topology note: {s}"));
+    assert!(note.contains("no event was invoked from one"), "{note}");
+    assert!(
+        stdout(&pact(&main, "reader", &["audit"])).contains("cannot be verified"),
+        "the note must reach the human-readable summary too"
+    );
+
+    // One lease actually taken from the worktree, and the hint retires — it
+    // is evidence-driven, not a permanent nag at any repo with worktrees.
+    assert!(pact(&wt, "agent-b", &["lease", "acquire", "b.rs"])
+        .status
+        .success());
+    let s = report(&main);
+    assert_eq!(s["by_invoked_from"]["wt-topo"], 1, "{s}");
+    assert!(
+        s["topology_note"].is_null(),
+        "a worktree-invoked event retires the hint: {s}"
+    );
+}

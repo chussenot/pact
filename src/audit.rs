@@ -298,6 +298,29 @@ pub struct Summary {
     pub hold_secs: Option<HoldStats>,
     pub top_contended: Vec<Contended>,
     pub per_agent: Vec<AgentActivity>,
+    /// How many events came from each invocation point — a linked worktree's
+    /// name, `main`, `outside`, or `unknown` for events written before pact
+    /// recorded it at all (pact-ler.1/.2).
+    ///
+    /// The question this answers is "did this run use the topology I asked
+    /// for", which nothing could answer before: a 20-agent run with one git
+    /// worktree per agent produced events indistinguishable from a plain
+    /// single-checkout run.
+    pub by_invoked_from: BTreeMap<String, usize>,
+    /// Set only when this repository **currently has linked worktrees** and
+    /// not one event was invoked from any of them.
+    ///
+    /// Deliberately not inferred from merge-commit shape, which was the
+    /// obvious heuristic and is a bad one: a repo that merges ordinary feature
+    /// branches has exactly the same commit shape, so the hint would fire on
+    /// most repositories and mean nothing. docs/audit.md already records what
+    /// that costs — "a metric that returns the same answer regardless of the
+    /// behaviour it claims to measure is worse than no metric, because it
+    /// looks like evidence". `has_worktrees` is a fact about this repository
+    /// right now, so this cannot false-positive; it simply says nothing about
+    /// worktrees that have since been removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology_note: Option<String>,
 }
 
 /// The report for a named check: findings plus enough context to judge them.
@@ -738,6 +761,32 @@ pub fn summary(
         max_secs: *durations.last().unwrap_or(&0),
     });
 
+    // Counted over every event, including kinds that open no hold: the
+    // question is where pact was RUN, not where work was held.
+    let mut by_invoked_from: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, e) in &events {
+        let key = e
+            .invoked_from
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        *by_invoked_from.entry(key).or_insert(0) += 1;
+    }
+    let ctx = crate::repo::RepoContext::resolve(repo_root);
+    let from_a_worktree = by_invoked_from
+        .keys()
+        .any(|k| k != "main" && k != "outside" && k != "unknown");
+    // Only when the evidence is unambiguous: worktrees exist NOW, events
+    // exist, at least one of them was stamped at all, and none names a
+    // worktree. Requiring a stamped event is what keeps a pre-stamping log
+    // from producing a false hint — see `Summary::topology_note`.
+    let any_stamped = by_invoked_from.keys().any(|k| k != "unknown");
+    let topology_note = (ctx.has_worktrees && any_stamped && !from_a_worktree).then(|| {
+        "this repository has linked worktrees, but no event was invoked from one — agents may \
+         be editing in worktrees while running pact from the main checkout, in which case the \
+         lease/edit binding rests on convention and cannot be verified from this log"
+            .to_string()
+    });
+
     Ok(Summary {
         events: events.len(),
         excluded_by_annotation: loaded.excluded,
@@ -753,6 +802,8 @@ pub fn summary(
         hold_secs,
         top_contended,
         per_agent,
+        by_invoked_from,
+        topology_note,
     })
 }
 
@@ -1210,6 +1261,23 @@ pub fn render_summary(s: &Summary) -> String {
     out.push(format!("  kinds  {}", kinds.join(", ")));
     if s.open_holds > 0 {
         out.push(format!("  open   {} lease(s) still held", s.open_holds));
+    }
+    if !s.by_invoked_from.is_empty() {
+        // `unknown` last and spelled out: a log that predates context
+        // stamping must read as "not recorded", never as a topology.
+        let mut parts: Vec<String> = s
+            .by_invoked_from
+            .iter()
+            .filter(|(k, _)| k.as_str() != "unknown")
+            .map(|(k, n)| format!("{n} from {k}"))
+            .collect();
+        if let Some(n) = s.by_invoked_from.get("unknown") {
+            parts.push(format!("{n} predating context stamping"));
+        }
+        out.push(format!("  run in {}", parts.join(", ")));
+    }
+    if let Some(note) = &s.topology_note {
+        out.push(format!("  note   {note}"));
     }
 
     if let Some(h) = &s.hold_secs {
@@ -2316,6 +2384,57 @@ mod tests {
         assert_eq!(r.findings(), 0, "a missing hash is not a mismatch");
         assert_eq!(r.chain_tracked, 1);
         assert_eq!(r.chain_untracked, 1);
+    }
+
+    // ------------------------------------------------------------ topology
+
+    fn ev_from(at: &str, agent: &str, kind: &str, path: &str, from: &str) -> String {
+        format!(
+            r#"{{"at":"{at}","agent":"{agent}","kind":"{kind}","path":"{path}","invoked_from":"{from}","scope":"shared"}}"#
+        )
+    }
+
+    #[test]
+    fn the_summary_counts_events_by_where_pact_was_invoked() {
+        let tmp = with_log(&[
+            &ev_from("2026-08-01T10:00:00Z", "a", "acquired", "a.rs", "main"),
+            &ev_from("2026-08-01T10:01:00Z", "a", "released", "a.rs", "main"),
+            &ev_from("2026-08-01T10:02:00Z", "b", "acquired", "b.rs", "wt-b"),
+            &ev_from("2026-08-01T10:03:00Z", "b", "released", "b.rs", "wt-b"),
+            &ev_from("2026-08-01T10:04:00Z", "c", "acquired", "c.rs", "outside"),
+        ]);
+        let s = summary(tmp.path(), None, false).unwrap();
+        assert_eq!(s.by_invoked_from.get("main"), Some(&2));
+        assert_eq!(s.by_invoked_from.get("wt-b"), Some(&2));
+        assert_eq!(s.by_invoked_from.get("outside"), Some(&1));
+        assert_eq!(s.by_invoked_from.get("unknown"), None);
+
+        let text = render_summary(&s);
+        assert!(text.contains("2 from main"), "{text}");
+        assert!(text.contains("2 from wt-b"), "{text}");
+    }
+
+    /// The whole-log-predates-stamping case, which every existing repository
+    /// is. It must read as "not recorded" and must never produce a topology
+    /// claim or a hint — the "no data before <date>" convention.
+    #[test]
+    fn a_pre_stamping_log_reports_unknown_and_never_hints() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:01:00Z", "a", "released", "a.rs"),
+        ]);
+        let s = summary(tmp.path(), None, false).unwrap();
+        assert_eq!(s.by_invoked_from.get("unknown"), Some(&2));
+        assert_eq!(s.by_invoked_from.len(), 1, "{:?}", s.by_invoked_from);
+        assert_eq!(
+            s.topology_note, None,
+            "a log that predates stamping says nothing about topology"
+        );
+
+        let text = render_summary(&s);
+        assert!(text.contains("predating context stamping"), "{text}");
+        // Must not claim a topology it cannot know.
+        assert!(!text.contains("from main"), "{text}");
     }
 
     // ------------------------------------------------- commit-correlation
