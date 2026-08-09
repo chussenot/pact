@@ -10,6 +10,15 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.7.3 - 2026-08-09
+#### Features
+- **(audit)** add --compare to report what moved between two runs - (6989fa0) - Clement HUSSENOT-DESENONGES
+- **(protocol)** version the managed block and stamp the era on events - (24f63ec) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- Add the interaction - (49f1ac2) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.7.2 - 2026-08-09
 #### Features
 - **(audit)** assert run topology with --check topology --expect - (11e1de3) - Clement HUSSENOT-DESENONGES
