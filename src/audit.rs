@@ -390,6 +390,24 @@ pub struct Summary {
     /// established by git archaeology instead. `unknown` counts events from
     /// before pact recorded it.
     pub by_protocol: BTreeMap<String, usize>,
+    /// Events written before pact recorded the protocol at all (pact-b73.1).
+    ///
+    /// Counted here rather than under an `"unknown"` key in `by_protocol`,
+    /// and the distinction is not cosmetic: folding it in made a run that
+    /// merely spanned a **binary upgrade** report that the protocol had
+    /// changed. grimcast did exactly that — 159 events from pact 0.7.2, which
+    /// predates the stamp, and 104 from 0.7.4, all under one unchanged block —
+    /// and was told the block changed underneath it. Same discipline as
+    /// `chain_untracked` and the topology check: "not recorded" is never a
+    /// value.
+    pub protocol_unstamped: usize,
+    /// Which pact versions wrote the events in this window.
+    ///
+    /// More than one means the binary was upgraded mid-run, which changes what
+    /// the log is even able to record — and is the thing that explains a
+    /// sudden appearance of any newer field. Nothing surfaced it before, so
+    /// the only symptom was a field that "started existing" halfway through.
+    pub by_pact_version: BTreeMap<String, usize>,
     /// Subscriptions in force right now (pact-8qu). Live state, not history —
     /// read from `.pact/watches.jsonl` rather than reconstructed from the
     /// event log, because a `watched` event says a subscription was created,
@@ -881,12 +899,16 @@ pub fn summary(
         *by_invoked_from.entry(key).or_insert(0) += 1;
     }
     let mut by_protocol: BTreeMap<String, usize> = BTreeMap::new();
+    let mut protocol_unstamped = 0usize;
+    let mut by_pact_version: BTreeMap<String, usize> = BTreeMap::new();
     for (_, e) in &events {
-        let key = e
-            .protocol_hash
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-        *by_protocol.entry(key).or_insert(0) += 1;
+        match &e.protocol_hash {
+            Some(h) => *by_protocol.entry(h.clone()).or_insert(0) += 1,
+            None => protocol_unstamped += 1,
+        }
+        if let Some(v) = &e.pact_version {
+            *by_pact_version.entry(v.clone()).or_insert(0) += 1;
+        }
     }
     let watches_active = crate::watch::active(repo_root)
         .map(|w| w.len())
@@ -926,6 +948,8 @@ pub fn summary(
         per_agent,
         by_invoked_from,
         by_protocol,
+        protocol_unstamped,
+        by_pact_version,
         watches_active,
         diffs_delivered,
         deliveries_failed,
@@ -1700,10 +1724,15 @@ pub fn render_summary(s: &Summary) -> String {
             }
         ));
     }
+    // Two or more KNOWN hashes, never a known one plus "not recorded". The
+    // first version counted unstamped events as an era, so grimcast — one
+    // unchanged block, read across a mid-run upgrade from pact 0.7.2 (which
+    // could not stamp) to 0.7.4 (which could) — was told its protocol had
+    // changed. It had not: AGENTS.md was last written 23 minutes before the
+    // run's first event and never touched again. The reader believed the
+    // false version until git was consulted, which is the whole cost of
+    // getting this line wrong.
     if s.by_protocol.len() > 1 {
-        // Only when it changed. One protocol for the whole window is the
-        // normal case and needs no line; two or more is the thing a reader
-        // comparing runs has to know before they average anything.
         let mut parts: Vec<String> = s
             .by_protocol
             .iter()
@@ -1712,6 +1741,29 @@ pub fn render_summary(s: &Summary) -> String {
         parts.sort();
         out.push(format!(
             "  proto  the protocol block CHANGED inside this window: {}",
+            parts.join(", ")
+        ));
+    }
+    if s.protocol_unstamped > 0 {
+        out.push(format!(
+            "  proto  {} event(s) predate protocol stamping — which protocol they were written \
+             under is not recorded",
+            s.protocol_unstamped
+        ));
+    }
+    // The thing that DID change in that run, and which nothing reported. A
+    // newer binary can record fields an older one could not, so a field that
+    // appears halfway through a log is explained here rather than left to
+    // look like the fleet changed its behaviour.
+    if s.by_pact_version.len() > 1 {
+        let mut parts: Vec<String> = s
+            .by_pact_version
+            .iter()
+            .map(|(v, n)| format!("{n} by {v}"))
+            .collect();
+        parts.sort();
+        out.push(format!(
+            "  pact   the binary was UPGRADED inside this window: {}",
             parts.join(", ")
         ));
     }
@@ -2808,6 +2860,7 @@ mod tests {
             subscriber: None,
             message_id: None,
             protocol_hash: None,
+            head: None,
         }
     }
 
@@ -3036,6 +3089,108 @@ mod tests {
             unknown.contains("topology"),
             "the list must name it: {unknown}"
         );
+    }
+
+    fn ev_meta(at: &str, agent: &str, kind: &str, path: &str, extra: &str) -> String {
+        format!(r#"{{"at":"{at}","agent":"{agent}","kind":"{kind}","path":"{path}"{extra}}}"#)
+    }
+
+    /// pact-b73.1, from the field: grimcast spanned an upgrade from a pact
+    /// that could not stamp the protocol to one that could, under ONE
+    /// unchanged block — and was told its protocol had changed.
+    #[test]
+    fn a_run_spanning_the_stamps_introduction_is_not_a_protocol_change() {
+        let tmp = with_log(&[
+            &ev_meta(
+                "2026-08-01T10:00:00Z",
+                "a",
+                "acquired",
+                "a.rs",
+                r#","pact_version":"0.7.2""#,
+            ),
+            &ev_meta(
+                "2026-08-01T10:01:00Z",
+                "a",
+                "released",
+                "a.rs",
+                r#","pact_version":"0.7.2""#,
+            ),
+            &ev_meta(
+                "2026-08-01T10:02:00Z",
+                "b",
+                "acquired",
+                "b.rs",
+                r#","pact_version":"0.7.4","protocol_hash":"97b43b5d""#,
+            ),
+        ]);
+        let s = summary(tmp.path(), None, false).unwrap();
+        assert_eq!(s.protocol_unstamped, 2);
+        assert_eq!(
+            s.by_protocol.len(),
+            1,
+            "one KNOWN protocol: {:?}",
+            s.by_protocol
+        );
+
+        let text = render_summary(&s);
+        assert!(
+            !text.contains("protocol block CHANGED"),
+            "unstamped events are not an era: {text}"
+        );
+        assert!(text.contains("predate protocol stamping"), "{text}");
+        // And the thing that actually changed is reported.
+        assert!(text.contains("binary was UPGRADED"), "{text}");
+        assert!(text.contains("0.7.2") && text.contains("0.7.4"), "{text}");
+    }
+
+    /// Two genuinely different blocks must still warn — the fix must not
+    /// silence the case the line exists for.
+    #[test]
+    fn two_known_protocol_hashes_still_report_a_change() {
+        let tmp = with_log(&[
+            &ev_meta(
+                "2026-08-01T10:00:00Z",
+                "a",
+                "acquired",
+                "a.rs",
+                r#","protocol_hash":"aaaaaaaa""#,
+            ),
+            &ev_meta(
+                "2026-08-01T10:01:00Z",
+                "b",
+                "acquired",
+                "b.rs",
+                r#","protocol_hash":"bbbbbbbb""#,
+            ),
+        ]);
+        let s = summary(tmp.path(), None, false).unwrap();
+        assert_eq!(s.by_protocol.len(), 2);
+        assert_eq!(s.protocol_unstamped, 0);
+        assert!(render_summary(&s).contains("protocol block CHANGED"));
+    }
+
+    /// One binary for the whole run is the normal case and earns no line.
+    #[test]
+    fn a_single_pact_version_is_not_worth_reporting() {
+        let tmp = with_log(&[
+            &ev_meta(
+                "2026-08-01T10:00:00Z",
+                "a",
+                "acquired",
+                "a.rs",
+                r#","pact_version":"0.7.4""#,
+            ),
+            &ev_meta(
+                "2026-08-01T10:01:00Z",
+                "a",
+                "released",
+                "a.rs",
+                r#","pact_version":"0.7.4""#,
+            ),
+        ]);
+        let s = summary(tmp.path(), None, false).unwrap();
+        assert_eq!(s.by_pact_version.len(), 1);
+        assert!(!render_summary(&s).contains("UPGRADED"));
     }
 
     // ------------------------------------------------- commit-correlation
