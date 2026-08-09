@@ -10,6 +10,14 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.7.4 - 2026-08-09
+#### Documentation
+- bring the docs back in step with the implementation - (e0c2e5f) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(cli)** add `pact completion <shell>` - (e636757) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.7.3 - 2026-08-09
 #### Features
 - **(audit)** add --compare to report what moved between two runs - (6989fa0) - Clement HUSSENOT-DESENONGES
