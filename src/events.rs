@@ -120,6 +120,37 @@ pub struct Event {
     /// immediately before it, never for history before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_hash: Option<String>,
+    /// Which worktree of this repository pact was invoked from — a linked
+    /// worktree's name, `"main"`, or `"outside"` (pact-ler.1). See
+    /// [`crate::repo::invoked_from`].
+    ///
+    /// Stamped by [`append`] on **every** event, unconditionally, rather than
+    /// by each call site or only when worktree topology is detected. That is
+    /// the whole point of the field. `LeaseInfo`'s existing `branch`/
+    /// `worktree` pair is gated on `RepoContext::has_worktrees` (so a repo
+    /// that never uses worktrees keeps byte-identical lock files) — correct
+    /// for a lock file, useless for a log, because a gated field cannot tell
+    /// "not applicable" from "not recorded".
+    ///
+    /// Measured need: a 20-agent fleet run with one git worktree per agent
+    /// (megablast, 2026-08-08) produced 62 events indistinguishable from a
+    /// plain single-checkout run, because a lease event has never carried any
+    /// topology at all. The one place it was recorded — the lock file — is
+    /// deleted on release *and* gitignored, so the run's topology was
+    /// unrecoverable by construction.
+    ///
+    /// `None` dates a line to a pact older than this field, exactly as
+    /// `ttl_secs` and `chain_hash` already do for theirs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoked_from: Option<String>,
+    /// The coordination scope actually in force — `"shared"` or `"local"`.
+    /// See [`crate::repo::effective_scope`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// The pact version that wrote this line, so a behaviour change can be
+    /// dated against the log rather than guessed at from surrounding commits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pact_version: Option<String>,
 }
 
 /// For appending: creates `.pact/` if needed.
@@ -327,6 +358,20 @@ pub fn verify_chain(numbered: &[(usize, Event)]) -> (Vec<ChainMismatch>, usize, 
     (mismatches, tracked, untracked)
 }
 
+/// Fill in the invocation context every event carries (pact-ler.1).
+///
+/// Overwrites rather than filling only when absent: the caller constructing
+/// an `Event` does not know where pact was invoked from, and a value it
+/// somehow supplied would be a guess overriding a measurement. The one
+/// exception that matters — re-appending an event read back from a log —
+/// does not exist in pact, which never rewrites history.
+fn stamp_context(repo_root: &Path, ev: &mut Event) {
+    let ctx = crate::repo::RepoContext::resolve(repo_root);
+    ev.invoked_from = Some(crate::repo::invoked_from(&ctx));
+    ev.scope = Some(crate::repo::effective_scope().to_string());
+    ev.pact_version = Some(env!("CARGO_PKG_VERSION").to_string());
+}
+
 /// Append one event to `.pact/events.jsonl`.
 ///
 /// Infallible by signature: I/O errors are swallowed, because a logging
@@ -379,7 +424,20 @@ fn append_bounded(repo_root: &Path, ev: &Event, max_lines: usize, keep_lines: us
         // fold this read into the exclusive-lock section below.
         let prev_chain_point = last_chain_point(&path)?;
         let mut chained = ev.clone();
-        chained.chain_hash = Some(expected_chain_hash(&prev_chain_point, ev)?);
+        // Stamped HERE, in the one funnel every event of every kind passes
+        // through, and before the chain hash is computed (pact-ler.1).
+        //
+        // Not at the call sites: `log_event` is the common path but not the
+        // only one — `release_fs`'s force-release bypasses it to set
+        // `displaced`, and any future kind is one more place to forget. A
+        // field documented as unconditional has to be unforgettable, and a
+        // per-call-site stamp is exactly how `branch`/`worktree` ended up
+        // conditional in the first place.
+        stamp_context(repo_root, &mut chained);
+        // Over `chained`, not `ev`: the context fields are part of what the
+        // chain attests to, so a forged line cannot strip or rewrite them and
+        // still verify.
+        chained.chain_hash = Some(expected_chain_hash(&prev_chain_point, &chained)?);
         let line = serde_json::to_string(&chained)?;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -698,6 +756,9 @@ mod tests {
             // append() computes this; a hand-built fixture leaves it unset,
             // same as every event this test module writes before append().
             chain_hash: None,
+            invoked_from: None,
+            scope: None,
+            pact_version: None,
         }
     }
 

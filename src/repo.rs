@@ -208,6 +208,57 @@ fn scope_is_local() -> bool {
     matches!(std::env::var("PACT_WORKTREE_SCOPE").as_deref(), Ok("local"))
 }
 
+/// The scope pact is **actually** operating under, for the event log
+/// (pact-ler.1).
+///
+/// Deliberately not the raw `PACT_WORKTREE_SCOPE` string: an unrecognised
+/// value like `PACT_WORKTREE_SCOPE=locale` behaves as shared (see
+/// [`scope_is_local`]'s exact match), so recording the raw text would put a
+/// value in the log that pact never honoured. This records the behaviour.
+pub fn effective_scope() -> &'static str {
+    if scope_is_local() {
+        "local"
+    } else {
+        "shared"
+    }
+}
+
+/// Which worktree of this repository the running pact process was invoked
+/// from: a linked worktree's own name, `"main"`, or `"outside"`.
+///
+/// The literal `"main"` rather than [`RepoContext::worktree_name`], which for
+/// a main worktree is that directory's *name* (`megablast`, `pact`, …) — real
+/// data, but not comparable across repositories, and indistinguishable from a
+/// linked worktree that happens to be called the same thing. A field whose
+/// whole purpose is answering "did this fleet run where I asked it to" has to
+/// be machine-comparable, so the main worktree gets one fixed spelling.
+///
+/// `"outside"` means the process's CWD is not under this repository's
+/// worktree at all — reachable when `PACT_STATE_DIR` points pact at a
+/// repository the caller is not standing in, and the one case where the
+/// lease/edit binding genuinely cannot be assumed. Same relationship test
+/// `lease::normalize_path` makes for the same reason; an unreadable CWD is
+/// treated as outside, because "cannot tell" must not silently read as
+/// "here".
+pub fn invoked_from(ctx: &RepoContext) -> String {
+    let cwd_inside = std::env::current_dir()
+        .ok()
+        .is_some_and(|cwd| cwd.starts_with(&ctx.worktree_root));
+    if !cwd_inside {
+        return "outside".to_string();
+    }
+    if ctx.is_linked_worktree {
+        // A linked worktree always has a name (it is the `.git/worktrees/<name>`
+        // component); the fallback only exists so this cannot panic on a
+        // resolution that fell back.
+        return ctx
+            .worktree_name
+            .clone()
+            .unwrap_or_else(|| "linked".to_string());
+    }
+    "main".to_string()
+}
+
 /// Read a `gitdir:`-style pointer file and resolve it against `base`.
 ///
 /// Split out to be unit-testable: the forms that turn up in the wild are an

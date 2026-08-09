@@ -711,6 +711,47 @@ opens nothing and closes nothing in `reconstruct`'s hold-window math — see
 [audit.md](audit.md#--check-double-win) — so its presence in a log never skews
 an existing hold's duration or trips a false double-win.
 
+### Every event records where pact was invoked from
+
+Three fields ride on **every** event, whatever its kind:
+
+| Field | Value |
+|---|---|
+| `invoked_from` | the linked worktree pact ran in, or `main`, or `outside` |
+| `scope` | the coordination scope actually in force: `shared` or `local` |
+| `pact_version` | the version that wrote the line |
+
+`invoked_from` says `main` literally, not the main worktree's directory name —
+the field exists to be compared across repositories and runs. `outside` means
+the process's working directory was not under this repository at all, which is
+reachable by pointing pact at another repo with `PACT_STATE_DIR`, and is the
+one value that says the lease/edit binding cannot be assumed.
+
+`scope` records what pact *did*, not what the environment said: an
+unrecognised `PACT_WORKTREE_SCOPE=locale` behaves as `shared`, so `shared` is
+what gets logged. Recording the raw string would put a value in the log that
+pact never honoured.
+
+**Unconditional is the whole point.** The lock file's `branch`/`worktree` pair
+is stamped only when the repository actually has linked worktrees, which is
+right for a lock file — a repo that never uses worktrees keeps byte-identical
+locks — and useless for a log, because a gated field cannot distinguish "not
+applicable" from "not recorded". These three are set in one place, the append
+funnel every kind passes through, so no future event kind can quietly miss
+them.
+
+The need was measured rather than imagined. A 20-agent fleet run with one git
+worktree per agent produced 62 events indistinguishable from a plain
+single-checkout run: events had never carried topology, and the one place it
+*was* recorded — the lock file — is deleted on release **and** gitignored, so
+the run's own topology was unrecoverable by the time anyone audited it. The
+fields are inside what `chain_hash` attests to, so a forged line cannot strip
+or rewrite them and still verify.
+
+Their **absence** dates a line to a pact older than this, exactly as a missing
+`ttl_secs` or `chain_hash` already does. Existing logs keep verifying
+untouched.
+
 ## What lease telemetry measures
 
 Only in a build with `--features otel`, and only once a collector is configured

@@ -1116,3 +1116,128 @@ fn submodule_and_superproject_leases_stay_isolated_under_concurrent_contention()
         assert_eq!(sub_board[0]["lease"]["agent"], "agent-sub");
     }
 }
+
+/// pact-ler.1: the megablast shape, end to end. A fleet that edits in linked
+/// worktrees but runs `pact` from the main checkout produced 62 events that
+/// were indistinguishable from a plain single-checkout run, because a lease
+/// event had never carried any topology at all — and the one place it WAS
+/// recorded (the lock file's `branch`/`worktree`) is deleted on release and
+/// gitignored, so the run's topology was unrecoverable by construction.
+///
+/// Asserts what the log can now answer: which worktree each event came from,
+/// under the real binary, with a real linked worktree.
+#[test]
+fn every_event_records_which_worktree_pact_was_invoked_from() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+    let (_tmp, main, wt) = repo_with_worktree("feat/ctx", "wt-ctx");
+
+    // Same repo, same shared coordination space, two different invocation
+    // points — exactly the ambiguity the field run could not resolve.
+    assert!(pact(&main, "agent-main", &["lease", "acquire", "a.rs"])
+        .status
+        .success());
+    assert!(pact(&wt, "agent-wt", &["lease", "acquire", "b.rs"])
+        .status
+        .success());
+
+    // Read the committed artifact itself, not `pact log --json` (which emits a
+    // projected feed struct merging leases and messages): the whole bead is
+    // about what survives IN `.pact/events.jsonl`.
+    let feed = std::fs::read_to_string(main.join(".pact/events.jsonl")).unwrap();
+    let events: Vec<serde_json::Value> = feed
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let by_agent = |who: &str| -> serde_json::Value {
+        events
+            .iter()
+            .find(|e| e["agent"] == who && e["kind"] == "acquired")
+            .unwrap_or_else(|| panic!("no acquired event for {who} in {feed}"))
+            .clone()
+    };
+
+    // The literal "main", not the main worktree's directory name: the field
+    // has to be comparable across repositories.
+    assert_eq!(by_agent("agent-main")["invoked_from"], "main");
+    assert_eq!(by_agent("agent-wt")["invoked_from"], "wt-ctx");
+
+    // Unconditional means unconditional: present on every event, with the
+    // scope actually in force and the version that wrote the line.
+    for e in &events {
+        assert!(
+            e["invoked_from"].is_string(),
+            "every event carries invoked_from: {e}"
+        );
+        assert_eq!(e["scope"], "shared", "{e}");
+        assert_eq!(e["pact_version"], env!("CARGO_PKG_VERSION"), "{e}");
+    }
+
+    // The context fields are inside what the chain attests to, so a forged
+    // line cannot strip or rewrite them and still verify.
+    let audit = stdout(&pact(
+        &main,
+        "reader",
+        &["audit", "--check", "chain-integrity", "--json"],
+    ));
+    let report: serde_json::Value = serde_json::from_str(&audit).unwrap();
+    assert_eq!(
+        report["chain_breaks"].as_array().unwrap().len(),
+        0,
+        "{audit}"
+    );
+    assert!(report["chain_tracked"].as_u64().unwrap() >= 2, "{audit}");
+}
+
+/// `local` scope is a different coordination space, and the log has to say so
+/// — otherwise two logs that cannot see each other's leases look identical.
+#[test]
+fn the_effective_scope_is_recorded_not_the_raw_env_var() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+    let (_tmp, main, _wt) = repo_with_worktree("feat/scope", "wt-scope");
+
+    assert!(pact_scoped(
+        &main,
+        "agent-local",
+        &["lease", "acquire", "a.rs"],
+        Some("local")
+    )
+    .status
+    .success());
+    // An unrecognised value behaves as shared, so that is what must be
+    // recorded — logging the raw string would put a value in the log that
+    // pact never honoured.
+    assert!(pact_scoped(
+        &main,
+        "agent-bogus",
+        &["lease", "acquire", "b.rs"],
+        Some("locale")
+    )
+    .status
+    .success());
+
+    // `local` scope puts state in a different directory, so each lease's event
+    // lands in its own log — read whichever file actually holds it.
+    let scope_of = |who: &str| -> String {
+        for dir in [&main, &_wt] {
+            let Ok(feed) = std::fs::read_to_string(dir.join(".pact/events.jsonl")) else {
+                continue;
+            };
+            for line in feed.lines().filter(|l| !l.trim().is_empty()) {
+                let e: serde_json::Value = serde_json::from_str(line).unwrap();
+                if e["agent"] == who {
+                    return e["scope"].as_str().unwrap().to_string();
+                }
+            }
+        }
+        panic!("no event for {who}");
+    };
+    assert_eq!(scope_of("agent-local"), "local");
+    assert_eq!(scope_of("agent-bogus"), "shared");
+}

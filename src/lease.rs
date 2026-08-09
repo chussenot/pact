@@ -902,6 +902,11 @@ fn log_event(
             // append() computes the real value from the log; see
             // Event::chain_hash (pact-m7j.2.5).
             chain_hash: None,
+            // Likewise stamped by append(), which is the only place that can
+            // measure them; see Event::invoked_from (pact-ler.1).
+            invoked_from: None,
+            scope: None,
+            pact_version: None,
         },
     );
 }
@@ -1700,6 +1705,11 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                     // append() computes the real value; see
                     // Event::chain_hash (pact-m7j.2.5).
                     chain_hash: None,
+                    // Likewise stamped by append(); see Event::invoked_from
+                    // (pact-ler.1).
+                    invoked_from: None,
+                    scope: None,
+                    pact_version: None,
                 },
             );
             count_transition("force_released");
@@ -1758,6 +1768,11 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                     // append() computes the real value; see
                     // Event::chain_hash (pact-m7j.2.5).
                     chain_hash: None,
+                    // Likewise stamped by append(); see Event::invoked_from
+                    // (pact-ler.1).
+                    invoked_from: None,
+                    scope: None,
+                    pact_version: None,
                 },
             );
             count_transition("force_released");
@@ -3043,6 +3058,56 @@ mod tests {
     /// contention in `pact log`, because there was nothing to show either
     /// way. `refused` closes that gap without opening or closing any hold
     /// window — see `audit::tests` for the reconstruct-side half of this.
+    /// pact-ler.1: the invocation context is stamped in `events::append`, the
+    /// one funnel every kind passes through — so it must be on kinds that do
+    /// NOT go through `log_event`'s common path too. `refused` is written from
+    /// the conflict branch and `force-released` bypasses `log_event` entirely
+    /// to set `displaced`; both were exactly the kind of call site that let
+    /// `branch`/`worktree` end up conditional in the first place.
+    #[test]
+    fn every_event_kind_carries_the_invocation_context_not_just_the_common_path() {
+        let tmp = repo();
+        let root = tmp.path();
+
+        acquire(root, "agent-a", "hot.rs", 900, false, None).unwrap();
+        // refused: the conflict branch.
+        assert!(acquire(root, "agent-b", "hot.rs", 900, false, None).is_err());
+        // force-released: bypasses log_event to name the displaced holder.
+        release(root, "agent-b", "hot.rs", true).unwrap();
+
+        let events = crate::events::recent(root, 100).unwrap();
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert!(
+            kinds.contains(&"refused") && kinds.contains(&"force-released"),
+            "fixture must exercise both off-common-path kinds: {kinds:?}"
+        );
+        for e in &events {
+            // `"outside"`, not `"main"`, and that is the correct answer rather
+            // than a test artefact to work around: a unit test's CWD is pact's
+            // own checkout while `root` is a tempdir, so the process really is
+            // standing outside the repository it is writing leases for — the
+            // same shape as driving pact at another repo via `PACT_STATE_DIR`,
+            // and the one case where the lease/edit binding cannot be assumed.
+            // The `"main"` and linked-worktree-name values are covered end to
+            // end, under the real binary with a real CWD, by
+            // `every_event_records_which_worktree_pact_was_invoked_from` in
+            // tests/worktree.rs.
+            assert_eq!(
+                e.invoked_from.as_deref(),
+                Some("outside"),
+                "{} has no invoked_from",
+                e.kind
+            );
+            assert_eq!(e.scope.as_deref(), Some("shared"), "{}", e.kind);
+            assert_eq!(
+                e.pact_version.as_deref(),
+                Some(env!("CARGO_PKG_VERSION")),
+                "{}",
+                e.kind
+            );
+        }
+    }
+
     #[test]
     fn a_denied_acquire_logs_a_refused_event_naming_the_holder() {
         let tmp = repo();

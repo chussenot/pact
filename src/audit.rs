@@ -2160,6 +2160,9 @@ mod tests {
             actor: None,
             displaced: None,
             chain_hash: None,
+            invoked_from: None,
+            scope: None,
+            pact_version: None,
         }
     }
 
