@@ -10,6 +10,7 @@ pact audit --check stale-holds        # exit 1 on holds past TTL with no renew
 pact audit --check chain-integrity    # exit 1 if a chain-tracked line was edited
 pact audit --check commit-correlation # exit 1 on a real concurrent write or a commit with no lease
 pact audit --check topology --expect worktrees   # exit 1 if the fleet did not run where it was told
+pact audit --compare base.json        # what moved since a previous --export
 pact audit --since 7d --json          # narrow the window, machine-readable
 ```
 
@@ -273,6 +274,60 @@ written.
 many events it could not speak for. Every log written before pact 0.7.0 is
 entirely in that state; failing them would have failed every repository on the
 day this shipped.
+
+## `--compare`
+
+```bash
+pact audit --export base.json        # before a change
+# … change the protocol, the module layout, the fleet recipe …
+pact audit --compare base.json       # what moved
+```
+
+```
+compared against base.json
+
+FIELD                        BASELINE        NOW      DELTA
+events                              2          4         +2
+agents                              1          3         +2
+refusals (contention)               0          1         +1
+
+15 field(s) unchanged
+```
+
+An instrument that reports each run in isolation cannot tell you whether a
+change improved anything. Establishing that took three hand-run `jq`
+comparisons in a single afternoon of improving pact from field runs, and **two
+of the three produced a wrong conclusion** a human had to correct.
+
+**Movement, never a verdict.** Which direction is good depends on what you
+changed and why, which the log cannot know. Scoring a run would need weights
+nobody derived from data — the failure this page records under
+[Worked example](#worked-example-measuring-the-things-that-motivated-this) —
+so `--compare` always exits 0 and leaves the judgement where it belongs.
+
+**A protocol shift is called out first**, before any number:
+
+```
+PROTOCOL CHANGED between these runs: 6cd5cc61 -> 97b43b5d.
+They are not a controlled comparison — anything below may be the
+protocol rather than the fleet.
+```
+
+That is the exact mistake the feature exists to prevent. 223 messages from
+pact's own fleet were once cited as evidence agents message voluntarily; every
+one predated the protocol change that suppressed them, and nothing said so.
+The era stamp ([onboarding.md](onboarding.md#what-init-writes)) is what makes
+this mechanical.
+
+**A field the baseline does not carry is "not comparable", never a delta from
+zero.** An older pact's export has no `unacknowledged_messages` at all, and
+reporting `0 → 3` would be a fabricated finding. The one exception is a count
+in a map that only lists what occurred — `by_kind/refused` is absent from a run
+with no contention, and that genuinely is zero.
+
+`--compare` is its own mode and conflicts with `--check`: both want to be the
+single thing stdout says, and two JSON values on one stdout breaks every
+`--json` caller.
 
 ## `--export`
 

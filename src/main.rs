@@ -151,6 +151,14 @@ enum Command {
         /// proportion threshold, deliberately (see docs/audit.md).
         #[arg(long, requires = "check")]
         expect: Option<String>,
+        /// Compare this repository against a previously written `--export`
+        /// report and print what moved.
+        ///
+        /// Its own mode: conflicts with `--check`, because both want to be
+        /// the single thing stdout says, and two JSON values on one stdout
+        /// breaks every `--json` caller.
+        #[arg(long, conflicts_with = "check")]
+        compare: Option<PathBuf>,
         /// Write the summary, every named check and `pact doctor`'s checks —
         /// combined into one JSON file — to this path.
         ///
@@ -453,6 +461,9 @@ fn subcommand_name(command: &Command) -> &'static str {
             WatchAction::Rm { .. } => "watch rm",
             WatchAction::Ls => "watch ls",
         },
+        Command::Audit {
+            compare: Some(_), ..
+        } => "audit compare",
         Command::Audit { check, .. } => match check.as_deref() {
             Some("double-win") => "audit double-win",
             Some("stale-holds") => "audit stale-holds",
@@ -537,15 +548,19 @@ fn run(cli: Cli) -> Result<i32> {
             since,
             include_annotated,
             expect,
+            compare,
             export,
         } => run_audit(
             &cwd,
             cli.json,
-            check,
-            since,
-            include_annotated,
-            expect,
-            export,
+            AuditArgs {
+                check,
+                since,
+                include_annotated,
+                expect,
+                compare,
+                export,
+            },
         ),
         #[cfg(feature = "ui")]
         Command::Ui => {
@@ -706,15 +721,27 @@ fn run_watch(cwd: &Path, agent_flag: Option<&str>, json: bool, action: WatchActi
 /// than a new one invented. `--export` never changes this: writing the file
 /// is orthogonal to what `--check`/no-`--check` decide for stdout and the
 /// exit code.
-fn run_audit(
-    cwd: &Path,
-    json: bool,
+/// Everything `pact audit` was invoked with, grouped rather than passed as
+/// eight positional arguments — the flags have grown past the point where a
+/// caller can get their order right by eye.
+struct AuditArgs {
     check: Option<String>,
     since: Option<String>,
     include_annotated: bool,
     expect: Option<String>,
+    compare: Option<PathBuf>,
     export: Option<PathBuf>,
-) -> Result<i32> {
+}
+
+fn run_audit(cwd: &Path, json: bool, args: AuditArgs) -> Result<i32> {
+    let AuditArgs {
+        check,
+        since,
+        include_annotated,
+        expect,
+        compare,
+        export,
+    } = args;
     let root = repo::find_repo_root(cwd)?;
     let since = match since {
         Some(s) => Some(audit::parse_since(&s)?),
@@ -738,6 +765,14 @@ fn run_audit(
                 path.display()
             ));
         }
+    }
+
+    if let Some(baseline) = compare {
+        let comparison = audit::compare(&root, &baseline, since, include_annotated)?;
+        output::emit(json, &comparison, audit::render_comparison);
+        // Always 0. A comparison reports movement and passes no judgement, so
+        // there is nothing for an exit code to mean — see `audit::Comparison`.
+        return Ok(0);
     }
 
     match check {

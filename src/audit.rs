@@ -1210,6 +1210,259 @@ pub fn export(
     })
 }
 
+/// One number that moved between two exported reports.
+#[derive(Debug, Clone, Serialize)]
+pub struct Movement {
+    pub field: &'static str,
+    pub baseline: i64,
+    pub current: i64,
+    pub delta: i64,
+}
+
+/// What changed between a baseline export and this repository now
+/// (pact-okz.2).
+///
+/// Reports movement and **never a verdict**. "Contention fell from 8 agents on
+/// one path to 3" is a fact; whether that was the module tree, the wave
+/// schedule or luck is not something the log can know. Scoring a run good or
+/// bad would need weights nobody derived from data — the failure docs/audit.md
+/// already records — so the judgement stays with the reader and the exit code
+/// stays 0.
+#[derive(Debug, Serialize)]
+pub struct Comparison {
+    pub baseline: String,
+    /// The protocol era each side ran under, when both recorded one and they
+    /// differ (pact-okz.1). Listed FIRST in the rendering because it is the
+    /// interpretive key: two runs under different protocols are not a
+    /// controlled comparison, and reading them as one is exactly the mistake
+    /// that made 223 messages look like evidence agents message voluntarily.
+    pub protocol_shift: Option<(String, String)>,
+    pub movements: Vec<Movement>,
+    /// Unchanged fields, counted rather than listed — a report that prints
+    /// forty "0" rows buries the three that moved.
+    pub unchanged: usize,
+    /// Fields the baseline does not carry at all, because it was written by an
+    /// older pact. Named, never rendered as a delta from zero: "uncovered
+    /// commits went from 0 to 19" would be a fabricated finding when the
+    /// baseline simply predates the check.
+    pub not_comparable: Vec<&'static str>,
+}
+
+/// How a comparable field is read out of an export document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Extract {
+    /// A number at the pointer. Absent means the baseline predates it.
+    Number,
+    /// An array at the pointer; its length is the value. Absent means the
+    /// baseline predates it; empty means it found nothing.
+    Len,
+    /// A key in a map that only carries what actually occurred, such as
+    /// `by_kind`. **Absent means zero, not unrecorded** — `by_kind` lists
+    /// only the kinds a run produced, so a missing `refused` is a run with no
+    /// contention, and calling that "the baseline is too old" would tell a
+    /// reader to go and upgrade when the honest answer is "nothing was
+    /// refused". Only the containing map going missing is "not comparable".
+    SparseCount,
+}
+
+/// Every field compared, as (label, JSON pointer, how to read it).
+///
+/// A fixed list rather than a structural diff of the two documents: a
+/// structural diff would report movement in timestamps, agent names and paths,
+/// which is noise, and would silently start comparing any field added later
+/// without anyone deciding it was comparable.
+const COMPARED: &[(&str, &str, Extract)] = &[
+    ("events", "/summary/events", Extract::Number),
+    ("agents", "/summary/agents", Extract::Len),
+    (
+        "completed holds",
+        "/summary/hold_secs/completed",
+        Extract::Number,
+    ),
+    (
+        "hold median (s)",
+        "/summary/hold_secs/median_secs",
+        Extract::Number,
+    ),
+    (
+        "hold p90 (s)",
+        "/summary/hold_secs/p90_secs",
+        Extract::Number,
+    ),
+    (
+        "hold max (s)",
+        "/summary/hold_secs/max_secs",
+        Extract::Number,
+    ),
+    ("open holds", "/summary/open_holds", Extract::Number),
+    ("steals", "/summary/steals", Extract::Number),
+    (
+        "refusals (contention)",
+        "/summary/by_kind/refused",
+        Extract::SparseCount,
+    ),
+    ("watches active", "/summary/watches_active", Extract::Number),
+    (
+        "diffs delivered",
+        "/summary/diffs_delivered",
+        Extract::Number,
+    ),
+    (
+        "deliveries failed",
+        "/summary/deliveries_failed",
+        Extract::Number,
+    ),
+    ("double-wins", "/double_win/double_wins", Extract::Len),
+    ("stale holds", "/stale_holds/stale_holds", Extract::Len),
+    (
+        "chain breaks",
+        "/chain_integrity/chain_breaks",
+        Extract::Len,
+    ),
+    (
+        "concurrent writes",
+        "/commit_correlation/concurrent_writes",
+        Extract::Len,
+    ),
+    (
+        "uncovered commits",
+        "/commit_correlation/uncovered_commits",
+        Extract::Len,
+    ),
+    (
+        "holds with no commit",
+        "/commit_correlation/holds_with_no_commit",
+        Extract::Len,
+    ),
+    (
+        "unacknowledged messages",
+        "/unacknowledged_messages",
+        Extract::Len,
+    ),
+];
+
+fn extract(doc: &serde_json::Value, pointer: &str, how: Extract) -> Option<i64> {
+    match how {
+        Extract::Number => doc.pointer(pointer)?.as_i64(),
+        // A missing array and an empty one are different: the first means the
+        // baseline predates the field, the second means it found nothing.
+        Extract::Len => doc.pointer(pointer)?.as_array().map(|a| a.len() as i64),
+        Extract::SparseCount => {
+            let (parent, _) = pointer.rsplit_once('/')?;
+            // The map itself must exist for absence of the key to mean zero.
+            doc.pointer(parent)?.as_object()?;
+            Some(doc.pointer(pointer).and_then(|v| v.as_i64()).unwrap_or(0))
+        }
+    }
+}
+
+/// Compare `baseline` (a previously written `--export` document) against this
+/// repository's current state.
+pub fn compare(
+    repo_root: &std::path::Path,
+    baseline_path: &std::path::Path,
+    since: Option<DateTime<Utc>>,
+    include_annotated: bool,
+) -> Result<Comparison> {
+    let text = std::fs::read_to_string(baseline_path)
+        .with_context(|| format!("reading baseline {}", baseline_path.display()))?;
+    let baseline: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parsing baseline {}", baseline_path.display()))?;
+    let current = serde_json::to_value(export(repo_root, since, include_annotated)?)?;
+
+    let mut movements = Vec::new();
+    let mut not_comparable = Vec::new();
+    let mut unchanged = 0usize;
+    for (field, pointer, how) in COMPARED {
+        let now = extract(&current, pointer, *how).unwrap_or(0);
+        match extract(&baseline, pointer, *how) {
+            None => not_comparable.push(*field),
+            Some(was) if was == now => unchanged += 1,
+            Some(was) => movements.push(Movement {
+                field,
+                baseline: was,
+                current: now,
+                delta: now - was,
+            }),
+        }
+    }
+
+    // The dominant era on each side. A window spanning a protocol change is
+    // already called out by the summary itself; here the question is only
+    // whether the two runs are comparable at all.
+    let era = |doc: &serde_json::Value| -> Option<String> {
+        let map = doc.pointer("/summary/by_protocol")?.as_object()?;
+        map.iter()
+            .filter(|(k, _)| k.as_str() != "unknown")
+            .max_by_key(|(_, v)| v.as_i64().unwrap_or(0))
+            .map(|(k, _)| k.clone())
+    };
+    let protocol_shift = match (era(&baseline), era(&current)) {
+        (Some(a), Some(b)) if a != b => Some((a, b)),
+        _ => None,
+    };
+
+    Ok(Comparison {
+        baseline: baseline_path.display().to_string(),
+        protocol_shift,
+        movements,
+        unchanged,
+        not_comparable,
+    })
+}
+
+pub fn render_comparison(c: &Comparison) -> String {
+    let mut out = vec![format!("compared against {}", c.baseline)];
+    if let Some((was, now)) = &c.protocol_shift {
+        out.push(String::new());
+        out.push(format!(
+            "PROTOCOL CHANGED between these runs: {was} -> {now}.\n\
+             They are not a controlled comparison — anything below may be the \n\
+             protocol rather than the fleet."
+        ));
+    }
+    if c.movements.is_empty() {
+        out.push(String::new());
+        out.push(format!(
+            "nothing moved ({} field(s) identical)",
+            c.unchanged
+        ));
+    } else {
+        out.push(String::new());
+        out.push(format!(
+            "{:<26} {:>10} {:>10} {:>10}",
+            "FIELD", "BASELINE", "NOW", "DELTA"
+        ));
+        for m in &c.movements {
+            out.push(format!(
+                "{:<26} {:>10} {:>10} {:>+10}",
+                m.field, m.baseline, m.current, m.delta
+            ));
+        }
+        out.push(String::new());
+        out.push(format!("{} field(s) unchanged", c.unchanged));
+    }
+    if !c.not_comparable.is_empty() {
+        out.push(String::new());
+        out.push(format!(
+            "not comparable — the baseline predates {}: {}",
+            if c.not_comparable.len() == 1 {
+                "this field"
+            } else {
+                "these fields"
+            },
+            c.not_comparable.join(", ")
+        ));
+    }
+    out.push(String::new());
+    out.push(
+        "Movement, not a verdict: which direction is GOOD depends on what you changed \n\
+         and why, which the log cannot know."
+            .to_string(),
+    );
+    out.join("\n")
+}
+
 /// The body of `Check::CommitCorrelation`, split out because it is the one
 /// check whose findings depend on something other than `.pact/events.jsonl`
 /// — see the module doc comment on why that is a deliberate, narrow widening
@@ -2981,6 +3234,168 @@ mod tests {
             0,
             "no git history to correlate against must never itself be a finding"
         );
+    }
+
+    // ---------------------------------------------------------- comparison
+
+    fn write_baseline(dir: &std::path::Path, report: &ExportReport) -> std::path::PathBuf {
+        let p = dir.join("baseline.json");
+        std::fs::write(&p, serde_json::to_string(report).unwrap()).unwrap();
+        p
+    }
+
+    #[test]
+    fn comparing_a_report_to_itself_reports_no_movement() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:01:00Z", "a", "released", "a.rs"),
+        ]);
+        let base = write_baseline(tmp.path(), &export(tmp.path(), None, false).unwrap());
+        let c = compare(tmp.path(), &base, None, false).unwrap();
+        assert!(c.movements.is_empty(), "{:?}", c.movements);
+        assert!(c.not_comparable.is_empty(), "{:?}", c.not_comparable);
+        assert!(c.unchanged > 0);
+        assert!(render_comparison(&c).contains("nothing moved"));
+    }
+
+    #[test]
+    fn a_run_that_moved_names_each_field_and_by_how_much() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:01:00Z", "a", "released", "a.rs"),
+        ]);
+        let base = write_baseline(tmp.path(), &export(tmp.path(), None, false).unwrap());
+
+        // A second, longer hold by a second agent.
+        let log = tmp.path().join(".pact").join("events.jsonl");
+        let mut text = std::fs::read_to_string(&log).unwrap();
+        text.push('\n');
+        text.push_str(&ev("2026-08-01T11:00:00Z", "b", "acquired", "b.rs"));
+        text.push('\n');
+        text.push_str(&ev("2026-08-01T11:30:00Z", "b", "released", "b.rs"));
+        std::fs::write(&log, text).unwrap();
+
+        let c = compare(tmp.path(), &base, None, false).unwrap();
+        let moved: BTreeMap<&str, i64> = c.movements.iter().map(|m| (m.field, m.delta)).collect();
+        assert_eq!(moved.get("events"), Some(&2), "{moved:?}");
+        assert_eq!(moved.get("agents"), Some(&1), "{moved:?}");
+        assert_eq!(moved.get("completed holds"), Some(&1), "{moved:?}");
+        assert!(moved.contains_key("hold max (s)"), "{moved:?}");
+
+        let text = render_comparison(&c);
+        assert!(text.contains("events"), "{text}");
+        // Never a verdict.
+        assert!(text.contains("Movement, not a verdict"), "{text}");
+    }
+
+    /// The acceptance case that keeps this honest: an older pact's export has
+    /// no `unacknowledged_messages` at all, and reporting "0 -> 3" would be a
+    /// fabricated finding rather than a measurement.
+    #[test]
+    fn a_baseline_missing_a_field_is_not_comparable_rather_than_a_delta_from_zero() {
+        let tmp = with_log(&[&ev("2026-08-01T10:00:00Z", "a", "acquired", "a.rs")]);
+        let mut doc = serde_json::to_value(export(tmp.path(), None, false).unwrap()).unwrap();
+        // Simulate an older export: drop two whole sections.
+        doc.as_object_mut()
+            .unwrap()
+            .remove("unacknowledged_messages");
+        doc.as_object_mut().unwrap().remove("commit_correlation");
+        let base = tmp.path().join("old.json");
+        std::fs::write(&base, serde_json::to_string(&doc).unwrap()).unwrap();
+
+        let c = compare(tmp.path(), &base, None, false).unwrap();
+        assert!(
+            c.not_comparable.contains(&"unacknowledged messages"),
+            "{:?}",
+            c.not_comparable
+        );
+        assert!(
+            c.not_comparable.contains(&"uncovered commits"),
+            "{:?}",
+            c.not_comparable
+        );
+        assert!(
+            !c.movements.iter().any(|m| m.field == "uncovered commits"),
+            "a missing baseline field must not produce a delta: {:?}",
+            c.movements
+        );
+        assert!(render_comparison(&c).contains("baseline predates"));
+    }
+
+    /// `by_kind` lists only the kinds that occurred, so an absent `refused`
+    /// means a run with no contention — NOT a baseline too old to say. Getting
+    /// this backwards tells a reader to upgrade when the honest answer is
+    /// "nothing was refused".
+    #[test]
+    fn an_absent_sparse_count_reads_as_zero_not_as_unrecorded() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:01:00Z", "a", "released", "a.rs"),
+        ]);
+        let base = write_baseline(tmp.path(), &export(tmp.path(), None, false).unwrap());
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&base).unwrap())
+                .unwrap()
+                .pointer("/summary/by_kind/refused")
+                .is_none(),
+            "fixture must genuinely lack the key"
+        );
+
+        let log = tmp.path().join(".pact").join("events.jsonl");
+        let mut text = std::fs::read_to_string(&log).unwrap();
+        text.push('\n');
+        text.push_str(&ev("2026-08-01T11:00:00Z", "b", "refused", "a.rs"));
+        std::fs::write(&log, text).unwrap();
+
+        let c = compare(tmp.path(), &base, None, false).unwrap();
+        assert!(
+            !c.not_comparable.contains(&"refusals (contention)"),
+            "absent means zero here: {:?}",
+            c.not_comparable
+        );
+        let m = c
+            .movements
+            .iter()
+            .find(|m| m.field == "refusals (contention)")
+            .expect("it moved from 0 to 1");
+        assert_eq!((m.baseline, m.current, m.delta), (0, 1, 1));
+    }
+
+    /// pact-okz.1 feeding pact-okz.2: two runs under different protocol
+    /// revisions are not a controlled comparison, and the report has to say so
+    /// before anything else — reading them as one is the mistake that made 223
+    /// messages look like evidence agents message voluntarily.
+    #[test]
+    fn a_protocol_shift_between_the_two_runs_is_called_out_first() {
+        let tmp = with_log(&[&ev("2026-08-01T10:00:00Z", "a", "acquired", "a.rs")]);
+        let mut doc = serde_json::to_value(export(tmp.path(), None, false).unwrap()).unwrap();
+        doc.pointer_mut("/summary")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "by_protocol".to_string(),
+                serde_json::json!({ "aaaaaaaa": 1 }),
+            );
+        let base = tmp.path().join("old-protocol.json");
+        std::fs::write(&base, serde_json::to_string(&doc).unwrap()).unwrap();
+
+        // Give the current side a different era.
+        let log = tmp.path().join(".pact").join("events.jsonl");
+        std::fs::write(
+            &log,
+            r#"{"at":"2026-08-01T10:00:00Z","agent":"a","kind":"acquired","path":"a.rs","protocol_hash":"bbbbbbbb"}"#,
+        )
+        .unwrap();
+
+        let c = compare(tmp.path(), &base, None, false).unwrap();
+        assert_eq!(
+            c.protocol_shift,
+            Some(("aaaaaaaa".to_string(), "bbbbbbbb".to_string()))
+        );
+        let text = render_comparison(&c);
+        assert!(text.contains("PROTOCOL CHANGED"), "{text}");
+        assert!(text.contains("not a controlled comparison"), "{text}");
     }
 
     // ------------------------------------------------------------- export
