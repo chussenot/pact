@@ -43,8 +43,12 @@ the `lean` one must have neither.
 
 | Profile | Contains | For |
 |---|---|---|
-| `lean` | no optional features: `init`, `lease`, `msg`, `log`, `doctor`, `agents`, `whoami` — 1.6 MiB | agents and CI images, which never open a dashboard |
-| `full` | `ui` + `otel` + `mcp` — the TUI, OpenTelemetry export, the read-only MCP server — 2.2 MiB | humans, and anything registering pact as an MCP server |
+| `lean` | no optional features: `init`, `lease`, `msg`, `watch`, `audit`, `log`, `doctor`, `agents`, `whoami`, `completion` — 2.5 MiB | agents and CI images, which never open a dashboard |
+| `full` | `ui` + `otel` + `mcp` — the TUI, OpenTelemetry export, the read-only MCP server — 3.0 MiB | humans, and anything registering pact as an MCP server |
+
+Sizes are `strip`ped x86-64 release binaries, measured rather than estimated,
+and they drift upward as pact grows — treat them as an order of magnitude, not
+a promise.
 
 Neither optional feature costs anything unasked, so `full` is the right default
 for a workstation: `otel` exports only when the standard `OTEL_*` variables are

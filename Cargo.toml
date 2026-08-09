@@ -28,6 +28,14 @@ chrono = "0.4.45"
 anyhow = "1.0.104"
 chrono = "0.4.45"
 clap = { version = "4.6.4", features = ["derive"] }
+# `pact completion <shell>`. The one dependency added for a feature rather than
+# avoided: it pulls in NO transitive crates (it sits on the clap already here),
+# and it generates from the same command tree clap parses with, so a completion
+# script cannot drift from the binary. The alternative is five hand-written
+# scripts covering 24 commands and 23 long flags, which go stale the moment one
+# is added — the exact failure `scripts/check-docs.sh` exists to catch for the
+# docs. Costs ~220 KiB in the release binary; measured, not guessed.
+clap_complete = "4.6.9"
 ratatui = { version = "0.30.2", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

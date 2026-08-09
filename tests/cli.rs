@@ -4932,3 +4932,78 @@ fn acquire_stamps_the_paths_content_hash_on_the_lease_and_the_event() {
         stdout_of(&new_file)
     );
 }
+
+/// The whole reason `completion` is a command rather than five checked-in
+/// scripts: it is generated from the same tree clap parses with, so it cannot
+/// drift. This asserts that property directly — every subcommand the binary
+/// has must appear in the script — rather than pinning a snapshot, which would
+/// itself need updating on every change and prove nothing about drift.
+#[test]
+fn the_completion_script_covers_every_subcommand_the_binary_has() {
+    let tmp = init_repo();
+
+    // Ask the binary, don't hardcode: a hardcoded list is the drift this
+    // feature exists to prevent, reintroduced in the test.
+    let help = stdout_of(&pact(tmp.path(), "agent", &["--help"]));
+    let subcommands: Vec<String> = help
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with("Commands:"))
+        .skip(1)
+        .take_while(|l| !l.trim().is_empty())
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|w| w.chars().all(|c| c.is_ascii_lowercase()))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        subcommands.len() >= 8,
+        "parsed too few subcommands from --help, the test is broken not the code: {subcommands:?}"
+    );
+
+    for shell in ["bash", "zsh", "fish"] {
+        let out = pact(tmp.path(), "agent", &["completion", shell]);
+        assert_ok(&out);
+        let script = stdout_of(&out);
+        assert!(!script.trim().is_empty(), "{shell} produced nothing");
+        for sub in &subcommands {
+            assert!(
+                script.contains(sub.as_str()),
+                "{shell} completion is missing the `{sub}` subcommand — generated \
+                 completions must not drift from the binary"
+            );
+        }
+    }
+}
+
+/// Every shell clap supports must work, and an unknown one must be a usage
+/// error (5) rather than a lease conflict (2) — the distinction exit 5 exists
+/// for.
+#[test]
+fn every_supported_shell_generates_and_an_unknown_one_is_a_usage_error() {
+    let tmp = init_repo();
+    for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
+        let out = pact(tmp.path(), "agent", &["completion", shell]);
+        assert_ok(&out);
+        assert!(
+            stdout_of(&out).lines().count() > 20,
+            "{shell} produced a suspiciously short script"
+        );
+    }
+    let bad = pact(tmp.path(), "agent", &["completion", "tcsh"]);
+    assert_eq!(
+        bad.status.code(),
+        Some(5),
+        "an unknown shell is a usage error, not a lease conflict: {}",
+        stderr_of(&bad)
+    );
+}
+
+/// `completion` must work outside a git repository. Every other command needs
+/// a repo to mean anything; this one is pure text generation, and shell
+/// profiles are sourced from `$HOME`, not from a checkout.
+#[test]
+fn completion_works_outside_a_repository() {
+    let outside = tempfile::tempdir().unwrap();
+    let out = pact(outside.path(), "agent", &["completion", "bash"]);
+    assert_ok(&out);
+    assert!(stdout_of(&out).contains("pact"), "{}", stdout_of(&out));
+}

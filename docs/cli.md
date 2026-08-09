@@ -36,6 +36,7 @@ pact watch rm <path>
 pact watch ls
 pact log [-n | --limit <count>]
 pact doctor
+pact completion <bash|zsh|fish|elvish|powershell>
 pact audit [--check <double-win|stale-holds|chain-integrity|commit-correlation|topology>] [--expect <worktrees|main|any>] [--since <rfc3339|duration>] [--include-annotated] [--compare <path>] [--export <path>]
 pact ui
 pact mcp serve
@@ -80,6 +81,22 @@ of `--json` — so the single most routine non-zero outcome two agents
 contending on a file will ever produce (a lease conflict, exit 2) gave a
 `--json` caller an empty stdout to parse. Without `--json`, nothing changes:
 the human-readable text is unchanged and still goes to stderr.
+
+`pact completion <shell>` prints a completion script on stdout. It is
+**generated from the same command tree clap parses with**, so it cannot drift
+out of step with the binary — which is why it is a command rather than five
+scripts checked into the repo. Where each shell wants it:
+
+```bash
+pact completion bash > /etc/bash_completion.d/pact          # or ~/.local/share/bash-completion/completions/pact
+pact completion zsh  > "${fpath[1]}/_pact"
+pact completion fish > ~/.config/fish/completions/pact.fish
+```
+
+It needs no repository: unlike every other command it reads no state, and a
+shell profile is sourced from `$HOME` rather than from a checkout. Regenerate
+it after upgrading pact — a script written by an older binary completes that
+binary's commands, which is the one way this can still go stale.
 
 `audit --export <path>` writes one combined JSON snapshot — the summary,
 every named check and `pact doctor`'s checks — to a file, orthogonal to
