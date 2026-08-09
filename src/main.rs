@@ -146,6 +146,11 @@ enum Command {
         /// is always reported. Pass this to see the raw log as written.
         #[arg(long)]
         include_annotated: bool,
+        /// What `--check topology` should assert: `worktrees`, `main` or
+        /// `any`. Every stamped event must satisfy it — there is no
+        /// proportion threshold, deliberately (see docs/audit.md).
+        #[arg(long, requires = "check")]
+        expect: Option<String>,
         /// Write the summary, every named check and `pact doctor`'s checks —
         /// combined into one JSON file — to this path.
         ///
@@ -453,6 +458,7 @@ fn subcommand_name(command: &Command) -> &'static str {
             Some("stale-holds") => "audit stale-holds",
             Some("chain-integrity") => "audit chain-integrity",
             Some("commit-correlation") => "audit commit-correlation",
+            Some("topology") => "audit topology",
             // One literal for anything else, including a bad value: the argument
             // is user text and must never reach a span name.
             Some(_) => "audit other",
@@ -530,8 +536,17 @@ fn run(cli: Cli) -> Result<i32> {
             check,
             since,
             include_annotated,
+            expect,
             export,
-        } => run_audit(&cwd, cli.json, check, since, include_annotated, export),
+        } => run_audit(
+            &cwd,
+            cli.json,
+            check,
+            since,
+            include_annotated,
+            expect,
+            export,
+        ),
         #[cfg(feature = "ui")]
         Command::Ui => {
             let root = repo::find_repo_root(&cwd)?;
@@ -695,6 +710,7 @@ fn run_audit(
     check: Option<String>,
     since: Option<String>,
     include_annotated: bool,
+    expect: Option<String>,
     export: Option<PathBuf>,
 ) -> Result<i32> {
     let root = repo::find_repo_root(cwd)?;
@@ -729,7 +745,7 @@ fn run_audit(
             Ok(0)
         }
         Some(name) => {
-            let check = audit::Check::parse(&name)?;
+            let check = audit::Check::parse(&name, expect.as_deref())?;
             let report = audit::run_check(&root, check, since, include_annotated)?;
             output::emit(json, &report, audit::render_check);
             // The whole point of a named check: a machine can branch on it.

@@ -9,6 +9,7 @@ pact audit --check double-win         # exit 1 if two agents ever held one path
 pact audit --check stale-holds        # exit 1 on holds past TTL with no renew
 pact audit --check chain-integrity    # exit 1 if a chain-tracked line was edited
 pact audit --check commit-correlation # exit 1 on a real concurrent write or a commit with no lease
+pact audit --check topology --expect worktrees   # exit 1 if the fleet did not run where it was told
 pact audit --since 7d --json          # narrow the window, machine-readable
 ```
 
@@ -237,6 +238,42 @@ to measure. `has_worktrees` is a fact about the repository, so this cannot
 false-positive. Its one blind spot is honest: worktrees deleted after the run
 leave nothing to detect.
 
+### `--check topology --expect <worktrees|main|any>`
+
+The summary reports where a run happened; this turns it into an assertion, so
+CI can answer "did the fleet use the topology I asked for" with an exit code.
+
+```
+$ pact audit --check topology --expect worktrees
+topology: scanned 43 event(s)
+  expected worktrees; 0 event(s) carry no invocation context
+
+TOPOLOGY MISMATCH: 43 event(s) invoked from "main", which --expect worktrees does not allow
+```
+
+**Every context-stamped event must satisfy the expectation. There is no
+proportion threshold, and that strictness is the point.** Any looser rule needs
+a cutoff — what fraction of events counts as "worktrees"? — and a verdict that
+depends on a cutoff nobody derived from data is exactly the failure this page
+records under [Worked example](#worked-example-measuring-the-things-that-motivated-this).
+All-or-nothing is explainable in one sentence and cannot drift. A genuinely
+mixed run therefore satisfies neither `worktrees` nor `main`, which is the
+honest answer rather than an inconvenient one.
+
+`outside` never satisfies `--expect worktrees`: it means pact ran somewhere not
+under this repository at all, the one value that says the lease/edit binding
+cannot be assumed.
+
+`--expect any` (also what a bare `--check topology` means) never fails — it
+reports the distribution. That is what `--export` records, so a stored
+retrospective does not fail on an expectation nobody declared when it was
+written.
+
+**A log with no invocation context exits 0 whatever was expected**, and says how
+many events it could not speak for. Every log written before pact 0.7.0 is
+entirely in that state; failing them would have failed every repository on the
+day this shipped.
+
 ## `--export`
 
 ```bash
@@ -246,8 +283,8 @@ pact audit --export report.json --since 7d --json     # combines with every othe
 ```
 
 One JSON file bundling `summary`, `double_win`, `stale_holds`,
-`chain_integrity`, `commit_correlation`, `doctor` (`pact doctor`'s own
-checks) and `unacknowledged_messages` — the exact set of things a real field
+`chain_integrity`, `commit_correlation`, `topology`, `doctor` (`pact doctor`'s
+own checks) and `unacknowledged_messages` — the exact set of things a real field
 audit (pact-juz) had to assemble by hand: a separate `pact doctor`, a separate
 `pact audit` per named check, and a raw grep of `.pact/events.jsonl`. Meant to
 be read directly by a human, or handed to another agent session asking "how is

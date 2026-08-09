@@ -117,21 +117,95 @@ pub enum Check {
     /// out to it directly for other checks; this is the same read, applied
     /// to history instead of working-tree state. See `git_history.rs`.
     CommitCorrelation,
+    /// pact-ler.2/.5: did this run use the topology it was supposed to?
+    /// Carries the expectation, because a check with no declared expectation
+    /// has nothing to fail against — the summary already reports the
+    /// distribution for a reader who just wants to look.
+    Topology(Expect),
+}
+
+/// What `--expect` declares a run's topology should have been.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expect {
+    /// Every stamped event was invoked from a linked worktree.
+    Worktrees,
+    /// Every stamped event was invoked from the main checkout.
+    Main,
+    /// Nothing to fail — report the distribution and exit 0.
+    Any,
+}
+
+impl Expect {
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "worktrees" => Ok(Expect::Worktrees),
+            "main" => Ok(Expect::Main),
+            "any" => Ok(Expect::Any),
+            other => Err(anyhow::anyhow!(
+                "unknown --expect \"{other}\"; expected worktrees, main or any"
+            )),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Expect::Worktrees => "worktrees",
+            Expect::Main => "main",
+            Expect::Any => "any",
+        }
+    }
+
+    /// Is `invoked_from` what this expectation asked for?
+    ///
+    /// **Every** stamped event must satisfy it — there is no "mostly" and no
+    /// proportion threshold. That strictness is what makes the check
+    /// meaningful rather than arbitrary: any looser rule needs a cutoff
+    /// ("what fraction counts as worktrees?"), and a verdict that depends on a
+    /// cutoff nobody derived from data is exactly the failure docs/audit.md
+    /// records under the dangling-hash example. All-or-nothing is explainable
+    /// in one sentence and cannot drift.
+    fn satisfied_by(self, invoked_from: &str) -> bool {
+        match self {
+            Expect::Any => true,
+            Expect::Main => invoked_from == "main",
+            // "outside" is not a worktree: it means pact ran somewhere that is
+            // not under this repository at all, which is the one value that
+            // says the lease/edit binding cannot be assumed.
+            Expect::Worktrees => invoked_from != "main" && invoked_from != "outside",
+        }
+    }
 }
 
 impl Check {
-    pub fn parse(s: &str) -> Result<Self> {
+    /// `expect` is only meaningful for `topology`; every other check ignores
+    /// it, and clap requires `--check` alongside it so it cannot be passed
+    /// alone.
+    pub fn parse(s: &str, expect: Option<&str>) -> Result<Self> {
         match s {
             "double-win" => Ok(Check::DoubleWin),
             "stale-holds" => Ok(Check::StaleHolds),
             "chain-integrity" => Ok(Check::ChainIntegrity),
             "commit-correlation" => Ok(Check::CommitCorrelation),
+            "topology" => Ok(Check::Topology(match expect {
+                Some(e) => Expect::parse(e)?,
+                // Defaulting to `any` rather than erroring: `--check topology`
+                // alone is a legitimate "show me the distribution", and the
+                // summary says the same thing without a flag.
+                None => Expect::Any,
+            })),
             other => Err(anyhow::anyhow!(
-                "unknown check \"{other}\"; expected double-win, stale-holds, chain-integrity or \
-                 commit-correlation"
+                "unknown check \"{other}\"; expected double-win, stale-holds, chain-integrity, \
+                 commit-correlation or topology"
             )),
         }
     }
+}
+
+/// One invocation point that contradicted `--expect`.
+#[derive(Debug, Clone, Serialize)]
+pub struct TopologyMismatch {
+    pub invoked_from: String,
+    pub events: usize,
 }
 
 /// One completed or still-open hold of one path by one agent.
@@ -377,6 +451,19 @@ pub struct CheckReport {
     pub concurrent_writes: Vec<ConcurrentWrite>,
     /// `Check::CommitCorrelation` only.
     pub uncovered_commits: Vec<UncoveredCommit>,
+    /// `Check::Topology` only: invocation points that contradicted
+    /// `--expect`, each with how many events came from it.
+    pub topology_mismatches: Vec<TopologyMismatch>,
+    /// `Check::Topology` only: what was expected, echoed so a stored report
+    /// says what it was judged against rather than only what it found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_topology: Option<&'static str>,
+    /// `Check::Topology` only: events carrying no `invoked_from` at all.
+    /// Reported, never a finding — every log written before pact 0.7.0 is
+    /// entirely in this state, and flagging it would fail every existing
+    /// repository the moment this shipped. Same discipline as
+    /// `chain_untracked`.
+    pub topology_unstamped: usize,
 }
 
 impl CheckReport {
@@ -386,6 +473,7 @@ impl CheckReport {
             + self.chain_breaks.len()
             + self.concurrent_writes.len()
             + self.uncovered_commits.len()
+            + self.topology_mismatches.len()
     }
 }
 
@@ -844,6 +932,7 @@ pub fn run_check(
             Check::StaleHolds => "stale-holds",
             Check::ChainIntegrity => "chain-integrity",
             Check::CommitCorrelation => "commit-correlation",
+            Check::Topology(_) => "topology",
         },
         events_scanned: events.len(),
         excluded_by_annotation: loaded.excluded,
@@ -859,6 +948,9 @@ pub fn run_check(
         holds_with_no_commit: Vec::new(),
         concurrent_writes: Vec::new(),
         uncovered_commits: Vec::new(),
+        topology_mismatches: Vec::new(),
+        expected_topology: None,
+        topology_unstamped: 0,
     };
 
     match check {
@@ -910,6 +1002,24 @@ pub fn run_check(
             report.chain_untracked = untracked;
         }
         Check::CommitCorrelation => correlate_commits(repo_root, &events, &holds, &mut report),
+        Check::Topology(expect) => {
+            report.expected_topology = Some(expect.label());
+            let mut by_point: BTreeMap<String, usize> = BTreeMap::new();
+            for (_, e) in &events {
+                match e.invoked_from.as_deref() {
+                    Some(from) => *by_point.entry(from.to_string()).or_insert(0) += 1,
+                    None => report.topology_unstamped += 1,
+                }
+            }
+            report.topology_mismatches = by_point
+                .into_iter()
+                .filter(|(from, _)| !expect.satisfied_by(from))
+                .map(|(invoked_from, events)| TopologyMismatch {
+                    invoked_from,
+                    events,
+                })
+                .collect();
+        }
     }
     Ok(report)
 }
@@ -928,6 +1038,10 @@ pub struct ExportReport {
     pub stale_holds: CheckReport,
     pub chain_integrity: CheckReport,
     pub commit_correlation: CheckReport,
+    /// Run with `--expect any`, so it reports the distribution rather than a
+    /// verdict: a stored retrospective should not fail on an expectation
+    /// nobody declared when it was written.
+    pub topology: CheckReport,
     pub doctor: crate::doctor::DoctorReport,
     /// Messages their own recipient never marked read (pact-ler.3).
     ///
@@ -963,6 +1077,12 @@ pub fn export(
     let double_win = run_check(repo_root, Check::DoubleWin, since, include_annotated)?;
     let stale_holds = run_check(repo_root, Check::StaleHolds, since, include_annotated)?;
     let chain_integrity = run_check(repo_root, Check::ChainIntegrity, since, include_annotated)?;
+    let topology = run_check(
+        repo_root,
+        Check::Topology(Expect::Any),
+        since,
+        include_annotated,
+    )?;
     let commit_correlation = run_check(
         repo_root,
         Check::CommitCorrelation,
@@ -1065,6 +1185,7 @@ pub fn export(
         stale_holds,
         chain_integrity,
         commit_correlation,
+        topology,
         doctor,
         unacknowledged_messages,
         observations,
@@ -1377,6 +1498,18 @@ pub fn render_check(r: &CheckReport) -> String {
         ));
     }
 
+    if r.check == "topology" {
+        // Stated before any verdict, and stated even when clean: a reader has
+        // to know how much of the log this check could speak to at all before
+        // believing what it says about it.
+        out.push(format!(
+            "  expected {}; {} event(s) carry no invocation context (written before pact \
+             recorded it)",
+            r.expected_topology.unwrap_or("any"),
+            r.topology_unstamped
+        ));
+    }
+
     if r.check == "chain-integrity" {
         // Informational regardless of findings: a reader needs to know how
         // much of the log this check could even speak to before it says
@@ -1412,6 +1545,10 @@ pub fn render_check(r: &CheckReport) -> String {
                 "no concurrent write landed, and no commit fell outside every hold's window"
                     .to_string()
             }
+            "topology" => format!(
+                "every context-stamped event matches --expect {}",
+                r.expected_topology.unwrap_or("any")
+            ),
             _ => "no holds ran past their own recorded TTL without a renew".to_string(),
         });
         // commit-correlation still has informational rows to print (holds
@@ -1565,6 +1702,26 @@ pub fn render_check(r: &CheckReport) -> String {
              with no lease, which the protocol exists to prevent.",
             r.uncovered_commits.len()
         ));
+    }
+
+    for m in &r.topology_mismatches {
+        out.push(String::new());
+        out.push(format!(
+            "TOPOLOGY MISMATCH: {} event(s) invoked from {:?}, which --expect {} does not allow",
+            m.events,
+            m.invoked_from,
+            r.expected_topology.unwrap_or("any")
+        ));
+    }
+    if !r.topology_mismatches.is_empty() {
+        out.push(String::new());
+        out.push(
+            "The run did not use the topology it was asked to. Under an orchestrated-wave fleet \n\
+             this usually means agents edited in their worktrees but ran pact from the main \n\
+             checkout, so the lease/edit binding rests on convention — see \n\
+             docs/fleet-patterns.md."
+                .to_string(),
+        );
     }
 
     if !r.holds_with_no_commit.is_empty() {
@@ -2510,6 +2667,88 @@ mod tests {
         assert!(text.contains("predating context stamping"), "{text}");
         // Must not claim a topology it cannot know.
         assert!(!text.contains("from main"), "{text}");
+    }
+
+    #[test]
+    fn topology_expectations_are_all_or_nothing() {
+        let tmp = with_log(&[
+            &ev_from("2026-08-01T10:00:00Z", "a", "acquired", "a.rs", "main"),
+            &ev_from("2026-08-01T10:01:00Z", "b", "acquired", "b.rs", "wt-b"),
+        ]);
+        // A mixed run satisfies neither expectation — deliberately, because
+        // any "mostly" rule needs a cutoff nobody derived from data.
+        let worktrees =
+            run_check(tmp.path(), Check::Topology(Expect::Worktrees), None, false).unwrap();
+        assert_eq!(worktrees.findings(), 1);
+        assert_eq!(worktrees.topology_mismatches[0].invoked_from, "main");
+
+        let main = run_check(tmp.path(), Check::Topology(Expect::Main), None, false).unwrap();
+        assert_eq!(main.findings(), 1);
+        assert_eq!(main.topology_mismatches[0].invoked_from, "wt-b");
+
+        // `any` is the "just show me" mode and can never fail.
+        let any = run_check(tmp.path(), Check::Topology(Expect::Any), None, false).unwrap();
+        assert_eq!(any.findings(), 0);
+        assert!(
+            render_check(&any).contains("expected any"),
+            "{}",
+            render_check(&any)
+        );
+    }
+
+    /// `outside` is not a worktree: it means pact ran somewhere that is not
+    /// under this repository at all, which is precisely the value that says
+    /// the lease/edit binding cannot be assumed.
+    #[test]
+    fn outside_never_satisfies_expect_worktrees() {
+        let tmp = with_log(&[&ev_from(
+            "2026-08-01T10:00:00Z",
+            "a",
+            "acquired",
+            "a.rs",
+            "outside",
+        )]);
+        let r = run_check(tmp.path(), Check::Topology(Expect::Worktrees), None, false).unwrap();
+        assert_eq!(r.findings(), 1, "{:?}", r.topology_mismatches);
+    }
+
+    /// The convention every existing repository depends on: a log written
+    /// before pact recorded invocation context reports "no data" and exits
+    /// clean, whatever was expected. Flagging it would have failed every repo
+    /// on the day this shipped.
+    #[test]
+    fn a_pre_stamping_log_never_fails_a_topology_expectation() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:01:00Z", "a", "released", "a.rs"),
+        ]);
+        for expect in [Expect::Worktrees, Expect::Main, Expect::Any] {
+            let r = run_check(tmp.path(), Check::Topology(expect), None, false).unwrap();
+            assert_eq!(
+                r.findings(),
+                0,
+                "{expect:?} must not fail on a pre-stamping log"
+            );
+            assert_eq!(r.topology_unstamped, 2);
+        }
+    }
+
+    #[test]
+    fn expect_and_check_names_are_validated() {
+        assert!(Check::parse("topology", Some("worktrees")).is_ok());
+        assert!(
+            Check::parse("topology", None).is_ok(),
+            "bare topology means `any`"
+        );
+        let bad = Check::parse("topology", Some("mostly"))
+            .unwrap_err()
+            .to_string();
+        assert!(bad.contains("worktrees, main or any"), "{bad}");
+        let unknown = Check::parse("nope", None).unwrap_err().to_string();
+        assert!(
+            unknown.contains("topology"),
+            "the list must name it: {unknown}"
+        );
     }
 
     // ------------------------------------------------- commit-correlation

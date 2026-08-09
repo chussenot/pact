@@ -30,7 +30,7 @@ pact watch rm <path>
 pact watch ls
 pact log [-n | --limit <count>]
 pact doctor
-pact audit [--check <double-win|stale-holds|chain-integrity|commit-correlation>] [--since <rfc3339|duration>] [--include-annotated] [--export <path>]
+pact audit [--check <double-win|stale-holds|chain-integrity|commit-correlation|topology>] [--expect <worktrees|main|any>] [--since <rfc3339|duration>] [--include-annotated] [--export <path>]
 pact ui
 pact mcp serve
 ```

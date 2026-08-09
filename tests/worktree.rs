@@ -1305,3 +1305,61 @@ fn audit_flags_worktrees_that_no_lease_was_ever_taken_from() {
         "a worktree-invoked event retires the hint: {s}"
     );
 }
+
+/// pact-ler.5: the CI assertion, end to end — "did the fleet run where I told
+/// it to". Exercises the megablast shape: a repo with a linked worktree where
+/// every lease was nonetheless taken from the main checkout.
+#[test]
+fn audit_check_topology_fails_when_the_run_contradicts_expect() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+    let (_tmp, main, wt) = repo_with_worktree("feat/expect", "wt-expect");
+
+    assert!(pact(&main, "agent-a", &["lease", "acquire", "a.rs"])
+        .status
+        .success());
+
+    // Asked for worktrees, got main: exit 1, with forensics naming the
+    // invocation point rather than only a count.
+    let failed = pact(
+        &main,
+        "reader",
+        &["audit", "--check", "topology", "--expect", "worktrees"],
+    );
+    assert_eq!(failed.status.code(), Some(1), "{}", stdout(&failed));
+    let text = stdout(&failed);
+    assert!(text.contains("TOPOLOGY MISMATCH"), "{text}");
+    assert!(
+        text.contains("main"),
+        "must name where it actually ran: {text}"
+    );
+
+    // The same log against the expectation it actually satisfies: exit 0.
+    let passed = pact(
+        &main,
+        "reader",
+        &["audit", "--check", "topology", "--expect", "main"],
+    );
+    assert_eq!(passed.status.code(), Some(0), "{}", stdout(&passed));
+
+    // Once a lease really is taken from the worktree, the run is mixed and
+    // satisfies neither — all-or-nothing, with no proportion threshold.
+    assert!(pact(&wt, "agent-b", &["lease", "acquire", "b.rs"])
+        .status
+        .success());
+    for expect in ["worktrees", "main"] {
+        let mixed = pact(
+            &main,
+            "reader",
+            &["audit", "--check", "topology", "--expect", expect],
+        );
+        assert_eq!(
+            mixed.status.code(),
+            Some(1),
+            "a mixed run satisfies neither --expect {expect}: {}",
+            stdout(&mixed)
+        );
+    }
+}

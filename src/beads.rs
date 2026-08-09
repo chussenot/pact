@@ -960,9 +960,31 @@ mod tests {
         // standing in for a `bd`/`br` upgrade or PATH change during a
         // long-lived `pact mcp serve`/`pact ui` session.
         std::fs::write(&marker, b"").unwrap();
+        // Retried, and self-diagnosing on failure. `supports_actor` folds a
+        // spawn failure into `false` by design (see its doc comment), so at
+        // this assertion a transient failure to fork is indistinguishable from
+        // the cached answer the test exists to rule out — and under the fully
+        // parallel suite it does transiently fail. Retrying cannot mask the
+        // real bug: a genuinely cached answer returns `false` every time.
+        //
+        // If it ever fails anyway, the panic carries what a direct spawn of
+        // the same stub actually did, so the next reader gets evidence instead
+        // of a fourth hypothesis.
+        let re_derived = (0..5).any(|_| cli.supports_actor(repo.path()));
         assert!(
-            cli.supports_actor(repo.path()),
-            "a cached answer would still report false here; it must be re-derived per call"
+            re_derived,
+            "a cached answer would still report false here; it must be re-derived per call. \
+             Direct probe of the stub: {:?}",
+            Command::new(binary)
+                .args(["create", "--help"])
+                .current_dir(repo.path())
+                .output()
+                .map(|o| format!(
+                    "status={} stdout={:?} stderr={:?}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ))
         );
     }
 }
