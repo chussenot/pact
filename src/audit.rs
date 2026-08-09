@@ -858,6 +858,23 @@ pub struct ExportReport {
     pub chain_integrity: CheckReport,
     pub commit_correlation: CheckReport,
     pub doctor: crate::doctor::DoctorReport,
+    /// Messages their own recipient never marked read (pact-ler.3).
+    ///
+    /// Here rather than in `pact doctor`, and that placement is forced rather
+    /// than preferred. Answering this needs a real `bd list`, and `bd` takes a
+    /// `.beads/.write.lock` to serve one — while `doctor` is exposed over MCP
+    /// as `pact_doctor`, which docs/mcp.md promises is strictly read-only and
+    /// `tests/mcp.rs::every_tool_call_leaves_the_repository_byte_identical`
+    /// enforces byte-for-byte. A doctor check would have quietly broken that
+    /// guarantee for every MCP observer. `--export` is CLI-only (MCP exposes
+    /// `audit::summary`, never this), deliberately run at the end of a run,
+    /// and is exactly the retrospective artifact this question belongs in.
+    ///
+    /// Empty when there is no Beads CLI or no `.beads/` — "cannot ask" and
+    /// "nothing pending" are both reported as nothing pending here, because
+    /// the sibling `doctor` section of this same report already says loudly
+    /// when the backend is missing.
+    pub unacknowledged_messages: Vec<crate::msg::Message>,
     /// Short, human-readable highlights pulled out of the structured fields
     /// above, so a reader does not have to re-derive "is this worth looking
     /// at" from raw counts and thresholds. Empty means nothing here rose to
@@ -882,6 +899,18 @@ pub fn export(
         include_annotated,
     )?;
     let doctor = crate::doctor::checks(repo_root);
+
+    // Best-effort by design: a repo with no `.beads/` or no backend on PATH
+    // is not a repo with a messaging problem, and `doctor` above already
+    // reports a missing CLI on its own line.
+    let unacknowledged_messages = if repo_root.join(".beads").exists() {
+        crate::beads::BeadsCli::locate()
+            .ok()
+            .and_then(|cli| crate::msg::unacknowledged(&cli, repo_root).ok())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     let mut observations = Vec::new();
     if double_win.findings() > 0 {
@@ -920,6 +949,34 @@ pub fn export(
             }
         }
     }
+    if !unacknowledged_messages.is_empty() {
+        // Named, not counted, and "nobody read it" kept distinct from "read
+        // by somebody who was not the addressee" — the second is the common
+        // field shape (`--to-owner-of` means a message about a path follows
+        // the path, so the agent who picks that path up is often the reader),
+        // and collapsing them would read as "nobody looked".
+        observations.push(format!(
+            "{} message(s) never read by their recipient: {}. `pact msg sent` shows these as \
+             undelivered to whoever sent them.",
+            unacknowledged_messages.len(),
+            unacknowledged_messages
+                .iter()
+                .map(|m| {
+                    if m.read_by.is_empty() {
+                        format!("{} (to {}, nobody has read it)", m.id, m.to)
+                    } else {
+                        format!(
+                            "{} (to {}, read only by {})",
+                            m.id,
+                            m.to,
+                            m.read_by.join("/")
+                        )
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     for c in &doctor.checks {
         if !c.ok || c.warn {
             observations.push(format!(
@@ -938,6 +995,7 @@ pub fn export(
         chain_integrity,
         commit_correlation,
         doctor,
+        unacknowledged_messages,
         observations,
     })
 }

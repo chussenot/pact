@@ -473,6 +473,41 @@ for something I sent; the sender's actual question is whether the peer they told
 has seen it. Answering it requires the shared read state above — with a local
 `read.json` there was nothing to show.
 
+### …and `pact audit --export` asks it for everybody
+
+`msg sent` answers that question for one agent, about their own messages, and
+only when they think to ask. [`pact audit --export`](audit.md#--export)'s
+`unacknowledged_messages` asks it across the whole repository, so a warning
+nobody acknowledged is not invisible at the end of a run:
+
+```
+1 message(s) never read by their recipient: pact-msg-c0a6b2c8 (to w5-juice,
+nobody has read it). `pact msg sent` shows these as undelivered to whoever
+sent them.
+```
+
+It names each message and distinguishes **nobody has read it** from **read only
+by \<someone\>** — because the second is the common shape, not a corner case.
+`--to-owner-of` means a message about a path *follows the path*, so whoever
+leases that path next is often the one who reads it, and that agent is usually
+not the addressee. The criterion stays "read by its recipient" regardless, so
+this and `msg sent` can never disagree about whether a message landed.
+
+Both cases really happen. One field run ended with a message warning that a
+constant change would panic at runtime: it was acted on correctly and never
+marked read, so its sender's `msg sent` reported it undelivered permanently and
+nothing else said a word. Another run had two of three messages read only by
+agents other than their addressee. Reported, never fatal — acting on a message
+without marking it read is untidy, not broken.
+
+**Why not `pact doctor`.** That was the obvious home and it is not available:
+answering this needs a real `bd list`, and `bd` takes a `.beads/.write.lock` to
+serve one, while `pact doctor` is exposed over MCP as `pact_doctor` — which
+[mcp.md](mcp.md) promises is strictly read-only and a test enforces
+byte-for-byte. A doctor check would have quietly broken that guarantee for
+every MCP observer. `--export` is CLI-only, deliberately run at the end of a
+run, and is the retrospective artifact this question belongs in anyway.
+
 ## Bodies that don't survive a shell: `--body-file`
 
 ```

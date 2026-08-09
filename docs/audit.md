@@ -205,12 +205,20 @@ pact audit --export report.json --since 7d --json     # combines with every othe
 ```
 
 One JSON file bundling `summary`, `double_win`, `stale_holds`,
-`chain_integrity`, `commit_correlation` and `doctor` (`pact doctor`'s own
-checks) — the exact set of things a real field audit (pact-juz) had to
-assemble by hand: a separate `pact doctor`, a separate `pact audit` per
-named check, and a raw grep of `.pact/events.jsonl`. Meant to be read
-directly by a human, or handed to another agent session asking "how is pact
-actually being used, and where does it fall down".
+`chain_integrity`, `commit_correlation`, `doctor` (`pact doctor`'s own
+checks) and `unacknowledged_messages` — the exact set of things a real field
+audit (pact-juz) had to assemble by hand: a separate `pact doctor`, a separate
+`pact audit` per named check, and a raw grep of `.pact/events.jsonl`. Meant to
+be read directly by a human, or handed to another agent session asking "how is
+pact actually being used, and where does it fall down".
+
+`unacknowledged_messages` lists every message its own recipient never marked
+read, distinguishing "nobody has read it" from "read only by someone who was
+not the addressee" — see
+[messaging.md](messaging.md#and-pact-audit---export-asks-it-for-everybody),
+which also explains why this cannot live in `pact doctor` (it needs a `bd
+list`, which takes a write lock, and doctor is served over MCP as strictly
+read-only).
 
 A top-level `observations` array pulls out short, human-readable highlights
 — a nonzero finding count from any check, or a `doctor` check that is not a

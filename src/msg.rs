@@ -1069,6 +1069,30 @@ pub fn all_messages(cli: &BeadsCli, repo_root: &Path) -> Result<Vec<Message>> {
     Ok(to_messages(list_issues(cli, repo_root, None, None)?, None))
 }
 
+/// Messages whose own recipient never marked them read (pact-ler.3), oldest
+/// first.
+///
+/// Leans on [`all_messages`] resolving `read` against each message's own
+/// recipient rather than a querying agent — so this is exactly "nobody the
+/// message was addressed to has acknowledged it", not "I have not read it".
+///
+/// Why this is worth a check of its own: `pact msg sent` already shows a
+/// sender whether their message landed, but only that sender, only for their
+/// own messages, and only if they think to look. A fleet field run
+/// (megablast) ended with one message unacknowledged — an agent warning the
+/// owner of a file it did not own that a constant it had just changed would
+/// panic at runtime if `MAX_QUADS` was not updated with it. The warning was
+/// acted on, correctly, but never marked read, so `pact msg sent` reported it
+/// undelivered permanently and nothing anywhere said so. The contrast case
+/// matters too: an earlier run's three messages all carry `read-by-` labels,
+/// so the acknowledgement mechanism works and is exercised — what was missing
+/// was anything reporting when it did not happen.
+pub fn unacknowledged(cli: &BeadsCli, repo_root: &Path) -> Result<Vec<Message>> {
+    let mut messages = all_messages(cli, repo_root)?;
+    messages.retain(|m| !m.read);
+    Ok(messages)
+}
+
 /// `list --json` output -> issues. bd emits a bare array, br an envelope.
 ///
 /// A parse failure here is frequently a backend-shape mismatch rather than a

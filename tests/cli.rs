@@ -4636,3 +4636,126 @@ fn audit_export_works_without_a_check_and_confirms_the_path_written() {
     let _ = json_stdout(&out_json); // panics with the raw stdout if not exactly one value
     assert!(export_path2.exists());
 }
+
+/// pact-ler.3: a message acted on but never marked read is invisible. Its
+/// sender's `pact msg sent` reports it undelivered permanently and nothing
+/// else says a word — which is exactly what a fleet field run produced, for a
+/// message warning that a constant change would panic at runtime.
+///
+/// Reported by `pact audit --export` rather than `pact doctor`, and that is
+/// forced rather than chosen: answering it needs a real `bd list`, which takes
+/// a `.beads/.write.lock`, and `pact doctor` is served over MCP as a strictly
+/// read-only tool (see `tests/mcp.rs`).
+#[test]
+fn export_names_messages_the_recipient_never_acknowledged() {
+    let Some(tmp) = bd_repo("export_names_unacknowledged_messages") else {
+        return;
+    };
+    let repo = tmp.path();
+    assert_ok(&pact(repo, "sender", &["init", "--no-commit"]));
+
+    let pending = |label: &str| -> Vec<serde_json::Value> {
+        let out = repo.join(format!("{label}.json"));
+        assert_ok(&pact(
+            repo,
+            "sender",
+            &["audit", "--export", out.to_str().unwrap()],
+        ));
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        report["unacknowledged_messages"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no unacknowledged_messages in {report}"))
+            .clone()
+    };
+    let observations = |label: &str| -> String {
+        let out = repo.join(format!("{label}-obs.json"));
+        assert_ok(&pact(
+            repo,
+            "sender",
+            &["audit", "--export", out.to_str().unwrap()],
+        ));
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        report["observations"].to_string()
+    };
+
+    // Nothing sent yet.
+    assert!(pending("empty").is_empty());
+
+    let send = pact(
+        repo,
+        "sender",
+        &[
+            "msg",
+            "send",
+            "--to",
+            "recipient",
+            "MAX_QUADS undercounts the background layer now",
+        ],
+    );
+    assert_ok(&send);
+    let id = stdout_of(&send)
+        .split_whitespace()
+        .nth(1)
+        .expect("`sent <id> to ...`")
+        .to_string();
+
+    let unread = pending("unread");
+    assert_eq!(unread.len(), 1, "{unread:?}");
+    assert_eq!(unread[0]["id"], id);
+    assert_eq!(unread[0]["to"], "recipient");
+    let obs = observations("unread");
+    assert!(obs.contains(&id), "observation must name the id: {obs}");
+    assert!(
+        obs.contains("nobody has read it"),
+        "an untouched message must not read as 'read by someone else': {obs}"
+    );
+
+    // Read by an agent who is NOT the addressee. This is the common field
+    // shape, not a corner case — `--to-owner-of` means a message about a path
+    // follows the path, so whoever leases it next is often the one who reads
+    // it. Still not acknowledged (that is what `pact msg sent` tells the
+    // sender), but the report has to say which of the two it is.
+    assert_ok(&pact(repo, "someone-else", &["msg", "read", &id]));
+    let bystander = pending("bystander");
+    assert_eq!(bystander.len(), 1, "{bystander:?}");
+    let obs = observations("bystander");
+    assert!(
+        obs.contains("read only by someone-else"),
+        "must name who did read it: {obs}"
+    );
+
+    // Reading it as the addressee closes the loop.
+    assert_ok(&pact(repo, "recipient", &["msg", "read", &id]));
+    assert!(pending("done").is_empty());
+    assert!(
+        !observations("done").contains("never read by their recipient"),
+        "{}",
+        observations("done")
+    );
+}
+
+/// The noise rule pact-juz.2/.4 established: a repo that never opted into
+/// Beads must not be nagged about a messaging feature it does not use.
+#[test]
+fn export_reports_no_messages_in_a_lease_only_repo() {
+    let tmp = init_repo();
+    let out = tmp.path().join("r.json");
+    assert_ok(&pact(
+        tmp.path(),
+        "solo",
+        &["audit", "--export", out.to_str().unwrap()],
+    ));
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(
+        report["unacknowledged_messages"].as_array().unwrap().len(),
+        0
+    );
+    assert!(
+        !report["observations"].to_string().contains("never read"),
+        "no .beads/ means no messaging observation at all: {}",
+        report["observations"]
+    );
+}
