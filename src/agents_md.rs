@@ -66,7 +66,11 @@ this protocol whenever you touch shared files or hand off work to others.
   work never needs to think about the TTL at all. `pact lease release <path>`
   frees one file, `pact lease release --all` frees everything you hold in a
   single call, so nothing gets half-forgotten. Release before you report
-  yourself finished, not after.
+  yourself finished, not after — but **commit before you release**. A lease
+  released while the work is still uncommitted breaks the one binding the log
+  exists to prove; measured on a 20-agent build, a fix landed 99 seconds after
+  its author had already let the file go, and `pact audit --check
+  commit-correlation` reports it as a commit nobody held a lease for.
 - **Ask whose file it is before you touch it, and hand it back by name**:
   `pact agents --for <path>` names the last agent to act on a path even after
   they released it and exited, and `pact lease acquire` tells you the same
@@ -103,6 +107,12 @@ this protocol whenever you touch shared files or hand off work to others.
 - **Confirm, don't re-send**: `pact msg sent` shows what you sent and whether
   the recipient has read it. If you are unsure a message went out, check
   there — a blind re-send is how a peer's inbox fills with duplicates.
+- **If you act on a message, mark it read.** `pact msg read <id>` is the only
+  thing that tells the sender their warning landed; act on one without it and
+  their `pact msg sent` says "undelivered" forever, which is indistinguishable
+  from being ignored. Across two fleet builds, three of four messages were
+  never acknowledged by the agent they were addressed to — including one that
+  prevented a runtime panic. `pact audit --export` lists the stragglers.
 - **Orient with `pact log`**: one chronological feed of who leased what and
   who said what. Read it when you join, and when you need to know whether a
   peer is still moving.

@@ -173,6 +173,7 @@ what the tooling did to it, and require a quoted command as evidence.
 | [tui.md](docs/tui.md) | `pact ui` — tabs, keybindings, and the `ui` build feature |
 | [telemetry.md](docs/telemetry.md) | the optional OpenTelemetry export: what leaves the machine and what never does |
 | [audit.md](docs/audit.md) | `pact audit`: what each check proves, and what it deliberately cannot see |
+| [fleet-patterns.md](docs/fleet-patterns.md) | the one fleet topology that has been measured twice, and what the numbers said — including where they contradicted the assumption |
 | [testing.md](docs/testing.md) | the fleet soak: scripted workers at concurrency, and what it cannot prove |
 | [development.md](docs/development.md) | build, test, the CI gates and why each exists, the upstream canary |
 | [mascot-animations.md](docs/mascot-animations.md) | the mascot in `pact ui`: gestures, triggers, frame data |
