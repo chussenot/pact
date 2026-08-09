@@ -567,13 +567,36 @@ citations of *another* repository's commits, which cannot resolve here and shoul
 not. Filtering to hashes actually introduced by a provenance word gives **0
 dangling out of 15**. The 30% was measuring the regex, not the repository.
 
-**"Claim skip 87%"** — not measurable from the available data, in either
-direction. bd 1.1.2 writes a `field_change/status` interaction **only on close**:
-running `bd update --claim`, which sets status to `in_progress`, appends nothing
-at all. Verified on a scratch store — the log had 0 lines after a claim and 1
-after the close. So "how many beads were closed without being claimed first"
-returns 100% for every repository, whatever anybody did. An early cut of
-`beads-retro.sh` shipped exactly that number before the check was run.
+**"Claim skip 87%"** — the number was wrong, and so was the correction that
+replaced it. This page said for a while that claim adherence is "not measurable
+from the available data, in either direction", because bd writes a
+`field_change/status` interaction only on close. The status half of that is
+true. The conclusion was not.
+
+`bd update --claim` "sets assignee to you, status to `in_progress`" — and bd
+logs **assignee** changes as interactions of their own. A self-claim has a
+distinctive shape: `actor` equals the new value, with an empty old value. Two
+fleet runs carry it plainly:
+
+| run | assignee interactions | status/closed | claim adherence |
+|---|---|---|---|
+| megablast | 22 | 23 | 22/23 |
+| grimcast | **0** | 22 | **0/22** |
+
+So it was measurable all along, through the wrong field — and the third run
+regressed to zero claims while closing every bead. The likeliest source of the
+original scratch-store result is that `--claim` is documented as **idempotent**:
+claiming an issue already assigned to you changes nothing, so it logs nothing.
+Testing the no-op path and generalising from it is the mistake.
+
+The lesson this bullet exists for still stands, just aimed one step further
+back: a metric that returns the same answer regardless of behaviour is worse
+than no metric — and so is concluding a thing cannot be measured because the
+first field you looked at did not move.
+
+Whether pact should *report* claim adherence is a separate question and
+deliberately still open: this data is Beads-side, and
+[audit reads `.pact/` and never the Beads store](#what-audit-deliberately-cannot-see).
 
 The general lesson is the one this repo keeps relearning: a metric that returns
 the same answer regardless of the behaviour it claims to measure is worse than no
