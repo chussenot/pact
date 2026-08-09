@@ -744,12 +744,28 @@ Three fields ride on **every** event, whatever its kind:
 | `scope` | the coordination scope actually in force: `shared` or `local` |
 | `pact_version` | the version that wrote the line |
 | `protocol_hash` | which revision of the managed `AGENTS.md` block was in force |
+| `head` | the repository's `HEAD` — **hold boundaries only** (see below) |
 
 `invoked_from` says `main` literally, not the main worktree's directory name —
 the field exists to be compared across repositories and runs. `outside` means
 the process's working directory was not under this repository at all, which is
 reachable by pointing pact at another repo with `PACT_STATE_DIR`, and is the
 one value that says the lease/edit binding cannot be assumed.
+
+`head` is the exception to "every event carries these". It is stamped only on
+the kinds that open or close a hold — `acquired`, `stolen`, `released`,
+`force-released` — because that is the only place it answers anything, and
+stamping it everywhere would spawn a `git rev-parse` per watch delivery to
+record noise. `expired` is excluded with them: the holder is gone, and `HEAD`
+at collection time belongs to whoever swept the lock.
+
+It exists because agent identity does not survive into git. Across three fleet
+runs every commit carried **one** git author — 90 of 90, 62 of 62 — while the
+agents were twenty-odd distinct identities. So "did this agent commit during
+that agent's hold" could not be answered from git at all, and
+[`--check commit-correlation`](audit.md#--check-commit-correlation) had to
+infer the binding from timestamps. An open and its close now bracket an exact
+commit range.
 
 `protocol_hash` is the block **in `AGENTS.md`**, not the one this binary would
 write — `pact_version` already says which binary ran, and a repository that has

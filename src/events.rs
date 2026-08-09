@@ -185,6 +185,24 @@ pub struct Event {
     /// them. See `agents_md::current_block_hash`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_hash: Option<String>,
+    /// The repository's `HEAD` when this hold opened or closed (pact-b73.3),
+    /// short form. `None` on kinds that are not a hold boundary, and where
+    /// git cannot answer — a repo with no commits yet.
+    ///
+    /// Exists because agent identity does not survive into git. Across three
+    /// fleet runs every commit carried ONE git author (grimcast 90/90,
+    /// megablast 62/62) while the agents were 23 and 20 distinct identities,
+    /// so "did this agent commit during that agent's hold" — the question a
+    /// coordination post-mortem most wants — could not be answered from git
+    /// at all, and `--check commit-correlation` had to infer the binding from
+    /// timestamps alone.
+    ///
+    /// An open and its matching close now bracket an exact commit range, so
+    /// what an agent landed under a lease stops being an inference. pact
+    /// already computed this value and threw it away: `head_short` existed
+    /// only to name a commit in a truncated watch diff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
 }
 
 /// For appending: creates `.pact/` if needed.
@@ -411,6 +429,27 @@ fn stamp_context(repo_root: &Path, ev: &mut Event) {
     // is exactly what makes a before/after comparison across a protocol change
     // interpretable. `None` when there is no readable managed block.
     ev.protocol_hash = crate::agents_md::current_block_hash(repo_root);
+    // The commit this repository was on when the hold opened or closed
+    // (pact-b73.3). Gated on kind, unlike everything above it, and the
+    // asymmetry is deliberate rather than an oversight:
+    //
+    // * `invoked_from`/`scope`/`pact_version` are meaningful for EVERY event —
+    //   where the command ran, under what rules, from which binary — so a
+    //   gated field there could not tell "not applicable" from "not recorded".
+    // * `head` is meaningful only at a hold's boundaries. A `notified` or
+    //   `watched` event has a HEAD, but it answers nothing, and stamping it
+    //   would spawn a `git rev-parse` per delivery — 87 of them in the run
+    //   that motivated this — to record noise.
+    //
+    // `expired` is excluded with the open/close kinds it otherwise resembles,
+    // for the same reason expiry delivers no watch diff: the holder is gone,
+    // and HEAD at collection time belongs to whoever swept the lock.
+    if matches!(
+        ev.kind.as_str(),
+        "acquired" | "stolen" | "released" | "force-released"
+    ) {
+        ev.head = crate::git_history::head_short(repo_root);
+    }
 }
 
 /// Append one event to `.pact/events.jsonl`.
@@ -830,6 +869,7 @@ mod tests {
             subscriber: None,
             message_id: None,
             protocol_hash: None,
+            head: None,
         }
     }
 

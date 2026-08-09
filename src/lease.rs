@@ -937,6 +937,7 @@ fn log_event(
             subscriber: None,
             message_id: None,
             protocol_hash: None,
+            head: None,
         },
     );
 }
@@ -1760,6 +1761,7 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                     subscriber: None,
                     message_id: None,
                     protocol_hash: None,
+                    head: None,
                 },
             );
             count_transition("force_released");
@@ -1827,6 +1829,7 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                     subscriber: None,
                     message_id: None,
                     protocol_hash: None,
+                    head: None,
                 },
             );
             count_transition("force_released");
