@@ -10,6 +10,18 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.7.1 - 2026-08-09
+#### Documentation
+- **(fleet)** codify the orchestrated-wave pattern from two measured runs - (f8031fa) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(audit)** report which worktree each run was invoked from - (39f5762) - Clement HUSSENOT-DESENONGES
+- **(audit)** report messages the recipient never acknowledged - (3fcd116) - Clement HUSSENOT-DESENONGES
+- **(events)** stamp invocation context on every event - (f6c6f2d) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- Add interactions - (27fe44e) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.7.0 - 2026-08-08
 #### Features
 - **(audit)** add --export for a combined self-improvement report - (ce3b451) - Clement HUSSENOT-DESENONGES
