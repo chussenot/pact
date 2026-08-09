@@ -1,3 +1,9 @@
+---
+title: Leases
+description: The lease lifecycle — TTL, grace period, steal versus expiry, path identity — and why each is shaped that way.
+audience: everyone
+---
+
 # Leases
 
 A lease is pact's way of letting an agent say "I'm working on this file" in a
@@ -17,9 +23,18 @@ A lease is one JSON file: `.pact/leases/<encoded-path>.lock`, containing
   "path": "src/auth.rs",
   "acquired_at": "2026-07-30T09:12:03Z",
   "ttl_secs": 900,
-  "note": "refactoring session handling"
+  "note": "refactoring session handling",
+  "content_hash": "22aa323169fb49d41e4b2fde189212c33bc21eab"
 }
 ```
+
+`content_hash` is the git blob id of the file's content at the moment it was
+claimed — absent, not null, when the path did not exist yet. It is what
+[`pact watch`](watch.md) diffs against when the lease is released, and it lives
+on the lock file because `release` already reads this struct to check ownership,
+so the baseline is one field away rather than a scan back through the event log.
+A `renew` deliberately inherits it rather than re-stamping: resetting the
+baseline mid-hold would hide everything done before the renew.
 
 `<encoded-path>` replaces `/` with `__` (so `src/auth.rs` becomes
 `src__auth.rs.lock`). This means a path containing a literal `__` could in
@@ -35,6 +50,7 @@ In a repository that uses `git worktree`, two more keys appear:
   "acquired_at": "2026-07-30T09:12:03Z",
   "ttl_secs": 900,
   "note": "refactoring session handling",
+  "content_hash": "22aa323169fb49d41e4b2fde189212c33bc21eab",
   "branch": "feat/auth",
   "worktree": "wt-auth"
 }
@@ -201,6 +217,7 @@ sequenceDiagram
 
     B->>L: pact lease acquire src/auth.rs
     L-->>B: exit 2 — held by agent-a (12s old, 888s remaining)
+    Note over L: a refused event is logged, so the<br/>contention is visible afterwards
     Note over B: picks a different file instead
 
     A->>L: pact lease release src/auth.rs
@@ -208,6 +225,12 @@ sequenceDiagram
     L-->>B: acquired
     Note over B: now safe to edit src/auth.rs
 ```
+
+The refusal is the step worth noticing. Exit 2 tells *B* it lost, and for a
+long time that was the only trace it left: the loser picked another file and the
+log recorded a clean sequence of holds, so a path six agents had queued on
+looked identical to one nobody else wanted. `refused` closes that — see
+[the event log](#the-event-log) below.
 
 Agent B's `acquire` fails with **exit code 2**, and the error message on
 stderr names the current holder, how old the lease is, and how much TTL is

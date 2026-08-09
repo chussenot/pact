@@ -1,3 +1,9 @@
+---
+title: pact watch
+description: Subscribing to paths, and why interface notification rides `lease release` instead of asking agents to remember.
+audience: everyone
+---
+
 # `pact watch`
 
 Subscribe to paths. When a holder releases one, pact sends you the diff of

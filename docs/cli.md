@@ -1,3 +1,9 @@
+---
+title: CLI reference
+description: Every command, flag, exit code and --json shape. The contract, checked against the binary in CI.
+audience: everyone
+---
+
 # CLI reference
 
 Every surface pact exposes, in one place. The reasoning behind each is in the

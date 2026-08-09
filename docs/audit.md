@@ -1,3 +1,9 @@
+---
+title: pact audit
+description: What each check proves, what `--compare` answers, and what audit deliberately cannot see.
+audience: operators
+---
+
 # `pact audit`
 
 Offline analysis of a repository's coordination history, from
@@ -137,7 +143,7 @@ log that is part pre-existing history and part chain-tracked (the shape every
 real repository has, indefinitely, from the moment this shipped) verify
 cleanly: a tracked line only ever answers for the line immediately before it.
 
-Unlike the other two checks, this one reads the **raw, unfiltered** log —
+Alone among the checks, this one reads the **raw, unfiltered** log —
 `--since` and `--include-annotated` do not apply to it. The chain is a
 property of physical line adjacency as written; an annotation line and
 whatever it covers are still real entries the writer's hash chain ran
@@ -145,7 +151,7 @@ through, whatever a lease-history statistic later excludes them from.
 
 ### `--check commit-correlation`
 
-The other three checks only ever look at `.pact/events.jsonl` — this one asks
+Every other check looks only at `.pact/events.jsonl` — this one asks
 whether real git history backs up what that log claims, by shelling out to
 `git log` (`git_history.rs`), the same way `repo.rs` and `doctor.rs` already
 shell out to `git` for other checks. It reports three things, only two of
@@ -603,10 +609,14 @@ against its own recorded TTL.
   `--check double-win --json` instead of the 40 lines of jq it used to carry. Two
   implementations of one invariant is one too many, and the jq copy would have had
   to independently know all four rows of the table above.
-- **[`.github/workflows/audit.yml`](../.github/workflows/audit.yml)** runs both
-  checks weekly against this repository's own committed history, so pact audits
-  its own development continuously and files an issue when a check turns up
-  something.
+- **[`.github/workflows/audit.yml`](../.github/workflows/audit.yml)** runs
+  `double-win` and `stale-holds` weekly against this repository's own committed
+  history, so pact audits its own development continuously and files an issue
+  when either turns up something. The three newer checks —
+  `chain-integrity`, `commit-correlation` and `topology` — are **not** wired
+  into that workflow yet. Said plainly rather than left to be assumed: a
+  reader who sees a green weekly audit should know exactly which questions it
+  asked.
 - **MCP**: `pact_audit_summary` exposes the summary as a sixth read-only tool
   ([mcp.md](mcp.md)). The named checks stay CLI-only, because their contract is an
   exit code and a tool result cannot express one.

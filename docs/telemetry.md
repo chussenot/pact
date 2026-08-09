@@ -1,3 +1,9 @@
+---
+title: Telemetry
+description: The optional OpenTelemetry export: what leaves the machine, and what never does.
+audience: operators
+---
+
 # Telemetry
 
 pact can export OpenTelemetry traces and metrics about its own runs. It is
@@ -66,10 +72,20 @@ already rejected with exit 1.
 
 ### Spans
 
-One root span per invocation, named for the argv shape (`lease acquire`, `msg
-inbox`, `doctor` — 13 literals plus `help` and `usage-error`). Child spans
-attach to it automatically through a thread-local stack, so nothing in pact
-passes a context object around.
+One root span per invocation, named for the **argv shape** — `lease acquire`,
+`msg inbox`, `audit compare`, `doctor` — plus `help` and `usage-error`. Child
+spans attach to it automatically through a thread-local stack, so nothing in
+pact passes a context object around.
+
+The shape, never the arguments. `subcommand_name` maps each command to one of a
+fixed set of literals, and a flag value that pact does not recognise collapses
+to a catch-all (`audit other`) rather than reaching a span name. That is not
+tidiness: a span name is high-cardinality by construction if user text can
+reach it, and `--check`'s value, a path and a `--note` are all user text. The
+same rule governs `pact.beads.exec`, which records the *shape* of the `bd`
+argv and never its values — `--title` and `--description` carry a colleague's
+message subject and body, and shipping those to a collector is not something an
+observability change gets to do quietly.
 
 ```mermaid
 graph TD

@@ -1,3 +1,9 @@
+---
+title: Architecture
+description: How pact, agents and Beads fit together; what is stored where, what is committed, and the non-goals in full.
+audience: contributors
+---
+
 # Architecture
 
 pact is a coordinator, not a platform: it has no server, no daemon, and no
@@ -14,10 +20,11 @@ flowchart TB
         B[Agent B]
     end
 
-    A -->|pact lease / msg / log / agents / whoami / init / doctor| P[pact CLI]
-    B -->|pact lease / msg / log / agents / whoami / init / doctor| P
+    A -->|"pact lease / msg / watch / audit / log / agents / whoami / init / doctor"| P[pact CLI]
+    B -->|"pact lease / msg / watch / audit / log / agents / whoami / init / doctor"| P
 
     P -->|reads/writes| L[".pact/leases/*.lock"]
+    P -->|appends/reads| W[".pact/watches.jsonl"]
     P -->|appends/reads| R[".pact/events.jsonl"]
     P -->|writes| M["AGENTS.md
     (managed block)"]
@@ -29,9 +36,16 @@ flowchart TB
     (bd or br)"]
     BD -->|reads/writes| DB[(Beads database)]
 
+    W -.->|"a release delivers the diff<br/>to each subscriber"| BD
+
     style P fill:#4a5568,color:#fff
     style BD fill:#4a5568,color:#fff
 ```
+
+Every solid edge is a command doing what it was asked. The dotted one is the
+only place pact acts without being asked directly: `lease release` looks up who
+subscribed to the path and sends them the diff, because a step agents have to
+remember is a step they measurably skip ([watch.md](watch.md)).
 
 Every box other than "pact CLI" and "Beads CLI" is a plain file or an existing
 tool. There's nothing in this diagram pact needs to keep alive between
@@ -53,6 +67,7 @@ below.
 |------|------|------------|
 | `.pact/leases/*.lock` | one JSON file per active lease | no |
 | `.pact/waits/*` | conflict breadcrumbs, so a wait can be measured across two processes | no |
+| `.pact/watches.jsonl` | who subscribed to which path, append-only with tombstones | no |
 | `.pact/events.jsonl` | append-only lease-event log behind `pact log`, bounded | **yes** |
 | `AGENTS.md` (managed block) | the coordination protocol, for agents to read | yes |
 | `CLAUDE.md` (managed block) | one `@AGENTS.md` import line, because Claude Code loads `CLAUDE.md` and never `AGENTS.md` | yes |
@@ -91,8 +106,9 @@ second run writes nothing. One caveat about the migration: it replaces the rule,
 not any comment a human wrote above it, so a hand-written "everything under
 .pact/ is local" line may need deleting by hand once.
 
-Leases and waits are transient, per-machine bookkeeping — committing them would
-have agents fighting over each other's in-flight claims. Anything else an agent
+Leases, waits and watches are transient, per-machine bookkeeping — committing
+them would have agents fighting over each other's in-flight claims, and would
+have every clone inherit subscriptions from agents that no longer exist. Anything else an agent
 drops under `.pact/` — an evidence log, a scratch file — is local too, and stays
 local without needing a rule of its own. Fleet artefacts worth keeping belong
 outside `.pact/` entirely; this repo keeps them in `tmp/`. The `AGENTS.md` block is

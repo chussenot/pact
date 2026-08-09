@@ -1,3 +1,9 @@
+---
+title: Fleet patterns
+description: The one fleet topology measured twice, the numbers it earned, and where those numbers contradicted the assumption.
+audience: orchestrators
+---
+
 # Fleet patterns
 
 pact does not require any particular way of running a fleet. This page

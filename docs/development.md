@@ -1,3 +1,9 @@
+---
+title: Development
+description: Build, test, the CI gates and why each exists, and the upstream canary.
+audience: contributors
+---
+
 # Development
 
 How to build, test and verify pact. The gates here exist because each one

@@ -1,3 +1,9 @@
+---
+title: Testing pact
+description: The fleet soak — scripted workers at concurrency — and what it cannot prove.
+audience: contributors
+---
+
 # Testing pact
 
 Four layers, each answering a question the one below it cannot.

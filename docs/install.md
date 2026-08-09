@@ -1,3 +1,9 @@
+---
+title: Installing pact
+description: Getting a binary, the lean and full build profiles, and choosing a Beads backend.
+audience: operators
+---
+
 # Installing pact
 
 pact is one binary with no runtime of its own. The only external thing it needs

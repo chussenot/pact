@@ -1,3 +1,9 @@
+---
+title: MCP server (read-only)
+description: The optional MCP server's six tools, and why none of them can write.
+audience: integrators
+---
+
 # MCP server (read-only)
 
 `pact mcp serve` exposes pact's **observation** surface over the Model Context

@@ -1,3 +1,9 @@
+---
+title: Messaging
+description: How messages map onto Beads issues, and why read state is shared rather than local.
+audience: everyone
+---
+
 # Messaging
 
 `pact msg` lets one agent hand context to another — "I renamed this

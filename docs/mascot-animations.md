@@ -1,3 +1,9 @@
+---
+title: pact ui mascot
+description: The mascot's gestures, triggers and frame data.
+audience: contributors
+---
+
 # pact ui mascot — character sheet and choreography
 
 The mascot is a small friendly blob that lives in the corner of `pact ui` and

@@ -1,3 +1,9 @@
+---
+title: Onboarding
+description: What `pact init` writes, to which files, and why the protocol lives where agents already read.
+audience: operators
+---
+
 # Onboarding
 
 `pact init` teaches every agent in a repository the coordination protocol, once,

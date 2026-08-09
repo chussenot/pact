@@ -1,3 +1,9 @@
+---
+title: pact
+description: Why pact is built the way it is: the problem multi-agent repositories create, and the four primitives that answer it.
+audience: everyone
+---
+
 # pact
 
 **pact** is a small, dependency-light CLI that helps multiple coding agents —
@@ -27,14 +33,21 @@ vocabulary to avoid it on their own.
 
 ```mermaid
 flowchart LR
-    A[Agent A] -->|lease / msg| P(pact)
-    B[Agent B] -->|lease / msg| P
-    P --> F[".pact/ (leases, event log)"]
-    P --> G["AGENTS.md (protocol)"]
-    P --> D["Beads CLI (bd or br)"]
+    A[Agent A] -->|"lease · msg · watch"| P(pact)
+    B[Agent B] -->|"lease · msg · watch"| P
+    P --> G["AGENTS.md<br/>the protocol agents read"]
+    P --> F[".pact/<br/>leases · watches · event log"]
+    P --> D["Beads CLI<br/>bd or br"]
+    D --> M[["messages, as issues"]]
+    P -.->|"on lease release,<br/>the diff goes to watchers"| D
 ```
 
-## Why these three primitives
+Everything pact owns is a file in the repository, and the one thing it does not
+own — messages — it hands to a tool that already exists. The dotted edge is the
+only automatic step: releasing a lease delivers what you changed to whoever
+subscribed to that path.
+
+## Why these four primitives
 
 ### Onboarding, because a protocol nobody reads is not a protocol
 
@@ -87,6 +100,29 @@ the retry lands on the message it is repeating instead of minting a second one �
 advice that manufactures duplicates is worse than no advice.
 
 → [docs/messaging.md](docs/messaging.md)
+
+### Watching, because asking agents to remember is not a mechanism
+
+The protocol has always asked agents to announce an interface change by hand.
+That request was tuned twice, in opposite directions, and overshot both times.
+Unrestrained, one fleet run produced 85 messages of which 41 were status pings,
+and a real `BLOCKER` sat unread for 38 minutes inside the noise. Restrained —
+"the lease note is the announcement; message only when you need something back"
+— the next three runs sent four messages between 28 agents, and the collapse
+took the load-bearing ones with it. One of those four is the only reason a
+runtime panic did not ship.
+
+The lesson is not that agents are lazy. It is that a voluntary step off the
+critical path is bimodal under prose: spam or silence, with no reachable middle.
+So `pact watch` asks for nothing at announce time. You subscribe to a path once,
+and the diff is delivered as a side effect of `pact lease release` — a command
+those same runs performed 31 times out of 31. Adherence stops being aspirational
+and becomes structural.
+
+There is no daemon and nothing that waits: a subscription is a registry entry,
+and release does the lookup and the sending before it exits.
+
+→ [docs/watch.md](docs/watch.md)
 
 ## What pact deliberately is not
 

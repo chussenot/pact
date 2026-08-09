@@ -1,3 +1,9 @@
+---
+title: pact ui
+description: Tabs, keybindings, mouse behaviour, and the `ui` build feature.
+audience: operators
+---
+
 # pact ui
 
 `pact ui` is an interactive terminal dashboard over everything else in this
