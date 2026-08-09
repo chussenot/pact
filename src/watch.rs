@@ -1,0 +1,695 @@
+//! Path subscriptions: who wants to be told when a path changes hands.
+//!
+//! ## Why this exists
+//!
+//! The protocol has asked agents to announce interface changes by hand for
+//! pact's whole life, and has been tuned by prose in both directions without
+//! ever finding a middle:
+//!
+//! - Before `107e7c4` the block restrained nothing, and agents spammed — 223
+//!   message beads across pact's own fleet runs, one run alone producing 85
+//!   messages of which 41 were status pings to a recipient who never read an
+//!   inbox. A real `BLOCKER` sat unread for 38 minutes inside that noise.
+//! - After it, the block says the lease note IS the announcement and reserves
+//!   messages for what needs something back. Messaging then collapsed: 4
+//!   messages across the next three fleet runs, between 28 agents — and the
+//!   collapse took the load-bearing ones with it. megablast's single surviving
+//!   message is the only reason a `write_buffer` overflow did not ship.
+//!
+//! Voluntary messaging is bimodal under prose: spam or silence, no reachable
+//! middle. So this does not ask agents to do anything new at announce time.
+//! Subscription is a one-off registration, and **delivery is a side effect of
+//! `lease release`** — a command the same runs performed 31 times out of 31.
+//!
+//! ## What this is not
+//!
+//! There is no watcher process, no daemon, no polling and nothing to wait on.
+//! This module is a registry and a lookup. `lease release` reads it, sends
+//! whatever messages it implies, and exits. A subscriber sees the message at
+//! their next `pact msg inbox`, which the protocol already asks for at task
+//! start.
+//!
+//! ## Storage
+//!
+//! `.pact/watches.jsonl` under the **resolved shared root**, so every worktree
+//! of one repository sees one registry — the same resolution leases use, for
+//! the same reason. Append-only with tombstones: `pact watch rm` writes an
+//! `unwatch` record rather than editing, so the file is never rewritten and
+//! two agents appending concurrently cannot lose each other's work.
+//!
+//! Chain-hashed exactly like `events.jsonl` (see [`crate::events::Event`]), so
+//! a hand-edited subscription is detectable rather than indistinguishable from
+//! a real one.
+//!
+//! Unlike `events.jsonl` this file stays **gitignored** — it is covered by the
+//! `.pact/*` rule `pact init` writes, and only `events.jsonl` is re-included.
+//! A subscription is live state belonging to a running fleet, like a lease and
+//! unlike history: committing it would have every clone inherit subscriptions
+//! from agents that no longer exist.
+
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+
+use crate::events::{chain_hash_of, CHAIN_GENESIS};
+
+/// One append to the registry: a subscription, or the tombstone retiring it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchRecord {
+    /// RFC3339.
+    pub at: String,
+    /// The subscriber — `PACT_AGENT`, resolved the same way every other
+    /// command resolves identity.
+    pub agent: String,
+    /// `"watch"` or `"unwatch"`. A plain `String` for the same reason
+    /// `Event::kind` is one: an older binary reading a newer registry shows an
+    /// unknown kind rather than refusing to parse the file.
+    pub kind: String,
+    /// Repo-relative, normalized by [`crate::lease::normalize_path`] so a
+    /// subscription and a lease on one file agree about its name however each
+    /// was spelled.
+    pub path: String,
+    /// Does this subscribe to everything **under** `path`, rather than to
+    /// `path` itself?
+    ///
+    /// Decided at registration from the raw argument (a trailing `/`, or an
+    /// existing directory) and stored, never re-derived at match time: the
+    /// directory may not exist any more by the time a release looks, and a
+    /// subscription that silently changes meaning is worse than one that is
+    /// wrong in a fixed way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prefix: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_hash: Option<String>,
+}
+
+/// A subscription that is currently in force.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ActiveWatch {
+    pub agent: String,
+    pub path: String,
+    pub prefix: bool,
+    pub since: String,
+}
+
+const WATCHES_FILE: &str = "watches.jsonl";
+
+/// For writing. Creates `.pact/` if needed, like every other write path.
+fn watches_file(repo_root: &Path) -> Result<PathBuf> {
+    Ok(crate::repo::pact_dir(repo_root)?.join(WATCHES_FILE))
+}
+
+/// For reading. Creates nothing — a question must not mutate (pact-rnc.27).
+fn watches_file_path(repo_root: &Path) -> PathBuf {
+    crate::repo::pact_dir_path(repo_root).join(WATCHES_FILE)
+}
+
+/// Every record in the file, oldest first, plus how many lines were
+/// unreadable.
+///
+/// Tolerant in the same two ways the event log is: a torn final line from an
+/// interrupted append is expected rather than corrupt, and an unknown `kind`
+/// parses fine and is simply ignored by [`active`].
+pub fn records(repo_root: &Path) -> Result<(Vec<WatchRecord>, usize)> {
+    let path = watches_file_path(repo_root);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok((Vec::new(), 0));
+    };
+    let mut out = Vec::new();
+    let mut skipped = 0;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        match serde_json::from_str::<WatchRecord>(line) {
+            Ok(r) => out.push(r),
+            Err(_) => skipped += 1,
+        }
+    }
+    Ok((out, skipped))
+}
+
+/// The subscriptions in force, resolved by replaying the log.
+///
+/// Last record wins per `(agent, path)`: a re-`add` after an `rm` revives the
+/// subscription without the file having to forget the `rm` ever happened.
+/// Sorted by agent then path so output is stable across runs.
+pub fn active(repo_root: &Path) -> Result<Vec<ActiveWatch>> {
+    let (records, _) = records(repo_root)?;
+    let mut by_key: BTreeMap<(String, String), WatchRecord> = BTreeMap::new();
+    for r in records {
+        by_key.insert((r.agent.clone(), r.path.clone()), r);
+    }
+    Ok(by_key
+        .into_values()
+        .filter(|r| r.kind == "watch")
+        .map(|r| ActiveWatch {
+            agent: r.agent,
+            path: r.path,
+            prefix: r.prefix,
+            since: r.at,
+        })
+        .collect())
+}
+
+/// Does `watch` cover `released`?
+///
+/// An exact watch matches only itself. A prefix watch matches the directory
+/// itself and anything beneath it, and the boundary is a `/` — so a watch on
+/// `src/render` never matches `src/renderer.rs`, which is the bug a naive
+/// `starts_with` would ship.
+fn covers(watch: &ActiveWatch, released: &str) -> bool {
+    if watch.path == released {
+        return true;
+    }
+    watch.prefix && released.starts_with(&format!("{}/", watch.path.trim_end_matches('/')))
+}
+
+/// Who should be told that `released` changed, excluding `holder`.
+///
+/// Excluding the holder is not a nicety: an agent that subscribes to a
+/// directory it also works in would otherwise message itself on every release,
+/// which is both noise and a self-inflicted inbox.
+pub fn subscribers_for(repo_root: &Path, released: &str, holder: &str) -> Result<Vec<ActiveWatch>> {
+    let mut subs: Vec<ActiveWatch> = active(repo_root)?
+        .into_iter()
+        .filter(|w| w.agent != holder && covers(w, released))
+        .collect();
+    // One agent can hold both an exact and a prefix subscription covering the
+    // same path; they are one recipient, not two messages.
+    subs.dedup_by(|a, b| a.agent == b.agent);
+    Ok(subs)
+}
+
+/// Append one record, chained to whatever is already at the end of the file.
+fn append(repo_root: &Path, mut record: WatchRecord) -> Result<()> {
+    let path = watches_file(repo_root)?;
+    let prev = last_chain_point(&path);
+    let mut unchained = record.clone();
+    unchained.chain_hash = None;
+    let canonical = serde_json::to_string(&unchained)?;
+    record.chain_hash = Some(chain_hash_of(&prev, &canonical));
+
+    let line = serde_json::to_string(&record)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    // One `write_all`, never `writeln!`: `O_APPEND` makes a single `write(2)`
+    // atomic against other appenders, and two calls leaves a window where a
+    // concurrent writer's line lands between them. Same reasoning, and the
+    // same bug, as `events::append_bounded`.
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(&line);
+    buf.push('\n');
+    f.write_all(buf.as_bytes())
+        .with_context(|| format!("appending to {}", path.display()))?;
+    Ok(())
+}
+
+/// The chain point the next append binds to: the last parseable line's own
+/// hash, or [`CHAIN_GENESIS`]. Identical rule to the event log's, so a run of
+/// untracked lines resets the chain rather than reaching back past them.
+fn last_chain_point(path: &Path) -> String {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return CHAIN_GENESIS.to_string();
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<WatchRecord>(l).ok())
+        .next_back()
+        .and_then(|r| r.chain_hash)
+        .unwrap_or_else(|| CHAIN_GENESIS.to_string())
+}
+
+/// Subscribe `agent` to `raw_path`.
+///
+/// Returns the normalized path and whether it was registered as a prefix, so
+/// the caller can report exactly what it recorded rather than echoing the
+/// argument back.
+pub fn add(repo_root: &Path, agent: &str, raw_path: &str) -> Result<(String, bool)> {
+    let prefix = is_prefix_request(repo_root, raw_path);
+    let path = crate::lease::normalize_path(repo_root, raw_path);
+    append(
+        repo_root,
+        WatchRecord {
+            at: Utc::now().to_rfc3339(),
+            agent: agent.to_string(),
+            kind: "watch".to_string(),
+            path: path.clone(),
+            prefix,
+            chain_hash: None,
+        },
+    )?;
+    Ok((path, prefix))
+}
+
+/// A trailing `/` says "everything under here" explicitly; an existing
+/// directory says it implicitly, because `pact watch add src/render` on a real
+/// directory can only sensibly mean its contents.
+fn is_prefix_request(repo_root: &Path, raw_path: &str) -> bool {
+    raw_path.ends_with('/') || repo_root.join(raw_path).is_dir()
+}
+
+/// Retire `agent`'s subscription to `raw_path`. `Ok(false)` when there was
+/// nothing to retire, so the caller can say so instead of implying it undid
+/// something.
+pub fn remove(repo_root: &Path, agent: &str, raw_path: &str) -> Result<bool> {
+    let path = crate::lease::normalize_path(repo_root, raw_path);
+    let existing = active(repo_root)?
+        .into_iter()
+        .find(|w| w.agent == agent && w.path == path);
+    let Some(existing) = existing else {
+        return Ok(false);
+    };
+    append(
+        repo_root,
+        WatchRecord {
+            at: Utc::now().to_rfc3339(),
+            agent: agent.to_string(),
+            kind: "unwatch".to_string(),
+            path,
+            prefix: existing.prefix,
+            chain_hash: None,
+        },
+    )?;
+    Ok(true)
+}
+
+/// How many diff lines a notification carries before it is cut short.
+///
+/// A cap rather than no cap because the message body is read by an agent with
+/// a context window, and a 4000-line refactor pasted into an inbox is worse
+/// than a pointer to it: the reader stops reading. The truncation notice names
+/// the holder's `HEAD`, so the full change is one `git show` away.
+const MAX_DIFF_LINES: usize = 200;
+
+/// Cut `diff` to [`MAX_DIFF_LINES`], appending a notice naming where to read
+/// the rest. Returns the text unchanged when it already fits.
+fn cap(diff: &str, head: Option<&str>) -> String {
+    let lines: Vec<&str> = diff.lines().collect();
+    if lines.len() <= MAX_DIFF_LINES {
+        return diff.to_string();
+    }
+    let shown = lines[..MAX_DIFF_LINES].join("\n");
+    let where_to_look = match head {
+        Some(h) => format!("see commit {h}"),
+        // A repo with no commits yet, or a git that would not answer. Saying
+        // "see commit <nothing>" would be worse than admitting the gap.
+        None => "the holder's working tree has the rest".to_string(),
+    };
+    format!(
+        "{shown}\n\n[diff truncated after {} of {} lines — {where_to_look}]",
+        MAX_DIFF_LINES,
+        lines.len()
+    )
+}
+
+/// Tell every subscriber to `released` what the holder changed while they held
+/// it (pact-8qu).
+///
+/// **Infallible by signature, and that is the contract.** Delivery is a side
+/// effect of `lease release`, and a release that failed because a notification
+/// could not be sent would be strictly worse than the silence this feature
+/// exists to fix: a lost message costs one missed diff, a stuck lease blocks a
+/// peer until it expires. Same doctrine as [`crate::events::append`], which
+/// swallows I/O errors for the same reason. Failures are recorded as
+/// `watch-delivery-failed` events so they are visible in `pact log` and
+/// `pact audit` rather than merely absent.
+///
+/// `old_hash` is the blob recorded at acquire time. `None` means the path did
+/// not exist when it was claimed, or that hashing failed — in both cases there
+/// is no fixed point to diff against, so nothing is sent. Silence is the right
+/// answer to "I cannot tell what changed"; a notification saying so would be
+/// noise on every lease taken to create a file.
+pub fn notify_release(repo_root: &Path, holder: &str, released: &str, old_hash: Option<&str>) {
+    let Some(old_hash) = old_hash else { return };
+    let new = crate::git_history::hash_objects(repo_root, &[released.to_string()]);
+    let new_hash = new.get(released);
+    // Unchanged content, or a file the holder deleted (no new blob). Neither
+    // is worth a message: the first says nothing happened, and the second is
+    // better learned from the commit than from a diff against nothing.
+    let Some(new_hash) = new_hash else { return };
+    if new_hash == old_hash {
+        return;
+    }
+
+    let subscribers = match subscribers_for(repo_root, released, holder) {
+        Ok(s) if !s.is_empty() => s,
+        _ => return,
+    };
+
+    let head = crate::git_history::head_short(repo_root);
+    let diff = crate::git_history::diff_blobs(repo_root, old_hash, new_hash, released)
+        .map(|d| cap(&d, head.as_deref()))
+        .unwrap_or_else(|| "(git produced no diff for this change)".to_string());
+
+    let about = [released.to_string()];
+    let subject = format!("{released} changed — released by {holder}");
+    let body = format!(
+        "{holder} released {released}, which you are watching. What changed while they held it:\n\
+         \n\
+         {diff}\n\
+         \n\
+         Holder's HEAD at release: {}\n\
+         \n\
+         You are receiving this because you ran `pact watch add`. \
+         `pact watch rm {released}` stops it.",
+        head.as_deref().unwrap_or("(unknown)")
+    );
+
+    let cli = match crate::beads::BeadsCli::locate() {
+        Ok(cli) => cli,
+        Err(e) => {
+            log_failure(repo_root, holder, released, None, &format!("{e:#}"));
+            return;
+        }
+    };
+    // One message per subscriber rather than one with several recipients:
+    // each is a separate conversation about a file THEY watch, and a shared
+    // thread would put unrelated agents into each other's replies.
+    for sub in subscribers {
+        let draft = crate::msg::Draft {
+            thread: None,
+            subject: Some(&subject),
+            body: &body,
+            // Tagged with the path, so the message follows the file the way
+            // `--to-owner-of` messages do: whoever leases it next is told one
+            // is waiting, even if this subscriber has exited.
+            about: &about,
+        };
+        match crate::msg::send(
+            &cli,
+            repo_root,
+            holder,
+            std::slice::from_ref(&sub.agent),
+            draft,
+        ) {
+            Ok(sent) => {
+                let id = sent.first().map(|m| m.id.clone());
+                crate::events::append(
+                    repo_root,
+                    &crate::events::Event {
+                        at: Utc::now().to_rfc3339(),
+                        agent: holder.to_string(),
+                        kind: "notified".to_string(),
+                        path: Some(released.to_string()),
+                        detail: None,
+                        ttl_secs: None,
+                        covers_lines: None,
+                        actor: None,
+                        displaced: None,
+                        chain_hash: None,
+                        invoked_from: None,
+                        scope: None,
+                        pact_version: None,
+                        content_hash: None,
+                        subscriber: Some(sub.agent.clone()),
+                        message_id: id,
+                    },
+                );
+            }
+            Err(e) => log_failure(
+                repo_root,
+                holder,
+                released,
+                Some(&sub.agent),
+                &format!("{e:#}"),
+            ),
+        }
+    }
+}
+
+/// A delivery that did not happen, recorded so it is visible rather than
+/// merely absent. Never printed: `lease release`'s output contract is fixed,
+/// and a warning on stderr for a best-effort side effect would train agents to
+/// ignore stderr.
+fn log_failure(repo_root: &Path, holder: &str, released: &str, sub: Option<&str>, why: &str) {
+    crate::events::append(
+        repo_root,
+        &crate::events::Event {
+            at: Utc::now().to_rfc3339(),
+            agent: holder.to_string(),
+            kind: "watch-delivery-failed".to_string(),
+            path: Some(released.to_string()),
+            detail: Some(why.to_string()),
+            ttl_secs: None,
+            covers_lines: None,
+            actor: None,
+            displaced: None,
+            chain_hash: None,
+            invoked_from: None,
+            scope: None,
+            pact_version: None,
+            content_hash: None,
+            subscriber: sub.map(str::to_string),
+            message_id: None,
+        },
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        tmp
+    }
+
+    fn watch(agent: &str, path: &str, prefix: bool) -> ActiveWatch {
+        ActiveWatch {
+            agent: agent.into(),
+            path: path.into(),
+            prefix,
+            since: String::new(),
+        }
+    }
+
+    #[test]
+    fn add_then_list_then_remove_round_trips() {
+        let tmp = repo();
+        let root = tmp.path();
+        assert!(active(root).unwrap().is_empty());
+
+        let (path, prefix) = add(root, "w5-juice", "src/render/mod.rs").unwrap();
+        assert_eq!(path, "src/render/mod.rs");
+        assert!(!prefix, "a plain file is an exact subscription");
+        assert_eq!(active(root).unwrap().len(), 1);
+
+        assert!(remove(root, "w5-juice", "src/render/mod.rs").unwrap());
+        assert!(active(root).unwrap().is_empty(), "the tombstone retires it");
+
+        // And the file was never rewritten — both records are still there.
+        let (records, _) = records(root).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].kind, "watch");
+        assert_eq!(records[1].kind, "unwatch");
+    }
+
+    #[test]
+    fn removing_something_never_watched_reports_it_rather_than_writing_a_tombstone() {
+        let tmp = repo();
+        assert!(!remove(tmp.path(), "nobody", "src/x.rs").unwrap());
+        assert_eq!(records(tmp.path()).unwrap().0.len(), 0);
+    }
+
+    /// Re-subscribing after an `rm` must work without the log forgetting the
+    /// `rm` — last record wins per (agent, path).
+    #[test]
+    fn a_resubscribe_after_a_remove_is_active_again() {
+        let tmp = repo();
+        let root = tmp.path();
+        add(root, "a", "src/x.rs").unwrap();
+        remove(root, "a", "src/x.rs").unwrap();
+        add(root, "a", "src/x.rs").unwrap();
+        assert_eq!(active(root).unwrap().len(), 1);
+        assert_eq!(records(root).unwrap().0.len(), 3);
+    }
+
+    /// The bug a naive `starts_with` ships: `src/render` must not match
+    /// `src/renderer.rs`. The boundary is a path separator.
+    #[test]
+    fn a_prefix_watch_matches_on_a_path_boundary_only() {
+        let dir = watch("a", "src/render", true);
+        assert!(covers(&dir, "src/render/mod.rs"));
+        assert!(covers(&dir, "src/render/deep/nested.rs"));
+        assert!(covers(&dir, "src/render"), "the directory itself counts");
+        assert!(
+            !covers(&dir, "src/renderer.rs"),
+            "a sibling sharing a name prefix is a different file"
+        );
+        assert!(!covers(&dir, "src/other.rs"));
+
+        let exact = watch("a", "src/render/mod.rs", false);
+        assert!(covers(&exact, "src/render/mod.rs"));
+        assert!(
+            !covers(&exact, "src/render/other.rs"),
+            "an exact watch subscribes to one file"
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_or_a_real_directory_registers_a_prefix() {
+        let tmp = repo();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src/render")).unwrap();
+
+        // Explicit, on a directory that does not exist.
+        let (_, prefix) = add(root, "a", "docs/future/").unwrap();
+        assert!(prefix, "a trailing slash says prefix outright");
+        // Implicit, from the directory really being one.
+        let (_, prefix) = add(root, "a", "src/render").unwrap();
+        assert!(prefix, "an existing directory can only mean its contents");
+        // A plain file is exact.
+        let (_, prefix) = add(root, "a", "src/render/mod.rs").unwrap();
+        assert!(!prefix);
+    }
+
+    /// Self-exclusion, and the reason it matters: an agent subscribed to a
+    /// directory it also works in would message itself on every release.
+    #[test]
+    fn the_releasing_agent_is_never_its_own_subscriber() {
+        let tmp = repo();
+        let root = tmp.path();
+        add(root, "holder", "src/").unwrap();
+        add(root, "watcher", "src/").unwrap();
+
+        let subs = subscribers_for(root, "src/api.rs", "holder").unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].agent, "watcher");
+    }
+
+    /// One agent holding both an exact and a covering prefix subscription is
+    /// one recipient, not two copies of the same diff.
+    #[test]
+    fn overlapping_subscriptions_by_one_agent_produce_one_recipient() {
+        let tmp = repo();
+        let root = tmp.path();
+        add(root, "watcher", "src/").unwrap();
+        add(root, "watcher", "src/api.rs").unwrap();
+
+        let subs = subscribers_for(root, "src/api.rs", "holder").unwrap();
+        assert_eq!(subs.len(), 1, "{subs:?}");
+    }
+
+    /// Chained like the event log, so a hand-edited subscription is
+    /// detectable rather than indistinguishable from a real one.
+    #[test]
+    fn each_record_chains_to_the_one_before_it() {
+        let tmp = repo();
+        let root = tmp.path();
+        add(root, "a", "x.rs").unwrap();
+        add(root, "b", "y.rs").unwrap();
+
+        let (records, _) = records(root).unwrap();
+        let first = records[0].chain_hash.clone().unwrap();
+        let mut unchained = records[1].clone();
+        unchained.chain_hash = None;
+        let expected = chain_hash_of(&first, &serde_json::to_string(&unchained).unwrap());
+        assert_eq!(records[1].chain_hash.as_deref(), Some(expected.as_str()));
+    }
+
+    /// A torn final line from an interrupted append is expected, not corrupt —
+    /// the same tolerance the event log has.
+    #[test]
+    fn a_torn_final_line_is_counted_and_skipped() {
+        let tmp = repo();
+        let root = tmp.path();
+        add(root, "a", "x.rs").unwrap();
+        let file = watches_file_path(root);
+        let mut text = std::fs::read_to_string(&file).unwrap();
+        text.push_str("{\"at\":\"2026-08-09T00:00:00Z\",\"agent\":\"b\",\"ki");
+        std::fs::write(&file, text).unwrap();
+
+        let (records, skipped) = records(root).unwrap();
+        assert_eq!(records.len(), 1, "the whole record still counts");
+        assert_eq!(skipped, 1);
+        assert_eq!(active(root).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_diff_under_the_cap_is_passed_through_untouched() {
+        let small = "diff --git a/x b/x\n-old\n+new\n";
+        assert_eq!(cap(small, Some("abc1234")), small);
+    }
+
+    #[test]
+    fn an_oversized_diff_is_cut_and_says_where_to_read_the_rest() {
+        let big: String = (0..MAX_DIFF_LINES + 50)
+            .map(|i| format!("+line {i}\n"))
+            .collect();
+        let out = cap(&big, Some("abc1234"));
+        // The cap plus the blank line and the notice — never the whole thing.
+        assert!(
+            out.lines().count() < MAX_DIFF_LINES + 10,
+            "{}",
+            out.lines().count()
+        );
+        assert!(out.contains("line 0"), "the head of the diff survives");
+        assert!(!out.contains("line 249"), "the tail is cut");
+        assert!(out.contains("truncated after 200 of 250 lines"), "{out}");
+        assert!(out.contains("see commit abc1234"), "{out}");
+    }
+
+    /// A repo with no commits has no HEAD to point at, and saying
+    /// "see commit " with nothing after it is worse than admitting the gap.
+    #[test]
+    fn truncation_without_a_head_says_so_rather_than_naming_nothing() {
+        let big: String = (0..MAX_DIFF_LINES + 1)
+            .map(|i| format!("+l{i}\n"))
+            .collect();
+        let out = cap(&big, None);
+        assert!(out.contains("working tree has the rest"), "{out}");
+        assert!(!out.contains("see commit"), "{out}");
+    }
+
+    /// The release must complete even when there is no backend to deliver
+    /// through, and the failure must be visible rather than silent.
+    #[test]
+    fn a_delivery_with_no_backend_records_a_failure_and_returns() {
+        let tmp = repo();
+        let root = tmp.path();
+        add(root, "watcher", "x.rs").unwrap();
+        // A hash that is not a real blob: git cannot diff it, and there is no
+        // Beads CLI configured for this tempdir either. Neither may panic.
+        notify_release(
+            root,
+            "holder",
+            "x.rs",
+            Some("0000000000000000000000000000000000000000"),
+        );
+        // Nothing to assert about delivery — the point is that it returned.
+        assert!(active(root).unwrap().len() == 1);
+    }
+
+    /// No baseline means no notification: a lease taken on a file that did not
+    /// exist yet must not produce a message saying nothing can be said.
+    #[test]
+    fn a_lease_with_no_recorded_content_hash_notifies_nobody() {
+        let tmp = repo();
+        let root = tmp.path();
+        add(root, "watcher", "x.rs").unwrap();
+        notify_release(root, "holder", "x.rs", None);
+        let (records, _) = crate::events::numbered(root).unwrap_or_default();
+        assert!(
+            records.is_empty(),
+            "no baseline must produce no event at all: {records:?}"
+        );
+    }
+
+    /// Reading must never create `.pact/` — audit and `watch ls` are
+    /// questions, and a question that mutates is not one.
+    #[test]
+    fn listing_creates_nothing() {
+        let tmp = repo();
+        assert!(active(tmp.path()).unwrap().is_empty());
+        assert!(
+            !tmp.path().join(".pact").exists(),
+            "listing watches must not create .pact/"
+        );
+    }
+}

@@ -172,6 +172,7 @@ what the tooling did to it, and require a quoted command as evidence.
 | [mcp.md](docs/mcp.md) | the optional read-only MCP server: the six tools, and why it cannot write |
 | [tui.md](docs/tui.md) | `pact ui` — tabs, keybindings, and the `ui` build feature |
 | [telemetry.md](docs/telemetry.md) | the optional OpenTelemetry export: what leaves the machine and what never does |
+| [watch.md](docs/watch.md) | `pact watch`: subscribing to paths, and why interface notification rides `lease release` instead of asking |
 | [audit.md](docs/audit.md) | `pact audit`: what each check proves, and what it deliberately cannot see |
 | [fleet-patterns.md](docs/fleet-patterns.md) | the one fleet topology that has been measured twice, and what the numbers said — including where they contradicted the assumption |
 | [testing.md](docs/testing.md) | the fleet soak: scripted workers at concurrency, and what it cannot prove |

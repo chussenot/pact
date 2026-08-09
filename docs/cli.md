@@ -25,6 +25,9 @@ pact msg send (--to <agent>... | --to-owner-of <path>...) [--thread <id>] [--sub
 pact msg inbox [--unread-only] [--full]
 pact msg sent
 pact msg read <id>
+pact watch add <path>
+pact watch rm <path>
+pact watch ls
 pact log [-n | --limit <count>]
 pact doctor
 pact audit [--check <double-win|stale-holds|chain-integrity|commit-correlation>] [--since <rfc3339|duration>] [--include-annotated] [--export <path>]

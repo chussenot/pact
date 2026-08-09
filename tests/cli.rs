@@ -4759,3 +4759,176 @@ fn export_reports_no_messages_in_a_lease_only_repo() {
         report["observations"]
     );
 }
+
+/// pact-8qu: a `watched`/`notified`/`refused` event is on a path but says
+/// nothing about who HELD it. Before `events::is_custody`, ownership questions
+/// took the last event on a path whatever it said — so a refusal made the
+/// agent who was DENIED the lease look like the owner, and
+/// `msg send --to-owner-of` addressed the wrong agent. Subscriptions would
+/// have widened the same bug.
+#[test]
+fn a_subscription_or_a_refusal_never_makes_an_agent_look_like_the_owner() {
+    let tmp = init_repo();
+    let repo = tmp.path();
+
+    assert_ok(&pact(repo, "holder", &["lease", "acquire", "src/api.rs"]));
+    // A watcher, and an agent refused the lease — both write events carrying
+    // this path, both AFTER the holder's acquire.
+    assert_ok(&pact(repo, "watcher", &["watch", "add", "src/api.rs"]));
+    let denied = pact(repo, "loser", &["lease", "acquire", "src/api.rs"]);
+    assert_eq!(denied.status.code(), Some(2), "{}", stderr_of(&denied));
+
+    let out = pact(repo, "asker", &["agents", "--for", "src/api.rs", "--json"]);
+    assert_ok(&out);
+    let owner = json_stdout(&out);
+    assert_eq!(
+        owner["agent"], "holder",
+        "the holder owns it — not the watcher, not the refused agent: {owner}"
+    );
+}
+
+/// The whole feature, end to end, through the real binary and a real Beads
+/// backend: subscribe, someone else takes the path and changes it, release
+/// delivers the diff, and the subscriber reads it.
+#[test]
+fn a_release_delivers_the_diff_to_a_subscriber_who_can_then_read_it() {
+    let Some(tmp) = bd_repo("watch_end_to_end") else {
+        return;
+    };
+    let repo = tmp.path();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/render.rs"), "pub const MAX: usize = 220;\n").unwrap();
+    for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "initial"]] {
+        assert!(Command::new("git")
+            .args(&args)
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+    }
+    assert_ok(&pact(repo, "setup", &["init", "--no-commit"]));
+
+    // A prefix subscription, so this also covers directory matching e2e.
+    assert_ok(&pact(repo, "w5-juice", &["watch", "add", "src/"]));
+
+    assert_ok(&pact(
+        repo,
+        "w5-parallax",
+        &["lease", "acquire", "src/render.rs"],
+    ));
+    std::fs::write(repo.join("src/render.rs"), "pub const MAX: usize = 348;\n").unwrap();
+    let released = pact(repo, "w5-parallax", &["lease", "release", "src/render.rs"]);
+    assert_ok(&released);
+    // The output contract is untouched by delivery riding along.
+    assert!(
+        stdout_of(&released).contains("released lease on src/render.rs"),
+        "{}",
+        stdout_of(&released)
+    );
+
+    let inbox = pact(repo, "w5-juice", &["msg", "inbox", "--json"]);
+    assert_ok(&inbox);
+    let messages = json_stdout(&inbox);
+    let m = messages
+        .as_array()
+        .and_then(|a| a.first())
+        .unwrap_or_else(|| panic!("subscriber got nothing: {messages}"));
+    assert_eq!(m["from"], "w5-parallax");
+    let id = m["id"].as_str().unwrap().to_string();
+
+    let read = pact(repo, "w5-juice", &["msg", "read", &id]);
+    assert_ok(&read);
+    let body = stdout_of(&read);
+    assert!(body.contains("src/render.rs"), "{body}");
+    // A real diff of the real change, labelled with the real filename rather
+    // than the blob ids `git diff <oid> <oid>` would otherwise print.
+    assert!(body.contains("-pub const MAX: usize = 220;"), "{body}");
+    assert!(body.contains("+pub const MAX: usize = 348;"), "{body}");
+    assert!(body.contains("--- a/src/render.rs"), "{body}");
+
+    // And the delivery is in the log, naming who it reached.
+    let log = pact(repo, "w5-juice", &["audit", "--json"]);
+    assert_ok(&log);
+    let summary = json_stdout(&log);
+    assert_eq!(summary["diffs_delivered"], 1, "{summary}");
+    assert_eq!(summary["deliveries_failed"], 0, "{summary}");
+    assert_eq!(summary["watches_active"], 1, "{summary}");
+}
+
+/// A release whose content did not change must not manufacture a message —
+/// otherwise every read-only lease spams every subscriber.
+#[test]
+fn releasing_an_unchanged_path_notifies_nobody() {
+    let Some(tmp) = bd_repo("watch_unchanged") else {
+        return;
+    };
+    let repo = tmp.path();
+    std::fs::write(repo.join("api.rs"), "unchanged\n").unwrap();
+    assert_ok(&pact(repo, "setup", &["init", "--no-commit"]));
+    assert_ok(&pact(repo, "watcher", &["watch", "add", "api.rs"]));
+
+    assert_ok(&pact(repo, "holder", &["lease", "acquire", "api.rs"]));
+    assert_ok(&pact(repo, "holder", &["lease", "release", "api.rs"]));
+
+    let inbox = pact(repo, "watcher", &["msg", "inbox", "--json"]);
+    assert_ok(&inbox);
+    assert_eq!(
+        json_stdout(&inbox).as_array().map(|a| a.len()),
+        Some(0),
+        "a read-only lease must deliver nothing: {}",
+        stdout_of(&inbox)
+    );
+}
+
+/// pact-8qu: `lease acquire` records the path's git blob id, and that stamp is
+/// what the release-time diff is computed against. It has to be the blob git
+/// itself would name, and it has to reach both the lock file (which `release`
+/// reads) and the event (which `audit` reads).
+#[test]
+fn acquire_stamps_the_paths_content_hash_on_the_lease_and_the_event() {
+    let Some(tmp) = git_repo("acquire_stamps_content_hash") else {
+        return;
+    };
+    let repo = tmp.path();
+    std::fs::write(repo.join("api.rs"), "pub const MAX: usize = 220;\n").unwrap();
+
+    let expected = String::from_utf8(
+        Command::new("git")
+            .args(["hash-object", "api.rs"])
+            .current_dir(repo)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let acquired = pact(repo, "holder", &["lease", "acquire", "api.rs", "--json"]);
+    assert_ok(&acquired);
+    assert_eq!(
+        json_stdout(&acquired)["lease"]["content_hash"],
+        expected,
+        "the lock file must carry the blob git itself names"
+    );
+
+    // And the event, which is what `pact audit` and a later reader see.
+    let feed = std::fs::read_to_string(repo.join(".pact/events.jsonl")).unwrap();
+    let event: serde_json::Value = serde_json::from_str(feed.lines().next().unwrap()).unwrap();
+    assert_eq!(event["kind"], "acquired");
+    assert_eq!(event["content_hash"], expected, "{event}");
+
+    // A path that does not exist yet records nothing rather than a fake hash:
+    // leasing a file you are about to create is a documented workflow.
+    let new_file = pact(
+        repo,
+        "holder",
+        &["lease", "acquire", "not-yet.rs", "--json"],
+    );
+    assert_ok(&new_file);
+    assert!(
+        json_stdout(&new_file)["lease"]["content_hash"].is_null(),
+        "{}",
+        stdout_of(&new_file)
+    );
+}

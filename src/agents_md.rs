@@ -107,6 +107,19 @@ this protocol whenever you touch shared files or hand off work to others.
 - **Confirm, don't re-send**: `pact msg sent` shows what you sent and whether
   the recipient has read it. If you are unsure a message went out, check
   there — a blind re-send is how a peer's inbox fills with duplicates.
+- **Subscribe to the interfaces you depend on but do not own.** At task start,
+  `pact watch add <path>` (a file, or a directory for everything under it) for
+  every file whose contract your work assumes. When its holder releases it,
+  pact sends you the diff of what they changed — automatically, as part of
+  their `lease release`. Nobody has to remember to tell you. This exists
+  because they demonstrably will not: across three fleet runs since the
+  protocol started reserving messages for what needs something back, 28 agents
+  sent 4 messages between them, and the one that mattered was the only reason a
+  runtime panic did not ship.
+- **Read your inbox at task start AND before your final commit.** The first
+  tells you what changed under you before you plan; the second catches the
+  interface change that landed while you were working, which is exactly when it
+  is cheapest to absorb and most expensive to miss.
 - **If you act on a message, mark it read.** `pact msg read <id>` is the only
   thing that tells the sender their warning landed; act on one without it and
   their `pact msg sent` says "undelivered" forever, which is indistinguishable

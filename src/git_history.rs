@@ -26,6 +26,7 @@
 //!   so a commit older than the clone's depth reads as "no commit", not as a
 //!   different kind of unknown.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -80,6 +81,123 @@ pub fn commits_since(repo_root: &Path, since: Option<DateTime<Utc>>) -> Result<V
     // about traversal order on a history with merges) to do it.
     commits.sort_by_key(|c| c.at);
     Ok(commits)
+}
+
+/// The git blob id of each path's **working-tree** content, for the paths that
+/// exist (pact-8qu).
+///
+/// `-w` writes the blob into the object database rather than only computing
+/// its id, and that is the load-bearing part: `pact watch` diffs at release
+/// against the content as it was at acquire, and the protocol now tells agents
+/// to commit before releasing — so by release time the working tree is usually
+/// clean and the at-acquire content exists nowhere else. An unreferenced loose
+/// blob is a few bytes that `git gc` prunes; losing the diff is permanent.
+///
+/// Best-effort by signature: a missing `git`, a bare repo, an unreadable file
+/// — every failure yields no entry for that path, and the caller treats a
+/// missing hash as "cannot diff this one" rather than as an error. A lease
+/// must never fail because a diff could not be prepared.
+///
+/// Paths that do not exist are simply absent from the result: a lease on a
+/// file you are about to create is a documented workflow, and `git
+/// hash-object` errors on the whole invocation if any argument is missing.
+pub fn hash_objects(repo_root: &Path, paths: &[String]) -> BTreeMap<String, String> {
+    let existing: Vec<&String> = paths
+        .iter()
+        .filter(|p| repo_root.join(p).is_file())
+        .collect();
+    if existing.is_empty() {
+        return BTreeMap::new();
+    }
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(repo_root)
+        .args(["hash-object", "-w", "--"]);
+    for p in &existing {
+        cmd.arg(p);
+    }
+    let Ok(out) = cmd.output() else {
+        return BTreeMap::new();
+    };
+    if !out.status.success() {
+        return BTreeMap::new();
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let hashes: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    // One hash per input, in order. A mismatch means git answered something
+    // this code does not understand, and pairing them up anyway would
+    // attribute one file's content to another — worse than no diff at all.
+    if hashes.len() != existing.len() {
+        return BTreeMap::new();
+    }
+    existing
+        .into_iter()
+        .zip(hashes)
+        .map(|(p, h)| (p.clone(), h.to_string()))
+        .collect()
+}
+
+/// A unified diff between two blobs, or `None` when git cannot produce one.
+///
+/// Blob-to-blob rather than against `HEAD` or the index, for the same reason
+/// [`hash_objects`] writes the object: the holder has usually committed by the
+/// time they release, so every working-tree-relative diff would be empty. The
+/// two blobs are fixed points that survive that.
+pub fn diff_blobs(repo_root: &Path, old: &str, new: &str, path: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["diff", "--no-color", old, new])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    (!text.trim().is_empty()).then(|| relabel(&text, old, new, path))
+}
+
+/// Put the real filename back into a blob-to-blob diff's headers.
+///
+/// `git diff <oid> <oid>` has no filename to report, so it prints the object
+/// ids: `--- a/22aa3231…`. Correct and unreadable. Only the three header lines
+/// are rewritten, and only where the id appears verbatim, so nothing inside
+/// the hunk bodies can be touched — a diff that happened to contain the id as
+/// content keeps it. The result reads like an ordinary diff of the file, which
+/// is what the subscriber needs (and is applicable with `git apply`).
+fn relabel(diff: &str, old: &str, new: &str, path: &str) -> String {
+    diff.lines()
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix("diff --git ") {
+                if rest == format!("a/{old} b/{new}") {
+                    return format!("diff --git a/{path} b/{path}");
+                }
+            }
+            if line == format!("--- a/{old}") {
+                return format!("--- a/{path}");
+            }
+            if line == format!("+++ b/{new}") {
+                return format!("+++ b/{path}");
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The short hash of `HEAD`, so a truncated diff can point at something the
+/// reader can go and look at in full.
+pub fn head_short(repo_root: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn parse_log(text: &str) -> Vec<Commit> {

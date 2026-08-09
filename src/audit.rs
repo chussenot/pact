@@ -307,6 +307,18 @@ pub struct Summary {
     /// worktree per agent produced events indistinguishable from a plain
     /// single-checkout run.
     pub by_invoked_from: BTreeMap<String, usize>,
+    /// Subscriptions in force right now (pact-8qu). Live state, not history —
+    /// read from `.pact/watches.jsonl` rather than reconstructed from the
+    /// event log, because a `watched` event says a subscription was created,
+    /// not that it still stands.
+    pub watches_active: usize,
+    /// `notified` events: diffs actually delivered to a subscriber.
+    pub diffs_delivered: usize,
+    /// `watch-delivery-failed` events. Reported next to `diffs_delivered`
+    /// rather than only when nonzero, because delivery is best-effort by
+    /// design and a reader needs to know whether "0 delivered" means nothing
+    /// changed or means nothing got through.
+    pub deliveries_failed: usize,
     /// Set only when this repository **currently has linked worktrees** and
     /// not one event was invoked from any of them.
     ///
@@ -771,6 +783,11 @@ pub fn summary(
             .unwrap_or_else(|| "unknown".to_string());
         *by_invoked_from.entry(key).or_insert(0) += 1;
     }
+    let watches_active = crate::watch::active(repo_root)
+        .map(|w| w.len())
+        .unwrap_or(0);
+    let diffs_delivered = by_kind.get("notified").copied().unwrap_or(0);
+    let deliveries_failed = by_kind.get("watch-delivery-failed").copied().unwrap_or(0);
     let ctx = crate::repo::RepoContext::resolve(repo_root);
     let from_a_worktree = by_invoked_from
         .keys()
@@ -803,6 +820,9 @@ pub fn summary(
         top_contended,
         per_agent,
         by_invoked_from,
+        watches_active,
+        diffs_delivered,
+        deliveries_failed,
         topology_note,
     })
 }
@@ -1275,6 +1295,18 @@ pub fn render_summary(s: &Summary) -> String {
             parts.push(format!("{n} predating context stamping"));
         }
         out.push(format!("  run in {}", parts.join(", ")));
+    }
+    if s.watches_active > 0 || s.diffs_delivered > 0 || s.deliveries_failed > 0 {
+        out.push(format!(
+            "  watch  {} active; {} diff(s) delivered{}",
+            s.watches_active,
+            s.diffs_delivered,
+            if s.deliveries_failed > 0 {
+                format!(", {} delivery FAILED", s.deliveries_failed)
+            } else {
+                String::new()
+            }
+        ));
     }
     if let Some(note) = &s.topology_note {
         out.push(format!("  note   {note}"));
@@ -1762,6 +1794,46 @@ mod tests {
                 .findings(),
             0,
             "a refused acquire must never itself read as a double-win"
+        );
+    }
+
+    /// pact-8qu: every watch kind must be neutral in `reconstruct`, the same
+    /// shape `refused`/`renewed`/`restored` already are — a fleet that
+    /// subscribes heavily must not have its hold-duration or double-win math
+    /// moved by subscriptions or deliveries.
+    #[test]
+    fn watch_kinds_neither_open_nor_close_a_hold_window() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "watcher", "watched", "src/a.rs"),
+            &ev("2026-08-01T10:00:10Z", "holder", "acquired", "src/a.rs"),
+            &ev("2026-08-01T10:00:20Z", "holder", "notified", "src/a.rs"),
+            &ev(
+                "2026-08-01T10:00:30Z",
+                "holder",
+                "watch-delivery-failed",
+                "src/a.rs",
+            ),
+            &ev("2026-08-01T10:00:40Z", "holder", "released", "src/a.rs"),
+            &ev("2026-08-01T10:00:50Z", "watcher", "unwatched", "src/a.rs"),
+        ]);
+        let s = summary(tmp.path(), None, false).unwrap();
+        // One window, 30s, unmoved by the four watch rows around it.
+        let h = s.hold_secs.as_ref().expect("one completed hold");
+        assert_eq!(h.completed, 1);
+        assert_eq!(h.max_secs, 30);
+        assert_eq!(
+            run_check(tmp.path(), Check::DoubleWin, None, false)
+                .unwrap()
+                .findings(),
+            0,
+            "a subscription must never read as a second holder"
+        );
+        assert_eq!(s.diffs_delivered, 1);
+        assert_eq!(s.deliveries_failed, 1);
+        assert!(
+            render_summary(&s).contains("diff(s) delivered"),
+            "{}",
+            render_summary(&s)
         );
     }
 
@@ -2289,6 +2361,9 @@ mod tests {
             invoked_from: None,
             scope: None,
             pact_version: None,
+            content_hash: None,
+            subscriber: None,
+            message_id: None,
         }
     }
 

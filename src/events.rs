@@ -151,6 +151,29 @@ pub struct Event {
     /// dated against the log rather than guessed at from surrounding commits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pact_version: Option<String>,
+    /// `kind: "acquired"`/`"stolen"` only — the git blob id of the leased
+    /// path's content at the moment it was claimed, or `None` when the file
+    /// did not exist yet (a lease on a file you are about to create is a
+    /// documented workflow, see docs/leases.md).
+    ///
+    /// Written with `git hash-object -w`, so the blob is retrievable
+    /// afterwards and `pact watch`'s release-time diff can be computed against
+    /// it. That matters more than it looks: the protocol now says commit
+    /// before you release, so by release time the working tree is usually
+    /// clean and `git diff HEAD` would show nothing at all. The at-acquire
+    /// blob is the only fixed point that survives the holder committing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// `kind: "notified"`/`"watch-delivery-failed"` only — the subscriber the
+    /// delivery was for. `agent` stays the releasing agent, matching the
+    /// convention every other kind follows (the row belongs to whoever ran the
+    /// command).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscriber: Option<String>,
+    /// `kind: "notified"` only — the bead id of the message that was sent, so
+    /// a delivery can be followed to the thread it created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 /// For appending: creates `.pact/` if needed.
@@ -232,7 +255,7 @@ fn ends_without_newline(path: &Path) -> Result<bool> {
 /// private to that module and mixes a different shape of input for a
 /// different purpose (message dedup, not log tamper-evidence); sharing it
 /// would couple two unrelated subsystems for a dozen lines of arithmetic.
-fn chain_hash_of(prev_chain_point: &str, event_json_without_chain_hash: &str) -> String {
+pub(crate) fn chain_hash_of(prev_chain_point: &str, event_json_without_chain_hash: &str) -> String {
     const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET_BASIS;
@@ -635,7 +658,28 @@ pub struct Owner {
     pub detail: Option<String>,
 }
 
-/// The last agent to act on `path`, or `None` if pact has never seen it.
+/// Does this kind mean its `agent` actually had custody of the path?
+///
+/// Ownership questions — `pact agents --for <path>`, `lease acquire`'s
+/// prior-claim note, `lease ls --all`'s free-but-owned rows, and above all
+/// `msg send --to-owner-of <path>` — must not answer with an agent that never
+/// held the file. Before this, every one of them took the last event on a path
+/// whatever it said, which was already wrong for `refused` (logged under the
+/// agent who was DENIED the lease, so a refusal made the loser look like the
+/// owner and `--to-owner-of` addressed the wrong agent) and would have become
+/// wrong again for every `watch` kind.
+///
+/// Listed as an allowlist, not a denylist, so a future kind is excluded until
+/// somebody decides it means custody — the safe direction, because the failure
+/// mode of guessing wrong here is misdirected mail.
+pub fn is_custody(kind: &str) -> bool {
+    matches!(
+        kind,
+        "acquired" | "stolen" | "renewed" | "released" | "force-released" | "expired" | "restored"
+    )
+}
+
+/// The last agent to actually hold `path`, or `None` if pact has never seen it.
 ///
 /// The log is bounded (rewritten to the newest 4000 lines past 5000), so an
 /// owner is forgettable by design: a path nobody has touched in thousands of
@@ -644,6 +688,7 @@ pub fn owner_of(repo_root: &Path, path: &str) -> Result<Option<Owner>> {
     Ok(all(repo_root)?
         .into_iter()
         .rev()
+        .filter(|e| is_custody(&e.kind))
         .find(|e| e.path.as_deref() == Some(path))
         .map(|e| Owner {
             agent: e.agent,
@@ -658,6 +703,10 @@ pub fn owner_of(repo_root: &Path, path: &str) -> Result<Option<Owner>> {
 pub fn owners(repo_root: &Path) -> Result<Vec<(String, Owner)>> {
     let mut seen: Vec<(String, Owner)> = Vec::new();
     for e in all(repo_root)?.into_iter().rev() {
+        // Same rule as `owner_of`: a subscription or a refusal is not custody.
+        if !is_custody(&e.kind) {
+            continue;
+        }
         let Some(path) = e.path.clone() else { continue };
         if seen.iter().any(|(p, _)| *p == path) {
             continue;
@@ -759,6 +808,9 @@ mod tests {
             invoked_from: None,
             scope: None,
             pact_version: None,
+            content_hash: None,
+            subscriber: None,
+            message_id: None,
         }
     }
 

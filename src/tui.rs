@@ -1126,6 +1126,7 @@ mod tests {
                 note: None,
                 branch: None,
                 worktree: None,
+                content_hash: None,
                 extra: Default::default(),
             },
             age_secs: 10,

@@ -884,7 +884,23 @@ fn a_submodule_writes_the_same_lock_file_as_a_plain_checkout() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["acquired_at", "agent", "note", "path", "ttl_secs"],
+        // `content_hash` is present in every repository, worktrees or not
+        // (pact-8qu) — it is what `pact watch` diffs a release against, and it
+        // is gated on the file existing rather than on topology. It is
+        // therefore NOT a counterexample to what this test protects, which is
+        // that `branch`/`worktree` stay absent: those two are gated on
+        // `has_worktrees`, and a submodule wrongly classified as having
+        // worktrees is the bug (its `commondir` looks worktree-shaped). The
+        // exact key set is kept rather than loosened to "does not contain
+        // branch" so a future field cannot appear here unnoticed.
+        [
+            "acquired_at",
+            "agent",
+            "content_hash",
+            "note",
+            "path",
+            "ttl_secs"
+        ],
         "a submodule must write the plain payload — no branch/worktree stamps"
     );
     assert!(

@@ -17,6 +17,7 @@ mod output;
 mod repo;
 #[cfg(feature = "ui")]
 mod tui;
+mod watch;
 
 use std::path::{Path, PathBuf};
 
@@ -108,6 +109,16 @@ enum Command {
     },
     /// Check that pact, AGENTS.md, and the Beads CLI are all in a healthy state.
     Doctor,
+    /// Subscribe to paths, and be sent the diff when a holder releases one.
+    ///
+    /// A registry, not a watcher: nothing runs in the background and nothing
+    /// waits. `pact lease release` looks the subscriptions up and sends the
+    /// messages as a side effect, so you receive them at your next
+    /// `pact msg inbox`. See docs/watch.md.
+    Watch {
+        #[command(subcommand)]
+        action: WatchAction,
+    },
     /// Analyse this repo's coordination history in `.pact/events.jsonl`.
     ///
     /// Reads `.pact/` and, for `--check commit-correlation` or `--export`,
@@ -170,6 +181,20 @@ enum McpAction {
     /// event log, and can neither claim a lease nor send a message nor mark a
     /// message read. Spawned by an MCP client, never run by hand.
     Serve,
+}
+
+#[derive(Subcommand)]
+enum WatchAction {
+    /// Subscribe to a path, or to everything under a directory.
+    Add {
+        /// A file, or a directory (or a path with a trailing `/`) to subscribe
+        /// to everything beneath it. No globs.
+        path: String,
+    },
+    /// Unsubscribe from a path you are watching.
+    Rm { path: String },
+    /// List the subscriptions currently in force, for every agent.
+    Ls,
 }
 
 #[derive(Subcommand)]
@@ -418,6 +443,11 @@ fn subcommand_name(command: &Command) -> &'static str {
         },
         Command::Log { .. } => "log",
         Command::Doctor => "doctor",
+        Command::Watch { action } => match action {
+            WatchAction::Add { .. } => "watch add",
+            WatchAction::Rm { .. } => "watch rm",
+            WatchAction::Ls => "watch ls",
+        },
         Command::Audit { check, .. } => match check.as_deref() {
             Some("double-win") => "audit double-win",
             Some("stale-holds") => "audit stale-holds",
@@ -493,6 +523,9 @@ fn run(cli: Cli) -> Result<i32> {
             run_msg(&cwd, cli.agent.as_deref(), cli.json, action).map(|()| 0)
         }
         Command::Log { limit } => run_log(&cwd, cli.json, limit).map(|()| 0),
+        Command::Watch { action } => {
+            run_watch(&cwd, cli.agent.as_deref(), cli.json, action).map(|()| 0)
+        }
         Command::Audit {
             check,
             since,
@@ -513,6 +546,138 @@ fn run(cli: Cli) -> Result<i32> {
             McpAction::Serve => mcp::serve(repo::find_repo_root(&cwd)?),
         },
     }
+}
+
+/// `pact watch`: register, retire and list path subscriptions.
+///
+/// No `--json` special-casing beyond `output::emit`, and no exit code of its
+/// own: registering a subscription cannot conflict with anything, because the
+/// registry is append-only and per-agent.
+fn run_watch(cwd: &Path, agent_flag: Option<&str>, json: bool, action: WatchAction) -> Result<()> {
+    let root = repo::find_repo_root(cwd)?;
+    match action {
+        WatchAction::Add { path } => {
+            let agent = identity::resolve_agent(agent_flag)?;
+            let (stored, prefix) = watch::add(&root, &agent, &path)?;
+            // The event log records the subscription too, so `pact log` shows
+            // a fleet forming its dependency graph, not just taking locks.
+            events::append(
+                &root,
+                &events::Event {
+                    at: chrono::Utc::now().to_rfc3339(),
+                    agent: agent.clone(),
+                    kind: "watched".to_string(),
+                    path: Some(stored.clone()),
+                    detail: prefix.then(|| "everything beneath this path".to_string()),
+                    ttl_secs: None,
+                    covers_lines: None,
+                    actor: None,
+                    displaced: None,
+                    chain_hash: None,
+                    invoked_from: None,
+                    scope: None,
+                    pact_version: None,
+                    content_hash: None,
+                    subscriber: None,
+                    message_id: None,
+                },
+            );
+            #[derive(serde::Serialize)]
+            struct Added {
+                path: String,
+                prefix: bool,
+                agent: String,
+            }
+            output::emit(
+                json,
+                &Added {
+                    path: stored,
+                    prefix,
+                    agent,
+                },
+                |a: &Added| {
+                    format!(
+                        "watching {}{} — you will be sent a diff when a holder releases it",
+                        a.path,
+                        if a.prefix {
+                            "/ (and everything under it)"
+                        } else {
+                            ""
+                        }
+                    )
+                },
+            );
+        }
+        WatchAction::Rm { path } => {
+            let agent = identity::resolve_agent(agent_flag)?;
+            let removed = watch::remove(&root, &agent, &path)?;
+            if removed {
+                events::append(
+                    &root,
+                    &events::Event {
+                        at: chrono::Utc::now().to_rfc3339(),
+                        agent: agent.clone(),
+                        kind: "unwatched".to_string(),
+                        path: Some(lease::normalize_path(&root, &path)),
+                        detail: None,
+                        ttl_secs: None,
+                        covers_lines: None,
+                        actor: None,
+                        displaced: None,
+                        chain_hash: None,
+                        invoked_from: None,
+                        scope: None,
+                        pact_version: None,
+                        content_hash: None,
+                        subscriber: None,
+                        message_id: None,
+                    },
+                );
+            }
+            #[derive(serde::Serialize)]
+            struct Removed {
+                path: String,
+                removed: bool,
+            }
+            output::emit(
+                json,
+                &Removed {
+                    path: path.clone(),
+                    removed,
+                },
+                |r: &Removed| {
+                    if r.removed {
+                        format!("no longer watching {}", r.path)
+                    } else {
+                        // Says what it found rather than implying it undid
+                        // something: a silent no-op reads as success.
+                        format!("not watching {} — nothing to remove", r.path)
+                    }
+                },
+            );
+        }
+        WatchAction::Ls => {
+            let watches = watch::active(&root)?;
+            output::emit(json, &watches, |ws: &Vec<watch::ActiveWatch>| {
+                if ws.is_empty() {
+                    return "no watches — `pact watch add <path>` to subscribe".to_string();
+                }
+                let mut rows = vec![format!("{:<44} {:<20} SINCE", "PATH", "AGENT")];
+                for w in ws {
+                    rows.push(format!(
+                        "{:<44} {:<20} {}",
+                        format!("{}{}", w.path, if w.prefix { "/**" } else { "" }),
+                        w.agent,
+                        w.since
+                    ));
+                }
+                rows.push(String::new());
+                rows.push(format!("{} watch(es)", ws.len()));
+                rows.join("\n")
+            });
+        }
+    }
+    Ok(())
 }
 
 /// `pact audit`: the summary, or one named check, plus an optional `--export`.
@@ -2131,6 +2296,7 @@ mod tests {
                 note: Some("wiring the CLI".to_string()),
                 branch: None,
                 worktree: None,
+                content_hash: None,
                 extra: Default::default(),
             },
             age_secs: age,

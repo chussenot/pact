@@ -12,6 +12,7 @@ use crate::events;
 use crate::otel;
 use crate::output::exit_with;
 use crate::repo::pact_dir;
+use crate::watch;
 
 /// Default lease lifetime: 45 minutes.
 ///
@@ -106,6 +107,24 @@ pub struct LeaseInfo {
     pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<String>,
+    /// The git blob id of this path's content when the lease was taken
+    /// (pact-8qu), or absent when the file did not exist yet.
+    ///
+    /// On the lock file as well as on the acquired event because `release` is
+    /// the reader: it already loads this struct to check ownership, so the
+    /// at-acquire content is one field away rather than a scan back through
+    /// the whole event log.
+    ///
+    /// Deliberately NOT re-stamped by `renew_fs`, which inherits it via
+    /// `..existing`: the diff a subscriber eventually receives must be against
+    /// the content the holder took responsibility for, and a renew that reset
+    /// the baseline would silently hide everything done before it.
+    ///
+    /// Absent — not null — when there was nothing to hash, so a repo whose
+    /// leases are all on not-yet-created files keeps lock files byte-identical
+    /// to what pact wrote before this existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
     /// Any field a NEWER lock file has that this compiled struct does not know
     /// about — the mirror image of `branch`/`worktree`'s `default`.
     ///
@@ -881,6 +900,13 @@ fn log_event(
     path: &str,
     detail: Option<String>,
     ttl_secs: u64,
+    // Only ever `Some` for the kinds that OPEN a hold — see
+    // `Event::content_hash`. Threaded as a parameter rather than recomputed
+    // here so the value written to the event is byte-identical to the one
+    // written to the lock file: two hashes of the same path taken moments
+    // apart could legitimately differ, and a diff computed against a baseline
+    // the log does not agree with would be unexplainable afterwards.
+    content_hash: Option<String>,
 ) {
     events::append(
         repo_root,
@@ -907,6 +933,9 @@ fn log_event(
             invoked_from: None,
             scope: None,
             pact_version: None,
+            content_hash,
+            subscriber: None,
+            message_id: None,
         },
     );
 }
@@ -1170,6 +1199,13 @@ fn acquire_inner(
     // `effective_now`'s doc comment.
     let now = effective_now(repo_root);
     let (branch, worktree) = worktree_stamp(repo_root);
+    // Hashed BEFORE the claim lands, so it describes the content the holder is
+    // taking responsibility for rather than whatever a racing writer left
+    // after. Best-effort: `hash_objects` yields nothing for a path that does
+    // not exist (leasing a file you are about to create is documented), and a
+    // lease must never fail because a diff could not be prepared.
+    let content_hash = crate::git_history::hash_objects(repo_root, std::slice::from_ref(&relative))
+        .remove(&relative);
     // Mutable so the expired-reclaim and --steal branches below can copy
     // `existing.extra` onto it before writing (pact-m7j.9.8) — everything
     // else about this lease (agent, note, branch/worktree) is already
@@ -1183,6 +1219,7 @@ fn acquire_inner(
         note,
         branch,
         worktree,
+        content_hash,
         extra: BTreeMap::new(),
     };
 
@@ -1245,6 +1282,7 @@ fn acquire_inner(
                 &relative,
                 new_lease.note.clone(),
                 new_lease.ttl_secs,
+                new_lease.content_hash.clone(),
             );
             count_transition("acquired");
             Ok(AcquireOutcome {
@@ -1284,6 +1322,7 @@ fn acquire_inner(
                             "recovered a corrupt lock file via --steal ({read_err:#})"
                         )),
                         new_lease.ttl_secs,
+                        new_lease.content_hash.clone(),
                     );
                     count_transition("stolen");
                     return Ok(AcquireOutcome {
@@ -1334,6 +1373,7 @@ fn acquire_inner(
                     )),
                     // The DEAD holder's ttl: this row closes their window.
                     existing.ttl_secs,
+                    None,
                 );
                 // Reported as `stolen` by AcquireOutcome, so logged as "stolen"
                 // too — but the detail says *why*, because taking over a dead
@@ -1349,6 +1389,7 @@ fn acquire_inner(
                     )),
                     // The NEW holder's ttl: this row opens their window.
                     new_lease.ttl_secs,
+                    new_lease.content_hash.clone(),
                 );
                 count_transition("expired");
                 record_hold(&existing, "expired");
@@ -1388,6 +1429,7 @@ fn acquire_inner(
                     &relative,
                     new_lease.note.clone(),
                     new_lease.ttl_secs,
+                    None,
                 );
                 count_transition("renewed");
                 Ok(AcquireOutcome {
@@ -1414,6 +1456,7 @@ fn acquire_inner(
                         existing.agent
                     )),
                     new_lease.ttl_secs,
+                    new_lease.content_hash.clone(),
                 );
                 count_transition("stolen");
                 record_hold(&existing, "stolen");
@@ -1459,6 +1502,7 @@ fn acquire_inner(
                         holder_location(&existing)
                     )),
                     ttl_secs,
+                    None,
                 );
                 // The holder's LOCATION, not just their name. A peer in another
                 // worktree is editing a checkout this reader cannot see, so
@@ -1587,6 +1631,7 @@ fn acquire_many_fs(
                             // restored hold by the promise that is actually
                             // live again.
                             before.ttl_secs,
+                            None,
                         );
                     }
                 }
@@ -1710,6 +1755,9 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                     invoked_from: None,
                     scope: None,
                     pact_version: None,
+                    content_hash: None,
+                    subscriber: None,
+                    message_id: None,
                 },
             );
             count_transition("force_released");
@@ -1773,6 +1821,9 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                     invoked_from: None,
                     scope: None,
                     pact_version: None,
+                    content_hash: None,
+                    subscriber: None,
+                    message_id: None,
                 },
             );
             count_transition("force_released");
@@ -1785,12 +1836,30 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                 agent,
                 "released",
                 &relative,
-                existing.note,
+                existing.note.clone(),
                 existing.ttl_secs,
+                None,
             );
             count_transition("released");
         }
     }
+
+    // pact-8qu: the release has already landed — lock removed, event written,
+    // metric counted — before a single subscriber is looked up. That ordering
+    // is the guarantee: `notify_release` is infallible by signature and cannot
+    // reach anything above it, so no notification failure can leave a lease
+    // held, change this function's return value, or alter its exit code.
+    //
+    // Both the plain and the force-released branches deliver. Expiry does NOT
+    // (see `collect_expired`): a lapsed lease means nobody is present to have
+    // changed anything deliberately, and the at-acquire content is as likely
+    // to differ because a peer edited the file as because the dead holder did.
+    watch::notify_release(
+        repo_root,
+        &existing.agent,
+        &relative,
+        existing.content_hash.as_deref(),
+    );
     Ok(displaced)
 }
 
@@ -1828,6 +1897,7 @@ fn collect_expired(repo_root: &Path, lock_path: &Path, lease: &LeaseInfo) {
                 lease.ttl_secs
             )),
             lease.ttl_secs,
+            None,
         );
     }
 }
@@ -1965,6 +2035,7 @@ fn renew_fs(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
         &relative,
         renewed.note.clone(),
         renewed.ttl_secs,
+        None,
     );
     count_transition("renewed");
     Ok(renewed)
@@ -2224,6 +2295,7 @@ mod tests {
                 note: None,
                 branch: None,
                 worktree: None,
+                content_hash: None,
                 extra: BTreeMap::new(),
             },
             now,
@@ -2302,6 +2374,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            content_hash: None,
             extra: BTreeMap::new(),
         };
         assert!(
@@ -2343,6 +2416,7 @@ mod tests {
                 note: None,
                 branch: None,
                 worktree: None,
+                content_hash: None,
                 extra: BTreeMap::new(),
             };
             assert_eq!(
@@ -2404,6 +2478,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            content_hash: None,
             extra: BTreeMap::new(),
         };
         // Years past ttl+grace, not just minutes: a forward jump, not a slow
@@ -2697,6 +2772,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            content_hash: None,
             extra: BTreeMap::new(),
         };
         write_lease_atomic(&lock_file_path(root, path).unwrap(), &lease).unwrap();
@@ -3434,6 +3510,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            content_hash: None,
             extra: BTreeMap::new(),
         };
         write_lease_atomic(&lock_path, &other).unwrap();
@@ -3602,6 +3679,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            content_hash: None,
             extra: BTreeMap::new(),
         };
         write_lease_atomic(&lock_path, &thief).unwrap();
@@ -3633,6 +3711,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            content_hash: None,
             extra: BTreeMap::new(),
         };
         write_lease_atomic(&lock_path2, &thief2).unwrap();
@@ -3679,6 +3758,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            content_hash: None,
             extra: BTreeMap::new(),
         };
         write_lease_atomic(&lock_path, &winner).unwrap();

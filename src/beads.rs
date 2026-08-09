@@ -930,12 +930,24 @@ mod tests {
         let repo = init_repo();
         let stub_dir = tempfile::tempdir().unwrap();
         let script = stub_dir.path().join("stub-bd");
-        let write_stub = |contents: &str| {
-            std::fs::write(&script, contents).unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        };
+        let marker = stub_dir.path().join("stub-bd.actor");
 
-        write_stub("#!/bin/sh\necho 'usage: create [--title] [--json]'\n");
+        // The stub is written ONCE and never rewritten; what changes between
+        // calls is a marker file it reads. The earlier version rewrote the
+        // executable in place between the two calls, which flaked repeatedly
+        // under the full parallel suite and never once in isolation — writing
+        // an executable that was just exec'd is a race with the loader, and
+        // `supports_actor` folds any spawn failure into `false` by design (see
+        // its doc comment), which is indistinguishable from the cached answer
+        // this test exists to rule out. Toggling a data file the stub reads
+        // tests exactly the same property with nothing to race.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nif [ -f \"$0.actor\" ]; then\n  echo 'usage: create [--actor ACTOR] [--json]'\nelse\n  echo 'usage: create [--title] [--json]'\nfi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
         let binary: &'static str =
             Box::leak(script.to_string_lossy().into_owned().into_boxed_str());
         let cli = BeadsCli { binary };
@@ -944,24 +956,12 @@ mod tests {
             "stub help text names no --actor, so this must report false"
         );
 
-        // Same `BeadsCli`, same process, the stub swapped in place — standing
-        // in for a `bd`/`br` upgrade or PATH change during a long-lived
-        // `pact mcp serve`/`pact ui` session.
-        write_stub("#!/bin/sh\necho 'usage: create [--actor ACTOR] [--json]'\n");
-        // Retried, because `supports_actor` folds a spawn failure into `false`
-        // deliberately (see its doc comment: understate rather than promise
-        // attribution pact cannot deliver) — and under the fully parallel test
-        // suite spawning transiently fails, which is indistinguishable from a
-        // cached answer at this assertion. Observed three times in
-        // `mise run check` on unrelated changes, never once in isolation
-        // (pact-vn9).
-        //
-        // This cannot mask the bug the test exists for: a genuinely cached
-        // answer returns `false` on every attempt, so the assertion still
-        // fails. Only a transient failure is absorbed.
-        let re_derived = (0..5).any(|_| cli.supports_actor(repo.path()));
+        // Same `BeadsCli`, same process, the backend's answer changed —
+        // standing in for a `bd`/`br` upgrade or PATH change during a
+        // long-lived `pact mcp serve`/`pact ui` session.
+        std::fs::write(&marker, b"").unwrap();
         assert!(
-            re_derived,
+            cli.supports_actor(repo.path()),
             "a cached answer would still report false here; it must be re-derived per call"
         );
     }
