@@ -281,10 +281,21 @@ pub fn remove(repo_root: &Path, agent: &str, raw_path: &str) -> Result<bool> {
 /// How many diff lines a notification carries before it is cut short.
 ///
 /// A cap rather than no cap because the message body is read by an agent with
-/// a context window, and a 4000-line refactor pasted into an inbox is worse
+/// a context window, and a very large refactor pasted into an inbox is worse
 /// than a pointer to it: the reader stops reading. The truncation notice names
 /// the holder's `HEAD`, so the full change is one `git show` away.
-const MAX_DIFF_LINES: usize = 200;
+///
+/// **1000 is measured, not guessed** (pact-b73.4). The first field run of this
+/// feature delivered 87 diffs and truncated 44 of them — half — at the
+/// original 200. The diffs it cut were nowhere near the size that motivated
+/// the cap: median 397 lines, largest 839. 1000 delivers every diff that run
+/// produced, in full, and still cuts anything genuinely unreadable.
+///
+/// Truncating is not free the way it would be for a human reader. A cut diff
+/// degrades to "go and run `git show`", which is a second step off the
+/// critical path — the exact category of voluntary step this whole feature
+/// exists because agents skip.
+const MAX_DIFF_LINES: usize = 1000;
 
 /// Cut `diff` to [`MAX_DIFF_LINES`], appending a notice naming where to read
 /// the rest. Returns the text unchanged when it already fits.
@@ -355,6 +366,12 @@ pub fn notify_release(repo_root: &Path, holder: &str, released: &str, old_hash: 
          \n\
          Holder's HEAD at release: {}\n\
          \n\
+         Questions, or a contract you need changed back? Reply to {holder} in \
+         THIS thread — `pact msg inbox` shows its id, then \
+         `pact msg send --to {holder} --thread <id> \"...\"`. A reply without \
+         `--thread` starts a new conversation nobody can follow back to this \
+         diff.\n\
+         \n\
          You are receiving this because you ran `pact watch add`. \
          `pact watch rm {released}` stops it.",
         head.as_deref().unwrap_or("(unknown)")
@@ -409,6 +426,7 @@ pub fn notify_release(repo_root: &Path, holder: &str, released: &str, old_hash: 
                         subscriber: Some(sub.agent.clone()),
                         message_id: id,
                         protocol_hash: None,
+                        head: None,
                     },
                 );
             }
@@ -448,6 +466,7 @@ fn log_failure(repo_root: &Path, holder: &str, released: &str, sub: Option<&str>
             subscriber: sub.map(str::to_string),
             message_id: None,
             protocol_hash: None,
+            head: None,
         },
     );
 }
@@ -632,8 +651,21 @@ mod tests {
             out.lines().count()
         );
         assert!(out.contains("line 0"), "the head of the diff survives");
-        assert!(!out.contains("line 249"), "the tail is cut");
-        assert!(out.contains("truncated after 200 of 250 lines"), "{out}");
+        assert!(
+            !out.contains(&format!("line {}", MAX_DIFF_LINES + 49)),
+            "the tail is cut: {out}"
+        );
+        // Derived from the constant, not hardcoded: the cap is measured
+        // against field data (see MAX_DIFF_LINES) and is expected to move
+        // again, so a literal here would just have to be chased.
+        assert!(
+            out.contains(&format!(
+                "truncated after {} of {} lines",
+                MAX_DIFF_LINES,
+                MAX_DIFF_LINES + 50
+            )),
+            "{out}"
+        );
         assert!(out.contains("see commit abc1234"), "{out}");
     }
 
