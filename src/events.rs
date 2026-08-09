@@ -174,6 +174,17 @@ pub struct Event {
     /// a delivery can be followed to the thread it created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
+    /// Which revision of the managed protocol block was in force in this
+    /// repository when the event was written (pact-okz.1).
+    ///
+    /// Answers "which protocol were these agents following", which nothing
+    /// could answer before: establishing it for three fleet runs took git
+    /// archaeology on `src/agents_md.rs`, and getting it wrong produced a
+    /// wrong conclusion about whether agents message voluntarily — 223
+    /// messages cited as evidence all predated the change that suppressed
+    /// them. See `agents_md::current_block_hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_hash: Option<String>,
 }
 
 /// For appending: creates `.pact/` if needed.
@@ -255,7 +266,7 @@ fn ends_without_newline(path: &Path) -> Result<bool> {
 /// private to that module and mixes a different shape of input for a
 /// different purpose (message dedup, not log tamper-evidence); sharing it
 /// would couple two unrelated subsystems for a dozen lines of arithmetic.
-pub(crate) fn chain_hash_of(prev_chain_point: &str, event_json_without_chain_hash: &str) -> String {
+pub fn chain_hash_of(prev_chain_point: &str, event_json_without_chain_hash: &str) -> String {
     const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET_BASIS;
@@ -393,6 +404,13 @@ fn stamp_context(repo_root: &Path, ev: &mut Event) {
     ev.invoked_from = Some(crate::repo::invoked_from(&ctx));
     ev.scope = Some(crate::repo::effective_scope().to_string());
     ev.pact_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    // The protocol the agents in this run were actually reading — the block in
+    // AGENTS.md, not the one this binary would write. `pact_version` above
+    // already says which binary ran; a repo that has not re-run `pact init`
+    // since an upgrade is still following the older text, and that difference
+    // is exactly what makes a before/after comparison across a protocol change
+    // interpretable. `None` when there is no readable managed block.
+    ev.protocol_hash = crate::agents_md::current_block_hash(repo_root);
 }
 
 /// Append one event to `.pact/events.jsonl`.
@@ -811,6 +829,7 @@ mod tests {
             content_hash: None,
             subscriber: None,
             message_id: None,
+            protocol_hash: None,
         }
     }
 

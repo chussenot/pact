@@ -381,6 +381,15 @@ pub struct Summary {
     /// worktree per agent produced events indistinguishable from a plain
     /// single-checkout run.
     pub by_invoked_from: BTreeMap<String, usize>,
+    /// Which revision(s) of the managed protocol block the events in this
+    /// window were written under (pact-okz.1), with a count each.
+    ///
+    /// More than one entry means the protocol changed mid-window, which is
+    /// exactly the case a before/after comparison must not average over — and
+    /// exactly the case that produced a wrong conclusion when it had to be
+    /// established by git archaeology instead. `unknown` counts events from
+    /// before pact recorded it.
+    pub by_protocol: BTreeMap<String, usize>,
     /// Subscriptions in force right now (pact-8qu). Live state, not history —
     /// read from `.pact/watches.jsonl` rather than reconstructed from the
     /// event log, because a `watched` event says a subscription was created,
@@ -871,6 +880,14 @@ pub fn summary(
             .unwrap_or_else(|| "unknown".to_string());
         *by_invoked_from.entry(key).or_insert(0) += 1;
     }
+    let mut by_protocol: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, e) in &events {
+        let key = e
+            .protocol_hash
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        *by_protocol.entry(key).or_insert(0) += 1;
+    }
     let watches_active = crate::watch::active(repo_root)
         .map(|w| w.len())
         .unwrap_or(0);
@@ -908,6 +925,7 @@ pub fn summary(
         top_contended,
         per_agent,
         by_invoked_from,
+        by_protocol,
         watches_active,
         diffs_delivered,
         deliveries_failed,
@@ -1427,6 +1445,21 @@ pub fn render_summary(s: &Summary) -> String {
             } else {
                 String::new()
             }
+        ));
+    }
+    if s.by_protocol.len() > 1 {
+        // Only when it changed. One protocol for the whole window is the
+        // normal case and needs no line; two or more is the thing a reader
+        // comparing runs has to know before they average anything.
+        let mut parts: Vec<String> = s
+            .by_protocol
+            .iter()
+            .map(|(h, n)| format!("{n} under {h}"))
+            .collect();
+        parts.sort();
+        out.push(format!(
+            "  proto  the protocol block CHANGED inside this window: {}",
+            parts.join(", ")
         ));
     }
     if let Some(note) = &s.topology_note {
@@ -2521,6 +2554,7 @@ mod tests {
             content_hash: None,
             subscriber: None,
             message_id: None,
+            protocol_hash: None,
         }
     }
 

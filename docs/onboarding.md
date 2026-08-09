@@ -11,10 +11,23 @@ repository file rather than in pact, and [cli.md](cli.md) for the flags.
 ## What `init` writes
 
 `pact init` writes a short block into `AGENTS.md`, between
-`<!-- pact:begin -->` / `<!-- pact:end -->` markers. Every agent that reads
+`<!-- pact:begin hash:… -->` / `<!-- pact:end -->` markers. Every agent that reads
 `AGENTS.md` at the start of a session — which most coding agents already
 do — picks up the coordination protocol automatically, with nothing for you
 to repeat by hand.
+
+The hash in the begin marker identifies **which revision of the protocol** the
+block is, the same way the bd markers in the same file do. Without it, "which
+protocol were these agents actually following" is answerable only by git
+archaeology on pact's own source — which is not hypothetical: it produced a
+wrong reading of whether agents message voluntarily, because the 223 messages
+cited as evidence all predated the change that suppressed them and nothing in
+any artifact said so. Every event now records it too, so a run's log answers
+the question by itself ([leases.md](leases.md#every-event-records-where-pact-was-invoked-from)).
+
+Marker matching is on the `<!-- pact:begin` prefix, so a block written by a
+pact from before the hash existed is still found and replaced in place rather
+than appended alongside.
 
 Claude Code is the exception: it loads `CLAUDE.md`, `.claude/CLAUDE.md`,
 `CLAUDE.local.md` and `.claude/rules/`, and never `AGENTS.md`. So `pact init`

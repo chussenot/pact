@@ -720,12 +720,21 @@ Three fields ride on **every** event, whatever its kind:
 | `invoked_from` | the linked worktree pact ran in, or `main`, or `outside` |
 | `scope` | the coordination scope actually in force: `shared` or `local` |
 | `pact_version` | the version that wrote the line |
+| `protocol_hash` | which revision of the managed `AGENTS.md` block was in force |
 
 `invoked_from` says `main` literally, not the main worktree's directory name —
 the field exists to be compared across repositories and runs. `outside` means
 the process's working directory was not under this repository at all, which is
 reachable by pointing pact at another repo with `PACT_STATE_DIR`, and is the
 one value that says the lease/edit binding cannot be assumed.
+
+`protocol_hash` is the block **in `AGENTS.md`**, not the one this binary would
+write — `pact_version` already says which binary ran, and a repository that has
+not re-run `pact init` since an upgrade is still following the older text. That
+distinction is the whole point: it is what makes a before/after comparison
+across a protocol change interpretable instead of archaeological.
+`pact audit` says so out loud when the protocol changed mid-window, because
+that is precisely the case a comparison must not average over.
 
 `scope` records what pact *did*, not what the environment said: an
 unrecognised `PACT_WORKTREE_SCOPE=locale` behaves as `shared`, so `shared` is

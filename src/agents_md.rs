@@ -5,8 +5,70 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-pub const BEGIN_MARKER: &str = "<!-- pact:begin -->";
+/// What every begin marker starts with. Matching is done on this PREFIX, not
+/// on a whole marker, because the marker carries the block's hash and so is
+/// not a fixed string — and because a repo written by a pact that predates the
+/// hash has the bare `<!-- pact:begin -->`, which must still be found so
+/// `pact init` can replace it.
+pub const BEGIN_MARKER_PREFIX: &str = "<!-- pact:begin";
 pub const END_MARKER: &str = "<!-- pact:end -->";
+
+/// The begin marker pact writes today: the prefix plus the hash of the block
+/// it is wrapping (pact-okz.1).
+///
+/// Self-identifying for the same reason bd's marker in the same file is
+/// (`<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:6cd5cc61 -->`):
+/// without it, "which version of the protocol was this fleet actually
+/// following" is answerable only by git archaeology on this file. That is not
+/// hypothetical — it produced a wrong analysis of whether agents message
+/// voluntarily, because 223 messages from pact's own fleet turned out to
+/// predate the protocol change that suppressed them and nothing in any
+/// artifact said so.
+pub fn begin_marker() -> String {
+    format!(
+        "{BEGIN_MARKER_PREFIX} hash:{} -->",
+        block_hash(&managed_block())
+    )
+}
+
+/// A short, stable identifier for one revision of the protocol text.
+///
+/// Truncated to 8 hex characters, which is an identity tag rather than an
+/// integrity check — `is_current` still compares the block's full text, so a
+/// collision would change nothing about staleness detection, only make two
+/// eras share a label. The same length bd uses, for the same job.
+pub fn block_hash(block: &str) -> String {
+    // Reuses the event log's hash rather than introducing a second one, with a
+    // fixed domain separator so a block and an event that happen to serialize
+    // to the same bytes cannot produce the same value.
+    crate::events::chain_hash_of("pact-protocol-block", block)[..8].to_string()
+}
+
+/// The hash of the block **actually present in `AGENTS.md`**, or `None` when
+/// there is no readable managed block there.
+///
+/// Deliberately the file's block, not [`begin_marker`]'s: the question this
+/// exists to answer is which protocol the agents in a run were reading, and a
+/// repository that has not re-run `pact init` since an upgrade is following
+/// the older text no matter what the binary would write. `Event::pact_version`
+/// already records which binary ran.
+///
+/// Not memoized. A `OnceLock` would be wrong rather than merely unnecessary:
+/// the test suite drives many repositories inside one process, so a global
+/// cache would report the first repo's protocol for all of them. The read is a
+/// few kilobytes, a handful of times per command.
+pub fn current_block_hash(repo_root: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(repo_root.join("AGENTS.md")).ok()?;
+    let (begin, end) = find_block_bounds(&content)?;
+    let block = &content[begin..end];
+    // Hash the BODY, not the wrapper: the marker contains the hash, so
+    // including it would make the value depend on itself.
+    let body_start = block.find("-->")? + "-->".len();
+    let body = block[body_start..].trim_start_matches('\n');
+    let body = body.strip_suffix('\n').unwrap_or(body);
+    let body = body.strip_suffix(END_MARKER).unwrap_or(body);
+    Some(block_hash(body))
+}
 
 /// The protocol block injected between the markers.
 pub fn managed_block() -> String {
@@ -161,7 +223,7 @@ pub fn apply(repo_root: &Path) -> Result<PathBuf> {
 /// that function for why a bare read/compute/rename can silently discard a
 /// concurrent edit.
 fn splice_block(path: &Path, body: &str, repo_root: &Path) -> Result<()> {
-    let block = format!("{BEGIN_MARKER}\n{body}{END_MARKER}\n");
+    let block = format!("{}\n{body}{END_MARKER}\n", begin_marker());
 
     write_atomic_cas(path, repo_root, |existing| {
         match find_block_bounds(existing) {
@@ -577,7 +639,7 @@ fn has_current_block(path: &Path, body: &str) -> Result<bool> {
     let Some((begin, end)) = find_block_bounds(&existing) else {
         return Ok(false);
     };
-    Ok(existing[begin..end] == format!("{BEGIN_MARKER}\n{body}{END_MARKER}\n"))
+    Ok(existing[begin..end] == format!("{}\n{body}{END_MARKER}\n", begin_marker()))
 }
 
 /// Follow a symlink to its target before replacing anything. `fs::write`
@@ -742,8 +804,10 @@ fn read_or_empty(path: &Path) -> Result<String> {
 /// are present and in order; `None` otherwise (including the malformed case
 /// where only one marker exists).
 fn find_block_bounds(content: &str) -> Option<(usize, usize)> {
-    let begin = content.find(BEGIN_MARKER)?;
-    let after_begin = begin + BEGIN_MARKER.len();
+    let begin = content.find(BEGIN_MARKER_PREFIX)?;
+    // Past the marker's own `-->`, wherever the hash puts it — and tolerant of
+    // the bare `<!-- pact:begin -->` a pre-hash pact wrote.
+    let after_begin = begin + content[begin..].find("-->")? + "-->".len();
     let end_rel = content[after_begin..].find(END_MARKER)?;
     let mut end = after_begin + end_rel + END_MARKER.len();
     // Consume one trailing newline after the end marker too, since `block`
@@ -909,7 +973,7 @@ mod tests {
 
         assert_eq!(path, tmp.path().join("AGENTS.md"));
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.starts_with(BEGIN_MARKER));
+        assert!(content.starts_with(BEGIN_MARKER_PREFIX));
         assert!(content.trim_end().ends_with(END_MARKER));
         assert!(content.contains(&managed_block()));
     }
@@ -944,7 +1008,7 @@ mod tests {
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.starts_with(original));
-        assert!(after.contains(BEGIN_MARKER));
+        assert!(after.contains(BEGIN_MARKER_PREFIX));
         assert!(after.contains(END_MARKER));
         assert!(after.contains(&managed_block()));
 
@@ -960,7 +1024,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("AGENTS.md");
         let original = format!(
-            "# Before\n\n{BEGIN_MARKER}\nstale content that should be replaced\n{END_MARKER}\n\n# After\n"
+            "# Before\n\n<!-- pact:begin -->\nstale content that should be replaced\n{END_MARKER}\n\n# After\n"
         );
         std::fs::write(&path, &original).unwrap();
 
@@ -1223,6 +1287,104 @@ mod tests {
     /// "Quick Reference" heading at a different level, unaware of the other,
     /// entirely before pact's own managed block. Matched on text, not level,
     /// since that is exactly what differed in the real case.
+    /// pact-okz.1: the marker identifies which revision of the protocol it
+    /// wraps, the way bd's marker in the same file already does.
+    #[test]
+    fn the_begin_marker_carries_the_blocks_hash() {
+        let marker = begin_marker();
+        assert!(marker.starts_with(BEGIN_MARKER_PREFIX), "{marker}");
+        assert!(marker.ends_with(" -->"), "{marker}");
+        let hash = block_hash(&managed_block());
+        assert_eq!(hash.len(), 8, "short enough to read in a marker: {hash}");
+        assert!(marker.contains(&format!("hash:{hash}")), "{marker}");
+    }
+
+    /// Two different protocol texts must not share a label, or the field
+    /// cannot answer the question it exists for.
+    #[test]
+    fn a_changed_block_changes_its_hash() {
+        let a = block_hash("## protocol\n\n- do the thing\n");
+        let b = block_hash("## protocol\n\n- do the OTHER thing\n");
+        assert_ne!(a, b);
+        assert_eq!(
+            a,
+            block_hash("## protocol\n\n- do the thing\n"),
+            "and is stable"
+        );
+    }
+
+    /// The compatibility case that decides whether this ships safely: every
+    /// repository in existence has the bare `<!-- pact:begin -->`, and
+    /// `pact init` must still find and replace it rather than treating the
+    /// file as unmarked and appending a SECOND block.
+    #[test]
+    fn a_pre_hash_marker_is_still_found_and_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        let path = root.join("AGENTS.md");
+        std::fs::write(
+            &path,
+            format!("# House rules\n\n<!-- pact:begin -->\nold protocol text\n{END_MARKER}\n\n# After\n"),
+        )
+        .unwrap();
+
+        // Found, despite carrying no hash.
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            find_block_bounds(&content).is_some(),
+            "a pre-hash marker must be found"
+        );
+        // And it is not "current", so `init` rewrites rather than skipping.
+        assert!(!has_current_block(&path, &managed_block()).unwrap());
+
+        apply(root).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after.matches(BEGIN_MARKER_PREFIX).count(),
+            1,
+            "replaced in place, never appended alongside:\n{after}"
+        );
+        assert!(after.starts_with("# House rules"), "{after}");
+        assert!(
+            after.contains("# After"),
+            "content after the block survives:\n{after}"
+        );
+        assert!(!after.contains("old protocol text"), "{after}");
+        assert!(has_current_block(&path, &managed_block()).unwrap());
+    }
+
+    /// The hash recorded is the one in the FILE, not the one this binary
+    /// would write — a repo that has not re-run `pact init` since an upgrade
+    /// is still following the older text, and that difference is the whole
+    /// point of the field.
+    #[test]
+    fn current_block_hash_reports_the_file_not_the_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        assert_eq!(current_block_hash(root), None, "no AGENTS.md is no era");
+
+        std::fs::write(
+            root.join("AGENTS.md"),
+            format!("<!-- pact:begin -->\nan older protocol\n{END_MARKER}\n"),
+        )
+        .unwrap();
+        let stale = current_block_hash(root).expect("a block is present");
+        assert_ne!(
+            stale,
+            block_hash(&managed_block()),
+            "a stale block must not report this binary's hash"
+        );
+
+        apply(root).unwrap();
+        assert_eq!(
+            current_block_hash(root).as_deref(),
+            Some(block_hash(&managed_block()).as_str()),
+            "after init it matches what the binary writes"
+        );
+    }
+
     #[test]
     fn duplicated_headings_outside_the_managed_block_are_found() {
         let content = "\
@@ -1295,7 +1457,7 @@ bd ready
 
         let after = std::fs::read_to_string(tmp.path().join("GEMINI.md")).unwrap();
         assert!(after.starts_with("# Gemini\n"), "prior content survives");
-        assert!(after.contains(BEGIN_MARKER) && after.contains(END_MARKER));
+        assert!(after.contains(BEGIN_MARKER_PREFIX) && after.contains(END_MARKER));
     }
 
     /// The whole reason this is not one shared loop: a format that expands
@@ -1415,7 +1577,7 @@ bd ready
         );
         let shared = std::fs::read_to_string(tmp.path().join("shared.md")).unwrap();
         assert_eq!(
-            shared.matches(BEGIN_MARKER).count(),
+            shared.matches(BEGIN_MARKER_PREFIX).count(),
             1,
             "the shared file must carry exactly one managed block:\n{shared}"
         );

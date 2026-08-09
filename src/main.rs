@@ -595,6 +595,7 @@ fn run_watch(cwd: &Path, agent_flag: Option<&str>, json: bool, action: WatchActi
                     content_hash: None,
                     subscriber: None,
                     message_id: None,
+                    protocol_hash: None,
                 },
             );
             #[derive(serde::Serialize)]
@@ -646,6 +647,7 @@ fn run_watch(cwd: &Path, agent_flag: Option<&str>, json: bool, action: WatchActi
                         content_hash: None,
                         subscriber: None,
                         message_id: None,
+                        protocol_hash: None,
                     },
                 );
             }

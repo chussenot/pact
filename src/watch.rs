@@ -408,6 +408,7 @@ pub fn notify_release(repo_root: &Path, holder: &str, released: &str, old_hash: 
                         content_hash: None,
                         subscriber: Some(sub.agent.clone()),
                         message_id: id,
+                        protocol_hash: None,
                     },
                 );
             }
@@ -446,6 +447,7 @@ fn log_failure(repo_root: &Path, holder: &str, released: &str, sub: Option<&str>
             content_hash: None,
             subscriber: sub.map(str::to_string),
             message_id: None,
+            protocol_hash: None,
         },
     );
 }

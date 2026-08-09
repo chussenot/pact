@@ -2019,7 +2019,7 @@ fn init_points_existing_instruction_files_at_agents_md_and_creates_none() {
         "pre-existing content must survive verbatim:\n{gemini}"
     );
     assert!(
-        gemini.contains("<!-- pact:begin -->") && gemini.contains("@AGENTS.md"),
+        gemini.contains("<!-- pact:begin") && gemini.contains("@AGENTS.md"),
         "GEMINI.md must carry a managed block importing AGENTS.md:\n{gemini}"
     );
     assert!(
@@ -2085,7 +2085,7 @@ fn init_skips_the_later_of_two_instruction_targets_aliased_to_each_other() {
 
     let shared = std::fs::read_to_string(root.join("shared-instructions.md")).unwrap();
     assert_eq!(
-        shared.matches("<!-- pact:begin -->").count(),
+        shared.matches("<!-- pact:begin").count(),
         1,
         "the shared file must carry exactly one managed block, not one per alias:\n{shared}"
     );
@@ -4366,7 +4366,7 @@ fn init_survives_a_concurrently_mutating_agents_md() {
             .find_map(|l| l.strip_prefix("revision ")?.trim().parse().ok())
     }
     fn block_onward_of(body: &str) -> String {
-        body.find("<!-- pact:begin -->")
+        body.find("<!-- pact:begin")
             .map(|i| body[i..].to_string())
             .unwrap_or_default()
     }
@@ -4432,7 +4432,7 @@ fn init_survives_a_concurrently_mutating_agents_md() {
             // block would mean `init`'s "no markers found" branch fired
             // against a torn or half-updated read instead of the real thing.
             Ok(body)
-                if body.matches("<!-- pact:begin -->").count() != 1
+                if body.matches("<!-- pact:begin").count() != 1
                     || body.matches("<!-- pact:end -->").count() != 1 =>
             {
                 bad += 1;
