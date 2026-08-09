@@ -4845,6 +4845,22 @@ fn a_release_delivers_the_diff_to_a_subscriber_who_can_then_read_it() {
     assert!(body.contains("-pub const MAX: usize = 220;"), "{body}");
     assert!(body.contains("+pub const MAX: usize = 348;"), "{body}");
     assert!(body.contains("--- a/src/render.rs"), "{body}");
+    // pact-b73.2: the notification must not be a conversational dead end.
+    // In its first field run, 0 of 33 hand-written messages replied into a
+    // notification thread — the body's only call to action was how to
+    // unsubscribe, so agents who wanted to answer started new threads and the
+    // exchange lost its link to the diff that prompted it.
+    assert!(body.contains("--thread"), "must show how to reply: {body}");
+    assert!(
+        body.contains("w5-parallax"),
+        "the reply hint must name the holder to reply to: {body}"
+    );
+    let reply_at = body.find("--thread").unwrap();
+    let unsub_at = body.find("watch rm").unwrap();
+    assert!(
+        reply_at < unsub_at,
+        "how to reply comes before how to unsubscribe: {body}"
+    );
 
     // And the delivery is in the log, naming who it reached.
     let log = pact(repo, "w5-juice", &["audit", "--json"]);
@@ -5006,4 +5022,114 @@ fn completion_works_outside_a_repository() {
     let out = pact(outside.path(), "agent", &["completion", "bash"]);
     assert_ok(&out);
     assert!(stdout_of(&out).contains("pact"), "{}", stdout_of(&out));
+}
+
+/// pact-b73.3: an open and its close must bracket exactly the commits made
+/// under that lease. This is the property agent identity cannot give us —
+/// across three fleet runs every commit carried one git author while the
+/// agents were twenty-odd identities — so the lease boundaries have to carry
+/// it instead.
+#[test]
+fn a_holds_open_and_close_bracket_the_commits_made_under_it() {
+    let Some(tmp) = git_repo("hold_brackets_commits") else {
+        return;
+    };
+    let repo = tmp.path();
+    let commit = |msg: &str| {
+        std::fs::write(repo.join("api.rs"), format!("// {msg}\n")).unwrap();
+        for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", msg]] {
+            assert!(Command::new("git")
+                .args(&args)
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .current_dir(repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    };
+
+    let before = commit("before the lease");
+    assert_ok(&pact(repo, "holder", &["lease", "acquire", "api.rs"]));
+    let during = commit("under the lease");
+    assert_ok(&pact(repo, "holder", &["lease", "release", "api.rs"]));
+
+    let feed = std::fs::read_to_string(repo.join(".pact/events.jsonl")).unwrap();
+    let events: Vec<serde_json::Value> = feed
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let of = |kind: &str| -> String {
+        events
+            .iter()
+            .find(|e| e["kind"] == kind)
+            .unwrap_or_else(|| panic!("no {kind} event in {feed}"))["head"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{kind} carries no head: {feed}"))
+            .to_string()
+    };
+
+    assert_eq!(
+        of("acquired"),
+        before,
+        "the open records HEAD as it was claimed"
+    );
+    assert_eq!(
+        of("released"),
+        during,
+        "the close records what the holder landed"
+    );
+    assert_ne!(
+        of("acquired"),
+        of("released"),
+        "a hold that produced a commit must not report the same HEAD at both ends"
+    );
+}
+
+/// The gating: `head` belongs on hold boundaries, not on every event. A
+/// notification's HEAD answers nothing and would cost a git subprocess per
+/// delivery — 87 of them in the run this came from.
+#[test]
+fn watch_events_carry_no_head_but_hold_boundaries_do() {
+    let Some(tmp) = bd_repo("head_is_gated_by_kind") else {
+        return;
+    };
+    let repo = tmp.path();
+    std::fs::write(repo.join("api.rs"), "one\n").unwrap();
+    for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "init"]] {
+        assert!(Command::new("git")
+            .args(&args)
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+    }
+    assert_ok(&pact(repo, "setup", &["init", "--no-commit"]));
+    assert_ok(&pact(repo, "watcher", &["watch", "add", "api.rs"]));
+    assert_ok(&pact(repo, "holder", &["lease", "acquire", "api.rs"]));
+    std::fs::write(repo.join("api.rs"), "two\n").unwrap();
+    assert_ok(&pact(repo, "holder", &["lease", "release", "api.rs"]));
+
+    let feed = std::fs::read_to_string(repo.join(".pact/events.jsonl")).unwrap();
+    for line in feed.lines().filter(|l| !l.trim().is_empty()) {
+        let e: serde_json::Value = serde_json::from_str(line).unwrap();
+        let kind = e["kind"].as_str().unwrap();
+        let has_head = e.get("head").is_some_and(|h| !h.is_null());
+        match kind {
+            "acquired" | "released" | "stolen" | "force-released" => {
+                assert!(has_head, "{kind} must carry head: {e}")
+            }
+            _ => assert!(!has_head, "{kind} must not carry head: {e}"),
+        }
+    }
 }

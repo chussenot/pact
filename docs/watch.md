@@ -83,7 +83,16 @@ would put unrelated agents into each other's replies. It carries:
 
 - the path, the holder, and what they changed as a unified diff
 - the holder's `HEAD` short hash at release
+- **how to reply in the same thread**, naming the holder
 - a reminder that `pact watch rm <path>` stops it
+
+The reply line is not decoration. In the first field run, **0 of 33**
+hand-written messages replied into the notification that prompted them — even
+though four were explicit acknowledgements of a received diff, and others
+adapted to one. The body's only call to action was how to unsubscribe: the one
+instruction pact gave a subscriber at the moment they had a question was how to
+stop hearing from you. It now says how to answer first, and how to leave
+second.
 
 The message is tagged with the path, so it follows the file the way
 `--to-owner-of` messages do: whoever leases that path next is told one is
@@ -107,14 +116,24 @@ with a message saying so on every lease taken to create a file.
 
 ### Size cap
 
-Diffs are cut at **200 lines**, with a notice naming the holder's `HEAD`:
+Diffs are cut at **1000 lines**, with a notice naming the holder's `HEAD`:
 
 ```
-[diff truncated after 200 of 4130 lines — see commit 976b4ef]
+[diff truncated after 1000 of 4130 lines — see commit 976b4ef]
 ```
 
-The reader is an agent with a context window. A 4000-line refactor pasted into
-an inbox is worse than a pointer to it, because the reader stops reading.
+The reader is an agent with a context window, so a very large refactor pasted
+into an inbox is worse than a pointer to it — the reader stops reading.
+
+**The figure is measured and expected to move.** It started at 200, chosen
+before any field data existed, and the first real run truncated *half* of
+everything it delivered: 44 of 87 diffs, whose real sizes were median 397 lines
+and largest 839 — nowhere near the size the cap was imagined for. 1000 delivers
+every diff that run produced, in full.
+
+Truncating costs more here than it would for a human. A cut diff degrades to
+"go and run `git show`", a second step off the critical path — the exact
+category of voluntary step this whole feature exists because agents skip.
 
 ## Subscriptions
 
