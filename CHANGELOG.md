@@ -10,6 +10,15 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.7.2 - 2026-08-09
+#### Features
+- **(audit)** assert run topology with --check topology --expect - (11e1de3) - Clement HUSSENOT-DESENONGES
+- **(watch)** deliver interface diffs on lease release - (d605c50) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- Add interactions - (e4ce359) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.7.1 - 2026-08-09
 #### Documentation
 - **(fleet)** codify the orchestrated-wave pattern from two measured runs - (f8031fa) - Clement HUSSENOT-DESENONGES
