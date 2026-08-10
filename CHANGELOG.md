@@ -10,6 +10,13 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.7.6 - 2026-08-10
+#### Bug Fixes
+- **(release)** drop the retired macos-13 leg and ship one asset per platform - (90ec727) - Clement HUSSENOT-DESENONGES
+- README - (f28c84c) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.7.5 - 2026-08-09
 #### Bug Fixes
 - **(audit)** a mid-run pact upgrade is not a protocol change - (ecf73f4) - Clement HUSSENOT-DESENONGES
