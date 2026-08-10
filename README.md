@@ -1,6 +1,6 @@
 ---
 title: pact
-description: Why pact is built the way it is: the problem multi-agent repositories create, and the four primitives that answer it.
+description: Why pact is built the way it is; the problem multi-agent repositories create, and the four primitives that answer it.
 audience: everyone
 ---
 
