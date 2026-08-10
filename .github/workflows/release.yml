@@ -230,24 +230,48 @@ jobs:
           - triple: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
             musl: true
-          - triple: x86_64-apple-darwin
-            os: macos-13
+          # Apple Silicon only. `x86_64-apple-darwin` was here on `macos-13`
+          # and is REMOVED rather than moved, because it is what stopped this
+          # workflow ever publishing: GitHub retired the macos-13 image, both
+          # Intel legs then sat "awaiting a runner" until the 24-hour ceiling
+          # killed them, and `publish` needs every leg — so all six healthy
+          # builds (each under 70 seconds) were thrown away on every tag from
+          # 0.5.0 to 0.7.5. Nine cancelled runs, zero releases.
+          #
+          # Not restored by cross-compiling on the arm runner: that would give
+          # up the sanity run below, which only works because every leg can
+          # execute the binary it just produced, and an untested Intel binary
+          # is worse than an absent one. Intel Mac users build from source
+          # (`cargo install --path .`) until a native runner exists again.
           - triple: aarch64-apple-darwin
             os: macos-latest
-        # Two profiles, in the README's vocabulary. Both pin their features
-        # explicitly: `--no-default-features` is a no-op while Cargo.toml has no
-        # default feature, and it stays anyway, because the artifact NAME is a
-        # promise about the contents and a default added later must not silently
-        # rewrite what `lean` means.
+        # ONE profile, and the reason is asset resolution rather than build
+        # cost. A tool manager picks a release asset by matching the OS and
+        # architecture in its name, so two tarballs per platform — `-lean` and
+        # `-full` — are two candidates it has to break a tie between. Which one
+        # it picks is an implementation detail of the manager, and getting it
+        # wrong hands `mise use -g github:chussenot/pact@latest` a binary with
+        # no `pact ui` and no `pact mcp serve` on a workstation. One asset per
+        # platform makes the question disappear instead of betting on it.
+        #
+        # `full` is the survivor because that is what install.md already calls
+        # the right default for a workstation: `otel` exports nothing until the
+        # standard `OTEL_*` variables are set and `mcp` does nothing until a
+        # client spawns `pact mcp serve`, so the features are inert until asked
+        # for and cost 0.5 MiB. `lean` remains buildable —
+        # `cargo install --path . --no-default-features` — and install.md says
+        # so; it is no longer a download.
+        #
+        # `--features` is pinned explicitly rather than relying on defaults: the
+        # artifact NAME is a promise about the contents, and a default feature
+        # added to Cargo.toml later must not silently rewrite it.
         profile:
-          - name: lean
-            flags: --no-default-features
           - name: full
             flags: --features ui,otel,mcp
-        # No exclusions. Every target × profile combination was built before this
-        # workflow was written, including `ui` on musl — ratatui and crossterm are
-        # pure Rust here, so musl needs no C toolchain for them and the resulting
-        # binary is `static-pie linked`. If a combination ever does break for a
+        # No exclusions. Every target was built before this workflow was
+        # written, including `ui` on musl — ratatui and crossterm are pure Rust
+        # here, so musl needs no C toolchain for them and the resulting binary
+        # is `static-pie linked`. If a combination ever does break for a
         # dependency reason, exclude it HERE with the reason, so that a missing
         # artifact is a documented decision rather than a mystery.
     steps:
@@ -315,7 +339,6 @@ jobs:
       - name: Verify the binary keeps its profile's promise
         env:
           TAG: ${{ needs.resolve.outputs.tag }}
-          PROFILE: ${{ matrix.profile.name }}
         run: |
           set -euo pipefail
           BIN="target/${{ matrix.target.triple }}/release/pact"
@@ -333,15 +356,14 @@ jobs:
           # in and exits.
           has_mcp() { "$BIN" mcp serve --help >/dev/null 2>&1; }
 
-          if [ "$PROFILE" = full ]; then
-            has_ui  || { echo "::error::full build is missing the ui subcommand"; exit 1; }
-            has_mcp || { echo "::error::full build is missing mcp serve"; exit 1; }
-            echo "full: ui and mcp serve both present"
-          else
-            has_ui  && { echo "::error::lean build has the ui subcommand; it was built --no-default-features"; exit 1; }
-            has_mcp && { echo "::error::lean build has mcp serve; it was built --no-default-features"; exit 1; }
-            echo "lean: neither ui nor mcp serve present, as promised"
-          fi
+          # Unconditional, because there is one profile. The `lean` branch that
+          # used to live here is deleted rather than left dead: a dead branch in
+          # a release gate is worse than no branch, since the day somebody adds
+          # a second profile it will pass whatever shape it happens to have.
+          # Restore the if/else together with the matrix entry, not before.
+          has_ui  || { echo "::error::full build is missing the ui subcommand"; exit 1; }
+          has_mcp || { echo "::error::full build is missing mcp serve"; exit 1; }
+          echo "full: ui and mcp serve both present"
 
       - name: Package
         id: package
@@ -349,7 +371,10 @@ jobs:
           TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
-          NAME="pact-$TAG-${{ matrix.target.triple }}-${{ matrix.profile.name }}"
+          # No profile suffix: `pact-<tag>-<triple>` is the shape every tool
+          # manager expects (cf. ripgrep, bat), and with one profile there is
+          # nothing left to disambiguate.
+          NAME="pact-$TAG-${{ matrix.target.triple }}"
           mkdir -p "dist/$NAME"
           cp "target/${{ matrix.target.triple }}/release/pact" "dist/$NAME/"
           cp README.md CHANGELOG.md "dist/$NAME/"

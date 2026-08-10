@@ -199,7 +199,7 @@ what the tooling did to it, and require a quoted command as evidence.
 
 | | |
 |---|---|
-| [install.md](docs/install.md) | downloading a release or building from source, the lean/full profiles, choosing a Beads backend |
+| [install.md](docs/install.md) | `mise use -g github:chussenot/pact@latest`, downloading a release or building from source, choosing a Beads backend |
 | [cli.md](docs/cli.md) | every command, flag, exit code and `--json` shape |
 | [onboarding.md](docs/onboarding.md) | what `pact init` writes, to which files, and how to check it |
 | [leases.md](docs/leases.md) | the lease lifecycle: TTL, grace period, steal vs. expiry, path identity |

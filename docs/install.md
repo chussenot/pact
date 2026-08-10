@@ -1,6 +1,6 @@
 ---
 title: Installing pact
-description: Getting a binary, the lean and full build profiles, and choosing a Beads backend.
+description: Installing with mise or by hand, what a release contains and why it is one binary per platform, and choosing a Beads backend.
 audience: operators
 ---
 
@@ -17,43 +17,63 @@ Every version tag publishes prebuilt tarballs, so installing pact does not
 require a Rust toolchain — an odd prerequisite for a tool whose main audience is
 CI fleets and coding agents.
 
+### With a version manager
+
 ```bash
-TAG=0.4.0
+mise use -g github:chussenot/pact@latest
+```
+
+This is the shortest route and needs nothing installed but `mise` itself. It
+works because a release publishes **exactly one tarball per platform**, so there
+is no ambiguity for mise to resolve — see [One profile](#one-profile) for why
+that constraint exists.
+
+### By hand
+
+```bash
+TAG=0.7.6
 TARGET=x86_64-unknown-linux-musl
-PROFILE=lean
 
 BASE="https://github.com/chussenot/pact/releases/download/$TAG"
-curl -fsSLO "$BASE/pact-$TAG-$TARGET-$PROFILE.tar.gz"
+curl -fsSLO "$BASE/pact-$TAG-$TARGET.tar.gz"
 curl -fsSLO "$BASE/SHA256SUMS"
 
 # Verify before extracting. `--ignore-missing` because SHA256SUMS covers every
 # tarball in the release and you downloaded one of them.
 sha256sum --ignore-missing -c SHA256SUMS
 
-tar -xzf "pact-$TAG-$TARGET-$PROFILE.tar.gz"
-install -m755 "pact-$TAG-$TARGET-$PROFILE/pact" /usr/local/bin/
+tar -xzf "pact-$TAG-$TARGET.tar.gz"
+install -m755 "pact-$TAG-$TARGET/pact" /usr/local/bin/
 ```
 
-### Two profiles
+### One profile
 
-Each target ships twice. The profile is in the filename because the name is a
-promise about the contents, and each release asserts that promise in both
-directions before publishing — the `full` binary must have `ui` and `mcp serve`,
-the `lean` one must have neither.
+A release ships one binary per platform, with `ui`, `otel` and `mcp` compiled
+in, and each release asserts that before publishing — the binary must answer to
+`pact ui` and `pact mcp serve` or the tag does not ship.
 
-| Profile | Contains | For |
-|---|---|---|
-| `lean` | no optional features: `init`, `lease`, `msg`, `watch`, `audit`, `log`, `doctor`, `agents`, `whoami`, `completion` — 2.5 MiB | agents and CI images, which never open a dashboard |
-| `full` | `ui` + `otel` + `mcp` — the TUI, OpenTelemetry export, the read-only MCP server — 3.0 MiB | humans, and anything registering pact as an MCP server |
+**That is a constraint imposed by version managers, not a preference.** They
+pick a release asset by matching the OS and architecture in its name, so two
+tarballs per platform are two candidates to break a tie between, and which one
+wins is an implementation detail of the manager. Getting it wrong would hand
+`mise use -g github:chussenot/pact@latest` a binary with no TUI and no MCP
+server on somebody's workstation. One asset per platform makes the question
+disappear rather than betting on the answer.
 
-Sizes are `strip`ped x86-64 release binaries, measured rather than estimated,
-and they drift upward as pact grows — treat them as an order of magnitude, not
-a promise.
+Nothing is paid for unasked: `otel` exports only when the standard `OTEL_*`
+variables are set, and `mcp` does nothing until a client spawns
+`pact mcp serve`. The whole binary is 3.0 MiB — a `strip`ped x86-64 release,
+measured rather than estimated, and drifting upward as pact grows.
 
-Neither optional feature costs anything unasked, so `full` is the right default
-for a workstation: `otel` exports only when the standard `OTEL_*` variables are
-set, and `mcp` does nothing until a client spawns `pact mcp serve`. Pick `lean`
-when the 0.6 MiB matters — a container layer pulled by every job in a fleet.
+If the ~0.5 MiB matters — a container layer pulled by every job in a fleet —
+build without the optional features:
+
+```bash
+cargo install --path . --no-default-features   # or --git https://github.com/chussenot/pact
+```
+
+That was a published `lean` tarball until releases had to become
+unambiguous. It is still a supported build, just not a download.
 
 ### Targets
 
@@ -100,7 +120,7 @@ That is the `full` profile above. Or manually:
 
 ```bash
 cargo install --path . --force --features ui,otel,mcp   # full
-cargo install --path . --force                          # lean
+cargo install --path . --force                          # no optional features
 ```
 
 ```bash
@@ -109,6 +129,19 @@ cp target/release/pact /usr/local/bin/    # or anywhere on your PATH
 ```
 
 ## With mise
+
+```bash
+mise use -g github:chussenot/pact@latest
+```
+
+That is the whole thing. mise's **github backend** reads the release assets
+directly, needs no Rust toolchain, and resolves unambiguously because a release
+publishes exactly one tarball per platform ([One profile](#one-profile)).
+
+Pin a version instead of `latest` with `@0.7.6`; `mise ls-remote
+github:chussenot/pact` lists what exists.
+
+### Two routes that look right and are not
 
 `mise plugin add pact https://github.com/chussenot/pact.git` looks like the right
 command and is not one. pact ships no asdf/vfox plugin, so mise clones this
@@ -123,9 +156,15 @@ The failure arrives one command later, which is what makes it worth writing down
 — `mise use pact` then answers `pact not found in mise tool registry`, naming
 neither the clone nor the reason.
 
-What works is mise's **cargo backend**, pointed at a git tag. Features are a tool
-option rather than part of the version, so the `full` profile needs the table
-form:
+`ubi:chussenot/pact` also works today and should not be used: mise deprecated
+that backend in favour of `github:`, and warns that it goes away in 2027.1.0.
+
+### Building from source through mise
+
+The **cargo backend** compiles from a git tag instead of downloading, which is
+what you want if you need a build the release does not publish — the
+feature-less one, say. Features are a tool option rather than part of the
+version, so the table form is required:
 
 ```toml
 # mise.toml — or ~/.config/mise/config.toml to have it everywhere
@@ -145,7 +184,7 @@ Two pieces of syntax that fail in ways that don't point at themselves:
 - **Bracket options are not read on the command line here.** `mise use
   "cargo:…@tag:0.4.0[features=ui,otel,mcp]"` hands the brackets to cargo as part
   of the ref, and the error is about a refspec rather than about features. The
-  one-liner is only good for the `lean` profile:
+  one-liner is only good for a build with no optional features:
   `mise use "cargo:https://github.com/chussenot/pact@tag:0.4.0"`.
 
 `locked` defaults to true in this backend, so the build uses the `Cargo.lock` the
@@ -168,7 +207,7 @@ mise which pact
 Per-client configuration — Claude Code, Claude Desktop, Codex — is in
 [mcp.md](mcp.md#registering-it). Whichever client you use, `pact mcp serve` exists
 only in a build with the `mcp` feature, so check `pact --version` first: an MCP
-server that answers `unrecognized subcommand` is a `lean` binary, not a broken
+server that answers `unrecognized subcommand` was built without `mcp`, not a broken
 config.
 
 ## The Beads CLI
