@@ -282,6 +282,47 @@ and then you can't compile your own file. See
 A single path renders and serializes exactly as it always did, including
 `--json` emitting the lease object rather than a one-element array.
 
+### A granted lease is not a claim on the work
+
+`bd update --claim` decides who owns the **work**. `pact lease acquire` decides who
+may edit the **files**. They are separate locks, and pact grants the second without
+consulting the first — so an agent that *lost* the bead claim can still be handed
+every lease that bead names.
+
+That is not hypothetical. From one run, verbatim:
+
+> a race let me briefly hold `src/main.rs`+`src/lib.rs` for `crucible-2o3.27`
+> after `bd update --claim` had already lost that bead to agent-07 — pact granted
+> the lease with no cross-check against bd claim state. I released immediately and
+> told agent-07.
+
+It self-corrected because an agent noticed. Two more agents hit the same shape in
+the same run.
+
+The protocol says claim first, lease second, which makes the claim look like the
+serialization point. **It is not** — the lease is what protects the file. So when
+an acquire note names a bead, pact looks it up:
+
+```
+note: your lease note names crucible-2o3.27, which bd says is assigned to
+agent-07, not agent-06 — the bead claim and the file lease are separate locks,
+and pact just granted you the second without the first. If you lost
+`bd update --claim` for this bead, release and tell agent-07
+(`pact msg send --to agent-07`) rather than editing behind them
+```
+
+One lookup per `acquire` command, not per path, since the note is shared across a
+batch. It is **silent on every failure** — no note, no bead id in it, no backend,
+no such bead, no assignee, or an assignee that is you. Three Beads outages happened
+in that one run, and a warning that fires when the store is down is a warning
+agents learn to ignore.
+
+Which is also why this is a note and not a refusal. pact cannot know whether the
+assignee is stale, whether the bead was handed over verbally, or whether bd is
+simply behind; what it can do is put the contradiction in front of the one agent
+who can resolve it. The retrospective version is
+[`pact audit --check claim-lease-divergence`](audit.md#--check-claim-lease-divergence).
+
 ### A lease is exclusive in time, not across worktrees
 
 **In one shared checkout, a lease is all you need.** The file has a single state,

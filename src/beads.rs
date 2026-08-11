@@ -494,6 +494,86 @@ impl BeadsCli {
     }
 }
 
+/// Who a bead is assigned to, or `None` for every "cannot tell": no such bead, no
+/// backend, an unparseable answer, or an empty assignee.
+///
+/// Every one of those must be indistinguishable from "not assigned", because the
+/// only caller warns on the answer (pact-mqw.4) and a warning produced by a
+/// missing backend is a warning agents learn to ignore. Three bd outages happened
+/// in the crucible run alone.
+///
+/// One subprocess, and the only thing it reads is the assignee field. `show` is
+/// used rather than `list --assignee=` because the question is about a known id,
+/// not a search.
+pub fn assignee_of(cli: &BeadsCli, repo_root: &Path, id: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Assigned {
+        #[serde(default)]
+        assignee: Option<String>,
+    }
+    let out = cli.run(repo_root, &["show", id, "--json"]).ok()?;
+    // Both backends return an array even for one id.
+    let issues: Vec<Assigned> = serde_json::from_str(&out).ok()?;
+    let who = issues.into_iter().next()?.assignee?;
+    (!who.trim().is_empty()).then_some(who)
+}
+
+/// The first bead id in a free-text note, if it holds one.
+///
+/// Deliberately narrow: `<prefix>-<three alnum>` plus optional `.N` suffixes,
+/// which is the shape both bd and br generate (`pact-mqw`, `pact-mqw.4`,
+/// `crucible-2o3.27`). Ordinary hyphenated prose does not match, because its
+/// second component is almost never exactly three characters — and the few false
+/// positives that do slip through (`pact-msg` inside a message id) resolve to no
+/// bead and are silent, which is the safe direction.
+///
+/// The FIRST match only, so one acquire costs at most one backend lookup however
+/// chatty the note is.
+pub fn bead_id_in(note: &str) -> Option<&str> {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.';
+    for (start, _) in note.char_indices() {
+        // Only at a token boundary, or "impact-abc" would yield "pact-abc".
+        if start > 0 && is_word(note[..start].chars().next_back().unwrap_or(' ')) {
+            continue;
+        }
+        let rest = &note[start..];
+        let token: &str = rest.split(|c: char| !is_word(c)).next().unwrap_or("");
+        if let Some(id) = looks_like_bead_id(token) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// `<prefix>-<exactly three alnum>(.N)*`, and nothing else.
+fn looks_like_bead_id(token: &str) -> Option<&str> {
+    let (prefix, tail) = token.rsplit_once('-')?;
+    if prefix.is_empty() || !prefix.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return None;
+    }
+    if !prefix
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    let mut parts = tail.split('.');
+    let base = parts.next()?;
+    if base.len() != 3 || !base.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    // Trailing `.N` segments only; anything else means this is prose that happened
+    // to end in three characters, like a sentence ending in "-abc.".
+    let mut end = prefix.len() + 1 + base.len();
+    for part in parts {
+        if part.is_empty() || !part.chars().all(|c| c.is_ascii_digit()) {
+            break;
+        }
+        end += 1 + part.len();
+    }
+    Some(&token[..end])
+}
+
 pub fn conflicting_stores(repo_root: &Path) -> Option<(String, String)> {
     let beads = repo_root.join(".beads");
     let dolt = beads.join("embeddeddolt").is_dir();

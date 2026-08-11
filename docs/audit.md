@@ -259,6 +259,54 @@ and `topology_unstamped` follow. An unhashed close also *clears* the anchor rath
 than leaving a stale one, because comparing an acquire against a release two holds
 back would invent a finding out of nothing.
 
+### `--check claim-lease-divergence`
+
+A fleet on this protocol runs **two mutual-exclusion mechanisms answering two
+halves of one question**:
+
+| Lock | Decides |
+|---|---|
+| `bd update --claim` | who owns the WORK |
+| `pact lease acquire` | who may edit the FILES |
+
+Neither consulted the other. Nothing prevented agent A holding the bead while
+agent B held every file that bead names — and it happened. agent-06, verbatim:
+
+> a race let me briefly hold `src/main.rs`+`src/lib.rs` for `crucible-2o3.27`
+> after `bd update --claim` had already lost that bead to agent-07 — pact granted
+> the lease with no cross-check against bd claim state. I released immediately and
+> told agent-07.
+
+Corroborated twice more in the same run. It self-corrected only because an agent
+noticed and volunteered a release.
+
+The protocol tells agents to claim first and lease second, which makes the bead
+claim *look* like the serialization point. It is not: the lease is what actually
+protects the file, and it was grantable to whoever lost the claim.
+
+So when an acquire note names a bead, `pact lease acquire`
+[warns if that bead belongs to somebody else](leases.md), and this check asks the
+same question over the whole log.
+
+**One lookup per distinct bead**, not per hold: a wave of twenty holds naming one
+bead is one subprocess.
+
+**The caveat, which bounds the claim.** `assignee` is the assignee *now*, not at
+acquire time — the log records the note, not the bead's state when it was written.
+A hold that legitimately handed its bead on afterwards therefore appears here too.
+This answers the retrospective question ("whose bead did this hold name, and who
+owns it today"); the live question is answered at acquire time, where the assignee
+really is current.
+
+Two scope lines, printed clean or not: how many holds named no bead at all, and —
+when the store could not be asked — why. `claim_unavailable` reads as "this check
+could not run", never as "nothing found", the same contract `git_unavailable` has.
+
+This is the second place audit reaches outside `.pact/`, after
+`--check commit-correlation` reached for `git`. Same rule both times: the
+invariant is *never touch the Beads DB directly, only its CLI*, which this obeys —
+`--export` already asks bd a question for `unacknowledged_messages`.
+
 ## Where the run actually happened
 
 The summary counts events by the worktree pact was invoked from, so "did this

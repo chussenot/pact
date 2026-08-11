@@ -37,7 +37,7 @@ pact watch ls
 pact log [-n | --limit <count>]
 pact doctor
 pact completion <bash|zsh|fish|elvish|powershell>
-pact audit [--check <double-win|stale-holds|chain-integrity|commit-correlation|merge-divergence|topology>] [--expect <worktrees|main|any>] [--since <rfc3339|duration>] [--include-annotated] [--compare <path>] [--export <path>]
+pact audit [--check <double-win|stale-holds|chain-integrity|commit-correlation|merge-divergence|claim-lease-divergence|topology>] [--expect <worktrees|main|any>] [--since <rfc3339|duration>] [--include-annotated] [--compare <path>] [--export <path>]
 pact ui
 pact mcp serve
 ```

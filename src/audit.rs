@@ -128,6 +128,10 @@ pub enum Check {
     /// held by nobody. This is that hazard read back offline, from the content
     /// hashes `acquired` and `released` already carry.
     MergeDivergence,
+    /// pact-mqw.4: did a hold's note name a bead that belongs to somebody else?
+    /// The one check that asks the Beads store a question rather than reading only
+    /// `.pact/` — see [`ClaimDivergence`] for the caveat that comes with it.
+    ClaimLeaseDivergence,
 }
 
 /// What `--expect` declares a run's topology should have been.
@@ -193,6 +197,7 @@ impl Check {
             "chain-integrity" => Ok(Check::ChainIntegrity),
             "commit-correlation" => Ok(Check::CommitCorrelation),
             "merge-divergence" => Ok(Check::MergeDivergence),
+            "claim-lease-divergence" => Ok(Check::ClaimLeaseDivergence),
             "topology" => Ok(Check::Topology(match expect {
                 Some(e) => Expect::parse(e)?,
                 // Defaulting to `any` rather than erroring: `--check topology`
@@ -202,7 +207,7 @@ impl Check {
             })),
             other => Err(anyhow::anyhow!(
                 "unknown check \"{other}\"; expected double-win, stale-holds, chain-integrity, \
-                 commit-correlation, merge-divergence or topology"
+                 commit-correlation, merge-divergence, claim-lease-divergence or topology"
             )),
         }
     }
@@ -292,6 +297,84 @@ fn merge_divergences(events: &[(usize, Event)]) -> (Vec<MergeDivergence>, usize)
         });
     }
     (out, unhashed)
+}
+
+/// One hold whose note named a bead assigned to a different agent.
+///
+/// **The caveat, stated first because it bounds the claim.** `assignee` is the
+/// assignee *now*, not at acquire time — the log records the note, not the bead's
+/// state when it was written. So a hold that legitimately handed its bead on
+/// afterwards shows up here too. This answers "whose bead did this hold's note
+/// name, and who owns that bead today", which is the retrospective question; the
+/// live question is answered at acquire time, where the assignee really is current.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaimDivergence {
+    pub path: String,
+    pub agent: String,
+    pub bead: String,
+    pub assignee: String,
+    pub acquired_at: String,
+    pub line: usize,
+}
+
+/// Cross-check each hold's note against the Beads store.
+///
+/// Widens audit's usual "`.pact/` and nothing else" scope for the second time, the
+/// same way [`Check::CommitCorrelation`] widened it for git — and under the same
+/// rule: the invariant that section protects is "never touch the Beads DB
+/// directly, only its CLI", which this obeys. `pact audit --export` already asks
+/// bd a question for `unacknowledged_messages`.
+///
+/// One lookup per DISTINCT bead, not per hold: a wave of twenty holds naming one
+/// bead is one subprocess.
+fn claim_divergences(
+    repo_root: &std::path::Path,
+    events: &[(usize, Event)],
+    report: &mut CheckReport,
+) {
+    let cli = match crate::beads::BeadsCli::locate() {
+        Ok(cli) => cli,
+        Err(e) => {
+            report.claim_unavailable = Some(format!("{e:#}"));
+            return;
+        }
+    };
+    // bead id -> assignee, resolved once. `None` means asked and unassigned (or
+    // unknown), which is not worth asking twice either.
+    let mut resolved: BTreeMap<String, Option<String>> = BTreeMap::new();
+    // Walked over the OPENING EVENTS rather than over reconstructed `Hold`s,
+    // because the note lives on the event's `detail` and a Hold does not carry it.
+    // Same set either way — every hold has exactly one open — with no need to widen
+    // a serialized shape three other checks render.
+    for (line, e) in events.iter().filter(|(_, e)| opens(&e.kind)) {
+        let Some(path) = e.path.as_deref() else {
+            continue;
+        };
+        let Some(note) = e.detail.as_deref() else {
+            report.holds_naming_no_bead += 1;
+            continue;
+        };
+        let Some(bead) = crate::beads::bead_id_in(note) else {
+            report.holds_naming_no_bead += 1;
+            continue;
+        };
+        let assignee = resolved
+            .entry(bead.to_string())
+            .or_insert_with(|| crate::beads::assignee_of(&cli, repo_root, bead))
+            .clone();
+        let Some(assignee) = assignee else { continue };
+        if assignee == e.agent {
+            continue;
+        }
+        report.claim_divergences.push(ClaimDivergence {
+            path: path.to_string(),
+            agent: e.agent.clone(),
+            bead: bead.to_string(),
+            assignee,
+            acquired_at: e.at.clone(),
+            line: *line,
+        });
+    }
 }
 
 /// One invocation point that contradicted `--expect`.
@@ -597,6 +680,16 @@ pub struct CheckReport {
     /// and flagging it would fail every existing repository. Same discipline as
     /// `chain_untracked` and `topology_unstamped`.
     pub divergence_unhashed: usize,
+    /// `Check::ClaimLeaseDivergence` only.
+    pub claim_divergences: Vec<ClaimDivergence>,
+    /// `Check::ClaimLeaseDivergence` only: `Some(reason)` when the Beads store
+    /// could not be asked at all. `claim_divergences` is then always empty, which
+    /// must read as "this check could not run", never as "nothing found" — the same
+    /// contract `git_unavailable` has.
+    pub claim_unavailable: Option<String>,
+    /// `Check::ClaimLeaseDivergence` only: holds whose note named no bead, so there
+    /// was nothing to cross-check. Scope, not a finding.
+    pub holds_naming_no_bead: usize,
     /// `Check::Topology` only: events carrying no `invoked_from` at all.
     /// Reported, never a finding — every log written before pact 0.7.0 is
     /// entirely in this state, and flagging it would fail every existing
@@ -614,6 +707,7 @@ impl CheckReport {
             + self.uncovered_commits.len()
             + self.topology_mismatches.len()
             + self.merge_divergences.len()
+            + self.claim_divergences.len()
     }
 }
 
@@ -1198,6 +1292,7 @@ pub fn run_check(
             Check::CommitCorrelation => "commit-correlation",
             Check::Topology(_) => "topology",
             Check::MergeDivergence => "merge-divergence",
+            Check::ClaimLeaseDivergence => "claim-lease-divergence",
         },
         events_scanned: events.len(),
         excluded_by_annotation: loaded.excluded,
@@ -1218,6 +1313,9 @@ pub fn run_check(
         topology_unstamped: 0,
         merge_divergences: Vec::new(),
         divergence_unhashed: 0,
+        claim_divergences: Vec::new(),
+        claim_unavailable: None,
+        holds_naming_no_bead: 0,
     };
 
     match check {
@@ -1274,6 +1372,7 @@ pub fn run_check(
             report.merge_divergences = divergences;
             report.divergence_unhashed = unhashed;
         }
+        Check::ClaimLeaseDivergence => claim_divergences(repo_root, &events, &mut report),
         Check::Topology(expect) => {
             report.expected_topology = Some(expect.label());
             let mut by_point: BTreeMap<String, usize> = BTreeMap::new();
@@ -1312,6 +1411,8 @@ pub struct ExportReport {
     pub commit_correlation: CheckReport,
     /// pact-mqw.3: successive holds that started from divergent content.
     pub merge_divergence: CheckReport,
+    /// pact-mqw.4: holds whose note named a bead assigned to another agent.
+    pub claim_lease_divergence: CheckReport,
     /// Run with `--expect any`, so it reports the distribution rather than a
     /// verdict: a stored retrospective should not fail on an expectation
     /// nobody declared when it was written.
@@ -1364,6 +1465,12 @@ pub fn export(
         include_annotated,
     )?;
     let merge_divergence = run_check(repo_root, Check::MergeDivergence, since, include_annotated)?;
+    let claim_lease_divergence = run_check(
+        repo_root,
+        Check::ClaimLeaseDivergence,
+        since,
+        include_annotated,
+    )?;
     let doctor = crate::doctor::checks(repo_root);
 
     // Best-effort by design: a repo with no `.beads/` or no backend on PATH
@@ -1422,6 +1529,17 @@ pub fn export(
             merge_divergence.findings()
         ));
     }
+    match &claim_lease_divergence.claim_unavailable {
+        Some(reason) => {
+            observations.push(format!("claim-lease-divergence could not run: {reason}"))
+        }
+        None if claim_lease_divergence.findings() > 0 => observations.push(format!(
+            "{} hold(s) named a bead their holder does not own: the bead claim and the file \
+             lease are separate locks that do not consult each other.",
+            claim_lease_divergence.findings()
+        )),
+        None => {}
+    }
     if !unacknowledged_messages.is_empty() {
         // Named, not counted, and "nobody read it" kept distinct from "read
         // by somebody who was not the addressee" — the second is the common
@@ -1468,6 +1586,7 @@ pub fn export(
         chain_integrity,
         commit_correlation,
         merge_divergence,
+        claim_lease_divergence,
         topology,
         doctor,
         unacknowledged_messages,
@@ -1603,6 +1722,11 @@ const COMPARED: &[(&str, &str, Extract)] = &[
     (
         "merge divergences",
         "/merge_divergence/merge_divergences",
+        Extract::Len,
+    ),
+    (
+        "claim/lease divergences",
+        "/claim_lease_divergence/claim_divergences",
         Extract::Len,
     ),
     (
@@ -2121,6 +2245,20 @@ pub fn render_check(r: &CheckReport) -> String {
         ));
     }
 
+    if r.check == "claim-lease-divergence" {
+        if let Some(reason) = &r.claim_unavailable {
+            out.push(format!(
+                "  the Beads store could not be asked ({reason}) — claim-lease-divergence could \
+                 not run"
+            ));
+            return out.join("\n");
+        }
+        out.push(format!(
+            "  {} hold(s) named no bead in their note, so there was nothing to cross-check",
+            r.holds_naming_no_bead
+        ));
+    }
+
     if r.check == "commit-correlation" {
         if let Some(reason) = &r.git_unavailable {
             out.push(format!(
@@ -2148,6 +2286,10 @@ pub fn render_check(r: &CheckReport) -> String {
                 "every context-stamped event matches --expect {}",
                 r.expected_topology.unwrap_or("any")
             ),
+            "claim-lease-divergence" => {
+                "every hold whose note named a bead was held by that bead's own assignee"
+                    .to_string()
+            }
             "merge-divergence" => {
                 "every hold started from the content the previous holder left — no edit was made \
                  against a stale copy"
@@ -2327,6 +2469,26 @@ pub fn render_check(r: &CheckReport) -> String {
              this usually means agents edited in their worktrees but ran pact from the main \n\
              checkout, so the lease/edit binding rests on convention — see \n\
              docs/fleet-patterns.md."
+                .to_string(),
+        );
+    }
+
+    for c in &r.claim_divergences {
+        out.push(String::new());
+        out.push(format!(
+            "CLAIM/LEASE DIVERGENCE on {}: held by {} for {}, which bd assigns to {} (line {}, \
+             acquired {})",
+            c.path, c.agent, c.bead, c.assignee, c.line, c.acquired_at
+        ));
+    }
+    if !r.claim_divergences.is_empty() {
+        out.push(String::new());
+        out.push(
+            "A fleet on this protocol has TWO mutual-exclusion mechanisms answering two halves \n\
+             of one question — `bd update --claim` for who owns the work, `pact lease acquire` \n\
+             for who may edit the files — and pact grants the second without consulting the \n\
+             first. Assignees above are CURRENT, not as of the acquire, so a bead legitimately \n\
+             handed on later appears here too; see docs/audit.md."
                 .to_string(),
         );
     }

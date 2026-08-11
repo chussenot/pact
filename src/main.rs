@@ -498,6 +498,8 @@ fn subcommand_name(command: &Command) -> &'static str {
             Some("stale-holds") => "audit stale-holds",
             Some("chain-integrity") => "audit chain-integrity",
             Some("commit-correlation") => "audit commit-correlation",
+            Some("merge-divergence") => "audit merge-divergence",
+            Some("claim-lease-divergence") => "audit claim-lease-divergence",
             Some("topology") => "audit topology",
             // One literal for anything else, including a bad value: the argument
             // is user text and must never reach a span name.
@@ -1466,6 +1468,45 @@ fn messages_about(root: &Path, paths: &[String], agent: &str) -> Vec<MessageChec
         .collect()
 }
 
+/// Warn when the bead named in an acquire note belongs to somebody else.
+///
+/// A fleet on this protocol runs **two mutual-exclusion mechanisms answering two
+/// halves of one question** — `bd update --claim` for who owns the WORK, `pact
+/// lease acquire` for who may edit the FILES — and neither consulted the other.
+/// Nothing prevented agent A holding the bead while agent B held every file that
+/// bead names.
+///
+/// It happened. agent-06, verbatim: "a race let me briefly hold
+/// src/main.rs+src/lib.rs for crucible-2o3.27 after `bd update --claim` had
+/// already lost that bead to agent-07 — pact granted the lease with no
+/// cross-check against bd claim state. I released immediately and told agent-07."
+/// Corroborated twice more in the same run, and it self-corrected only because an
+/// agent noticed and volunteered a release.
+///
+/// The protocol tells agents to claim first and lease second, which makes the bead
+/// claim look like the serialization point — but the lease is what actually
+/// protects the file, and it was grantable to whoever lost the claim.
+///
+/// Advisory, and **silent on every failure**: no note, no bead id in the note, no
+/// backend, no such bead, no assignee, or an assignee that is the acquirer. Three
+/// bd outages happened in that run alone, and a warning that fires when the
+/// backend is down is a warning agents learn to ignore.
+fn claim_warning(root: &Path, note: Option<&str>, agent: &str) -> Option<String> {
+    let id = beads::bead_id_in(note?)?;
+    let cli = beads::BeadsCli::locate().ok()?;
+    let assignee = beads::assignee_of(&cli, root, id)?;
+    if assignee == agent {
+        return None;
+    }
+    Some(format!(
+        "note: your lease note names {id}, which bd says is assigned to {assignee}, not \
+         {agent} — the bead claim and the file lease are separate locks, and pact just \
+         granted you the second without the first. If you lost `bd update --claim` for this \
+         bead, release and tell {assignee} (`pact msg send --to {assignee}`) rather than \
+         editing behind them"
+    ))
+}
+
 /// One path's [`MessageCheck`], from its own `about_path` result — split out
 /// of [`messages_about`] so this per-path resolution (an `Ok`/`Err` from ONE
 /// path must never affect a SIBLING path's result, pact-m7j.10.4) is testable
@@ -1597,6 +1638,9 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
             // Look up prior owners BEFORE acquiring: the acquire appends its own
             // event, which would make the caller the answer to its own question.
             let prior = prior_owners(&root, &paths, &agent);
+            // Resolved from the note, so it costs one lookup per COMMAND rather
+            // than one per path — the note is shared by every path in a batch.
+            let claim = claim_warning(&root, note.as_deref(), &agent);
             let mut outcomes = lease::acquire_many(&root, &agent, &paths, ttl, steal, note)?;
             // One path renders and serializes exactly as it always did — a
             // script doing `lease acquire f --json | jq .lease.path` must not
@@ -1626,6 +1670,9 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
             // After the success line, never before it: what happened first,
             // then what you should know.
             for line in prior {
+                output::warn(&line);
+            }
+            if let Some(line) = claim {
                 output::warn(&line);
             }
             for check in messages_about(&root, &paths, &agent) {
