@@ -294,6 +294,13 @@ enum MsgAction {
         /// Print every body in full instead of one line per message.
         #[arg(long)]
         full: bool,
+        /// List `pact watch` notices alongside authored messages, one entry per
+        /// path rather than one per delivery.
+        #[arg(long, conflicts_with = "watch_only")]
+        include_watch: bool,
+        /// Only `pact watch` notices — what changed under you while you worked.
+        #[arg(long)]
+        watch_only: bool,
     },
     /// List messages you sent, newest first, and whether they were read.
     Sent,
@@ -1824,6 +1831,10 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
                     subject: subject.as_deref(),
                     body: &body,
                     about: &to_owner_of,
+                    // Always authored. There is deliberately no flag for
+                    // "file this under machine noise" — that tag exists so an
+                    // agent can trust that what is left IS correspondence.
+                    notice: false,
                 },
             )?;
             output::emit(json, &sent, |sent: &Vec<msg::Message>| {
@@ -1860,23 +1871,41 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
             });
             Ok(())
         }
-        MsgAction::Inbox { unread_only, full } => {
+        MsgAction::Inbox {
+            unread_only,
+            full,
+            include_watch,
+            watch_only,
+        } => {
+            let view = if watch_only {
+                msg::WatchView::Only
+            } else if include_watch {
+                msg::WatchView::Include
+            } else {
+                msg::WatchView::Authored
+            };
             let messages = msg::inbox(&cli, &root, &agent, unread_only)?;
-            output::emit(json, &messages, |messages: &Vec<msg::Message>| {
-                if messages.is_empty() {
-                    "inbox empty".to_string()
-                } else if full {
-                    render_full(messages)
-                } else {
-                    render_inbox(messages)
-                }
+            // `--json` is never coalesced: a machine can group for itself, and
+            // collapsing nine deliveries into one entry would cost it their ids.
+            // The flags choose which messages it sees and nothing else.
+            let picked: Vec<&msg::Message> = messages
+                .iter()
+                .filter(|m| match view {
+                    msg::WatchView::Authored => !m.notice,
+                    msg::WatchView::Include => true,
+                    msg::WatchView::Only => m.notice,
+                })
+                .collect();
+            let (authored, notices) = msg::split_notices(&messages);
+            output::emit(json, &picked, |_: &Vec<&msg::Message>| {
+                render_inbox_view(&authored, &notices, view, full)
             });
             Ok(())
         }
         MsgAction::Read { id } => {
             let thread = msg::read_thread(&cli, &root, &agent, &id)?;
             output::emit(json, &thread, |thread: &Vec<msg::Message>| {
-                render_full(thread)
+                render_full(&thread.iter().collect::<Vec<_>>())
             });
             Ok(())
         }
@@ -2244,7 +2273,97 @@ fn read_by_recipient(m: &msg::Message) -> bool {
 /// just to see how stale it was. `Message.created_at` was already carried
 /// end to end; this is `pact log`'s own `since()` reused for the same
 /// column, not a new mechanism.
-fn render_inbox(messages: &[msg::Message]) -> String {
+/// The inbox an agent actually reads: correspondence, with `pact watch` notices
+/// summarised rather than listed (pact-mqw.5).
+///
+/// The default is authored-only because a notice is a side effect of a peer
+/// doing its job, and the queue an agent checks for "does anybody need something
+/// from me" must not be dominated by them. In the crucible run it was, 11 to 1,
+/// and the one authored message in that window was a warning about six duplicate
+/// test functions.
+///
+/// Notices are never *hidden*: the trailing line always counts them, per path,
+/// and names the flag that shows them. A count an agent can see is what makes
+/// skipping them a decision instead of an accident.
+fn render_inbox_view(
+    authored: &[&msg::Message],
+    notices: &[msg::NoticeGroup],
+    view: msg::WatchView,
+    full: bool,
+) -> String {
+    // Nothing at all keeps the string it has always had: "inbox empty" is what
+    // an agent's first command prints on a quiet repo, and "no authored
+    // messages" would imply something else is waiting.
+    if authored.is_empty() && notices.is_empty() {
+        return "inbox empty".to_string();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if view != msg::WatchView::Only {
+        if authored.is_empty() {
+            parts.push("no authored messages".to_string());
+        } else if full {
+            parts.push(render_full(authored));
+        } else {
+            parts.push(render_inbox(authored));
+        }
+    }
+
+    if notices.is_empty() {
+        if view == msg::WatchView::Only {
+            parts.push("no watch notices".to_string());
+        }
+    } else if view == msg::WatchView::Authored {
+        // The summary, not the notices. One line, because its job is to let an
+        // agent decide whether to look — not to be the looking.
+        let total: usize = notices.iter().map(|g| g.count).sum();
+        let unread: usize = notices.iter().map(|g| g.unread).sum();
+        let per_path = notices
+            .iter()
+            .map(|g| format!("{} ×{}", g.path, g.count))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!(
+            "{total} watch notice(s) on {} path(s), {unread} unread: {per_path}\n\
+             `pact msg inbox --include-watch` lists them, `--watch-only` shows only them",
+            notices.len(),
+        ));
+    } else {
+        // One row per PATH, not per delivery. Nine diffs of one file nine
+        // seconds apart answer one question and only the last of them answers
+        // it, so the earlier ones are counted and the latest is the one offered
+        // to `pact msg read`.
+        let mut rows = vec![vec![
+            "PATH".to_string(),
+            "CHANGES".to_string(),
+            "UNREAD".to_string(),
+            "LATEST FROM".to_string(),
+            "WHEN".to_string(),
+            "LATEST ID".to_string(),
+        ]];
+        rows.extend(notices.iter().map(|g| {
+            vec![
+                g.path.clone(),
+                g.count.to_string(),
+                g.unread.to_string(),
+                if g.latest_from.is_empty() {
+                    "?".to_string()
+                } else {
+                    g.latest_from.clone()
+                },
+                since(&g.latest_at),
+                g.latest_id.clone(),
+            ]
+        }));
+        parts.push(format!(
+            "{}\n\n{} path(s) changed under you — `pact msg read <latest id>` for the newest diff",
+            table(&rows),
+            notices.len(),
+        ));
+    }
+    parts.join("\n\n")
+}
+
+fn render_inbox(messages: &[&msg::Message]) -> String {
     let mut rows = vec![vec![
         "ID".to_string(),
         String::new(), // unread marker; a header would be wider than the column
@@ -2274,7 +2393,7 @@ fn render_inbox(messages: &[msg::Message]) -> String {
 /// Full text with the envelope pact used to throw away: from, to, subject, time
 /// (pact-rnc.1). Shared by `msg read` and `msg inbox --full`, so a sender can
 /// finally read their own message back with its metadata.
-fn render_full(messages: &[msg::Message]) -> String {
+fn render_full(messages: &[&msg::Message]) -> String {
     messages
         .iter()
         .map(|m| {
@@ -2421,6 +2540,19 @@ mod tests {
             } else {
                 Vec::new()
             },
+            notice: false,
+        }
+    }
+
+    /// A `pact watch` release notice, subject-shaped the way
+    /// `watch::notify_release` builds it so `split_notices` can parse the path
+    /// back out.
+    fn notice(id: &str, path: &str, holder: &str, read: bool) -> msg::Message {
+        msg::Message {
+            subject: Some(format!("{path}{}{holder}", msg::NOTICE_SUBJECT_MARKER)),
+            from: holder.to_string(),
+            notice: true,
+            ..message(id, holder, "a diff", read)
         }
     }
 
@@ -2496,10 +2628,9 @@ mod tests {
     #[test]
     fn inbox_shows_from_and_an_unread_marker_on_one_line_each() {
         let body = "para one\n\npara two with \"quotes\"\n".repeat(40);
-        let out = render_inbox(&[
-            message("pact-wisp-aaa", "msg-fix", &body, false),
-            message("pact-wisp-bbb", "lease-fix", "short", true),
-        ]);
+        let a = message("pact-wisp-aaa", "msg-fix", &body, false);
+        let b = message("pact-wisp-bbb", "lease-fix", "short", true);
+        let out = render_inbox(&[&a, &b]);
         let rows: Vec<&str> = out.lines().take(3).collect();
         assert_eq!(rows.len(), 3, "header + one line per message: {out}");
         assert!(
@@ -2520,9 +2651,82 @@ mod tests {
         assert!(out.contains("1 unread"), "{out}");
     }
 
+    /// pact-mqw.5: the inbox an agent reads is correspondence, and watch notices
+    /// are a trailing count. Reproduces the crucible ratio directly — 11
+    /// automatic notices to 1 authored message — and asserts the authored one is
+    /// the thing on screen.
+    #[test]
+    fn the_default_inbox_is_authored_only_with_notices_counted() {
+        let mut all: Vec<msg::Message> = (0..9)
+            .map(|i| notice("n{i}", "src/ast.rs", &format!("agent-0{i}"), false))
+            .collect();
+        all.push(notice("n9", "src/eval.rs", "agent-09", false));
+        all.push(notice("n10", "src/eval.rs", "agent-09", true));
+        let authored_msg = message("a1", "agent-05", "six duplicate test fns", false);
+        all.push(authored_msg);
+
+        let (authored, notices) = msg::split_notices(&all);
+        let out = render_inbox_view(&authored, &notices, msg::WatchView::Authored, false);
+
+        assert!(
+            out.contains("agent-05"),
+            "the authored message must show: {out}"
+        );
+        assert!(
+            !out.contains("src/ast.rs ×9\nn0"),
+            "notices must not be listed row by row: {out}"
+        );
+        // Counted, per path, with the flag that reveals them.
+        assert!(out.contains("11 watch notice(s) on 2 path(s)"), "{out}");
+        assert!(out.contains("src/ast.rs ×9"), "{out}");
+        assert!(out.contains("src/eval.rs ×2"), "{out}");
+        assert!(out.contains("10 unread"), "{out}");
+        assert!(out.contains("--include-watch"), "{out}");
+        // And the notice ids are NOT in the default table, or nothing was saved.
+        assert!(!out.contains("n0"), "{out}");
+    }
+
+    /// `--watch-only` is one row per PATH, not per delivery. Nine diffs of one
+    /// file nine seconds apart answer one question and only the last answers it,
+    /// so the latest id is what gets offered to `msg read`.
+    #[test]
+    fn watch_only_coalesces_per_path_and_offers_the_newest_diff() {
+        let all: Vec<msg::Message> = vec![
+            notice("n0", "src/ast.rs", "agent-01", true),
+            notice("n1", "src/ast.rs", "agent-04-r2", false),
+            notice("n2", "src/printer.rs", "agent-02", false),
+        ];
+        let (authored, notices) = msg::split_notices(&all);
+        let out = render_inbox_view(&authored, &notices, msg::WatchView::Only, false);
+
+        let rows: Vec<&str> = out.lines().filter(|l| l.contains("src/")).collect();
+        assert_eq!(rows.len(), 2, "one row per path: {out}");
+        let ast = rows.iter().find(|r| r.contains("src/ast.rs")).unwrap();
+        assert!(ast.contains("agent-04-r2"), "the latest releaser: {ast}");
+        assert!(ast.contains("n1"), "the latest id: {ast}");
+        assert!(
+            !out.contains("n0"),
+            "a superseded diff is a count, not a row: {out}"
+        );
+        // No authored section at all in this view.
+        assert!(!out.contains("no authored messages"), "{out}");
+    }
+
+    /// An inbox with nothing but notices must not read as "inbox empty" — that
+    /// was the shape that let a fleet believe nothing had happened.
+    #[test]
+    fn an_inbox_of_only_notices_says_so_rather_than_looking_empty() {
+        let all = vec![notice("n0", "src/ast.rs", "agent-01", false)];
+        let (authored, notices) = msg::split_notices(&all);
+        let out = render_inbox_view(&authored, &notices, msg::WatchView::Authored, false);
+        assert!(out.contains("no authored messages"), "{out}");
+        assert!(out.contains("1 watch notice(s)"), "{out}");
+    }
+
     #[test]
     fn full_render_carries_the_envelope() {
-        let out = render_full(&[message("pact-wisp-aaa", "msg-fix", "the body", true)]);
+        let m = message("pact-wisp-aaa", "msg-fix", "the body", true);
+        let out = render_full(&[&m]);
         assert!(out.contains("from: msg-fix"), "{out}");
         assert!(out.contains("to: cli-wire"), "{out}");
         assert!(out.contains("subject: a subject"), "{out}");

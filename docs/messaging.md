@@ -458,8 +458,55 @@ author bd never recorded shows `from: ?`.
 
 `pact msg inbox --full` prints every message through that same renderer — one
 full-text format, not two — for when you genuinely do want the whole inbox.
-`--json` is complete: all nine fields, including `from`, `read` (by the agent
-asking) and `read_by` (everyone who has read it).
+`--json` is complete: all ten fields, including `from`, `read` (by the agent
+asking), `read_by` (everyone who has read it) and `notice` (see below).
+
+### A notification is not correspondence
+
+The inbox lists **authored messages only**. `pact watch` release notices are
+counted at the bottom, per path, and shown by
+`--include-watch` or `--watch-only`:
+
+```
+2 message(s), 1 unread (*) — `pact msg read <id>` for the full text
+
+11 watch notice(s) on 2 path(s), 10 unread: src/ast.rs ×9, src/eval.rs ×2
+`pact msg inbox --include-watch` lists them, `--watch-only` shows only them
+```
+
+This is not a preference about tidiness. In the crucible run, one release of the
+designed hot file emitted **nine messages in nine seconds**, one per watcher, and
+`lease acquire` reported `32 unread message(s) about src/ast.rs`. Sampled across
+that window: 12 messages, **11 of them automatic release notices and exactly one
+authored by an agent** — a warning about six duplicate test functions that a peer
+needed to read.
+
+The fleet was not undisciplined. It was *compliant*: [watch.md](watch.md) tells
+agents to subscribe to interfaces they depend on but do not own, and the cost of
+following that advice is watchers × releases. So the better a fleet complies, the
+deeper it buries the one message worth reading — the same failure the protocol
+block already warns about ("a real `BLOCKER` sat unread for 38 minutes"), reached
+structurally instead of behaviourally.
+
+Three properties make the split safe to rely on:
+
+- **The distinction is a label, written at creation** (`watch-notice`), not a
+  guess from the wording. An agent that writes "src/ast.rs changed — released by
+  me" by hand is still correspondence, and there is deliberately no flag for
+  sending a message *as* a notice.
+- **Notices are counted, never hidden.** A count an agent can see makes skipping
+  them a decision; silence would make it an accident. An inbox holding nothing
+  but notices says so rather than printing `inbox empty`.
+- **`--include-watch` coalesces per path, not per delivery.** Nine diffs of one
+  file nine seconds apart answer one question, and only the last of them answers
+  it; the earlier eight are superseded before anyone reads them. One row carries
+  the change count, the latest releaser, and the id of the diff that is still
+  current.
+
+`--json` is never coalesced — a machine can group for itself, and collapsing nine
+deliveries into one entry would cost it their ids. The flags choose which
+messages it sees and nothing else, and every record carries `notice: true|false`
+so a consumer can branch without parsing prose.
 
 ## Reading back what you sent: `pact msg sent`
 

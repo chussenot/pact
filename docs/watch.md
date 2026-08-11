@@ -98,6 +98,28 @@ The message is tagged with the path, so it follows the file the way
 `--to-owner-of` messages do: whoever leases that path next is told one is
 waiting, even if the original subscriber has exited.
 
+### And it is tagged as a notice, because the cost is watchers × releases
+
+A notice carries a `watch-notice` label, and `pact msg inbox` shows authored
+messages by default with notices counted per path
+([why](messaging.md#a-notification-is-not-correspondence)).
+
+That tag exists because this feature's own advice creates the pile. The first
+fleet to follow it — ten agents all watching one designed hot file — turned a
+single release into **nine messages in nine seconds**, and `lease acquire`
+reported `32 unread message(s) about src/ast.rs`. Across that window: 11
+automatic notices to 1 authored message, and the authored one was the warning
+somebody actually needed.
+
+So the advice above is unchanged and still right — subscribe to the interfaces
+you depend on — but the delivery had to stop competing with correspondence for
+the same queue. **The better a fleet complies, the worse the ratio gets**, which
+makes this a property of the mechanism rather than of the fleet.
+
+`pact msg inbox --include-watch` collapses them one row per **path**, not per
+delivery, and points `msg read` at the latest diff. Eight superseded diffs of one
+file are a number; the ninth is the answer.
+
 ### The diff is against the content at acquire time
 
 Not against `HEAD`, and not against the index. The protocol now tells agents to

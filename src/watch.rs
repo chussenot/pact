@@ -358,7 +358,10 @@ pub fn notify_release(repo_root: &Path, holder: &str, released: &str, old_hash: 
         .unwrap_or_else(|| "(git produced no diff for this change)".to_string());
 
     let about = [released.to_string()];
-    let subject = format!("{released} changed — released by {holder}");
+    // Built with the shared marker, because `pact msg inbox` parses the path
+    // back out of it to group notices per path (pact-mqw.5). The const is the
+    // only thing keeping the two halves from drifting apart.
+    let subject = format!("{released}{}{holder}", crate::msg::NOTICE_SUBJECT_MARKER);
     let body = format!(
         "{holder} released {released}, which you are watching. What changed while they held it:\n\
          \n\
@@ -396,6 +399,10 @@ pub fn notify_release(repo_root: &Path, holder: &str, released: &str, old_hash: 
             // `--to-owner-of` messages do: whoever leases it next is told one
             // is waiting, even if this subscriber has exited.
             about: &about,
+            // The one caller that sets this. It is what keeps a hot file's
+            // release fanout out of the queue an agent reads for correspondence
+            // — see `msg::NOTICE`.
+            notice: true,
         };
         match crate::msg::send(
             &cli,

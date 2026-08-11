@@ -2473,6 +2473,10 @@ fn json_shapes_of_every_msg_command() {
         "created_at",
         "read",
         "read_by",
+        // pact-mqw.5: watch notices are tagged at creation, so every consumer
+        // can tell a release fanout from correspondence by a flag rather than by
+        // pattern-matching English in the body.
+        "notice",
     ];
 
     let sent = pact(
@@ -4826,7 +4830,37 @@ fn a_release_delivers_the_diff_to_a_subscriber_who_can_then_read_it() {
         stdout_of(&released)
     );
 
-    let inbox = pact(repo, "w5-juice", &["msg", "inbox", "--json"]);
+    // pact-mqw.5: a notice is NOT correspondence, so the default inbox does not
+    // list it — it counts it. The default listing is what an agent runs at task
+    // start, and a hot file's release fanout must not be what fills it.
+    let default_inbox = pact(repo, "w5-juice", &["msg", "inbox"]);
+    assert_ok(&default_inbox);
+    let plain = stdout_of(&default_inbox);
+    assert!(
+        plain.contains("1 watch notice(s) on 1 path(s)") && plain.contains("src/render.rs ×1"),
+        "the default inbox must COUNT the notice, per path: {plain}"
+    );
+    assert!(
+        plain.contains("--include-watch"),
+        "and name the flag that shows it: {plain}"
+    );
+    assert!(
+        !plain.contains("pact-msg-"),
+        "a notice must not occupy a row in the default listing: {plain}"
+    );
+    let empty = pact(repo, "w5-juice", &["msg", "inbox", "--json"]);
+    assert_ok(&empty);
+    assert_eq!(
+        json_stdout(&empty).as_array().map(Vec::len),
+        Some(0),
+        "--json defaults to authored-only too, or the two surfaces disagree"
+    );
+
+    let inbox = pact(
+        repo,
+        "w5-juice",
+        &["msg", "inbox", "--include-watch", "--json"],
+    );
     assert_ok(&inbox);
     let messages = json_stdout(&inbox);
     let m = messages
@@ -4834,6 +4868,10 @@ fn a_release_delivers_the_diff_to_a_subscriber_who_can_then_read_it() {
         .and_then(|a| a.first())
         .unwrap_or_else(|| panic!("subscriber got nothing: {messages}"));
     assert_eq!(m["from"], "w5-parallax");
+    assert_eq!(
+        m["notice"], true,
+        "the notice flag is what every consumer branches on: {m}"
+    );
     let id = m["id"].as_str().unwrap().to_string();
 
     let read = pact(repo, "w5-juice", &["msg", "read", &id]);
