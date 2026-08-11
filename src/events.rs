@@ -788,6 +788,48 @@ pub fn last_custody_by(repo_root: &Path, path: &str, agent: &str) -> Result<Opti
         }))
 }
 
+/// What the last agent to RELEASE `path` left behind: their name, when, and the
+/// content hash of the file at that moment.
+///
+/// The pairing this exists for (pact-mqw.3): a lease is exclusive in TIME, but
+/// under the branch-per-agent worktree topology it is not exclusive across
+/// COPIES. Agent A acquires, edits, commits to branch A, releases — compliant.
+/// Agent B acquires and edits a different copy on branch B that never contained
+/// A's change, commits, releases — also compliant. Both leases were honoured and
+/// the conflict is deferred to a merge nobody holds a lease for.
+///
+/// The hash a releasing agent left is the only fixed point that can detect it, so
+/// comparing it against the acquiring worktree's own hash answers "am I about to
+/// edit a stale copy" at the one moment it is cheap to act on.
+///
+/// `None` when the log has no close for this path, when the closing event predates
+/// content-hash stamping on releases, or when hashing failed at release time.
+/// Every one of those is "cannot tell", which must read as silence rather than as
+/// a warning — a false alarm on every first acquire would train agents to ignore
+/// the real one.
+pub fn last_released_content(repo_root: &Path, path: &str) -> Result<Option<ReleasedContent>> {
+    Ok(all(repo_root)?
+        .into_iter()
+        .rev()
+        .filter(|e| matches!(e.kind.as_str(), "released" | "force-released"))
+        .find(|e| e.path.as_deref() == Some(path) && e.content_hash.is_some())
+        .map(|e| ReleasedContent {
+            agent: e.agent,
+            at: e.at,
+            hash: e.content_hash.unwrap_or_default(),
+        }))
+}
+
+/// The three facts [`last_released_content`] answers with.
+#[derive(Debug, Clone)]
+pub struct ReleasedContent {
+    pub agent: String,
+    /// RFC3339 of the release.
+    pub at: String,
+    /// The path's git blob id as the releasing agent left it.
+    pub hash: String,
+}
+
 /// Every path pact has ever seen an event for, with its last owner, most
 /// recently touched first. Backs the free-but-owned rows in `lease ls --all`.
 pub fn owners(repo_root: &Path) -> Result<Vec<(String, Owner)>> {

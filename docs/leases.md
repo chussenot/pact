@@ -282,6 +282,59 @@ and then you can't compile your own file. See
 A single path renders and serializes exactly as it always did, including
 `--json` emitting the lease object rather than a one-element array.
 
+### A lease is exclusive in time, not across worktrees
+
+**In one shared checkout, a lease is all you need.** The file has a single state,
+so the second writer sees the first writer's bytes and nothing can be lost.
+
+Under [one worktree per agent](fleet-patterns.md) — which pact supports and every
+field run so far has used — the guarantee is narrower than it looks:
+
+```text
+agent A  acquires, edits, commits to branch A, releases      (compliant)
+agent B  acquires, edits a DIFFERENT COPY on branch B that
+         never contained A's change, commits, releases       (compliant)
+```
+
+Both leases were honoured. Neither agent broke the protocol. **The conflict is
+deferred to a merge performed later, by someone else, with no lease held by
+anyone and pact not involved** — and that merge is where the corruption lands.
+
+Three instances in one 85-minute run: duplicate match arms in `src/printer.rs`,
+six duplicate test functions in `src/parser.rs` (E0428), and a near-miss where a
+successor agent found that applying a stashed diff would have silently reverted a
+peer's `Expr::If`. **No conflict marker was ever produced in any of them.** git
+merged both insertions cleanly because they were textually non-adjacent — exactly
+the shape an additive change to a shared enum or `match` has, which is the shape
+this topology encourages and a designed hot file attracts.
+
+So `lease acquire` compares the path's content hash in *your* worktree against the
+hash the last agent left when they released it, and says so when they differ:
+
+```
+warning: your copy of src/printer.rs is NOT the copy agent-05 left when they
+released it at 2026-08-11T09:10:00Z — a lease is exclusive in time, not across
+worktrees, so you may be about to edit a branch that never contained their
+change. git will often merge both edits with no conflict marker. Reconcile first
+(`git merge`/`git rebase`, or `pact msg send --to-owner-of src/printer.rs`)
+rather than at merge time, when both plans are sunk cost.
+```
+
+Advisory, exit 0, and **silent whenever it cannot tell** — no prior release on
+record, a file that does not exist yet, a release logged before pact stamped
+content hashes. A false alarm on every first acquire would train agents to ignore
+the real one.
+
+The same hazard reads back offline as
+[`pact audit --check merge-divergence`](audit.md#--check-merge-divergence), for
+the retrospective question: which paths did a successor start editing from a copy
+its predecessor never produced?
+
+**What this does not do.** It does not block, it does not merge for you, and it
+cannot see a divergence pact was never told about — an agent editing without a
+lease leaves no hash to compare. The window is still there; it is now loud
+instead of silent.
+
 ### A lease is on a path, not on a file
 
 `pact lease acquire src/parser.rs` succeeds when `src/parser.rs` doesn't exist
@@ -399,8 +452,9 @@ The reason that matters is not tidiness. **`release` is where an agent confirms 
 played by the rules, and the binding rule is commit-before-release.** An agent that
 overruns its TTL, commits, and releases sees an unbroken success path and concludes
 it complied. It did not: for ninety seconds the path was free, and any peer could
-have taken it and edited from a different worktree. Nobody did, and that was luck,
-not coordination.
+have taken it and edited from a different worktree — the
+[divergence hazard](#a-lease-is-exclusive-in-time-not-across-worktrees) below.
+Nobody did, and that was luck, not coordination.
 
 So the four outcomes now read differently, and all of them still **exit 0** —
 an idempotent release is a feature, it is just not a release:

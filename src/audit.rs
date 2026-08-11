@@ -122,6 +122,12 @@ pub enum Check {
     /// has nothing to fail against — the summary already reports the
     /// distribution for a reader who just wants to look.
     Topology(Expect),
+    /// pact-mqw.3: did an agent start editing from a copy the previous holder
+    /// never produced? A lease is exclusive in TIME; under one-worktree-per-agent
+    /// it is not exclusive across COPIES, and the merge that reconciles them is
+    /// held by nobody. This is that hazard read back offline, from the content
+    /// hashes `acquired` and `released` already carry.
+    MergeDivergence,
 }
 
 /// What `--expect` declares a run's topology should have been.
@@ -186,6 +192,7 @@ impl Check {
             "stale-holds" => Ok(Check::StaleHolds),
             "chain-integrity" => Ok(Check::ChainIntegrity),
             "commit-correlation" => Ok(Check::CommitCorrelation),
+            "merge-divergence" => Ok(Check::MergeDivergence),
             "topology" => Ok(Check::Topology(match expect {
                 Some(e) => Expect::parse(e)?,
                 // Defaulting to `any` rather than erroring: `--check topology`
@@ -195,10 +202,96 @@ impl Check {
             })),
             other => Err(anyhow::anyhow!(
                 "unknown check \"{other}\"; expected double-win, stale-holds, chain-integrity, \
-                 commit-correlation or topology"
+                 commit-correlation, merge-divergence or topology"
             )),
         }
     }
+}
+
+/// One path whose next holder started from content the previous holder never
+/// produced — the signature of an edit made against a stale copy.
+///
+/// Both agents were compliant. That is what makes this worth a check of its own:
+/// nothing in the lease log looks wrong, because nothing in the lease protocol WAS
+/// wrong. The divergence lives between a release on one branch and an acquire on
+/// another, in a window no lease covers.
+#[derive(Debug, Clone, Serialize)]
+pub struct MergeDivergence {
+    pub path: String,
+    /// Who released, and what they left.
+    pub released_by: String,
+    pub released_at: String,
+    pub released_hash: String,
+    /// Who acquired next, and what their copy actually contained.
+    pub acquired_by: String,
+    pub acquired_at: String,
+    pub acquired_hash: String,
+    /// 1-based line of the acquire in `.pact/events.jsonl`, which is the only id
+    /// an event has (see `events::numbered`).
+    pub line: usize,
+}
+
+/// Pair each close that recorded a content hash with the next open of the same
+/// path that recorded one, and report the pairs that disagree.
+///
+/// Only *adjacent* pairs, and only in that order: a hash that differs two holds
+/// later says nothing, because the intervening holder was entitled to change the
+/// file. The claim being made is narrow on purpose — "the copy this agent started
+/// from is not the copy the last agent finished with" — and anything wider would
+/// flag ordinary sequential work.
+///
+/// Renewals are neither, and are skipped: a renewal is the same hold continuing,
+/// so treating it as a new open would compare an agent against itself.
+fn merge_divergences(events: &[(usize, Event)]) -> (Vec<MergeDivergence>, usize) {
+    // Per path: the last close's (agent, at, hash), waiting for the next open.
+    let mut pending: BTreeMap<String, (String, String, String)> = BTreeMap::new();
+    let mut out = Vec::new();
+    let mut unhashed = 0usize;
+    for (line, e) in events {
+        let Some(path) = e.path.as_deref() else {
+            continue;
+        };
+        if closes(&e.kind) {
+            match &e.content_hash {
+                Some(h) => {
+                    pending.insert(path.to_string(), (e.agent.clone(), e.at.clone(), h.clone()));
+                }
+                // A close with no hash cannot anchor the next comparison, and must
+                // also not leave a STALE anchor behind for it — that would compare
+                // an acquire against a release two holds back.
+                None => {
+                    pending.remove(path);
+                    unhashed += 1;
+                }
+            }
+            continue;
+        }
+        if !opens(&e.kind) {
+            continue;
+        }
+        // Consumed either way: one close anchors exactly one comparison, so a
+        // third and fourth acquire of an unchanged path do not each report it.
+        let Some((released_by, released_at, released_hash)) = pending.remove(path) else {
+            continue;
+        };
+        let Some(acquired_hash) = e.content_hash.clone() else {
+            continue;
+        };
+        if acquired_hash == released_hash {
+            continue;
+        }
+        out.push(MergeDivergence {
+            path: path.to_string(),
+            released_by,
+            released_at,
+            released_hash,
+            acquired_by: e.agent.clone(),
+            acquired_at: e.at.clone(),
+            acquired_hash,
+            line: *line,
+        });
+    }
+    (out, unhashed)
 }
 
 /// One invocation point that contradicted `--expect`.
@@ -495,6 +588,15 @@ pub struct CheckReport {
     /// says what it was judged against rather than only what it found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_topology: Option<&'static str>,
+    /// `Check::MergeDivergence` only: successive holds of one path that started
+    /// from content the previous holder never left behind.
+    pub merge_divergences: Vec<MergeDivergence>,
+    /// `Check::MergeDivergence` only: closes carrying no `content_hash`, so the
+    /// next acquire had nothing to compare against. Reported, never a finding —
+    /// every log written before pact stamped releases is entirely in this state,
+    /// and flagging it would fail every existing repository. Same discipline as
+    /// `chain_untracked` and `topology_unstamped`.
+    pub divergence_unhashed: usize,
     /// `Check::Topology` only: events carrying no `invoked_from` at all.
     /// Reported, never a finding — every log written before pact 0.7.0 is
     /// entirely in this state, and flagging it would fail every existing
@@ -511,6 +613,7 @@ impl CheckReport {
             + self.concurrent_writes.len()
             + self.uncovered_commits.len()
             + self.topology_mismatches.len()
+            + self.merge_divergences.len()
     }
 }
 
@@ -1094,6 +1197,7 @@ pub fn run_check(
             Check::ChainIntegrity => "chain-integrity",
             Check::CommitCorrelation => "commit-correlation",
             Check::Topology(_) => "topology",
+            Check::MergeDivergence => "merge-divergence",
         },
         events_scanned: events.len(),
         excluded_by_annotation: loaded.excluded,
@@ -1112,6 +1216,8 @@ pub fn run_check(
         topology_mismatches: Vec::new(),
         expected_topology: None,
         topology_unstamped: 0,
+        merge_divergences: Vec::new(),
+        divergence_unhashed: 0,
     };
 
     match check {
@@ -1163,6 +1269,11 @@ pub fn run_check(
             report.chain_untracked = untracked;
         }
         Check::CommitCorrelation => correlate_commits(repo_root, &events, &holds, &mut report),
+        Check::MergeDivergence => {
+            let (divergences, unhashed) = merge_divergences(&events);
+            report.merge_divergences = divergences;
+            report.divergence_unhashed = unhashed;
+        }
         Check::Topology(expect) => {
             report.expected_topology = Some(expect.label());
             let mut by_point: BTreeMap<String, usize> = BTreeMap::new();
@@ -1199,6 +1310,8 @@ pub struct ExportReport {
     pub stale_holds: CheckReport,
     pub chain_integrity: CheckReport,
     pub commit_correlation: CheckReport,
+    /// pact-mqw.3: successive holds that started from divergent content.
+    pub merge_divergence: CheckReport,
     /// Run with `--expect any`, so it reports the distribution rather than a
     /// verdict: a stored retrospective should not fail on an expectation
     /// nobody declared when it was written.
@@ -1250,6 +1363,7 @@ pub fn export(
         since,
         include_annotated,
     )?;
+    let merge_divergence = run_check(repo_root, Check::MergeDivergence, since, include_annotated)?;
     let doctor = crate::doctor::checks(repo_root);
 
     // Best-effort by design: a repo with no `.beads/` or no backend on PATH
@@ -1301,6 +1415,13 @@ pub fn export(
             }
         }
     }
+    if merge_divergence.findings() > 0 {
+        observations.push(format!(
+            "{} hold(s) started from a copy the previous holder never produced: an edit made \
+             against a stale worktree, which git often merges with no conflict marker.",
+            merge_divergence.findings()
+        ));
+    }
     if !unacknowledged_messages.is_empty() {
         // Named, not counted, and "nobody read it" kept distinct from "read
         // by somebody who was not the addressee" — the second is the common
@@ -1346,6 +1467,7 @@ pub fn export(
         stale_holds,
         chain_integrity,
         commit_correlation,
+        merge_divergence,
         topology,
         doctor,
         unacknowledged_messages,
@@ -1476,6 +1598,11 @@ const COMPARED: &[(&str, &str, Extract)] = &[
     (
         "holds with no commit",
         "/commit_correlation/holds_with_no_commit",
+        Extract::Len,
+    ),
+    (
+        "merge divergences",
+        "/merge_divergence/merge_divergences",
         Extract::Len,
     ),
     (
@@ -1981,6 +2108,19 @@ pub fn render_check(r: &CheckReport) -> String {
         ));
     }
 
+    if r.check == "merge-divergence" {
+        // Same reasoning as topology's and chain-integrity's scope lines, and
+        // stated even when clean: a close with no content hash gives the acquire
+        // after it nothing to compare against, so a reader has to know how much
+        // of the log this check could speak to before believing what it says.
+        out.push(format!(
+            "  {} close(s) recorded no content hash, so the acquire after each had nothing to \
+             compare against (logs written before pact stamped releases are entirely in this \
+             state)",
+            r.divergence_unhashed
+        ));
+    }
+
     if r.check == "commit-correlation" {
         if let Some(reason) = &r.git_unavailable {
             out.push(format!(
@@ -2008,6 +2148,14 @@ pub fn render_check(r: &CheckReport) -> String {
                 "every context-stamped event matches --expect {}",
                 r.expected_topology.unwrap_or("any")
             ),
+            "merge-divergence" => {
+                "every hold started from the content the previous holder left — no edit was made \
+                 against a stale copy"
+                    .to_string()
+            }
+            // `stale-holds` named explicitly rather than left to the catch-all it
+            // used to own: a new check landing on that arm inherited the wrong
+            // clean message, which is how this comment got written.
             _ => "no holds ran past their own recorded TTL without a renew".to_string(),
         });
         // commit-correlation still has informational rows to print (holds
@@ -2183,6 +2331,33 @@ pub fn render_check(r: &CheckReport) -> String {
         );
     }
 
+    for d in &r.merge_divergences {
+        out.push(String::new());
+        out.push(format!(
+            "MERGE DIVERGENCE on {}: {} released it at {} leaving {}, then {} acquired it at {} \
+             holding {} instead (line {})",
+            d.path,
+            d.released_by,
+            d.released_at,
+            &d.released_hash[..d.released_hash.len().min(12)],
+            d.acquired_by,
+            d.acquired_at,
+            &d.acquired_hash[..d.acquired_hash.len().min(12)],
+            d.line
+        ));
+    }
+    if !r.merge_divergences.is_empty() {
+        out.push(String::new());
+        out.push(format!(
+            "{} hold(s) started from a copy the previous holder never produced. Both agents were \n\
+             compliant — a lease is exclusive in TIME, not across worktrees, so the conflict was \n\
+             deferred to a merge no lease covered. git often merges such edits with NO conflict \n\
+             marker when they are textually non-adjacent, which is the shape an additive change \n\
+             to a shared enum or match statement has. Check those paths for duplicated arms, \n\
+             duplicated definitions, or a peer's change silently reverted — see docs/leases.md.",
+            r.merge_divergences.len()
+        ));
+    }
     if !r.holds_with_no_commit.is_empty() {
         out.push(String::new());
         out.push(format!(
@@ -2221,6 +2396,151 @@ mod tests {
 
     fn ev(at: &str, agent: &str, kind: &str, path: &str) -> String {
         format!(r#"{{"at":"{at}","agent":"{agent}","kind":"{kind}","path":"{path}"}}"#)
+    }
+
+    /// A content-hash-bearing event, for the merge-divergence walk.
+    fn ev_hash(at: &str, agent: &str, kind: &str, path: &str, hash: &str) -> String {
+        format!(
+            r#"{{"at":"{at}","agent":"{agent}","kind":"{kind}","path":"{path}","content_hash":"{hash}"}}"#
+        )
+    }
+
+    /// pact-mqw.3: the crucible shape. Two agents each correctly held one file at
+    /// different times, each added a match arm to the SAME match statement on its
+    /// own branch, and git merged both insertions cleanly because they were
+    /// textually non-adjacent — duplicate arms, no conflict marker, caught by a
+    /// later compile failure rather than by pact.
+    ///
+    /// Nothing in the lease log looks wrong, because nothing in the lease protocol
+    /// WAS wrong. The evidence is entirely in the content hashes.
+    #[test]
+    fn merge_divergence_flags_an_acquire_from_a_copy_the_releaser_never_left() {
+        let tmp = with_log(&[
+            // Compliant hold: agent-a takes it at aaa, leaves it as bbb.
+            &ev_hash(
+                "2026-08-11T09:00:00Z",
+                "agent-a",
+                "acquired",
+                "src/printer.rs",
+                "aaa",
+            ),
+            &ev_hash(
+                "2026-08-11T09:10:00Z",
+                "agent-a",
+                "released",
+                "src/printer.rs",
+                "bbb",
+            ),
+            // agent-b acquires on a branch that never contained agent-a's change.
+            &ev_hash(
+                "2026-08-11T09:11:00Z",
+                "agent-b",
+                "acquired",
+                "src/printer.rs",
+                "aaa",
+            ),
+            &ev_hash(
+                "2026-08-11T09:20:00Z",
+                "agent-b",
+                "released",
+                "src/printer.rs",
+                "ccc",
+            ),
+            // And a path whose successor DID start from what was left: silent.
+            &ev_hash(
+                "2026-08-11T09:00:00Z",
+                "agent-c",
+                "acquired",
+                "src/ok.rs",
+                "111",
+            ),
+            &ev_hash(
+                "2026-08-11T09:05:00Z",
+                "agent-c",
+                "released",
+                "src/ok.rs",
+                "222",
+            ),
+            &ev_hash(
+                "2026-08-11T09:06:00Z",
+                "agent-d",
+                "acquired",
+                "src/ok.rs",
+                "222",
+            ),
+        ]);
+        let r = run_check(tmp.path(), Check::MergeDivergence, None, false).unwrap();
+        assert_eq!(r.findings(), 1, "{:?}", r.merge_divergences);
+        let d = &r.merge_divergences[0];
+        assert_eq!(d.path, "src/printer.rs");
+        assert_eq!(
+            (d.released_by.as_str(), d.released_hash.as_str()),
+            ("agent-a", "bbb")
+        );
+        assert_eq!(
+            (d.acquired_by.as_str(), d.acquired_hash.as_str()),
+            ("agent-b", "aaa")
+        );
+        // The renderer must name both sides and say what to look for, or the
+        // finding is unactionable.
+        let text = render_check(&r);
+        assert!(
+            text.contains("MERGE DIVERGENCE on src/printer.rs"),
+            "{text}"
+        );
+        assert!(text.contains("NO conflict"), "{text}");
+    }
+
+    /// The claim is narrow on purpose: only ADJACENT close/open pairs. A hash that
+    /// differs two holds later says nothing, because the intervening holder was
+    /// entitled to change the file — and a close anchors exactly one comparison, so
+    /// repeated acquires of an unchanged path do not each report it.
+    #[test]
+    fn merge_divergence_compares_only_adjacent_holds() {
+        let tmp = with_log(&[
+            &ev_hash("2026-08-11T09:00:00Z", "a", "acquired", "p.rs", "h1"),
+            &ev_hash("2026-08-11T09:01:00Z", "a", "released", "p.rs", "h2"),
+            // Started from h2: fine. Legitimately changed it to h3.
+            &ev_hash("2026-08-11T09:02:00Z", "b", "acquired", "p.rs", "h2"),
+            &ev_hash("2026-08-11T09:03:00Z", "b", "released", "p.rs", "h3"),
+            // Started from h3: fine, even though it differs from h1 and h2.
+            &ev_hash("2026-08-11T09:04:00Z", "c", "acquired", "p.rs", "h3"),
+        ]);
+        let r = run_check(tmp.path(), Check::MergeDivergence, None, false).unwrap();
+        assert_eq!(r.findings(), 0, "{:?}", r.merge_divergences);
+    }
+
+    /// Every log written before pact stamped releases has no hash to compare
+    /// against. That must be reported as SCOPE, never as a finding — flagging it
+    /// would fail every existing repository the moment the check shipped, which is
+    /// the same discipline `chain_untracked` and `topology_unstamped` follow.
+    ///
+    /// And an unhashed close must not leave a stale anchor behind: comparing the
+    /// next acquire against a release two holds back would invent a finding.
+    #[test]
+    fn merge_divergence_treats_an_unhashed_close_as_scope_not_a_finding() {
+        let tmp = with_log(&[
+            &ev_hash("2026-08-11T09:00:00Z", "a", "acquired", "p.rs", "h1"),
+            // A pre-stamping release.
+            &ev("2026-08-11T09:01:00Z", "a", "released", "p.rs"),
+            // Would have "diverged" from h1 if the walk fell back to the acquire.
+            &ev_hash("2026-08-11T09:02:00Z", "b", "acquired", "p.rs", "h9"),
+        ]);
+        let r = run_check(tmp.path(), Check::MergeDivergence, None, false).unwrap();
+        assert_eq!(r.findings(), 0, "{:?}", r.merge_divergences);
+        assert_eq!(r.divergence_unhashed, 1);
+        assert!(
+            render_check(&r).contains("1 close(s) recorded no content hash"),
+            "the scope must be stated even when the check is clean: {}",
+            render_check(&r)
+        );
+        // And the clean message must be this check's own, not the one the
+        // catch-all arm used to hand every new check.
+        assert!(
+            render_check(&r).contains("no edit was made against a stale copy"),
+            "{}",
+            render_check(&r)
+        );
     }
 
     #[test]

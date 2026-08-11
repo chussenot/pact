@@ -204,6 +204,61 @@ call, not an oversight — see
 below for why that does not touch the Beads-store invariant the rest of this
 page rests on.
 
+### `--check merge-divergence`
+
+**A lease is exclusive in TIME. It is not exclusive across COPIES.**
+
+In one shared checkout that distinction does not exist — the file has a single
+state and the second writer sees the first writer's bytes. Under
+[one worktree per agent](fleet-patterns.md), which pact explicitly supports and
+every field run so far has used, it does:
+
+```text
+agent A  acquires, edits, commits to branch A, releases      (compliant)
+agent B  acquires, edits a DIFFERENT COPY on branch B that
+         never contained A's change, commits, releases       (compliant)
+```
+
+Both leases were honoured. The conflict is deferred to a merge performed later,
+by someone else, with no lease held by anyone and pact not involved — and the
+merge window is where the corruption lands.
+
+Three instances in one 85-minute crucible run: duplicate match arms in
+`src/printer.rs`, six duplicate test functions in `src/parser.rs` (E0428), and a
+near-miss where a successor found that applying a stashed diff would have
+silently reverted a peer's `Expr::If`. **No conflict marker was ever produced in
+any of them.** git merged both insertions cleanly because they were textually
+non-adjacent — precisely the edit shape this topology encourages and a designed
+hot file attracts. Two were caught by reading a diff and by a later compile
+failure; none by pact.
+
+pact cannot fix git. What it can do is compare the content hash a releasing agent
+left against the hash the next acquirer's own copy has, which is a fact both
+`acquired` and `released` events already carry. `lease acquire` does that live and
+[warns on stderr](leases.md), exit 0. This check does it offline, over the whole
+log.
+
+It pairs each **close** that recorded a hash with the **next open** of the same
+path that recorded one, and reports the pairs that disagree. Two deliberate
+narrowings:
+
+- **Adjacent pairs only, in that order.** A hash that differs two holds later says
+  nothing — the intervening holder was entitled to change the file. The claim is
+  exactly "the copy this agent started from is not the copy the last agent
+  finished with", and anything wider would flag ordinary sequential work.
+- **One close anchors one comparison.** A third and fourth acquire of an unchanged
+  path do not each re-report it. Renewals are skipped entirely: a renewal is the
+  same hold continuing, so treating it as an open would compare an agent against
+  itself.
+
+**A close with no content hash is scope, not a finding**, and is reported on its
+own line whether or not the check is clean. Every log written before pact stamped
+releases is entirely in that state, so flagging it would fail every existing
+repository the moment the check shipped — the same discipline `chain_untracked`
+and `topology_unstamped` follow. An unhashed close also *clears* the anchor rather
+than leaving a stale one, because comparing an acquire against a release two holds
+back would invent a finding out of nothing.
+
 ## Where the run actually happened
 
 The summary counts events by the worktree pact was invoked from, so "did this

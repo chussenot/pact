@@ -2825,6 +2825,100 @@ fn acquiring_a_recently_released_path_warns_but_succeeds() {
     );
 }
 
+/// pact-mqw.3: a lease is exclusive in TIME, not across COPIES.
+///
+/// Agent A acquires, edits, commits to its branch, releases — compliant. Agent B
+/// acquires and edits a different copy that never contained A's change, commits,
+/// releases — also compliant. Both leases were honoured and the conflict is
+/// deferred to a merge no lease covers. Three instances in one 85-minute crucible
+/// run, and **no conflict marker was ever produced** in any of them: git merged
+/// the insertions cleanly because they were textually non-adjacent, which is the
+/// shape an additive change to a shared match statement has.
+///
+/// pact cannot fix git. It can say so at the moment it is cheap to act on.
+#[test]
+fn acquiring_a_copy_the_last_holder_never_left_warns_and_still_succeeds() {
+    let tmp = init_repo();
+    let repo = tmp.path();
+    // A real git object database: the comparison is between git blob ids, so a
+    // bare `.git` directory would produce no hash on either side and prove
+    // nothing.
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q", "."])
+        .current_dir(repo)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(repo.join("printer.rs"), "match e { A => 1 }\n").unwrap();
+
+    // 1. A FIRST acquire has nothing to compare against, and must be silent. A
+    //    false alarm here would train agents to ignore the real one.
+    let first = pact(repo, "agent-a", &["lease", "acquire", "printer.rs"]);
+    assert_ok(&first);
+    assert!(
+        !stderr_of(&first).contains("NOT the copy"),
+        "no prior release on record must be silent: {}",
+        stderr_of(&first)
+    );
+
+    // agent-a does its work and releases, which records what it left behind.
+    std::fs::write(repo.join("printer.rs"), "match e { A => 1, B => 2 }\n").unwrap();
+    assert_ok(&pact(repo, "agent-a", &["lease", "release", "printer.rs"]));
+
+    // 2. A successor whose copy IS what agent-a left: silent. This is the
+    //    single-checkout case, which is the common one and must stay quiet.
+    let same = pact(repo, "agent-b", &["lease", "acquire", "printer.rs"]);
+    assert_ok(&same);
+    assert!(
+        !stderr_of(&same).contains("NOT the copy"),
+        "an up-to-date copy must be silent: {}",
+        stderr_of(&same)
+    );
+    assert_ok(&pact(repo, "agent-b", &["lease", "release", "printer.rs"]));
+
+    // 3. A successor holding a DIFFERENT copy — the worktree case, reproduced
+    //    here by putting the file back to a state agent-b never left.
+    std::fs::write(repo.join("printer.rs"), "match e { A => 1, C => 3 }\n").unwrap();
+    let stale = pact(repo, "agent-c", &["lease", "acquire", "printer.rs"]);
+    assert_ok(&stale);
+    let err = stderr_of(&stale);
+    assert!(
+        err.contains("NOT the copy") && err.contains("agent-b"),
+        "must warn and name who to reconcile with: {err}"
+    );
+    assert!(
+        err.contains("exclusive in time"),
+        "must say WHY a compliant lease did not prevent this: {err}"
+    );
+    assert!(
+        stdout_of(&stale).contains("acquired lease"),
+        "advisory must never block the acquire: {}",
+        stdout_of(&stale)
+    );
+
+    // And the same hazard read back offline, which is what an audit after the
+    // fact has to work from.
+    let audit = pact(
+        repo,
+        "auditor",
+        &["audit", "--check", "merge-divergence", "--json"],
+    );
+    assert_eq!(
+        audit.status.code(),
+        Some(1),
+        "a divergence is a finding: {}",
+        stdout_of(&audit)
+    );
+    let report = json_stdout(&audit);
+    let found = report["merge_divergences"]
+        .as_array()
+        .expect("merge_divergences must be an array");
+    assert_eq!(found.len(), 1, "{report}");
+    assert_eq!(found[0]["path"], "printer.rs");
+    assert_eq!(found[0]["released_by"], "agent-b");
+    assert_eq!(found[0]["acquired_by"], "agent-c");
+}
+
 /// Your own history is not news. A long task that renews or re-acquires its own
 /// path would otherwise warn about itself on every call, which is how a warning
 /// becomes noise people filter out.

@@ -172,6 +172,55 @@ fn holder_location(lease: &LeaseInfo) -> String {
     }
 }
 
+/// Warn when the copy being leased is not the copy the last holder left.
+///
+/// **A lease is exclusive in TIME. It is not exclusive across COPIES.** In one
+/// shared checkout that distinction does not exist — the file has a single state
+/// and the second writer sees the first writer's bytes. Under the
+/// branch-per-agent worktree topology, which pact explicitly supports and every
+/// field run so far has used, it does:
+///
+/// ```text
+/// agent A  acquires, edits, commits to branch A, releases      (compliant)
+/// agent B  acquires, edits a DIFFERENT COPY on branch B that
+///          never contained A's change, commits, releases       (compliant)
+/// ```
+///
+/// Both leases were honoured. The conflict is deferred to a merge performed later,
+/// by someone else, with no lease held by anyone and pact not involved — and the
+/// merge window is where the corruption lands. Three instances in one 85-minute
+/// crucible run: duplicate match arms in src/printer.rs, six duplicate test
+/// functions in src/parser.rs (E0428), and a near-miss where a successor found
+/// that applying a stashed diff would have silently reverted a peer's `Expr::If`.
+/// **No conflict marker was ever produced** — git merged both insertions cleanly
+/// because they were textually non-adjacent, which is exactly the edit shape this
+/// topology encourages and a designed hot file attracts.
+///
+/// pact cannot fix git. It can convert a silent deferred hazard into a loud
+/// warning at the one moment it is cheap to act on, which is now.
+///
+/// Advisory: warns on stderr, never fails the acquire, and stays silent whenever
+/// it cannot tell — no prior release on record, a file that does not exist yet, a
+/// release logged before content hashes were stamped. A false alarm on a first
+/// acquire would train agents to ignore the real one.
+fn warn_if_copy_diverged(repo_root: &Path, relative: &str, mine: Option<&str>) {
+    let Some(mine) = mine else { return };
+    let Ok(Some(left)) = events::last_released_content(repo_root, relative) else {
+        return;
+    };
+    if left.hash == mine {
+        return;
+    }
+    crate::output::warn(&format!(
+        "warning: your copy of {relative} is NOT the copy {} left when they released it at {} \
+         — a lease is exclusive in time, not across worktrees, so you may be about to edit a \
+         branch that never contained their change. git will often merge both edits with no \
+         conflict marker. Reconcile first (`git merge`/`git rebase`, or `pact msg send \
+         --to-owner-of {relative}`) rather than at merge time, when both plans are sunk cost",
+        left.agent, left.at
+    ));
+}
+
 #[derive(Debug, Serialize)]
 pub struct AcquireOutcome {
     pub lease: LeaseInfo,
@@ -1380,6 +1429,7 @@ fn acquire_inner(
                     ));
                 }
             }
+            warn_if_copy_diverged(repo_root, &relative, new_lease.content_hash.as_deref());
             log_event(
                 repo_root,
                 agent,
@@ -1992,7 +2042,15 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                     invoked_from: None,
                     scope: None,
                     pact_version: None,
-                    content_hash: None,
+                    // Same as the plain-release branch: what the displaced
+                    // holder's copy contained at the moment it was taken away,
+                    // so a later acquirer can still tell whether its own copy
+                    // diverged (pact-mqw.3).
+                    content_hash: crate::git_history::hash_objects(
+                        repo_root,
+                        std::slice::from_ref(&relative),
+                    )
+                    .remove(&relative),
                     subscriber: None,
                     message_id: None,
                     protocol_hash: None,
@@ -2011,7 +2069,14 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                 &relative,
                 existing.note.clone(),
                 existing.ttl_secs,
-                None,
+                // The content this holder LEFT, where the acquire event records
+                // the content they took responsibility for. Without it a lease is
+                // exclusive in time and invisible across worktrees: the next
+                // acquirer has nothing to compare its own copy against
+                // (pact-mqw.3). Best-effort, like every other hash here — a
+                // release must never fail because git could not be asked.
+                crate::git_history::hash_objects(repo_root, std::slice::from_ref(&relative))
+                    .remove(&relative),
             );
             count_transition("released");
         }
