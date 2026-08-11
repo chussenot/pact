@@ -494,6 +494,34 @@ Three properties make the split safe to rely on:
   guess from the wording. An agent that writes "src/ast.rs changed — released by
   me" by hand is still correspondence, and there is deliberately no flag for
   sending a message *as* a notice.
+
+#### Notices that predate the label
+
+Tagging at creation is forward-only, and on a real store that cost the whole
+point. Measured across nine agents' inboxes in an existing fleet store: `inbox`
+and `inbox --include-watch` returned **identical** counts for every one of them,
+`--watch-only` answered "no watch notices" for inboxes that were mostly notices,
+and one agent's 14 authored rows were 12 machine notices and 2 pieces of real
+correspondence. The burial was exactly as bad as before the fix.
+
+Those are recoverable because **pact wrote them**: their shape is a format string,
+not user text. An untagged message is treated as a notice only when all three of
+these hold:
+
+- its subject splits on ` changed — released by ` into exactly two halves;
+- neither half contains whitespace, so they are a path and an agent name rather
+  than prose containing the phrase;
+- its body carries `, which you are watching.` — a second, independent piece of the
+  same format string.
+
+Anchored to the full shape rather than a substring, because the cost of a false
+positive here is precisely what this feature exists to prevent: filing a real
+warning as machine noise. "src/ast.rs changed — released by agent-01, please
+re-read it" fails the second condition and stays in the inbox.
+
+The label always wins and is checked first, so anything written since it shipped is
+classified by the fact pact recorded rather than by prose — and the heuristic can
+only ever add to what the label already knows.
 - **Notices are counted, never hidden.** A count an agent can see makes skipping
   them a decision; silence would make it an accident. An inbox holding nothing
   but notices says so rather than printing `inbox empty`.

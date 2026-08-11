@@ -115,6 +115,51 @@ const NOTICE: &str = "watch-notice";
 /// its whole subject, so drift degrades the grouping instead of losing messages.
 pub const NOTICE_SUBJECT_MARKER: &str = " changed — released by ";
 
+/// The phrase every `pact watch` notice body has opened with since the feature
+/// shipped, used only to corroborate [`looks_like_legacy_notice`].
+const NOTICE_BODY_ANCHOR: &str = ", which you are watching.";
+
+/// Is this untagged message one pact itself wrote before the tag existed?
+///
+/// [`NOTICE`] is stamped at creation, so it is forward-only — and measured
+/// against the crucible store, that cost the whole point of the fix: for every
+/// one of nine agents, `inbox` and `inbox --include-watch` returned **identical**
+/// counts, `--watch-only` answered "no watch notices" for inboxes that were mostly
+/// notices, and agent-08's 14 authored rows were 12 machine notices and 2 pieces of
+/// real correspondence. On an existing store the burial was exactly as bad as
+/// before (pact-mqw.11).
+///
+/// Recovering those relies on the fact that **pact wrote them**, so their shape is
+/// a format string rather than user text. Anchored to the FULL shape, not a loose
+/// substring, because the cost of a false positive here is the one thing this whole
+/// feature exists to prevent: silently filing a real warning as machine noise.
+/// Three conditions, all required:
+///
+/// - the subject splits on [`NOTICE_SUBJECT_MARKER`] into exactly two halves;
+/// - neither half contains whitespace, so they are a path and an agent name rather
+///   than prose that happens to contain the phrase;
+/// - the body carries [`NOTICE_BODY_ANCHOR`], which is a second independent piece
+///   of the same format string.
+///
+/// An agent writing "src/ast.rs changed — released by agent-01, please re-read it"
+/// fails the second condition and stays in the inbox where it belongs.
+///
+/// Applies to untagged messages only. Anything written after [`NOTICE`] shipped is
+/// classified by its label alone, so this heuristic can never override a real tag
+/// and needs no maintenance as the notice text evolves.
+fn looks_like_legacy_notice(subject: Option<&str>, body: &str) -> bool {
+    let Some(subject) = subject else { return false };
+    let mut halves = subject.split(NOTICE_SUBJECT_MARKER);
+    let (Some(path), Some(holder), None) = (halves.next(), halves.next(), halves.next()) else {
+        return false;
+    };
+    !path.is_empty()
+        && !holder.is_empty()
+        && !path.contains(char::is_whitespace)
+        && !holder.contains(char::is_whitespace)
+        && body.contains(NOTICE_BODY_ANCHOR)
+}
+
 /// A path as a label-safe token: `/` to `__`, the same convention lease lock
 /// files use — but, unlike a lock filename, this token is never written to a
 /// filesystem, only compared against itself inside a bd/br label. So it goes
@@ -251,7 +296,12 @@ impl BdIssue {
             .iter()
             .filter_map(|l| l.strip_prefix(READ_BY).map(str::to_string))
             .collect();
-        let notice = labels.iter().any(|l| l == NOTICE);
+        let body = self.description.unwrap_or_default();
+        // The label first, and the legacy shape only when there is no label —
+        // never the other way round, so a tagged message is classified by the fact
+        // pact recorded rather than by prose.
+        let notice = labels.iter().any(|l| l == NOTICE)
+            || looks_like_legacy_notice(Some(self.title.as_str()), &body);
         let to = self.assignee.unwrap_or_default();
         let read = read_by.iter().any(|a| a == viewer.unwrap_or(&to));
         Message {
@@ -262,7 +312,7 @@ impl BdIssue {
             from: self.created_by.unwrap_or_default(),
             to,
             subject: Some(self.title),
-            body: self.description.unwrap_or_default(),
+            body,
             created_at: self.created_at,
             id: self.id,
             read,
@@ -2463,6 +2513,80 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].path, "something else entirely");
         assert_eq!(groups[0].count, 1);
+    }
+
+    /// pact-mqw.11: the tag is forward-only, and on a real store that cost the
+    /// whole point of the fix — nine agents' inboxes returned identical counts with
+    /// and without `--include-watch`, because every notice already in the store
+    /// predates the label. Recovering those leans on the fact that pact WROTE them:
+    /// their shape is a format string, not user text.
+    #[test]
+    fn a_notice_written_before_the_tag_existed_is_still_recognised() {
+        // Exactly what pact's watch notices looked like before the tag.
+        let legacy = issue(
+            r#"{"id":"pact-msg-old","title":"src/ast.rs changed — released by agent-01",
+                "description":"agent-01 released src/ast.rs, which you are watching. What changed while they held it:\n\n@@ -1 +1 @@\n",
+                "assignee":"agent-05","created_by":"agent-01",
+                "created_at":"2026-08-11T09:30:50Z","issue_type":"message",
+                "labels":["about-src__ast-rs"]}"#,
+        )
+        .into_message(None, Some("agent-05"));
+        assert!(
+            legacy.notice,
+            "an untagged message in pact's own notice shape must classify"
+        );
+    }
+
+    /// The cost of a false positive here is the one thing this feature exists to
+    /// prevent: silently filing a real warning as machine noise. So the fallback is
+    /// anchored to the FULL shape, and each of these fails a different anchor.
+    #[test]
+    fn a_human_writing_the_same_phrase_is_never_reclassified() {
+        let authored = |title: &str, body: &str| {
+            issue(&format!(
+                r#"{{"id":"pact-msg-h","title":"{title}","description":"{body}",
+                    "assignee":"agent-05","created_by":"agent-06",
+                    "created_at":"2026-08-11T09:30:55Z","issue_type":"message"}}"#
+            ))
+            .into_message(None, Some("agent-05"))
+            .notice
+        };
+
+        // Prose after the holder name: the second half is not an agent name.
+        assert!(!authored(
+            "src/ast.rs changed — released by agent-01, please re-read it",
+            "agent-01 released src/ast.rs, which you are watching."
+        ));
+        // The right subject shape, but no body anchor — one half of a format string
+        // is not the format string.
+        assert!(!authored(
+            "src/ast.rs changed — released by agent-01",
+            "heads up, I think this needs another look"
+        ));
+        // The phrase quoted mid-sentence.
+        assert!(!authored(
+            "re: your note",
+            "you said src/ast.rs changed — released by agent-01, which you are watching."
+        ));
+        // And the marker twice, which is prose rather than a subject.
+        assert!(!authored(
+            "a.rs changed — released by b.rs changed — released by c",
+            "x released y, which you are watching."
+        ));
+    }
+
+    /// The label wins, always. A tagged message must never depend on prose, so the
+    /// heuristic can only ever ADD to what the tag already knows.
+    #[test]
+    fn the_tag_classifies_on_its_own_without_help_from_the_subject() {
+        let tagged = issue(
+            r#"{"id":"pact-msg-new","title":"anything at all","description":"and any body",
+                "assignee":"agent-05","created_by":"agent-01",
+                "created_at":"2026-08-11T09:30:50Z","issue_type":"message",
+                "labels":["watch-notice"]}"#,
+        )
+        .into_message(None, Some("agent-05"));
+        assert!(tagged.notice);
     }
 
     /// The label has to ride the SAME create call as the about-<path> labels —
