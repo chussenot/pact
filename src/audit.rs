@@ -332,6 +332,11 @@ pub struct AgentActivity {
     pub events: usize,
     pub holds: usize,
     pub steals: usize,
+    /// Takeovers of a lease that had already lapsed — an `expired` row for the
+    /// path precedes them. Counted apart from `steals`, which is reserved for a
+    /// forced `--steal` over a claim that was still live (pact-mqw.2).
+    #[serde(default)]
+    pub reclaims: usize,
     pub held_secs_total: i64,
 }
 
@@ -368,6 +373,11 @@ pub struct Summary {
     pub first_event_at: Option<String>,
     pub last_event_at: Option<String>,
     pub steals: usize,
+    /// Takeovers of a lease that had already lapsed — an `expired` row for the
+    /// path precedes them. Counted apart from `steals`, which is reserved for a
+    /// forced `--steal` over a claim that was still live (pact-mqw.2).
+    #[serde(default)]
+    pub reclaims: usize,
     pub open_holds: usize,
     pub hold_secs: Option<HoldStats>,
     pub top_contended: Vec<Contended>,
@@ -921,19 +931,42 @@ pub fn summary(
     let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
     let mut agents: BTreeSet<String> = BTreeSet::new();
     let mut per: BTreeMap<String, AgentActivity> = BTreeMap::new();
+    // pact-mqw.2: "stolen" covers both halves of a takeover, and counting it flat
+    // reports routine reclaims as aggression. The two are distinguishable and
+    // always have been — lease.rs writes an `expired` row under the dead holder
+    // before a reclaim's `stolen`, and a forced `--steal` never has one — but
+    // this summary was not using that. On the crucible log the flat count read
+    // "5 steals" for 3 forced overrides, and credited an agent with "2 steal(s)"
+    // that had never passed --steal in its life.
+    let mut prev_kind_for_path: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut forced_total = 0usize;
+    let mut reclaim_total = 0usize;
     for (_, e) in &events {
         *by_kind.entry(e.kind.clone()).or_insert(0) += 1;
         agents.insert(e.agent.clone());
+        let path = e.path.as_deref().unwrap_or_default();
+        let takeover_of_a_lapsed_lease =
+            e.kind == "stolen" && prev_kind_for_path.get(path) == Some(&"expired");
         let a = per.entry(e.agent.clone()).or_insert_with(|| AgentActivity {
             agent: e.agent.clone(),
             events: 0,
             holds: 0,
             steals: 0,
+            reclaims: 0,
             held_secs_total: 0,
         });
         a.events += 1;
         if e.kind == "stolen" {
-            a.steals += 1;
+            if takeover_of_a_lapsed_lease {
+                a.reclaims += 1;
+                reclaim_total += 1;
+            } else {
+                a.steals += 1;
+                forced_total += 1;
+            }
+        }
+        if !path.is_empty() {
+            prev_kind_for_path.insert(path, e.kind.as_str());
         }
     }
     for h in &holds {
@@ -1030,7 +1063,8 @@ pub fn summary(
         annotations: loaded.annotations,
         unparseable_lines: unparseable,
         orphaned_closes,
-        steals: by_kind.get("stolen").copied().unwrap_or(0),
+        steals: forced_total,
+        reclaims: reclaim_total,
         by_kind,
         agents: agents.into_iter().collect(),
         first_event_at: events.first().map(|(_, e)| e.at.clone()),
@@ -1412,7 +1446,8 @@ const COMPARED: &[(&str, &str, Extract)] = &[
         Extract::Number,
     ),
     ("open holds", "/summary/open_holds", Extract::Number),
-    ("steals", "/summary/steals", Extract::Number),
+    ("steals (forced)", "/summary/steals", Extract::Number),
+    ("reclaims (expired)", "/summary/reclaims", Extract::Number),
     (
         "refusals (contention)",
         "/summary/by_kind/refused",
@@ -1895,10 +1930,11 @@ pub fn render_summary(s: &Summary) -> String {
                 a.agent,
                 a.events,
                 a.holds,
-                if a.steals > 0 {
-                    format!(", {} steal(s)", a.steals)
-                } else {
-                    String::new()
+                match (a.steals, a.reclaims) {
+                    (0, 0) => String::new(),
+                    (0, r) => format!(", {r} reclaim(s)"),
+                    (st, 0) => format!(", {st} steal(s)"),
+                    (st, r) => format!(", {st} steal(s), {r} reclaim(s)"),
                 },
                 secs(a.held_secs_total)
             ));
