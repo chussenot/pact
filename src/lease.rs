@@ -245,6 +245,33 @@ pub struct LeaseEntry {
     pub age_secs: i64,
     pub remaining_secs: i64,
     pub expired: bool,
+    /// Seconds since this holder's most recent event of ANY kind in
+    /// `.pact/events.jsonl`, or `None` when the log has never seen them act.
+    ///
+    /// Derived, not stored. Every pact command an agent runs appends an event, so
+    /// the log is already a liveness signal — it just was not being read as one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_silent_secs: Option<i64>,
+    /// Has this holder been quiet for longer than half its own TTL?
+    ///
+    /// **A stalled holder is strictly worse than a crashed one**, which is why
+    /// this exists. A crashed holder's lease expires and peers reclaim it — that
+    /// happened three times in the crucible run and worked every time. A stalled
+    /// one renews nothing, releases nothing, and blocks peers who are correctly
+    /// declining to steal a lease that still reads as live. Seven of ten agents in
+    /// that run ended their turn early waiting on a poller that could not wake
+    /// them, one of them holding `src/printer.rs`; to `lease ls` that lease was
+    /// `active` and its holder alive. It cost more fleet time than every injected
+    /// fault combined.
+    ///
+    /// pact had only the TTL, and the TTL is the slowest possible detector: it
+    /// says nothing until the whole lease is over. This says something at half
+    /// time, from data pact was already writing.
+    ///
+    /// Advisory and deliberately weak — it is evidence to message a peer about,
+    /// never grounds to `--steal`. A holder can legitimately think for a long time
+    /// without running a pact command.
+    pub suspect: bool,
 }
 
 impl LeaseEntry {
@@ -278,6 +305,21 @@ impl LeaseEntry {
                 "stale (reclaimable in {})",
                 human_secs(self.remaining_secs + GRACE_SECS)
             ),
+            // A suspect holder is still `active` to `state()` — the machine
+            // answer must not change, because a suspect lease is exactly as
+            // unavailable to a peer as any other live one. Only the label an
+            // operator reads changes, and it says the age rather than just the
+            // word: "quiet 8m12s" is actionable, "SUSPECT" alone invites a steal.
+            //
+            // Kept under 26 characters — the width `pact ui`'s State column is
+            // fixed at so that "stale (reclaimable in 20s)" can never be
+            // truncated. A half-read state is how pact-rnc.10 happened, and a
+            // half-read "SUSPECT: quiet 8m1…" would be the same mistake with a
+            // longer word.
+            "active" if self.suspect => match self.holder_silent_secs {
+                Some(silent) => format!("SUSPECT: quiet {}", human_secs(silent)),
+                None => "SUSPECT: never seen".to_string(),
+            },
             other => other.to_string(),
         }
     }
@@ -2210,6 +2252,12 @@ fn scan(repo_root: &Path) -> Result<Vec<(PathBuf, LeaseEntry)>> {
     // benefits: the watermark it reads was written by whatever `acquire`/
     // `renew` call created the lease it is now sweeping.
     let now = effective_now_readonly(repo_root);
+    // ONE log read for the whole listing, not one per lease. `actors` already
+    // returns every agent's most recent event, which is exactly the question.
+    // Best-effort: an unreadable or absent log means "no liveness signal", never
+    // a failed listing — `lease ls` must keep working in a repo whose log was
+    // never committed.
+    let last_seen: Vec<(String, String, usize)> = events::actors(repo_root).unwrap_or_default();
     let mut entries = Vec::new();
 
     let dir = match std::fs::read_dir(&leases_dir) {
@@ -2236,6 +2284,25 @@ fn scan(repo_root: &Path) -> Result<Vec<(PathBuf, LeaseEntry)>> {
 
         let (age_secs, remaining_secs) = age_and_remaining(&lease, now);
         let expired = is_expired(&lease, now);
+        let holder_silent_secs = last_seen
+            .iter()
+            .find(|(agent, _, _)| *agent == lease.agent)
+            .and_then(|(_, at, _)| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| (now - at.with_timezone(&Utc)).num_seconds().max(0));
+        // Half the lease's OWN ttl, not a global constant: a 10-minute lease and a
+        // 45-minute one deserve different patience, and the lease already carries
+        // the number. An already-expired lease is not flagged — it has a louder
+        // label of its own, and calling it suspect too would just double-report.
+        let suspect = !expired
+            && match holder_silent_secs {
+                Some(silent) => silent * 2 > ttl_as_i64(lease.ttl_secs),
+                // No event at all from an agent holding a lock: either the log was
+                // never written (a hand-planted lock, a fresh clone) or it has been
+                // rewritten past this agent's last line. Either way pact cannot
+                // corroborate that anyone is behind this claim, which is precisely
+                // what this column is for.
+                None => true,
+            };
 
         entries.push((
             path,
@@ -2244,6 +2311,8 @@ fn scan(repo_root: &Path) -> Result<Vec<(PathBuf, LeaseEntry)>> {
                 age_secs,
                 remaining_secs,
                 expired,
+                holder_silent_secs,
+                suspect,
             },
         ));
     }
@@ -2470,6 +2539,151 @@ mod tests {
         assert!(is_expired(&lease, now), "ttl+grace+1s should be expired");
     }
 
+    /// pact-mqw.6: a stalled holder is strictly worse than a crashed one, and the
+    /// TTL is the slowest possible detector of it. Seven of ten crucible agents
+    /// ended their turn early waiting on a poller that could not wake them, one
+    /// while holding `src/printer.rs` — a lease `lease ls` called `active` with a
+    /// live holder, for minutes.
+    ///
+    /// Every case is driven through the real `peek` over a real log, not through a
+    /// hand-built `LeaseEntry`, because the derivation is the thing under test.
+    #[test]
+    fn lease_ls_flags_a_holder_that_has_gone_quiet_for_half_its_ttl() {
+        let tmp = repo();
+        let root = tmp.path();
+        let suspect_of = |path: &str| -> (bool, Option<i64>) {
+            let e = peek(root, true)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.lease.path == path)
+                .unwrap_or_else(|| panic!("no entry for {path}"));
+            (e.suspect, e.holder_silent_secs)
+        };
+
+        // 1. A holder that just acted. `acquire` itself is an event, so a fresh
+        //    lease is never suspect — which is also the "ttl not yet past the
+        //    threshold" case: silence is measured from the last event, so a young
+        //    lease cannot be quiet for half its ttl.
+        acquire(root, "busy", "fresh.rs", 600, false, None).unwrap();
+        assert_eq!(suspect_of("fresh.rs"), (false, Some(0)));
+
+        // 2. A holder whose last event is old relative to its OWN ttl. The lease
+        //    is still well inside its ttl — this is the whole point: the TTL says
+        //    nothing yet, and this does.
+        let ttl = 600u64;
+        claim_at(
+            root,
+            "stalled",
+            "printer.rs",
+            ttl,
+            Utc::now() - Duration::seconds(400),
+        );
+        events::append(
+            root,
+            &events::Event {
+                at: (Utc::now() - Duration::seconds(400)).to_rfc3339(),
+                agent: "stalled".to_string(),
+                kind: "acquired".to_string(),
+                path: Some("printer.rs".to_string()),
+                detail: None,
+                ttl_secs: Some(ttl),
+                covers_lines: None,
+                actor: None,
+                displaced: None,
+                chain_hash: None,
+                invoked_from: None,
+                scope: None,
+                pact_version: None,
+                content_hash: None,
+                subscriber: None,
+                message_id: None,
+                protocol_hash: None,
+                head: None,
+            },
+        );
+        let (suspect, silent) = suspect_of("printer.rs");
+        assert!(suspect, "quiet 400s against a 600s ttl must be suspect");
+        assert!(
+            silent.unwrap_or(0) >= 399,
+            "and must report the age: {silent:?}"
+        );
+        // Still `active` to the machine — a suspect lease is exactly as
+        // unavailable to a peer as any other live one.
+        let entry = peek(root, true)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.lease.path == "printer.rs")
+            .unwrap();
+        assert_eq!(entry.state(), "active");
+        assert!(
+            entry.state_label().contains("SUSPECT"),
+            "{}",
+            entry.state_label()
+        );
+
+        // 3. A lock whose holder the log has never seen act at all — a
+        //    hand-planted lock, a lock file from a clone, or a log rewritten past
+        //    that agent's last line. pact cannot corroborate anyone is behind it.
+        claim_at(root, "ghost", "planted.rs", 600, Utc::now());
+        assert_eq!(suspect_of("planted.rs"), (true, None));
+
+        // 4. Half of a LONGER ttl is not yet suspicious. Same 400s of silence as
+        //    case 2, against pact's default ttl instead of 600s: the threshold is
+        //    the lease's own patience, not a global constant.
+        claim_at(
+            root,
+            "thinker",
+            "long.rs",
+            DEFAULT_TTL_SECS,
+            Utc::now() - Duration::seconds(400),
+        );
+        events::append(
+            root,
+            &events::Event {
+                at: (Utc::now() - Duration::seconds(400)).to_rfc3339(),
+                agent: "thinker".to_string(),
+                kind: "acquired".to_string(),
+                path: Some("long.rs".to_string()),
+                detail: None,
+                ttl_secs: Some(DEFAULT_TTL_SECS),
+                covers_lines: None,
+                actor: None,
+                displaced: None,
+                chain_hash: None,
+                invoked_from: None,
+                scope: None,
+                pact_version: None,
+                content_hash: None,
+                subscriber: None,
+                message_id: None,
+                protocol_hash: None,
+                head: None,
+            },
+        );
+        assert!(
+            !suspect_of("long.rs").0,
+            "400s of silence against a 2700s ttl is a thinking agent, not a stalled one"
+        );
+
+        // 5. An EXPIRED lease is never flagged: it has a louder label of its own,
+        //    and double-reporting it would just add noise to the one row a peer
+        //    can already act on.
+        claim_at(
+            root,
+            "dead",
+            "gone.rs",
+            60,
+            Utc::now() - Duration::seconds(60 + GRACE_SECS + 10),
+        );
+        let expired = peek(root, true)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.lease.path == "gone.rs")
+            .unwrap();
+        assert!(expired.expired);
+        assert!(!expired.suspect, "an expired lease is not merely suspect");
+    }
+
     /// Same boundary style as `expiry_respects_grace_period_boundary`, one age
     /// per state.
     #[test]
@@ -2484,6 +2698,8 @@ mod tests {
                 age_secs,
                 remaining_secs,
                 expired,
+                holder_silent_secs: None,
+                suspect: false,
             }
         };
 

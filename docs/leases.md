@@ -446,8 +446,46 @@ implementation, both surfaces, so the dashboard and the CLI can't disagree.
 | State | Meaning | Can another agent take it? |
 |---|---|---|
 | `active` | within its TTL | no (not without `--steal`) |
+| `SUSPECT: quiet Ns` | within its TTL, but its holder has not run a pact command for half of it | no — and see below |
 | `stale (reclaimable in Ns)` | past its TTL, inside the 30s grace window | not yet |
 | `expired` | past TTL + 30s | yes, the next `acquire` takes it |
+
+#### `SUSPECT`: a stalled holder is worse than a crashed one
+
+A crashed holder's lease expires and a peer reclaims it. That happened three
+times in the crucible run and worked every time. **A stalled holder is worse**: it
+renews nothing, releases nothing, and blocks peers who are correctly declining to
+steal a lease that still reads as live.
+
+Seven of ten agents in that run ended their turn early waiting on a poller that
+could not wake them. One sat stopped for minutes *while holding* `src/printer.rs`,
+and to `pact lease ls` that lease was `active` and its holder alive. It cost more
+fleet time than every injected fault combined.
+
+pact had only the TTL, and the TTL is the slowest possible detector — it says
+nothing until the whole lease is over. So `lease ls` now derives a second signal
+from data pact was already writing: **every command an agent runs appends an
+event**, so the age of a holder's most recent event is how long since anything
+was heard from them. Quiet for more than half its own TTL, and the lease is
+`SUSPECT`. `pact ui` shows it in the same yellow as `stale`, from the same
+`state_label()` — one implementation, both surfaces.
+
+The threshold is half the lease's *own* TTL, not a global constant: 400 seconds of
+silence is alarming on a 10-minute lease and unremarkable on a 45-minute one, and
+the lease already carries the number. A lock whose holder the log has never seen
+act at all reads `SUSPECT: never seen` — a hand-planted lock, or a log rewritten
+past that agent's last line. An already-expired lease is never flagged; it has a
+louder label of its own.
+
+**It is advisory and deliberately weak.** `state()` still reports `active`, and
+`--json` still says nothing about availability — a suspect lease is exactly as
+unavailable to a peer as any other live one. An agent can legitimately think for a
+long time without running a pact command. This is evidence to
+[message the holder](messaging.md) about, never grounds to `--steal`: the whole
+point of naming the state is that the next step is a question, not a takeover.
+
+Costs nothing extra: one log read per listing, no new state files, no daemon.
+`--json` carries `suspect` and, when the log knows, `holder_silent_secs`.
 
 **`stale` is distinct from `expired` on purpose.** The 30-second grace period
 exists to absorb clock drift between machines, so a lease that has merely

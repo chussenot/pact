@@ -936,6 +936,11 @@ fn lease_row<'a>(app: &App, index: usize, entry: &'a LeaseEntry) -> Row<'a> {
     let state_style = match entry.state() {
         "expired" => Style::default().fg(Color::Red),
         "stale" => Style::default().fg(Color::Yellow),
+        // A suspect holder is the case this dashboard exists to catch: seven of
+        // ten crucible agents stalled, and to a green `active` row they looked
+        // fine. Yellow like `stale`, because both mean "look at this" — the label
+        // is what says which (pact-mqw.6).
+        _ if entry.suspect => Style::default().fg(Color::Yellow),
         _ => Style::default().fg(Color::Green),
     };
 
@@ -1133,6 +1138,8 @@ mod tests {
             age_secs: 10,
             remaining_secs: 890,
             expired,
+            holder_silent_secs: None,
+            suspect: false,
         }
     }
 

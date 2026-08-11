@@ -2517,7 +2517,17 @@ fn json_shapes_of_every_command_that_needs_no_beads_backend() {
     assert_array_of(
         "lease ls",
         &ls,
-        &["lease", "age_secs", "remaining_secs", "expired"],
+        &[
+            "lease",
+            "age_secs",
+            "remaining_secs",
+            "expired",
+            // pact-mqw.6: derived liveness. `holder_silent_secs` is skipped when
+            // the log has never seen the holder act, so it is absent rather than
+            // null in that case — `suspect` is the field to branch on.
+            "holder_silent_secs",
+            "suspect",
+        ],
     );
     assert_object_keys("lease ls[].lease", &ls[0]["lease"], LEASE);
 

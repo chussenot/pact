@@ -2671,6 +2671,8 @@ mod tests {
             age_secs: age,
             remaining_secs: remaining,
             expired,
+            holder_silent_secs: None,
+            suspect: false,
         }
     }
 
