@@ -43,13 +43,19 @@ pub const CHAIN_GENESIS: &str = "genesis";
 
 /// One lease-lifecycle event. `kind` is one of the strings emitted by
 /// `lease.rs`: `"acquired"`, `"renewed"`, `"released"`, `"stolen"`,
-/// `"force-released"`, `"expired"`, `"restored"`, `"refused"`. Kept as a
-/// plain `String` rather than an enum so an older `pact` reading a newer log
-/// shows an unknown kind instead of refusing to parse the line.
+/// `"displaced"`, `"force-released"`, `"expired"`, `"restored"`, `"refused"`.
+/// Kept as a plain `String` rather than an enum so an older `pact` reading a
+/// newer log shows an unknown kind instead of refusing to parse the line.
 ///
-/// `"expired"` is the only kind whose `agent` did not run the command that wrote
-/// it: a lapsed lease is noticed by whoever collects the lock, and the event
-/// belongs to the holder whose claim ended (pact-rnc.13).
+/// `"expired"` and `"displaced"` are the two kinds whose `agent` did not run the
+/// command that wrote them; both belong to the holder whose claim ENDED, not to
+/// whoever ended it (pact-rnc.13, pact-mqw.1). A lapsed lease is noticed by
+/// whoever collects the lock; a displaced one is noticed by whoever stole it.
+/// They are kept distinct because the difference is exactly what a reader needs:
+/// `"expired"` means a TTL ran out and nobody was harmed, `"displaced"` means a
+/// live claim was overridden via `--steal`. Both are immediately followed by a
+/// `"stolen"` row under the incoming agent, so `owner_of` still resolves to the
+/// new holder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     /// RFC3339.

@@ -1446,6 +1446,7 @@ fn acquire_inner(
                 // Same takeover reasoning as the expired-reclaim branch above:
                 // preserve the displaced lease's unknown fields (pact-m7j.9.8).
                 new_lease.extra = existing.extra.clone();
+                let (_, displaced_remaining) = age_and_remaining(&existing, now);
                 write_lease_atomic(&lock_path, &new_lease)?;
                 verify_own_lease(&lock_path, agent)?;
                 log_event(
@@ -1460,6 +1461,47 @@ fn acquire_inner(
                     new_lease.ttl_secs,
                     new_lease.content_hash.clone(),
                 );
+                // Closes the displaced holder's window, as the "expired" row does
+                // one branch up and for the identical reason: without it the
+                // feed's last word on `existing.agent` is still "acquired", so
+                // every consumer keeps naming a holder who was overridden minutes
+                // ago as the current one, and `audit --check double-win` reads
+                // every LATER acquire of this path as an overlap against them —
+                // nine such reports in the crucible run, eight of them naming one
+                // SIGKILLed agent, none of them a real concurrent hold
+                // (pact-mqw.1).
+                //
+                // Logged AFTER the "stolen" row, and that order is load-bearing.
+                // A --steal over a live claim IS a genuine overlap at the instant
+                // it happens, and reporting it is deliberate
+                // (`stealing_a_live_lease_is_a_double_win`). Closing first would
+                // silently retire that detection; closing second keeps it and
+                // stops the window leaking past the steal. Each branch's order
+                // mirrors what actually happened: a reclaim's holder was already
+                // gone before the takeover, a steal's holder was still live
+                // during it.
+                //
+                // A distinct kind rather than reusing "expired", because the two
+                // are not the same event and the difference is the point:
+                // "expired" means a TTL lapsed and nobody was harmed,
+                // "displaced" means a live claim was overridden. Keeping them
+                // apart lets a consumer grouping by `kind` tell a routine reclaim
+                // from a forced override without parsing prose.
+                log_event(
+                    repo_root,
+                    &existing.agent,
+                    "displaced",
+                    &relative,
+                    Some(format!(
+                        "live lease overridden by {agent} via --steal ({} still remaining of ttl {}s)",
+                        human_secs(displaced_remaining),
+                        existing.ttl_secs
+                    )),
+                    // The DISPLACED holder's ttl: this row closes their window.
+                    existing.ttl_secs,
+                    None,
+                );
+                count_transition("displaced");
                 count_transition("stolen");
                 record_hold(&existing, "stolen");
                 Ok(AcquireOutcome {
@@ -3095,7 +3137,11 @@ mod tests {
                 ("acquired".to_string(), "f.rs".to_string()),
                 ("renewed".to_string(), "f.rs".to_string()),
                 ("renewed".to_string(), "f.rs".to_string()),
+                // The steal closes agent-a's window before opening agent-b's
+                // (pact-mqw.1); without the first row agent-a reads as still
+                // holding f.rs for the rest of the log.
                 ("stolen".to_string(), "f.rs".to_string()),
+                ("displaced".to_string(), "f.rs".to_string()),
                 ("force-released".to_string(), "f.rs".to_string()),
                 ("acquired".to_string(), "g.rs".to_string()),
                 ("released".to_string(), "g.rs".to_string()),
@@ -3109,26 +3155,36 @@ mod tests {
             Some("why"),
             "acquire logs the note — the reason the claim exists"
         );
-        assert_eq!(events[3].agent, "agent-b");
+        // pact-mqw.1: the steal is two rows, matching the expired-reclaim branch
+        // — one closing the victim's window under THEIR name, one opening the
+        // thief's under theirs.
+        assert_eq!(events[3].agent, "agent-b", "the steal opens the thief's window");
         assert!(
             events[3].detail.as_deref().unwrap().contains("agent-a"),
             "a steal must name the displaced holder: {:?}",
             events[3].detail
         );
+        assert_eq!(events[4].kind, "displaced");
+        assert_eq!(events[4].agent, "agent-a", "the victim owns the closing row");
         assert!(
             events[4].detail.as_deref().unwrap().contains("agent-b"),
-            "a force-release must name the displaced holder: {:?}",
+            "the displaced row must name who overrode it: {:?}",
             events[4].detail
+        );
+        assert!(
+            events[5].detail.as_deref().unwrap().contains("agent-b"),
+            "a force-release must name the displaced holder: {:?}",
+            events[5].detail
         );
         // pact-m7j.2.6: the displaced holder in a structured field too, not
         // just free text — audit::reconstruct needs this to close THEIR
         // window, since this event's own `agent` (agent-a) is the one who
         // forced it, not the one displaced.
         assert_eq!(
-            events[4].displaced.as_deref(),
+            events[5].displaced.as_deref(),
             Some("agent-b"),
             "force-released must carry the displaced holder as a structured field: {:?}",
-            events[4].displaced
+            events[5].displaced
         );
     }
 
@@ -3338,14 +3394,38 @@ mod tests {
         assert_eq!(events[0].agent, "agent-a");
         assert_eq!(events[1].agent, "agent-b");
 
-        // A --steal of a LIVE claim has no "expired" row: that is the difference.
+        // A --steal of a LIVE claim closes the victim's window too, but with
+        // "displaced" rather than "expired": both close, and which one appears
+        // is how a consumer grouping by `kind` tells a routine reclaim from a
+        // forced override without parsing prose (pact-mqw.1, pact-mqw.2).
         acquire(root, "agent-c", "dead.rs", 900, true, None).unwrap();
-        let kinds: Vec<String> = crate::events::recent(root, 10)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.kind)
-            .collect();
-        assert_eq!(kinds, ["expired", "stolen", "stolen"]);
+        let events = crate::events::recent(root, 10).unwrap();
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, ["expired", "stolen", "stolen", "displaced"]);
+
+        // The closing row belongs to the agent whose claim ENDED, not to the one
+        // that ended it — the same ownership rule as "expired" one assertion up.
+        assert_eq!(events[3].agent, "agent-b", "displaced names the victim");
+        assert_eq!(events[2].agent, "agent-c", "stolen names the thief");
+        assert!(
+            events[3]
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("--steal"),
+            "the displaced row says why it ended: {:?}",
+            events[3].detail
+        );
+
+        // And custody still resolves to the thief: "displaced" is deliberately
+        // absent from is_custody()'s allowlist, and the "stolen" row that always
+        // follows it is newer, so `--to-owner-of` addresses agent-c either way.
+        assert_eq!(
+            crate::events::owner_of(root, "dead.rs")
+                .unwrap()
+                .map(|o| o.agent),
+            Some("agent-c".to_string())
+        );
     }
 
     // ---- pact-aw7.3: what the lease metrics are computed from -------------

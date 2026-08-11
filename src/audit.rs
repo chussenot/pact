@@ -558,8 +558,52 @@ fn opens(kind: &str) -> bool {
 /// `existing.agent`, not under the agent taking over. That is what makes a
 /// routine reclaim — `expired` then `stolen` — read correctly instead of looking
 /// like two agents holding at once.
+///
+/// A forced `--steal` is NOT in this list, and deliberately so: it closes the
+/// displaced holder from inside the `opens` arm, after recording the overlap the
+/// steal genuinely represents (pact-mqw.1). `displaced` is not here either — it
+/// is a feed row, and the `stolen` before it already did the closing.
 fn closes(kind: &str) -> bool {
     matches!(kind, "released" | "force-released" | "expired")
+}
+
+/// Close `agent`'s open window on `path`, if it has one, recording the finished
+/// hold. Returns whether anything was closed.
+///
+/// Split out for the two takeover sites (pact-mqw.1), which close a window
+/// belonging to somebody other than the event's own author and must stay silent
+/// when there is nothing open — unlike the ordinary close arm, whose whole job
+/// includes counting a close that found no window as orphaned.
+#[allow(clippy::too_many_arguments)]
+fn close_window(
+    open: &mut BTreeMap<String, (usize, String, usize, u64, bool)>,
+    holds: &mut Vec<Hold>,
+    path: &str,
+    agent: &str,
+    line: usize,
+    at: &str,
+    closed_by: &str,
+) -> bool {
+    let Some((oline, oat, renewals, ttl, ttl_assumed)) = open.remove(agent) else {
+        return false;
+    };
+    let held = parse_at(&oat)
+        .zip(parse_at(at))
+        .map(|(a, b)| (b - a).num_seconds());
+    holds.push(Hold {
+        path: path.to_string(),
+        agent: agent.to_string(),
+        opened_line: oline,
+        opened_at: oat,
+        closed_line: Some(line),
+        closed_at: Some(at.to_string()),
+        closed_by: Some(closed_by.to_string()),
+        renewals,
+        held_secs: held,
+        ttl_secs: ttl,
+        ttl_assumed,
+    });
+    true
 }
 
 /// Reconstruct every hold window, and notice where two overlap.
@@ -628,6 +672,55 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>, usize) 
                     e.ttl_secs.unwrap_or(LEGACY_DEFAULT_TTL_SECS),
                     e.ttl_secs.is_none(),
                 ));
+                // pact-mqw.1: a takeover ENDS the displaced holder's claim, and
+                // until now nothing said so. A routine reclaim gets an `expired`
+                // row to close it, but a `--steal` over a live lease had none —
+                // and a SIGKILLed holder emits no `released` either, so its
+                // window stayed open for the remainder of the log and every later
+                // acquire of the path was reported as an overlap against a holder
+                // that had been gone for minutes. Nine such reports on the
+                // crucible log, eight naming one killed agent, none of them a
+                // concurrent hold.
+                //
+                // Closing here rather than on the `displaced` row that lease.rs
+                // now writes, because this works on EVERY log: the false
+                // positives are in logs already on disk, written by versions that
+                // never emitted `displaced`. The overlap has already been
+                // recorded just above, so the steal itself is still reported —
+                // that part is deliberate.
+                if e.kind == "stolen" {
+                    let victims: Vec<String> =
+                        open.keys().filter(|a| *a != &e.agent).cloned().collect();
+                    for victim in victims {
+                        close_window(
+                            &mut open,
+                            &mut holds,
+                            path,
+                            &victim,
+                            line,
+                            &e.at,
+                            "stolen",
+                        );
+                    }
+                }
+            } else if e.kind == "displaced" {
+                // Primarily a feed row: it stops `pact log` and `pact ui` naming
+                // an overridden agent as the current holder. The `stolen` row
+                // immediately before it has normally closed this window already,
+                // so this is usually a no-op — but it closes if anything IS still
+                // open, which covers a bounded or truncated log whose `stolen`
+                // line was trimmed away. Silent when there is nothing to close:
+                // unlike the close arm below it must not count that as an orphan,
+                // because the expected case is that the steal got there first.
+                close_window(
+                    &mut open,
+                    &mut holds,
+                    path,
+                    &e.agent,
+                    line,
+                    &e.at,
+                    "displaced",
+                );
             } else if e.kind == "renewed" {
                 if let Some(slot) = open.get_mut(&e.agent) {
                     slot.2 += 1;
@@ -2189,9 +2282,59 @@ mod tests {
         assert_eq!(r.findings(), 0, "expired closes the old window first");
     }
 
-    /// A `--steal` over a LIVE lease has no `expired` before it, so it is a real
-    /// overlap and must be reported. That asymmetry is the whole reason `expired`
-    /// rows exist.
+    /// The crucible regression (pact-mqw.1). A holder is SIGKILLed, so it never
+    /// releases; a successor steals the path before the TTL lapses, so no
+    /// `expired` fires for it either. The `displaced` row is the ONLY thing that
+    /// ever closes that window.
+    ///
+    /// Without it, the dead agent stayed open for the rest of the log and every
+    /// later acquire of the path was reported against it. On the real crucible
+    /// log that was nine findings, eight naming one killed agent, and not one of
+    /// them a concurrent hold. The steal itself is still reported — see the test
+    /// below, that part is deliberate — but it must not leak past the steal.
+    #[test]
+    fn a_killed_holders_window_does_not_leak_past_the_steal() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "victim", "acquired", "src/a.rs"),
+            // no release, no expiry: the process was killed
+            &ev("2026-08-01T10:05:00Z", "heir", "stolen", "src/a.rs"),
+            &ev("2026-08-01T10:05:01Z", "victim", "displaced", "src/a.rs"),
+            &ev("2026-08-01T10:09:00Z", "heir", "released", "src/a.rs"),
+            // Three later, entirely uncontended acquires of the same path.
+            &ev("2026-08-01T10:20:00Z", "agent-c", "acquired", "src/a.rs"),
+            &ev("2026-08-01T10:21:00Z", "agent-c", "released", "src/a.rs"),
+            &ev("2026-08-01T10:30:00Z", "agent-d", "acquired", "src/a.rs"),
+            &ev("2026-08-01T10:31:00Z", "agent-d", "released", "src/a.rs"),
+            &ev("2026-08-01T10:40:00Z", "agent-e", "acquired", "src/a.rs"),
+        ]);
+        let r = run_check(tmp.path(), Check::DoubleWin, None, false).unwrap();
+        assert_eq!(
+            r.findings(),
+            1,
+            "only the steal itself, never the clean acquires after it: {:?}",
+            r.double_wins
+        );
+        assert_eq!(r.double_wins[0].incoming_agent, "heir");
+    }
+
+    /// `displaced` closes the victim's window even when the log never shows the
+    /// steal opening one for the thief — a truncated or bounded log that starts
+    /// mid-takeover must not leave the victim open forever either.
+    #[test]
+    fn a_displaced_row_closes_its_own_holder_not_the_event_author() {
+        let tmp = with_log(&[
+            &ev("2026-08-01T10:00:00Z", "victim", "acquired", "src/a.rs"),
+            &ev("2026-08-01T10:05:01Z", "victim", "displaced", "src/a.rs"),
+            &ev("2026-08-01T10:20:00Z", "later", "acquired", "src/a.rs"),
+        ]);
+        let r = run_check(tmp.path(), Check::DoubleWin, None, false).unwrap();
+        assert_eq!(r.findings(), 0, "{:?}", r.double_wins);
+    }
+
+    /// A `--steal` over a LIVE lease is a real overlap at the instant it happens
+    /// and must be reported. Deliberate, and the reason the `displaced` row that
+    /// closes the victim's window is logged AFTER the `stolen` row rather than
+    /// before: closing first would silently retire this detection.
     #[test]
     fn stealing_a_live_lease_is_a_double_win() {
         let tmp = with_log(&[
