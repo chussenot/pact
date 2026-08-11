@@ -134,6 +134,19 @@ run = [
   "scripts/fleet-verify.sh \"$(tail -1 /tmp/pact-fleet-treatment.txt)\"",
 ]
 
+[tasks.lint-scripts]
+description = "shellcheck every script in scripts/, at warning severity."
+# `--severity=warning`, not the default, and the reason is that the default
+# includes `info` — which today means SC2013 on a deliberate word-split and
+# SC2018/SC2019 on an ASCII-only `tr 'A-Z' 'a-z'` in check-docs.sh. Both are
+# correct as written, so a gate at default severity would be red on arrival and
+# get switched off. At `warning` it is green today and still catches the things
+# that are actually bugs: unquoted expansions, unreachable code, misused tests.
+#
+# This exists because scripts/chaos.sh is destructive, and "shellcheck-clean"
+# had to be a property something enforces rather than a sentence in its header.
+run = "shellcheck --severity=warning scripts/*.sh"
+
 [tasks.check]
 description = "Run the full CI check locally: fmt, lint, test, otel, docs — serially, as CI does."
 # Sequential, and this is not a preference. `depends` runs tasks in PARALLEL, and
@@ -149,6 +162,7 @@ description = "Run the full CI check locally: fmt, lint, test, otel, docs — se
 run = [
   "mise run fmt-check",
   "mise run lint",
+  "mise run lint-scripts",
   "mise run test",
   "mise run otel",
   "mise run check-docs",

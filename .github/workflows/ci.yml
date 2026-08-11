@@ -88,6 +88,11 @@ jobs:
         if: runner.os == 'Linux'
         run: ./scripts/check-docs.sh
 
+      - name: shellcheck scripts/
+        # scripts/chaos.sh is destructive, so "shellcheck-clean" is enforced
+        # rather than asserted in a comment. See mise.toml for the severity note.
+        run: shellcheck --severity=warning scripts/*.sh
+
   # Conventional-commit lint, PRs only.
   #
   # `cog bump` generates the changelog from commit subjects and silently drops

@@ -14,8 +14,9 @@ Four layers, each answering a question the one below it cannot.
 | Integration | `tests/*.rs` | does the real binary behave, over real pipes and real git |
 | Canary | [`scripts/canary.sh`](../scripts/canary.sh) | do pact's assumptions about somebody else's CLI still hold |
 | Fleet soak | [`scripts/fleet-sim.sh`](../scripts/fleet-sim.sh) | do the primitives hold when twenty agents contend |
+| Fault injection | [`scripts/chaos.sh`](../scripts/chaos.sh) | does a fleet RECOVER when agents and tools fail |
 
-The first three are in [development.md](development.md). This page is the fourth.
+The first three are in [development.md](development.md). This page is the last two.
 
 ## The fleet soak
 
@@ -220,3 +221,115 @@ benign already-released race.
 Two lessons, one general: the failure was diagnosable only because the worker
 captured `msg send`'s stderr. The first version discarded it with `2>&1`, and a
 harness that throws away the evidence for its own finding is half a harness.
+
+## Fault injection
+
+The soak proves the primitives hold when everyone behaves. Twenty workers race
+one checkout, every one of them following the protocol, and the verifier checks
+that no two ever held a path at once. That is the mechanics question.
+
+`scripts/chaos.sh` asks the other one: **does a fleet recover when things
+fail?** An agent SIGKILLed with three leases open. The Beads CLI gone from
+`PATH` for ninety seconds. A lock file truncated to zero bytes. A lease
+backdated past its own TTL so two agents both believe they can take it.
+
+```bash
+touch /tmp/fleet/.chaos-armed              # deliberate, and required
+scripts/chaos.sh --repo /tmp/fleet --pids /tmp/fleet/pids --dry-run
+scripts/chaos.sh --repo /tmp/fleet --pids /tmp/fleet/pids --seed 7 --duration 30
+scripts/chaos.sh … --time-unit sec         # duration AND gaps in seconds
+```
+
+`--pids` is a file the orchestrator appends `pid<TAB>agent` to as each agent
+spawns. It is the allowlist, so an agent that is not in it cannot be killed —
+which also means an orchestrator that forgets to register its agents gets a run
+full of logged skips rather than a run full of faults, and the log says which.
+
+`--time-unit sec` scales the duration *and* the gaps. It exists so the tests can
+drive real faults end to end in seconds; `mise run check` runs them on every
+gate, and `shellcheck --severity=warning scripts/*.sh` runs there too, because
+"shellcheck-clean" for a destructive script has to be enforced rather than
+claimed.
+
+Sim and chaos answer different questions and neither substitutes for the other.
+A fleet can pass the soak and still lose work the first time an agent dies
+holding something — the soak has no dying agents in it.
+
+### It must never run outside a disposable fleet repo
+
+**This script kills processes and rewrites files it did not create.** Almost all
+of its code is the blast radius rather than the faults; each fault is about a
+dozen lines. Five rails, in the order they fire:
+
+| Rail | What it refuses |
+|---|---|
+| pact's own checkout | `--repo` resolving to pact's canonical path, or to anything with `src/lease.rs` and a `Cargo.toml` naming the pact package |
+| two markers | a repo without **both** `.pact/` and `.chaos-armed` |
+| PID allowlist | signalling any PID not listed in `--pids`, re-verified per kill |
+| cwd re-check | signalling a listed PID whose working directory is not under `--repo` |
+| `$HOME` prefix | renaming a backend binary that lives outside `$HOME` |
+
+Two of those deserve their reasons stated. `.pact/` alone is **not** sufficient,
+because every repository pact has ever touched has one — including this one — so
+a single marker is one typo away from somebody's work. And the PID allowlist is
+re-verified *before every signal* rather than once at startup, because PIDs are
+recycled: an entry naming a process that has since exited can name something
+else entirely by the time chaos reads it, which is exactly how a bounded tool
+becomes unbounded.
+
+The `$HOME` rail is why `backend-outage` skips rather than fails on a
+system-installed `bd`. Hiding `/usr/bin/bd` would break the machine, not the
+fleet.
+
+### Restore is a trap, and its one limit is documented
+
+`backend-outage` renames a binary, so putting it back cannot be a code path that
+the happy case reaches — it is a `trap` on `EXIT INT TERM`. An outage must never
+outlive the process that caused it.
+
+**SIGKILL is the exception, and unavoidably so.** The kernel delivers it without
+running any handler, so a `kill -9` of chaos mid-outage leaves the binary
+renamed. The guarantee is "every signal a process can catch", not "every
+signal", and the test asserts the former because asserting the latter would be
+asserting an impossibility. If it does happen, the fix is one `mv` and the log
+names the file.
+
+### The join contract
+
+Every decision appends one line to `<repo>/chaos-log.jsonl`:
+
+```json
+{"ts":"…","seed":7,"action":"kill-holder","target":"w3-combat pid=4131","detail":"SIGKILL sent; held: src/game/mod.rs","dry":false}
+```
+
+**Including skips and refusals**, which is the point of the file rather than a
+nicety. An analysis joining effects to causes also has to join every *non*-effect
+to the rail that prevented it — otherwise "chaos did nothing here" cannot be
+told apart from "chaos tried and a rail stopped it", and a rail that fires
+silently is a rail nobody can audit.
+
+### Reproducibility
+
+Randomness comes from `sha256("<seed>:<counter>")`. Not `$RANDOM`, which cannot
+be seeded across processes, and deliberately not `awk`'s `srand()` either: that
+one *is* seedable, but its generator is implementation-defined, so mawk, gawk and
+busybox awk produce different sequences from the same seed. A plan built with it
+would reproduce on the machine that found a bug and nowhere else — worse than
+obvious non-determinism, because it looks reproducible until it is not.
+
+The whole fault plan is computed before anything is touched, so `--dry-run`
+emits exactly the decision sequence a real run would execute. That is also what
+CI runs: a dry pass is a full self-test of the planner and every rail, with no
+side effect but its own log.
+
+A run given no `--seed` picks one and logs it like any other decision, because a
+fault injector whose failures cannot be replayed is the one thing it must never
+be.
+
+### What it cannot tell you
+
+Nothing about whether a language model recovers well. chaos breaks things and
+records what it broke; whether the fleet then did something sensible is a
+question for `pact audit` over the same window, and ultimately for a human
+reading both logs side by side. The `--seed` and the timestamps are what let you
+line them up.
