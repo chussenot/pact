@@ -758,6 +758,100 @@ recipe](onboarding.md#recipe-one-agent-per-git-worktree), which already
 relies on exactly this: two worktrees sharing one `PACT_AGENT` are, on
 purpose, one agent as far as leases are concerned).
 
+## Crash recovery: taking over from a dead agent
+
+The protocol tells you to pick up after a peer that died. No single command does
+it, so here is the procedure, in the order that costs you least if you are wrong.
+
+Measured against three SIGKILLed holders in one run: **the lease half worked every
+time**, and the reference sequence is below. It is written down because the two
+successors each had to reconstruct it, and one of them nearly reverted a peer's
+work doing so.
+
+**1. Look in the dead agent's worktree before you touch a lease.** Its uncommitted
+work is the only thing here that is not recoverable from a log. A SIGKILL leaves
+the working tree exactly as it was mid-edit, and it may contain the change you are
+about to redo — or one you are about to overwrite. In this run a successor found
+that applying its predecessor's stashed diff would have silently reverted a
+*third* agent's change; it read the diff first and caught it.
+
+**2. Establish the holder is actually gone.** Not "quiet" — gone.
+`pact lease ls` flags a holder that has not run a pact command for half its TTL as
+`SUSPECT`, and [that flag is deliberately weak](#suspect-a-stalled-holder-is-worse-than-a-crashed-one):
+an agent can think for a long time without running anything. Confirm out of band —
+the orchestrator knows what it spawned, and `pact log` shows whether the agent is
+still acting anywhere else. Then message it: a dead agent cannot answer, and a
+live one will.
+
+**3. Try a plain `acquire` first, and expect exit 2.** This is not a formality —
+it tells you what pact knows:
+
+```
+$ pact lease acquire src/ast.rs src/parser.rs --ttl 600 --note '...'
+error: lease on src/ast.rs is held by agent-04 on branch crucible/agent-04
+in worktree agent-04 (377s old, 223s remaining); use --steal to override
+[exit 2]
+```
+
+The branch and worktree are the useful part: they tell you *where* to go looking
+for step 1.
+
+**A dead holder may have left nothing to reclaim.** One of the three killed
+agents had already released cleanly before the signal landed, so its successor
+found no lease at all. Exit 0 on a plain acquire is a normal outcome of this
+procedure, not a sign you misread the situation.
+
+**4. `--steal` is the carve-out for a holder you know is dead.** Not for one that
+is merely slow, and not for impatience:
+
+```
+$ pact lease acquire src/ast.rs src/parser.rs --steal --ttl 600 --note '...'
+warning: stealing non-expired lease on src/ast.rs held by agent-04 on branch
+crucible/agent-04 in worktree agent-04 (advisory override via --steal)
+note: src/ast.rs was last acquired by agent-04 (6m57s ago) — their note: ...
+note: 2 unread message(s) about src/ast.rs, oldest from agent-01 ...
+[exit 0]
+```
+
+It names the displaced agent, its branch and worktree, how long it held, its note,
+and any messages waiting on the path — which is usually the reason the last agent
+stopped. Read them before you edit.
+
+`--steal` over a live lease writes `stolen` under you and `displaced` under the
+victim, so [`pact audit`](audit.md#--check-double-win) reads the takeover as a
+takeover rather than as two agents holding one path.
+
+Taking over a lease that had already **lapsed** is a different act and audit counts
+it separately, as a reclaim rather than a steal. Both write `stolen`, but a reclaim
+is always preceded by an `expired` row for that path and a forced override never
+is — so the two are told apart structurally, not by reading the detail prose.
+Routine reclaim is what TTLs are *for* and needs no justification.
+
+**5. The bead half has no equivalent, and that is a Beads-side gap.**
+`bd update <id> --claim` is claim-if-unclaimed and refuses even when the holder is
+confirmed dead:
+
+```
+Error claiming crucible-2o3.14: issue already claimed by agent-03
+[exit 1]
+```
+
+Both successors in that run independently fell back to:
+
+```bash
+bd update <id> -a <you> -s in_progress
+```
+
+That works, and you should use it — but know what it costs. It is a two-field
+manual overwrite with no atomicity, and **it leaves no record that a takeover
+happened**: in `.beads/interactions.jsonl` it is indistinguishable from a
+voluntary handoff. Compare the lease side, which logs `force-released` with a
+reason and the displaced identity. So say it in a message, since the store will
+not: `pact msg send --to-owner-of <path> "took over <bead> from <dead agent>"`.
+
+Fixing `--claim` is upstream in Beads, not pact's to do. The procedure is here
+because pact's protocol block is what asks you to run it.
+
 ## Renewing a long task's lease
 
 ```
