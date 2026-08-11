@@ -414,6 +414,137 @@ fn renew_of_another_agents_lease_exits_2() {
 
 // ---------------------------------------------------------- lease release
 
+/// pact-mqw.7, half one: `release` takes many paths, like `acquire`.
+///
+/// Four agents in the crucible run hit `error: unexpected argument 'tests/cases'
+/// found` and each had to release one path per call. The run's own agent brief
+/// wrote the usage as `release <path>...` by analogy with `acquire`, which is how
+/// they all found it.
+///
+/// Unlike `acquire` it is NOT all-or-nothing: on the way out, releasing three of
+/// four beats releasing none, so a refusal in the middle does not abort the rest.
+#[test]
+fn release_takes_many_paths_and_a_refusal_does_not_abort_the_others() {
+    let tmp = init_repo();
+    let repo = tmp.path();
+    assert_ok(&pact(
+        repo,
+        "agent-a",
+        &["lease", "acquire", "a.rs", "b.rs"],
+    ));
+    assert_ok(&pact(repo, "agent-b", &["lease", "acquire", "theirs.rs"]));
+
+    // The plain multi-path form, which used to be a usage error.
+    let out = pact(repo, "agent-a", &["lease", "release", "a.rs", "b.rs"]);
+    assert_ok(&out);
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("released lease on a.rs") && text.contains("released lease on b.rs"),
+        "{text}"
+    );
+    assert!(!lock_path(repo, "a.rs").exists());
+    assert!(!lock_path(repo, "b.rs").exists());
+
+    // A refusal in the middle: the sibling still gets released, and the exit code
+    // is still 2 so a script branching on it behaves as documented.
+    assert_ok(&pact(repo, "agent-a", &["lease", "acquire", "mine.rs"]));
+    let mixed = pact(
+        repo,
+        "agent-a",
+        &["lease", "release", "theirs.rs", "mine.rs"],
+    );
+    assert_eq!(
+        mixed.status.code(),
+        Some(2),
+        "a refused path must still exit 2: {}",
+        stderr_of(&mixed)
+    );
+    assert!(
+        !lock_path(repo, "mine.rs").exists(),
+        "the path this agent DID hold must have been released anyway"
+    );
+    assert!(
+        lock_path(repo, "theirs.rs").exists(),
+        "and the peer's claim must survive"
+    );
+    assert!(
+        stderr_of(&mixed).contains("theirs.rs"),
+        "the refusal must name the path: {}",
+        stderr_of(&mixed)
+    );
+}
+
+/// pact-mqw.7, half two: a lease that lapsed and had its lock collected must not
+/// report as a clean release.
+///
+/// The crucible sequence exactly: agent-08's lease expired at 09:12:32Z, a sweep
+/// collected the lock, the agent committed at 09:14:01Z and only then released —
+/// and pact printed `released lease on tests/corpus.rs` and exited 0. It learned
+/// the truth by reading events.jsonl afterwards. `release` is where an agent
+/// confirms it played by the rules, so a uniform success line let it conclude it
+/// had complied when for ninety seconds the path had been free.
+#[test]
+fn releasing_a_lapsed_lease_says_so_instead_of_reporting_success() {
+    let tmp = init_repo();
+    let repo = tmp.path();
+    // A TTL short enough to lapse inside the test, plus pact's own GRACE_SECS.
+    assert_ok(&pact(
+        repo,
+        "agent-08",
+        &["lease", "acquire", "corpus.rs", "--ttl", "1"],
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // Backdate the lock past ttl+grace, which is what waiting 31 real seconds
+    // would do. The sweep below is then a peer's ordinary `lease ls`.
+    let lock = lock_path(repo, "corpus.rs");
+    let mut lease: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&lock).unwrap()).unwrap();
+    lease["acquired_at"] =
+        serde_json::json!((chrono::Utc::now() - chrono::Duration::seconds(100)).to_rfc3339());
+    std::fs::write(&lock, serde_json::to_string(&lease).unwrap()).unwrap();
+    assert_ok(&pact(repo, "peer", &["lease", "ls"]));
+    assert!(
+        !lock.exists(),
+        "the sweep must have collected it, or this test proves nothing"
+    );
+
+    let out = pact(repo, "agent-08", &["lease", "release", "corpus.rs"]);
+    // Still exit 0 — an idempotent release is not an error, it is just not a
+    // release.
+    assert_ok(&out);
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("nothing to release on corpus.rs"),
+        "a collected lease must not report as released: {text}"
+    );
+    assert!(
+        text.contains("already lapsed at"),
+        "and must date the lapse: {text}"
+    );
+    assert!(
+        !text.contains("released lease on corpus.rs"),
+        "the old, misleading line must be gone: {text}"
+    );
+
+    let json = json_stdout(&pact(
+        repo,
+        "agent-08",
+        &["lease", "release", "corpus.rs", "--json"],
+    ));
+    assert_eq!(json["outcome"], "already-expired", "{json}");
+    assert!(json["expired_at"].is_string(), "{json}");
+
+    // A path never leased here is a different answer again: no lock, and no
+    // expiry of this agent's on record.
+    let never = pact(repo, "agent-08", &["lease", "release", "untouched.rs"]);
+    assert_ok(&never);
+    assert!(
+        stdout_of(&never).contains("no lock held here and no expiry of yours on record"),
+        "{}",
+        stdout_of(&never)
+    );
+}
+
 #[test]
 fn release_all_releases_yours_and_leaves_another_agents_alone() {
     let tmp = init_repo();
@@ -2427,7 +2558,26 @@ fn json_shapes_of_every_command_that_needs_no_beads_backend() {
     assert_object_keys(
         "lease release <one>",
         &run(&["lease", "release", "a.rs", "--json"]),
-        &["path", "displaced"],
+        // pact-mqw.7: `outcome` says which of the four things release actually
+        // did, because "released", "your lease had already lapsed" and "there
+        // was nothing here" used to print the same line and exit 0.
+        // `expired_at`/`past_ttl_secs` are skipped when they do not apply, so
+        // they are absent from this — the plain-release — payload by design.
+        &["path", "displaced", "outcome"],
+    );
+
+    // And a MULTI-path release is an array of the same element, matching
+    // `acquire`'s single-object/many-array convention rather than inventing a
+    // second one (pact-mqw.7).
+    assert_ok(&pact(
+        repo,
+        "shape-agent",
+        &["lease", "acquire", "m1.rs", "m2.rs"],
+    ));
+    assert_array_of(
+        "lease release <many>",
+        &run(&["lease", "release", "m1.rs", "m2.rs", "--json"]),
+        &["path", "displaced", "outcome"],
     );
 
     // `release --all` is an array of bare path STRINGS, not of the

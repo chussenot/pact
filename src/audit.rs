@@ -702,15 +702,7 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>, usize) 
                     let victims: Vec<String> =
                         open.keys().filter(|a| *a != &e.agent).cloned().collect();
                     for victim in victims {
-                        close_window(
-                            &mut open,
-                            &mut holds,
-                            path,
-                            &victim,
-                            line,
-                            &e.at,
-                            "stolen",
-                        );
+                        close_window(&mut open, &mut holds, path, &victim, line, &e.at, "stolen");
                     }
                 }
             } else if e.kind == "displaced" {

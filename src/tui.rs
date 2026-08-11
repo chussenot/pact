@@ -488,16 +488,17 @@ impl App {
                 .clone()
                 .unwrap_or_else(|| entry.lease.agent.clone());
             match lease::release(&self.repo_root, &agent, &path, true) {
-                // Some(holder) means force actually took the lease off someone
-                // else. Naming them is the whole value of the force path here:
-                // the ui is where a human does this, and "who did I just step
-                // on" is the one fact they need to go tell that agent.
-                Ok(Some(displaced)) => {
-                    self.status = Some(format!("force-released {path} (was held by {displaced})"));
-                    self.mascot.play(Gesture::Cheer, now);
-                }
-                Ok(None) => {
-                    self.status = Some(format!("released {path}"));
+                // A displaced holder means force actually took the lease off
+                // someone else. Naming them is the whole value of the force path
+                // here: the ui is where a human does this, and "who did I just
+                // step on" is the one fact they need to go tell that agent.
+                Ok(outcome) => {
+                    self.status = Some(match outcome.displaced() {
+                        Some(displaced) => {
+                            format!("force-released {path} (was held by {displaced})")
+                        }
+                        None => format!("released {path}"),
+                    });
                     self.mascot.play(Gesture::Cheer, now);
                 }
                 Err(e) => {

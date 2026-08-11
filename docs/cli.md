@@ -24,7 +24,7 @@ pact whoami
 pact agents
 pact lease acquire <path>... [--ttl <seconds>] [--steal] [--note <text>]
 pact lease renew <path>
-pact lease release <path> [--force]
+pact lease release <path>... [--force]
 pact lease release --all
 pact lease ls [--all]
 pact msg send (--to <agent>... | --to-owner-of <path>...) [--thread <id>] [--subject <text>] [--skip <agent>...] (<body> | --body-file <path|->)

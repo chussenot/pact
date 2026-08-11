@@ -384,6 +384,60 @@ Every transition in that diagram also appends a line to `.pact/events.jsonl`, so
 `pact log` can show a lease that was taken and released while you weren't
 looking — see [The event log](#the-event-log) below.
 
+### `release` tells you whether you actually held it
+
+`pact lease release` used to print `released lease on <path>` and exit 0 for
+three different situations, one of which was "you have not held this for the last
+ninety seconds".
+
+That is the crucible sequence, verbatim: agent-08's lease lapsed at 09:12:32Z and
+a peer's `lease ls` collected the lock. The agent committed at 09:14:01Z, released,
+was told it had released cleanly, and found out otherwise only by reading
+`events.jsonl` afterwards.
+
+The reason that matters is not tidiness. **`release` is where an agent confirms it
+played by the rules, and the binding rule is commit-before-release.** An agent that
+overruns its TTL, commits, and releases sees an unbroken success path and concludes
+it complied. It did not: for ninety seconds the path was free, and any peer could
+have taken it and edited from a different worktree. Nobody did, and that was luck,
+not coordination.
+
+So the four outcomes now read differently, and all of them still **exit 0** —
+an idempotent release is a feature, it is just not a release:
+
+| `outcome` | What it means |
+|---|---|
+| `released` | a live lock you held, removed. Carries `past_ttl_secs` when you overran and got away with it |
+| `force-released` | `--force` destroyed a different agent's live claim, who is named |
+| `already-expired` | your lease had lapsed and its lock was collected. Dated, with how long the path was free |
+| `nothing-held` | no lock, and no expiry of yours on record |
+
+`past_ttl_secs` is measured against your plain TTL, not TTL + grace: the grace
+window is pact's tolerance for a skewed clock before it lets a *peer* reclaim, not
+an extension of the promise you made.
+
+Only this agent's own row in the log answers the `already-expired` question — a
+peer's expiry on the same path says nothing about whether *you* overran. Past the
+log's rewrite horizon the answer degrades to `nothing-held`, which reads as "no
+expiry on record" rather than as a claim that none happened.
+
+### Releasing several paths
+
+`pact lease release <path>...` takes many paths, like `acquire`. Four agents in
+one run hit `error: unexpected argument 'tests/cases' found` and released one path
+per call; the run's own brief had written the usage as `release <path>...` by
+analogy with `acquire`, which is how they all found it.
+
+**It is deliberately NOT all-or-nothing, unlike `acquire`.** Holding half of what
+you need is useless, so `acquire` rolls back; releasing three of four is strictly
+better than releasing none, and `release` is what an agent runs on its way out. So
+every path is attempted, a refusal is warned about on stderr, and the exit code is
+still 2 if any path was refused.
+
+`--json` follows `acquire`'s convention: one path is an object, several are an
+array of the same element. A refusal anywhere suppresses the payload and emits the
+error object instead, so `--json` is always exactly one document.
+
 ### The three states
 
 `pact lease ls` labels every lease, and `pact ui` uses the same labels — one

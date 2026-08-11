@@ -237,10 +237,13 @@ enum LeaseAction {
     },
     /// Refresh a lease you already hold, so a long task doesn't outlive it.
     Renew { path: String },
-    /// Release a lease you hold, or all of them with --all.
+    /// Release leases you hold, or all of them with --all.
     Release {
+        /// One or more paths, like `acquire`. Unlike `acquire` this is NOT
+        /// all-or-nothing: every path is attempted, because on the way out
+        /// releasing three of four beats releasing none (pact-mqw.7).
         #[arg(required_unless_present = "all", conflicts_with = "all")]
-        path: Option<String>,
+        path: Vec<String>,
         /// Release even if held by another agent.
         #[arg(long, conflicts_with = "all")]
         force: bool,
@@ -1472,19 +1475,50 @@ fn messages_about(root: &Path, paths: &[String], agent: &str) -> Vec<MessageChec
 fn check_one_path(result: Result<Vec<msg::Message>>, path: &str, agent: &str) -> MessageCheck {
     match result {
         Ok(msgs) => {
+            let mut notices = 0usize;
             let waiting: Vec<msg::Message> = msgs
                 .into_iter()
                 // Yours already, or already read by you: not news.
                 .filter(|m| m.from != agent && !m.read_by.iter().any(|r| r == agent))
+                // Watch notices are counted, not quoted. This line is the last
+                // thing an agent reads before it starts editing, and in crucible
+                // it said "32 unread message(s) about src/ast.rs, oldest from
+                // agent-01 — 'src/ast.rs changed — released by agent-01'": a
+                // number dominated by this file's own release fanout, quoting a
+                // superseded diff as the thing to read first. The count of
+                // authored messages is the actionable number; the notices are a
+                // separate clause (pact-mqw.5/pact-mqw.7).
+                .filter(|m| {
+                    if m.notice {
+                        notices += 1;
+                    }
+                    !m.notice
+                })
                 .collect();
+            let tail = if notices > 0 {
+                format!(
+                    " ({notices} watch notice(s) on this path too — \
+                     `pact msg inbox --watch-only`)"
+                )
+            } else {
+                String::new()
+            };
             match waiting.first() {
                 Some(first) => MessageCheck::Found(format!(
                     "note: {} unread message(s) about {path}, oldest from {} — \"{}\". \
-                     Read it before you edit: `pact msg read {}`",
+                     Read it before you edit: `pact msg read {}`{tail}",
                     waiting.len(),
                     first.from,
                     first.subject.as_deref().unwrap_or("(no subject)"),
                     first.id
+                )),
+                // Notices alone do not make an acquire noisy, but staying
+                // completely silent about them would hide the diff of what the
+                // last holder did to the file being claimed — which is the one
+                // moment it is most worth knowing.
+                None if notices > 0 => MessageCheck::Found(format!(
+                    "note: no unread messages about {path}, but {notices} watch notice(s) \
+                     — `pact msg inbox --watch-only` shows what changed under you"
                 )),
                 None => MessageCheck::Clean,
             }
@@ -1638,26 +1672,59 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
                 });
                 return Ok(());
             }
-            // clap enforces `path` unless `--all`, which returned above.
-            let path = path.expect("clap requires <path> unless --all");
-            let displaced = lease::release(&root, &agent, &path, force)?;
-            if let Some(who) = &displaced {
-                // pact-rnc.11: overriding someone else's claim is loud in the
-                // `acquire --steal` direction; make it loud here too.
-                output::warn(&format!(
-                    "warning: force-released {path} — destroyed {who}'s live claim; \
-                     they were not notified (`pact msg send --to {who}`)"
-                ));
+            // Not all-or-nothing, unlike `acquire`: a half-held set of leases
+            // is useless, but a half-released one is strictly better than none,
+            // and `release` is what an agent runs on its way out. So every path
+            // is attempted and the first refusal decides the exit code rather
+            // than aborting the rest (pact-mqw.7).
+            let mut released: Vec<Released> = Vec::new();
+            let mut refusal: Option<anyhow::Error> = None;
+            for p in &path {
+                match lease::release(&root, &agent, p, force) {
+                    Ok(outcome) => {
+                        if let Some(who) = outcome.displaced() {
+                            // pact-rnc.11: overriding someone else's claim is
+                            // loud in the `acquire --steal` direction; make it
+                            // loud here too.
+                            output::warn(&format!(
+                                "warning: force-released {p} — destroyed {who}'s live claim; \
+                                 they were not notified (`pact msg send --to {who}`)"
+                            ));
+                        }
+                        released.push(Released::from(p.clone(), &outcome));
+                    }
+                    // Kept, not returned: the paths after this one still deserve
+                    // their attempt. Re-raised below once every path has had it.
+                    Err(e) => {
+                        output::warn(&format!("warning: {e:#}"));
+                        refusal = refusal.or(Some(e));
+                    }
+                }
             }
-            // pact-rnc.25: the displaced holder used to exist only in that
-            // stderr prose, so `--json` callers — the scripted ones, the ones
-            // that most need to go apologise — could not see whose claim they
-            // destroyed. This changes `release --json` from a bare string to
-            // an object; the human line is unchanged.
-            let released = Released { path, displaced };
-            output::emit(json, &released, |r: &Released| {
-                format!("released lease on {}", r.path)
-            });
+            // pact-rnc.25: the displaced holder used to exist only in stderr
+            // prose, so `--json` callers — the scripted ones, the ones that most
+            // need to go apologise — could not see whose claim they destroyed.
+            //
+            // One path stays an OBJECT and many are an ARRAY, matching
+            // `acquire`'s pinned convention (pact-er0) rather than inventing a
+            // second one.
+            //
+            // A refusal anywhere suppresses the payload and returns the error
+            // instead, so `--json` stays exactly one document — the shape a
+            // refused single-path release has always had. The refused paths are
+            // named on stderr above and in the error itself; what did succeed is
+            // visible in `pact log` and `lease ls`.
+            if let Some(e) = refusal {
+                return Err(e);
+            }
+            if path.len() == 1 {
+                let one = released.remove(0);
+                output::emit(json, &one, |r: &Released| r.line());
+            } else {
+                output::emit(json, &released, |rs: &Vec<Released>| {
+                    rs.iter().map(Released::line).collect::<Vec<_>>().join("\n")
+                });
+            }
             Ok(())
         }
         LeaseAction::Ls { all } => {
@@ -2185,12 +2252,94 @@ fn acquire_verb(o: &lease::AcquireOutcome) -> &'static str {
     }
 }
 
-/// `lease release --json`: the path, plus whoever's live claim `--force`
-/// destroyed (pact-rnc.25).
+/// `lease release --json`: the path, whoever's live claim `--force` destroyed
+/// (pact-rnc.25), and which of the four outcomes this was (pact-mqw.7).
 #[derive(serde::Serialize)]
 struct Released {
     path: String,
     displaced: Option<String>,
+    /// `released` | `force-released` | `already-expired` | `nothing-held`. A
+    /// flat string rather than a tagged enum so a `jq` one-liner can branch on
+    /// it without knowing serde's representation.
+    outcome: &'static str,
+    /// When the lease lapsed, for `already-expired`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expired_at: Option<String>,
+    /// How far past its TTL the holder ran — set whenever it overran, whether or
+    /// not the lock survived long enough to be released.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    past_ttl_secs: Option<i64>,
+}
+
+impl Released {
+    fn from(path: String, outcome: &lease::ReleaseOutcome) -> Self {
+        match outcome {
+            lease::ReleaseOutcome::Released { past_ttl_secs } => Released {
+                path,
+                displaced: None,
+                outcome: "released",
+                expired_at: None,
+                past_ttl_secs: *past_ttl_secs,
+            },
+            lease::ReleaseOutcome::ForceReleased { displaced } => Released {
+                path,
+                displaced: Some(displaced.clone()),
+                outcome: "force-released",
+                expired_at: None,
+                past_ttl_secs: None,
+            },
+            lease::ReleaseOutcome::AlreadyExpired { at, since_secs, .. } => Released {
+                path,
+                displaced: None,
+                outcome: "already-expired",
+                expired_at: Some(at.clone()),
+                past_ttl_secs: *since_secs,
+            },
+            lease::ReleaseOutcome::NothingHeld => Released {
+                path,
+                displaced: None,
+                outcome: "nothing-held",
+                expired_at: None,
+                past_ttl_secs: None,
+            },
+        }
+    }
+
+    /// The line an agent reads. "released lease on X" is unchanged for the case
+    /// that really is a release; the other three say what actually happened,
+    /// because `release` is where an agent checks its own compliance and a
+    /// uniform success line let it conclude it had complied when it had not.
+    fn line(&self) -> String {
+        match self.outcome {
+            "released" => match self.past_ttl_secs {
+                // Released, but late. Nobody reclaimed in the window, which is
+                // luck rather than compliance, so say so where the agent will
+                // read it.
+                Some(over) => format!(
+                    "released lease on {} — WARNING: {} past its ttl; the path was \
+                     reclaimable by any peer for that long. Renew next time, or take a longer --ttl",
+                    self.path,
+                    human_secs(over)
+                ),
+                None => format!("released lease on {}", self.path),
+            },
+            "force-released" => format!("force-released lease on {}", self.path),
+            "already-expired" => format!(
+                "nothing to release on {} — your lease had already lapsed at {}{} and its lock was \
+                 collected. The path was free for that window and any peer could have taken it: \
+                 commit BEFORE the ttl runs out, or `pact lease renew` while you work",
+                self.path,
+                self.expired_at.as_deref().unwrap_or("(unknown)"),
+                self.past_ttl_secs
+                    .map(|s| format!(" ({} ago)", human_secs(s)))
+                    .unwrap_or_default(),
+            ),
+            _ => format!(
+                "nothing to release on {} — no lock held here and no expiry of yours on record",
+                self.path
+            ),
+        }
+    }
 }
 
 /// Sortable instant. Unparsable stamps sort oldest, so a corrupt line ends up

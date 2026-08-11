@@ -178,6 +178,67 @@ pub struct AcquireOutcome {
     pub stolen: bool,
 }
 
+/// What `release` actually did — because until pact-mqw.7 three different things
+/// printed the same line and exited 0.
+///
+/// Observed in crucible: agent-08's leases lapsed at 09:12:32Z and their locks
+/// were collected. It committed at 09:14:01Z and only then released; pact printed
+/// `released lease on tests/corpus.rs` and exited 0. There was nothing to
+/// release. The agent was told it had cleanly released a lease it had not held
+/// for a minute and a half, and could not learn otherwise from the command it
+/// ran — it found out by reading `events.jsonl` afterwards.
+///
+/// That matters because `release` is where an agent confirms it played by the
+/// rules, and the binding rule is commit-before-release. An agent that overruns
+/// its TTL, commits, and releases sees an unbroken success path and concludes it
+/// complied. It did not: for ninety seconds the path was free, and any peer could
+/// have taken it and edited from a different worktree. Nobody did, and that was
+/// luck.
+///
+/// None of these is an error — an idempotent release is a feature. They differ in
+/// what they tell the agent about its own conduct, so they differ in what they
+/// say.
+#[derive(Debug, Clone, Serialize)]
+pub enum ReleaseOutcome {
+    /// A live lock this agent held, removed. `past_ttl_secs` is set when the
+    /// lock was still there but already past its TTL — the holder overran and
+    /// got away with it because nobody reclaimed in the window.
+    Released { past_ttl_secs: Option<i64> },
+    /// `--force` destroyed a different agent's live claim.
+    ForceReleased { displaced: String },
+    /// No lock, and this agent's own last word on the path in the event log is
+    /// an expiry. The lease ended without them, and this call is a no-op.
+    AlreadyExpired {
+        at: String,
+        ttl_secs: Option<u64>,
+        /// How long between the lapse and this call: the window in which the
+        /// path was free while the agent believed it held it.
+        since_secs: Option<i64>,
+    },
+    /// No lock and no expiry of this agent's on record. A genuinely idempotent
+    /// repeat release, or a path never leased here.
+    NothingHeld,
+}
+
+impl ReleaseOutcome {
+    /// The displaced holder, for the one caller that has to go apologise.
+    pub fn displaced(&self) -> Option<&str> {
+        match self {
+            ReleaseOutcome::ForceReleased { displaced } => Some(displaced),
+            _ => None,
+        }
+    }
+
+    /// Did a lock actually go away because of this call? `release --all` counts
+    /// only these, and so does the exit-code decision for a multi-path release.
+    pub fn removed_a_lock(&self) -> bool {
+        matches!(
+            self,
+            ReleaseOutcome::Released { .. } | ReleaseOutcome::ForceReleased { .. }
+        )
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct LeaseEntry {
     pub lease: LeaseInfo,
@@ -248,7 +309,7 @@ pub trait LeaseStore {
         agent: &str,
         path: &str,
         force: bool,
-    ) -> Result<Option<String>>;
+    ) -> Result<ReleaseOutcome>;
     fn release_all(&self, repo_root: &Path, agent: &str) -> Result<Vec<String>>;
     fn renew(&self, repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo>;
     fn list(&self, repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>>;
@@ -289,7 +350,7 @@ impl LeaseStore for FileLeaseStore {
         agent: &str,
         path: &str,
         force: bool,
-    ) -> Result<Option<String>> {
+    ) -> Result<ReleaseOutcome> {
         release_fs(repo_root, agent, path, force)
     }
 
@@ -1699,17 +1760,17 @@ fn acquire_many_fs(
     Ok(outcomes)
 }
 
-/// Release a lease. Returns `Some(displaced_agent)` when `force` destroyed a
-/// *different* agent's live claim, so the caller can warn and name them the way
-/// `acquire --steal` already does (pact-rnc.11); `None` when the caller held it
-/// or nothing was held.
-pub fn release(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<Option<String>> {
+/// Release a lease. See [`ReleaseOutcome`] for why the four cases are told apart
+/// rather than all reported as success.
+pub fn release(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<ReleaseOutcome> {
     current_store().release(repo_root, agent, path, force)
 }
 
-fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<Option<String>> {
+fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<ReleaseOutcome> {
     let relative = normalize_path(repo_root, path);
     let lock_path = lock_file_path(repo_root, &relative)?;
+    // The clock-corrected now, same as acquire's — see `effective_now`.
+    let now = effective_now(repo_root);
     let mut sp = otel::span("pact.lease.release");
     sp.set("pact.path", relative.clone());
 
@@ -1731,7 +1792,24 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                 ));
             }
         }
-        return Ok(None); // idempotent: nothing to release
+        // Idempotent either way, but not the same news. A lock that lapsed and
+        // was collected leaves nothing on disk, so the filesystem cannot tell
+        // "already released" from "your TTL ran out under you" — the log can,
+        // and only this agent's own row answers it (see
+        // `events::last_custody_by`).
+        return Ok(match events::last_custody_by(repo_root, &relative, agent) {
+            Ok(Some(own)) if own.kind == "expired" => {
+                let since_secs = chrono::DateTime::parse_from_rfc3339(&own.at)
+                    .ok()
+                    .map(|at| (effective_now(repo_root) - at.with_timezone(&Utc)).num_seconds());
+                ReleaseOutcome::AlreadyExpired {
+                    at: own.at,
+                    ttl_secs: None,
+                    since_secs,
+                }
+            }
+            _ => ReleaseOutcome::NothingHeld,
+        });
     }
     // release_fs had no verify guard at all (pact-m7j.1.5): without it, a
     // concurrent legitimate takeover's write could land between this read and
@@ -1741,7 +1819,7 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
     let existing = match read_lease(&lock_path) {
         Ok(lease) => lease,
         // Released by a peer while we waited for the guard.
-        Err(_) if !lock_path.exists() => return Ok(None),
+        Err(_) if !lock_path.exists() => return Ok(ReleaseOutcome::NothingHeld),
         // Corrupt content means ownership cannot be checked (`existing.agent
         // == agent` below has no `existing.agent` to compare), so a plain
         // release must refuse rather than guess. `--force` is the same
@@ -1807,7 +1885,12 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                 },
             );
             count_transition("force_released");
-            return Ok(None);
+            // Nothing survived to name as displaced, so this is not
+            // `ForceReleased` — but a lock did go away, which is what
+            // `removed_a_lock` reports.
+            return Ok(ReleaseOutcome::Released {
+                past_ttl_secs: None,
+            });
         }
     };
 
@@ -1908,7 +1991,20 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
         &relative,
         existing.content_hash.as_deref(),
     );
-    Ok(displaced)
+    Ok(match displaced {
+        Some(displaced) => ReleaseOutcome::ForceReleased { displaced },
+        None => ReleaseOutcome::Released {
+            // Measured against the plain TTL, not ttl+GRACE_SECS: the grace
+            // window is pact's tolerance for a skewed clock before it lets a
+            // PEER reclaim, not an extension of the promise this agent made.
+            // The lock was still here, so nobody reclaimed — but the path was
+            // unprotected for this long and the holder should have renewed.
+            past_ttl_secs: {
+                let over = age_and_remaining(&existing, now).1;
+                (over < 0).then_some(-over)
+            },
+        },
+    })
 }
 
 /// Unlink an expired lock file and record the lapse as an `"expired"` event
@@ -1983,9 +2079,20 @@ fn release_all_fs(repo_root: &Path, agent: &str) -> Result<Vec<String>> {
     }
     held.sort();
 
-    for path in &held {
-        release_fs(repo_root, agent, path, false)?;
-    }
+    // Filtered on what release_fs actually did, not on what `peek` predicted.
+    // `peek` runs first and the TTL keeps running: a lease that was live at the
+    // read can lapse before its turn comes, and reporting it as released would
+    // be the same overstatement pact-rnc.24 removed — now detectable, because
+    // `ReleaseOutcome` distinguishes the cases (pact-mqw.7).
+    let mut held: Vec<String> = held
+        .into_iter()
+        .filter_map(|path| match release_fs(repo_root, agent, &path, false) {
+            Ok(o) if o.removed_a_lock() => Some(Ok(path)),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<Result<Vec<String>>>()?;
+    held.sort();
     // Swept, not reported — and deliberately not via `release`, which would
     // append a "released" event and put the same overstatement back into the
     // activity feed. It is logged as what it actually was, an "expired" lease
@@ -2635,15 +2742,94 @@ mod tests {
         let root = tmp.path();
 
         claim(root, "agent-a", "mine.rs");
-        assert_eq!(release(root, "agent-a", "mine.rs", false).unwrap(), None);
-        assert_eq!(release(root, "agent-a", "mine.rs", false).unwrap(), None); // idempotent
+        let first = release(root, "agent-a", "mine.rs", false).unwrap();
+        assert!(matches!(
+            first,
+            ReleaseOutcome::Released {
+                past_ttl_secs: None
+            }
+        ));
+        assert_eq!(first.displaced(), None);
+        // Idempotent, and now distinguishable: a repeat release removed nothing
+        // and there is no expiry of this agent's on record (pact-mqw.7).
+        assert!(matches!(
+            release(root, "agent-a", "mine.rs", false).unwrap(),
+            ReleaseOutcome::NothingHeld
+        ));
 
         claim(root, "agent-a", "theirs.rs");
         assert!(release(root, "agent-b", "theirs.rs", false).is_err());
-        assert_eq!(
-            release(root, "agent-b", "theirs.rs", true).unwrap(),
-            Some("agent-a".to_string())
+        let forced = release(root, "agent-b", "theirs.rs", true).unwrap();
+        assert_eq!(forced.displaced(), Some("agent-a"));
+    }
+
+    /// pact-mqw.7: the crucible shape. A lease lapses, `lease ls` collects the
+    /// lock, the agent commits and only then releases — and used to be told it had
+    /// released cleanly. The window it was actually unprotected for is the one
+    /// fact it needs, and the only place that fact survives is the event log.
+    #[test]
+    fn releasing_a_lapsed_lease_reports_the_lapse_instead_of_success() {
+        let tmp = repo();
+        let root = tmp.path();
+
+        // A lease with a TTL short enough to lapse, backdated past ttl+grace so
+        // `list`'s sweep collects it exactly as a peer's `lease ls` would.
+        let ttl = 600u64;
+        claim_at(
+            root,
+            "agent-08",
+            "tests/corpus.rs",
+            ttl,
+            Utc::now() - Duration::seconds(ttl as i64 + GRACE_SECS + 90),
         );
+        // The sweep: this is what leaves no lock file behind.
+        let _ = list(root, false).unwrap();
+
+        let outcome = release(root, "agent-08", "tests/corpus.rs", false).unwrap();
+        let ReleaseOutcome::AlreadyExpired { at, since_secs, .. } = &outcome else {
+            panic!("a lapsed-and-collected lease must not report as released: {outcome:?}");
+        };
+        assert!(!at.is_empty(), "the lapse must be dated: {outcome:?}");
+        assert!(
+            since_secs.unwrap_or(-1) >= 0,
+            "and the free window measured: {outcome:?}"
+        );
+        assert!(!outcome.removed_a_lock());
+
+        // A DIFFERENT agent asking about the same path gets `nothing-held`, not
+        // somebody else's expiry: the question is "did I overrun", and a peer's
+        // lapse says nothing about that.
+        assert!(matches!(
+            release(root, "agent-09", "tests/corpus.rs", false).unwrap(),
+            ReleaseOutcome::NothingHeld
+        ));
+    }
+
+    /// The other half: the lock survived, so it really is a release — but the
+    /// holder ran past its own TTL and only luck kept a peer from reclaiming.
+    #[test]
+    fn releasing_an_overrun_lease_says_how_far_past_its_ttl_it_ran() {
+        let tmp = repo();
+        let root = tmp.path();
+        // Past the ttl but inside the grace window, so nothing has swept it.
+        let ttl = 600u64;
+        claim_at(
+            root,
+            "agent-05",
+            "src/ast.rs",
+            ttl,
+            Utc::now() - Duration::seconds(ttl as i64 + 10),
+        );
+
+        let outcome = release(root, "agent-05", "src/ast.rs", false).unwrap();
+        let ReleaseOutcome::Released { past_ttl_secs } = &outcome else {
+            panic!("the lock was still there, so this IS a release: {outcome:?}");
+        };
+        assert!(
+            past_ttl_secs.unwrap_or(0) >= 10,
+            "and it must say how late: {outcome:?}"
+        );
+        assert!(outcome.removed_a_lock());
     }
 
     #[test]
@@ -3158,14 +3344,20 @@ mod tests {
         // pact-mqw.1: the steal is two rows, matching the expired-reclaim branch
         // — one closing the victim's window under THEIR name, one opening the
         // thief's under theirs.
-        assert_eq!(events[3].agent, "agent-b", "the steal opens the thief's window");
+        assert_eq!(
+            events[3].agent, "agent-b",
+            "the steal opens the thief's window"
+        );
         assert!(
             events[3].detail.as_deref().unwrap().contains("agent-a"),
             "a steal must name the displaced holder: {:?}",
             events[3].detail
         );
         assert_eq!(events[4].kind, "displaced");
-        assert_eq!(events[4].agent, "agent-a", "the victim owns the closing row");
+        assert_eq!(
+            events[4].agent, "agent-a",
+            "the victim owns the closing row"
+        );
         assert!(
             events[4].detail.as_deref().unwrap().contains("agent-b"),
             "the displaced row must name who overrode it: {:?}",

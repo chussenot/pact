@@ -761,6 +761,33 @@ pub fn owner_of(repo_root: &Path, path: &str) -> Result<Option<Owner>> {
         }))
 }
 
+/// The last custody event for `path` authored by `agent` — "what did *I* last do
+/// to this file", where [`owner_of`] answers "who has it now".
+///
+/// `lease release` needs the narrower question (pact-mqw.7). A lease that lapsed
+/// and had its lock collected leaves no lock file, so release cannot tell that
+/// case from "nothing was ever held here" by looking at the filesystem — and it
+/// reported both as a clean success. The log knows, but only the asking agent's
+/// own row answers it: a peer's expiry on the same path says nothing about
+/// whether *this* agent overran its TTL.
+///
+/// Same bounded-log caveat as `owner_of`: past the rewrite horizon the answer is
+/// `None`, which reads as "no expiry on record" rather than as a claim that none
+/// happened.
+pub fn last_custody_by(repo_root: &Path, path: &str, agent: &str) -> Result<Option<Owner>> {
+    Ok(all(repo_root)?
+        .into_iter()
+        .rev()
+        .filter(|e| is_custody(&e.kind))
+        .find(|e| e.path.as_deref() == Some(path) && e.agent == agent)
+        .map(|e| Owner {
+            agent: e.agent,
+            at: e.at,
+            kind: e.kind,
+            detail: e.detail,
+        }))
+}
+
 /// Every path pact has ever seen an event for, with its last owner, most
 /// recently touched first. Backs the free-but-owned rows in `lease ls --all`.
 pub fn owners(repo_root: &Path) -> Result<Vec<(String, Owner)>> {
