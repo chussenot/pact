@@ -56,7 +56,10 @@
 # non-determinism because it looks reproducible until it is not.
 #
 # The whole fault plan is computed BEFORE anything is touched, so `--dry-run`
-# emits exactly the decision sequence a real run would execute.
+# emits exactly the sequence of faults a real run would ATTEMPT. It prints
+# attempts, not outcomes: a dry run cannot know that a PID will have exited or
+# that a peer will hold a path, so it reports what an unobstructed run would do
+# and a real run's skips are where the two diverge.
 #
 #   scripts/chaos.sh --repo /tmp/fleet --pids /tmp/fleet/pids --dry-run
 #   scripts/chaos.sh --repo /tmp/fleet --pids /tmp/fleet/pids --seed 7 --duration 30
@@ -290,7 +293,28 @@ rand_below() {
 
 # ------------------------------------------------------------- action parsing
 
+# Actions that may land at most once per run — but once per run means once
+# EXECUTED, not once scheduled. They are gated at dispatch (see ONCE_DONE below),
+# not by draining them out of the draw pool in plan_build.
+#
+# The pool used to lose a once-action the moment it was SCHEDULED, which made
+# the guarantee "at most one attempt" rather than "at most one fault". In
+# crucible (pact-mqw.8) that cost the whole run: stale-lock drew src/printer.rs,
+# a live agent held it, chaos logged one skip and the run planted zero stale
+# leases. stale-lock is the only action that exercises expired-lease takeover
+# against a lock pact itself wrote, so the highest-value fault in the set was
+# also the one likeliest to no-op — and likelier the busier the fleet, which is
+# backwards.
+#
+# The cost of gating at dispatch instead: a long run can draw a once-action
+# again after it has already fired, and that slot becomes a logged skip rather
+# than a fault. Paid deliberately. A wasted slot is visible in the log; a fault
+# that never fired because it got one unlucky draw is not.
 ONCE_ACTIONS=" lock-vandal stale-lock "
+ONCE_DONE=" "
+once_done() { case "$ONCE_DONE" in *" $1 "*) return 0 ;; *) return 1 ;; esac }
+is_once_action() { case "$ONCE_ACTIONS" in *" $1 "*) return 0 ;; *) return 1 ;; esac }
+
 declare -a ENABLED=()
 IFS=',' read -r -a _requested <<<"$ACTIONS"
 for a in "${_requested[@]}"; do
@@ -310,25 +334,12 @@ done
 declare -a PLAN=()
 plan_build() {
 	local t=0 total=$((DURATION_MIN * UNIT_SECS)) span=$((INTERVAL_MAX - INTERVAL_MIN + 1))
-	local -a pool=("${ENABLED[@]}")
 	while :; do
 		rand_below "$span"
 		t=$((t + (INTERVAL_MIN + RAND_OUT) * UNIT_SECS))
 		[ "$t" -le "$total" ] || break
-		[ "${#pool[@]}" -gt 0 ] || break
-		rand_below "${#pool[@]}"
-		local action="${pool[$RAND_OUT]}"
-		PLAN+=("$t $action")
-		# A once-per-run action leaves the pool after it is scheduled, so the
-		# plan cannot contain two of them however long the run is.
-		case "$ONCE_ACTIONS" in
-		*" $action "*)
-			local -a rest=()
-			local p
-			for p in "${pool[@]}"; do [ "$p" = "$action" ] || rest+=("$p"); done
-			pool=("${rest[@]+"${rest[@]}"}")
-			;;
-		esac
+		rand_below "${#ENABLED[@]}"
+		PLAN+=("$t ${ENABLED[$RAND_OUT]}")
 	done
 }
 plan_build
@@ -487,7 +498,7 @@ do_lock_vandal() {
 	fi
 	if [ "${#locks[@]}" -eq 0 ]; then
 		log_skip lock-vandal "" "no .lock files under .pact/leases"
-		return
+		return 1
 	fi
 	rand_below "${#locks[@]}"
 	target="${locks[$RAND_OUT]}"
@@ -505,54 +516,81 @@ do_lock_vandal() {
 # the lock's shape, so the only field chaos invents is the timestamp, and the
 # keys it depends on are asserted before anything is written. If the shape ever
 # changes, this fails loudly instead of writing a file pact will call corrupt.
+#
+# It walks the WHOLE hint list rather than drawing one path, because every path
+# worth putting in a hint file is a hot file a busy fleet holds nearly all the
+# time — so a single draw made the highest-value fault the likeliest to no-op,
+# and likelier to no-op the busier the fleet was. Order is a seeded shuffle, not
+# the file's order, so a hint file whose first line is the hottest path does not
+# systematically burn the first attempt.
+#
+# Returns 0 only if a stale lease was actually planted. The dispatch loop uses
+# that to decide whether stale-lock has spent its once-per-run budget.
 do_stale_lock() {
-	local hint_path lock encoded now_ttl backdated content
+	local hint_path lock encoded now_ttl backdated content i j tmp
 	if [ -z "$PATHS_HINT" ] || [ ! -f "$PATHS_HINT" ]; then
 		log_skip stale-lock "" "no --paths-hint file to choose a path from"
-		return
+		return 1
 	fi
 	local -a hints=()
 	while IFS= read -r p; do [ -n "$p" ] && hints+=("$p"); done <"$PATHS_HINT"
 	if [ "${#hints[@]}" -eq 0 ]; then
 		log_skip stale-lock "$PATHS_HINT" "paths-hint file is empty"
-		return
+		return 1
 	fi
-	rand_below "${#hints[@]}"
-	hint_path="${hints[$RAND_OUT]}"
+	# Seeded Fisher-Yates.
+	for ((i = ${#hints[@]} - 1; i > 0; i--)); do
+		rand_below $((i + 1))
+		j="$RAND_OUT"
+		tmp="${hints[i]}"
+		hints[i]="${hints[j]}"
+		hints[j]="$tmp"
+	done
 
 	if [ "$DRY_RUN" -eq 1 ]; then
-		log_decision stale-lock "$hint_path" "would plant a lock backdated past ttl+grace"
-		return
+		# Reported against the first path it would try. A dry run cannot know
+		# which acquires would fail, so it shows the sequence of a run where
+		# nothing is in the way — which is also why it counts as done.
+		log_decision stale-lock "${hints[0]}" "would plant a lock backdated past ttl+grace"
+		return 0
 	fi
 
-	# Let pact write it, so the shape is pact's.
-	if ! (cd "$REPO" && PACT_AGENT=chaos-ghost pact lease acquire "$hint_path" \
-		--note "chaos: planted stale lease" >/dev/null 2>&1); then
-		log_skip stale-lock "$hint_path" "pact lease acquire failed (already held?)"
-		return
-	fi
-	encoded="$(printf '%s' "$hint_path" | sed 's|/|__|g')"
-	lock="$REPO/.pact/leases/${encoded}.lock"
-	if [ ! -f "$lock" ]; then
-		log_skip stale-lock "$hint_path" "expected lock at $lock after acquire, found none"
-		return
-	fi
-	content="$(cat "$lock")"
-	# The drift assertion. Every key chaos relies on must be present and of the
-	# type it expects, or this refuses rather than guessing.
-	if ! jq -e 'has("acquired_at") and has("ttl_secs") and (.ttl_secs|type=="number") and has("agent")' \
-		<<<"$content" >/dev/null 2>&1; then
-		log_skip stale-lock "$lock" "LOCK SHAPE DRIFTED: no acquired_at/ttl_secs/agent; refusing to write garbage"
-		return
-	fi
-	now_ttl="$(jq -r '.ttl_secs' <<<"$content")"
-	# ttl + grace + a minute, so the lease is provably past the documented
-	# GRACE_SECS window rather than sitting on its boundary.
-	backdated="$(date -u -d "@$(($(date +%s) - now_ttl - 30 - 60))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null ||
-		date -u -r "$(($(date +%s) - now_ttl - 30 - 60))" +%Y-%m-%dT%H:%M:%SZ)"
-	jq --arg t "$backdated" '.acquired_at = $t' <<<"$content" >"$lock.chaos-tmp"
-	mv -f "$lock.chaos-tmp" "$lock"
-	log_decision stale-lock "$hint_path" "backdated acquired_at to $backdated (ttl ${now_ttl}s + 30s grace)"
+	for hint_path in "${hints[@]}"; do
+		# Let pact write it, so the shape is pact's.
+		if ! (cd "$REPO" && PACT_AGENT=chaos-ghost pact lease acquire "$hint_path" \
+			--note "chaos: planted stale lease" >/dev/null 2>&1); then
+			log_skip stale-lock "$hint_path" "pact lease acquire failed (held by a live agent?)"
+			continue
+		fi
+		encoded="$(printf '%s' "$hint_path" | sed 's|/|__|g')"
+		lock="$REPO/.pact/leases/${encoded}.lock"
+		# Both remaining failures are drift, not contention: another path would
+		# hit them identically, so they stop the whole action rather than
+		# advancing to the next hint.
+		if [ ! -f "$lock" ]; then
+			log_skip stale-lock "$hint_path" "expected lock at $lock after acquire, found none"
+			return 1
+		fi
+		content="$(cat "$lock")"
+		# The drift assertion. Every key chaos relies on must be present and of
+		# the type it expects, or this refuses rather than guessing.
+		if ! jq -e 'has("acquired_at") and has("ttl_secs") and (.ttl_secs|type=="number") and has("agent")' \
+			<<<"$content" >/dev/null 2>&1; then
+			log_skip stale-lock "$lock" "LOCK SHAPE DRIFTED: no acquired_at/ttl_secs/agent; refusing to write garbage"
+			return 1
+		fi
+		now_ttl="$(jq -r '.ttl_secs' <<<"$content")"
+		# ttl + grace + a minute, so the lease is provably past the documented
+		# GRACE_SECS window rather than sitting on its boundary.
+		backdated="$(date -u -d "@$(($(date +%s) - now_ttl - 30 - 60))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null ||
+			date -u -r "$(($(date +%s) - now_ttl - 30 - 60))" +%Y-%m-%dT%H:%M:%SZ)"
+		jq --arg t "$backdated" '.acquired_at = $t' <<<"$content" >"$lock.chaos-tmp"
+		mv -f "$lock.chaos-tmp" "$lock"
+		log_decision stale-lock "$hint_path" "backdated acquired_at to $backdated (ttl ${now_ttl}s + 30s grace)"
+		return 0
+	done
+	log_skip stale-lock "$PATHS_HINT" "every hint path is held by a live agent; no stale lease planted"
+	return 1
 }
 
 # ----------------------------------------------------------------------- main
@@ -577,11 +615,19 @@ for i in "${!PLAN[@]}"; do
 		interruptible_sleep $((at - elapsed))
 	fi
 	elapsed="$at"
+	# The once-per-run gate. A slot drawn for an action that has already FIRED
+	# becomes a logged skip; a slot drawn for one that was only ATTEMPTED is a
+	# fresh attempt, which is the whole point of gating here rather than in
+	# plan_build.
+	if is_once_action "$action" && once_done "$action"; then
+		log_skip "$action" "" "once-per-run and already executed this run"
+		continue
+	fi
 	case "$action" in
 	kill-holder) do_kill_holder ;;
 	backend-outage) do_backend_outage ;;
-	lock-vandal) do_lock_vandal ;;
-	stale-lock) do_stale_lock ;;
+	lock-vandal) if do_lock_vandal; then ONCE_DONE="${ONCE_DONE}lock-vandal "; fi ;;
+	stale-lock) if do_stale_lock; then ONCE_DONE="${ONCE_DONE}stale-lock "; fi ;;
 	esac
 done
 

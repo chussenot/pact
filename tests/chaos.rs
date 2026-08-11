@@ -577,6 +577,21 @@ fn lock_vandal_produces_the_documented_corrupt_lease_path() {
     let d = decisions(tmp.path()).join("\n");
     assert!(d.contains("was:") && d.contains("holder"), "{d}");
 
+    // Six slots were planned and lock-vandal is once-per-run, so the five after
+    // the one that fired must say so rather than truncating again. This is the
+    // half of pact-mqw.8 that moved the once-per-run gate from plan_build to
+    // dispatch: the plan may now offer an action several slots, and the gate
+    // spends the budget on the first one that actually EXECUTES.
+    assert_eq!(
+        d.matches("truncated to 0 bytes").count(),
+        1,
+        "lock-vandal must fire exactly once however many slots it is offered: {d}"
+    );
+    assert!(
+        d.contains("once-per-run and already executed this run"),
+        "the slots after the fault must be logged as spent, not silently dropped: {d}"
+    );
+
     // pact's documented behaviour on a corrupt lock: refuse with exit 2.
     let refused = Command::new(pact)
         .args(["lease", "acquire", "src/victim.rs"])
@@ -681,4 +696,143 @@ fn stale_lock_plants_a_lease_pact_treats_as_expired() {
         "an expired lease must be acquirable with no --steal: {}",
         stderr(&took)
     );
+}
+
+/// A held hint path must cost one attempt, not the whole action.
+///
+/// pact-mqw.8: `do_stale_lock` drew ONE path from `--paths-hint` and gave up if
+/// the acquire failed. In crucible that meant one attempt against a file a live
+/// agent held, one logged skip, and zero stale leases planted in an 85-minute
+/// run — for the only fault that exercises expired-lease takeover against a lock
+/// pact itself wrote. Every path worth listing in a hint file is a hot path, so
+/// the busier the fleet the likelier the highest-value fault no-opped.
+#[test]
+fn stale_lock_moves_on_to_a_free_path_when_the_first_one_is_held() {
+    if !have("bash") || !have("jq") {
+        eprintln!("SKIP: bash or jq missing");
+        return;
+    }
+    let tmp = armed_repo();
+    let pact = env!("CARGO_BIN_EXE_pact");
+    assert!(Command::new("git")
+        .args(["init", "-q", "."])
+        .current_dir(tmp.path())
+        .status()
+        .unwrap()
+        .success());
+    // One of the two hint paths is held by a live agent for a long TTL, so no
+    // acquire of it can succeed for the duration of this test.
+    assert!(Command::new(pact)
+        .args(["lease", "acquire", "src/held.rs", "--ttl", "3600"])
+        .current_dir(tmp.path())
+        .env("PACT_AGENT", "live-holder")
+        .status()
+        .unwrap()
+        .success());
+    let hint = tmp.path().join("paths-hint");
+    std::fs::write(&hint, "src/held.rs\nsrc/free.rs\n").unwrap();
+
+    let out = chaos(
+        tmp.path(),
+        &[
+            "--seed",
+            "11",
+            "--duration",
+            "1",
+            "--time-unit",
+            "sec",
+            "--interval-min",
+            "1",
+            "--interval-max",
+            "1",
+            "--actions",
+            "stale-lock",
+            "--paths-hint",
+            hint.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // Order-independent: the shuffle may try either path first, but the free one
+    // is the only one that can be planted, and it must be.
+    let d = decisions(tmp.path()).join("\n");
+    assert!(
+        !d.contains("SHAPE DRIFTED"),
+        "the lock shape drifted and chaos correctly refused — update chaos.sh: {d}"
+    );
+    assert!(
+        d.contains("stale-lock|src/free.rs|backdated"),
+        "the free hint path must be planted even though another was held: {d}"
+    );
+    // And the live holder's lock is untouched: chaos plants, it does not displace.
+    let held = std::fs::read_to_string(tmp.path().join(".pact/leases/src__held.rs.lock")).unwrap();
+    assert!(
+        held.contains("live-holder"),
+        "a held path must be left to its holder: {held}"
+    );
+}
+
+/// Exhausting the hint list must be a stated conclusion, not one silent skip.
+///
+/// This is the deterministic half of the pact-mqw.8 regression: with every hint
+/// path held there is no shuffle order in which the old code and the new one
+/// agree. Old: one skip. New: one skip per path plus the verdict.
+#[test]
+fn stale_lock_reports_the_whole_hint_list_as_held_when_it_is() {
+    if !have("bash") || !have("jq") {
+        eprintln!("SKIP: bash or jq missing");
+        return;
+    }
+    let tmp = armed_repo();
+    let pact = env!("CARGO_BIN_EXE_pact");
+    assert!(Command::new("git")
+        .args(["init", "-q", "."])
+        .current_dir(tmp.path())
+        .status()
+        .unwrap()
+        .success());
+    for path in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+        assert!(Command::new(pact)
+            .args(["lease", "acquire", path, "--ttl", "3600"])
+            .current_dir(tmp.path())
+            .env("PACT_AGENT", "live-holder")
+            .status()
+            .unwrap()
+            .success());
+    }
+    let hint = tmp.path().join("paths-hint");
+    std::fs::write(&hint, "src/a.rs\nsrc/b.rs\nsrc/c.rs\n").unwrap();
+
+    let out = chaos(
+        tmp.path(),
+        &[
+            "--seed",
+            "12",
+            "--duration",
+            "1",
+            "--time-unit",
+            "sec",
+            "--interval-min",
+            "1",
+            "--interval-max",
+            "1",
+            "--actions",
+            "stale-lock",
+            "--paths-hint",
+            hint.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let d = decisions(tmp.path()).join("\n");
+    assert_eq!(
+        d.matches("pact lease acquire failed").count(),
+        3,
+        "every hint path must be tried and each failure logged: {d}"
+    );
+    assert!(
+        d.contains("every hint path is held by a live agent; no stale lease planted"),
+        "exhausting the list must be stated, or 'chaos did nothing' is unreadable: {d}"
+    );
+    assert!(!d.contains("backdated"), "nothing was plantable: {d}");
 }

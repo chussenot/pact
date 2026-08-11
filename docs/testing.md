@@ -308,6 +308,33 @@ to the rail that prevented it — otherwise "chaos did nothing here" cannot be
 told apart from "chaos tried and a rail stopped it", and a rail that fires
 silently is a rail nobody can audit.
 
+### Once per run means once *fired*, not once attempted
+
+`lock-vandal` and `stale-lock` land at most once in a run. That budget is spent
+when the fault actually executes, not when the planner schedules it — and the
+difference cost a whole run's worth of coverage before it was fixed.
+
+In the crucible run, `stale-lock` drew one path from `--paths-hint`, found a live
+agent holding it, logged one skip and left the pool. The run planted **zero**
+stale leases. It is the only fault that exercises expired-lease takeover against
+a lock pact itself wrote, and every path worth listing in a hint file is a hot
+path a busy fleet holds nearly all the time — so the highest-value fault was also
+the likeliest to no-op, and likelier the busier the fleet was. Exactly backwards.
+
+Two changes, together:
+
+- **`stale-lock` walks the whole hint list**, in a seeded shuffle, and plants on
+  the first path it can acquire. A path it cannot take is one logged skip, not the
+  end of the action. Exhausting the list is its own logged verdict, so "chaos
+  planted nothing" always says why.
+- **The gate moved from the planner to the dispatch loop.** A once-per-run action
+  stays in the draw pool, so a long run may offer it several slots; the first slot
+  that *fires* spends the budget and later ones are logged as spent.
+
+The cost is that a spent slot is a logged skip rather than a fault. Paid
+deliberately: a wasted slot is visible in the log, and a fault that never fired
+because it got one unlucky draw is not.
+
 ### Reproducibility
 
 Randomness comes from `sha256("<seed>:<counter>")`. Not `$RANDOM`, which cannot
@@ -318,9 +345,14 @@ would reproduce on the machine that found a bug and nowhere else — worse than
 obvious non-determinism, because it looks reproducible until it is not.
 
 The whole fault plan is computed before anything is touched, so `--dry-run`
-emits exactly the decision sequence a real run would execute. That is also what
+emits exactly the sequence of faults a real run would attempt. That is also what
 CI runs: a dry pass is a full self-test of the planner and every rail, with no
 side effect but its own log.
+
+It prints attempts, not outcomes — a dry run cannot know that a PID will have
+exited or that a peer will be holding a path, so it reports what an unobstructed
+run would do. A real run's skips are where the two diverge, and each one says
+which rail or which peer accounts for it.
 
 A run given no `--seed` picks one and logs it like any other decision, because a
 fault injector whose failures cannot be replayed is the one thing it must never
