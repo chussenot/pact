@@ -502,6 +502,39 @@ pub struct UncoveredCommit {
     pub at: String,
 }
 
+/// `Check::CommitCorrelation`: a commit that fell inside a hold, but a hold held
+/// by a DIFFERENT agent than the one that made the commit (pact-mqw.10).
+///
+/// The class that had to exist because "covered" was answering the wrong question.
+/// `uncovered` asks whether ANYONE held the path at that moment; it never asked
+/// whether the COMMITTER did. In the crucible run one agent was deliberately told
+/// the protocol did not apply to it, authored zero of 346 coordination events, and
+/// committed freely — and its **worst** commit was invisible. `6fa4542` touched
+/// five files in one unleased shot, and at that instant every one of those paths
+/// was under an active lease held by a compliant peer, so the commit passed.
+///
+/// The perverse consequence: the rogue's most damaging commit was hidden
+/// *specifically because* its peers were compliant. The better the rest of the
+/// fleet behaves, the better a rogue hides. Cost of that miss: merging the branch
+/// conflicted on all five files and could not be resolved by taking either side,
+/// because the rogue had branched before three peers' AST variants landed.
+/// Detection lag ~13 minutes, and the detector was a human running `git merge`.
+///
+/// This is a finding, and a louder one than `uncovered`: committing where nobody
+/// held the path risks your own work, committing where somebody ELSE held it
+/// corrupts theirs.
+#[derive(Debug, Clone, Serialize)]
+pub struct CrossHeldCommit {
+    pub path: String,
+    pub hash: String,
+    /// The `Pact-Agent` trailer — who actually made this commit.
+    pub committer_agent: String,
+    /// Who held the path across its author date.
+    pub holder: String,
+    pub at: String,
+    pub hold_opened_at: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentActivity {
     pub agent: String,
@@ -664,6 +697,18 @@ pub struct CheckReport {
     pub concurrent_writes: Vec<ConcurrentWrite>,
     /// `Check::CommitCorrelation` only.
     pub uncovered_commits: Vec<UncoveredCommit>,
+    /// `Check::CommitCorrelation` only (pact-mqw.10): commits made inside somebody
+    /// else's hold, as told by their `Pact-Agent` trailer.
+    pub cross_held_commits: Vec<CrossHeldCommit>,
+    /// `Check::CommitCorrelation` only: how many commits in the window carried a
+    /// `Pact-Agent` trailer, and how many did not.
+    ///
+    /// Both reported, always, because attribution is the difference between this
+    /// check answering "did the COMMITTER hold it" and only "did ANYONE hold it".
+    /// Every commit made before agents started writing the trailer is in the second
+    /// bucket, so a reader has to know which question the numbers answered.
+    pub commits_attributed: usize,
+    pub commits_unattributed: usize,
     /// `Check::Topology` only: invocation points that contradicted
     /// `--expect`, each with how many events came from it.
     pub topology_mismatches: Vec<TopologyMismatch>,
@@ -705,6 +750,7 @@ impl CheckReport {
             + self.chain_breaks.len()
             + self.concurrent_writes.len()
             + self.uncovered_commits.len()
+            + self.cross_held_commits.len()
             + self.topology_mismatches.len()
             + self.merge_divergences.len()
             + self.claim_divergences.len()
@@ -1308,6 +1354,9 @@ pub fn run_check(
         holds_with_no_commit: Vec::new(),
         concurrent_writes: Vec::new(),
         uncovered_commits: Vec::new(),
+        cross_held_commits: Vec::new(),
+        commits_attributed: 0,
+        commits_unattributed: 0,
         topology_mismatches: Vec::new(),
         expected_topology: None,
         topology_unstamped: 0,
@@ -1520,6 +1569,17 @@ pub fn export(
                     commit_correlation.uncovered_commits.len()
                 ));
             }
+            // `commits_attributed`/`commits_unattributed` are deliberately NOT
+            // observations: they are scope, and `observations` is the findings
+            // list. A clean history must not manufacture an entry there. The
+            // counts ride in the report itself and in `render_check`'s scope line.
+            if !commit_correlation.cross_held_commits.is_empty() {
+                observations.push(format!(
+                    "{} commit(s) landed on a path a DIFFERENT agent held, per their Pact-Agent \
+                     trailer.",
+                    commit_correlation.cross_held_commits.len()
+                ));
+            }
         }
     }
     if merge_divergence.findings() > 0 {
@@ -1529,16 +1589,17 @@ pub fn export(
             merge_divergence.findings()
         ));
     }
-    match &claim_lease_divergence.claim_unavailable {
-        Some(reason) => {
-            observations.push(format!("claim-lease-divergence could not run: {reason}"))
-        }
-        None if claim_lease_divergence.findings() > 0 => observations.push(format!(
+    // No observation for `claim_unavailable`, unlike commit-correlation's
+    // `git_unavailable`: `doctor` already reports a missing Beads CLI on its own
+    // line in this same list, and the reason a check could not run is scope rather
+    // than a finding. `observations` is the findings list — a repo with no backend
+    // must not read as a repo with a coordination problem.
+    if claim_lease_divergence.findings() > 0 {
+        observations.push(format!(
             "{} hold(s) named a bead their holder does not own: the bead claim and the file \
              lease are separate locks that do not consult each other.",
             claim_lease_divergence.findings()
-        )),
-        None => {}
+        ));
     }
     if !unacknowledged_messages.is_empty() {
         // Named, not counted, and "nobody read it" kept distinct from "read
@@ -1715,6 +1776,11 @@ const COMPARED: &[(&str, &str, Extract)] = &[
         Extract::Len,
     ),
     (
+        "cross-held commits",
+        "/commit_correlation/cross_held_commits",
+        Extract::Len,
+    ),
+    (
         "holds with no commit",
         "/commit_correlation/holds_with_no_commit",
         Extract::Len,
@@ -1862,6 +1928,15 @@ pub fn render_comparison(c: &Comparison) -> String {
 /// check whose findings depend on something other than `.pact/events.jsonl`
 /// — see the module doc comment on why that is a deliberate, narrow widening
 /// rather than a break of audit's Beads-store invariant.
+/// One hold's window plus WHO held it — the second half of which `covered` used to
+/// throw away, and the whole of pact-mqw.10's fix.
+struct HoldWindow {
+    agent: String,
+    open: DateTime<Utc>,
+    /// `None` while the log shows the lease still held.
+    close: Option<DateTime<Utc>>,
+}
+
 fn correlate_commits(
     repo_root: &std::path::Path,
     events: &[(usize, Event)],
@@ -1876,6 +1951,14 @@ fn correlate_commits(
             return;
         }
     };
+
+    for c in &commits {
+        if c.pact_agent.is_some() {
+            report.commits_attributed += 1;
+        } else {
+            report.commits_unattributed += 1;
+        }
+    }
 
     let mut by_path: BTreeMap<&str, Vec<&crate::git_history::Commit>> = BTreeMap::new();
     for c in &commits {
@@ -1975,28 +2058,59 @@ fn correlate_commits(
         let Some(touches) = by_path.get(path) else {
             continue;
         };
-        let windows: Vec<(DateTime<Utc>, Option<DateTime<Utc>>)> = holds
+        let windows: Vec<HoldWindow> = holds
             .iter()
             .filter(|h| h.path == *path)
             .filter_map(|h| {
-                parse_at(&h.opened_at).map(|o| (o, h.closed_at.as_deref().and_then(parse_at)))
+                parse_at(&h.opened_at).map(|o| HoldWindow {
+                    agent: h.agent.clone(),
+                    open: o,
+                    close: h.closed_at.as_deref().and_then(parse_at),
+                })
             })
             .collect();
         for c in touches {
-            let covered = windows
+            // Every hold spanning this commit, with WHO held it — the second half
+            // is what `covered` used to throw away.
+            let covering: Vec<&HoldWindow> = windows
                 .iter()
-                .any(|(open, close)| *open <= c.at && close.is_none_or(|cl| cl >= c.at));
-            if !covered {
+                .filter(|w| w.open <= c.at && w.close.is_none_or(|cl| cl >= c.at))
+                .collect();
+            if covering.is_empty() {
                 report.uncovered_commits.push(UncoveredCommit {
                     path: path.to_string(),
                     hash: c.hash.clone(),
                     author: c.author.clone(),
                     at: c.at.to_rfc3339(),
                 });
+                continue;
             }
+            // Attribution, or the honest absence of it. Without a trailer this
+            // stays exactly as permissive as it was — the alternative would be to
+            // guess from `author`, which every fleet so far collapses to one git
+            // identity for every agent.
+            let Some(committer) = c.pact_agent.as_deref() else {
+                continue;
+            };
+            if covering.iter().any(|w| w.agent == committer) {
+                continue;
+            }
+            // Held by someone, and not by whoever committed. The FIRST covering
+            // hold is named rather than all of them: more than one covering hold is
+            // itself a double-win, which its own check reports.
+            let first = covering[0];
+            report.cross_held_commits.push(CrossHeldCommit {
+                path: path.to_string(),
+                hash: c.hash.clone(),
+                committer_agent: committer.to_string(),
+                holder: first.agent.clone(),
+                at: c.at.to_rfc3339(),
+                hold_opened_at: first.open.to_rfc3339(),
+            });
         }
     }
     report.uncovered_commits.sort_by(|a, b| a.at.cmp(&b.at));
+    report.cross_held_commits.sort_by(|a, b| a.at.cmp(&b.at));
 }
 
 // --------------------------------------------------------------- rendering
@@ -2266,6 +2380,20 @@ pub fn render_check(r: &CheckReport) -> String {
             ));
             return out.join("\n");
         }
+        // Stated clean or not: with no trailers this check can only ask "did ANYONE
+        // hold the path", and a reader has to know that is the question it answered.
+        out.push(format!(
+            "  {} commit(s) carry a Pact-Agent trailer, {} do not{}",
+            r.commits_attributed,
+            r.commits_unattributed,
+            if r.commits_attributed == 0 && r.commits_unattributed > 0 {
+                " — with none attributed, a commit counts as covered when ANY agent held the \
+                 path, so an agent working without a lease is invisible whenever a compliant peer \
+                 holds it (see docs/audit.md)"
+            } else {
+                ""
+            }
+        ));
     }
 
     if r.findings() == 0 {
@@ -2279,7 +2407,8 @@ pub fn render_check(r: &CheckReport) -> String {
                     .to_string()
             }
             "commit-correlation" => {
-                "no concurrent write landed, and no commit fell outside every hold's window"
+                "no concurrent write landed, no commit fell outside every hold's window, and \
+                 every attributed commit was made by an agent that held the path"
                     .to_string()
             }
             "topology" => format!(
@@ -2450,6 +2579,29 @@ pub fn render_check(r: &CheckReport) -> String {
             "{} commit(s) touched a leased path outside every recorded hold for it — work done \
              with no lease, which the protocol exists to prevent.",
             r.uncovered_commits.len()
+        ));
+    }
+
+    for x in &r.cross_held_commits {
+        out.push(String::new());
+        out.push(format!(
+            "CROSS-HELD COMMIT on {}: {} by {} at {} — but {} held that path from {}",
+            x.path,
+            &x.hash[..x.hash.len().min(12)],
+            x.committer_agent,
+            x.at,
+            x.holder,
+            x.hold_opened_at
+        ));
+    }
+    if !r.cross_held_commits.is_empty() {
+        out.push(String::new());
+        out.push(format!(
+            "{} commit(s) landed on a path a DIFFERENT agent held. Louder than an uncovered \n\
+             commit, not quieter: committing where nobody held the path risks your own work, \n\
+             committing where somebody else held it corrupts theirs — and a peer's in-flight \n\
+             edits are the thing a lease exists to protect.",
+            r.cross_held_commits.len()
         ));
     }
 
@@ -3890,6 +4042,150 @@ mod tests {
         };
         assert!(run(&["add", file]).success());
         assert!(run(&["commit", "--quiet", "-m", &format!("touch {file}")]).success());
+    }
+
+    /// [`git_commit`] with a `Pact-Agent` trailer, so a fixture can say which
+    /// agent made a commit — which is the fact git itself cannot supply, since
+    /// every agent in every fleet so far commits under one git identity.
+    fn git_commit_as(repo: &std::path::Path, file: &str, at: &str, agent: &str) {
+        if let Some(parent) = repo.join(file).parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(repo.join(file), format!("{at} {agent}")).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "tester")
+                .env("GIT_AUTHOR_EMAIL", "tester@example.com")
+                .env("GIT_AUTHOR_DATE", at)
+                .env("GIT_COMMITTER_NAME", "tester")
+                .env("GIT_COMMITTER_EMAIL", "tester@example.com")
+                .env("GIT_COMMITTER_DATE", at)
+                .status()
+                .unwrap()
+        };
+        assert!(run(&["add", file]).success());
+        assert!(run(&[
+            "commit",
+            "--quiet",
+            "-m",
+            &format!("touch {file}"),
+            "--trailer",
+            &format!("Pact-Agent={agent}"),
+        ])
+        .success());
+    }
+
+    /// pact-mqw.10: "covered" was answering the wrong question.
+    ///
+    /// It asked whether ANYONE held the path across a commit, never whether the
+    /// COMMITTER did. In the crucible run one agent was told the protocol did not
+    /// apply to it; its worst commit touched five files in one unleased shot, and
+    /// every one of those paths was under an active lease held by a compliant peer,
+    /// so the commit passed. **The rogue's most damaging commit was invisible
+    /// specifically because its peers were compliant.**
+    #[test]
+    fn a_commit_inside_another_agents_hold_is_its_own_louder_class() {
+        let tmp = with_git_log(&[
+            // agent-a holds src/ast.rs across the whole window, compliantly.
+            &ev("2026-08-01T10:00:00Z", "agent-a", "acquired", "src/ast.rs"),
+            &ev("2026-08-01T10:10:00Z", "agent-a", "released", "src/ast.rs"),
+        ]);
+        // The rogue commits INSIDE agent-a's hold, and says so in its trailer.
+        git_commit_as(
+            tmp.path(),
+            "src/ast.rs",
+            "2026-08-01T10:05:00+00:00",
+            "rogue",
+        );
+
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert!(r.git_unavailable.is_none(), "{:?}", r.git_unavailable);
+        assert_eq!(
+            r.uncovered_commits.len(),
+            0,
+            "a hold DID span it — that is exactly why the old check passed it"
+        );
+        assert_eq!(r.cross_held_commits.len(), 1, "{:?}", r.cross_held_commits);
+        let x = &r.cross_held_commits[0];
+        assert_eq!(x.path, "src/ast.rs");
+        assert_eq!(x.committer_agent, "rogue");
+        assert_eq!(x.holder, "agent-a");
+        assert_eq!(r.findings(), 1, "and it must be a finding, not a note");
+        let text = render_check(&r);
+        assert!(text.contains("CROSS-HELD COMMIT on src/ast.rs"), "{text}");
+        assert!(
+            text.contains("1 commit(s) carry a Pact-Agent trailer"),
+            "{text}"
+        );
+        // Louder than uncovered, and the render must say why.
+        assert!(text.contains("corrupts theirs"), "{text}");
+    }
+
+    /// The holder's OWN commit inside its own hold is the compliant case and must
+    /// stay silent — the whole point of the protocol working.
+    #[test]
+    fn a_commit_inside_your_own_hold_is_not_a_finding() {
+        let tmp = with_git_log(&[
+            &ev("2026-08-01T10:00:00Z", "agent-a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:10:00Z", "agent-a", "released", "a.rs"),
+        ]);
+        git_commit_as(tmp.path(), "a.rs", "2026-08-01T10:05:00+00:00", "agent-a");
+
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert_eq!(r.findings(), 0, "{r:?}");
+        assert_eq!(r.commits_attributed, 1);
+        assert_eq!(r.commits_unattributed, 0);
+    }
+
+    /// Degrading, not failing. Every log and every commit that exists today
+    /// predates the trailer, so an unattributed commit must behave exactly as it
+    /// did before this class existed — and the report must SAY that is the question
+    /// it answered, or a clean result reads as a stronger claim than it is.
+    #[test]
+    fn an_unattributed_commit_keeps_the_old_permissive_behaviour_and_says_so() {
+        let tmp = with_git_log(&[
+            &ev("2026-08-01T10:00:00Z", "agent-a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:10:00Z", "agent-a", "released", "a.rs"),
+        ]);
+        // No trailer: this could be the rogue or it could be agent-a, and pact
+        // cannot tell. It must not guess from the git author, which every fleet
+        // collapses to one identity.
+        git_commit(tmp.path(), "a.rs", "2026-08-01T10:05:00+00:00");
+
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert_eq!(r.cross_held_commits.len(), 0);
+        assert_eq!(r.findings(), 0);
+        assert_eq!((r.commits_attributed, r.commits_unattributed), (0, 1));
+        let text = render_check(&r);
+        assert!(
+            text.contains("0 commit(s) carry a Pact-Agent trailer, 1 do not"),
+            "{text}"
+        );
+        assert!(
+            text.contains("invisible whenever a compliant peer holds it"),
+            "an unattributed run must state the weaker question it answered: {text}"
+        );
+    }
+
+    /// A mixed history: one attributed cross-held commit, one unattributed commit
+    /// in the same hold. Exactly one finding, and both counted.
+    #[test]
+    fn a_mixed_history_reports_only_what_it_can_attribute() {
+        let tmp = with_git_log(&[
+            &ev("2026-08-01T10:00:00Z", "agent-a", "acquired", "m.rs"),
+            &ev("2026-08-01T10:30:00Z", "agent-a", "released", "m.rs"),
+        ]);
+        git_commit(tmp.path(), "m.rs", "2026-08-01T10:05:00+00:00");
+        git_commit_as(tmp.path(), "m.rs", "2026-08-01T10:10:00+00:00", "rogue");
+        git_commit_as(tmp.path(), "m.rs", "2026-08-01T10:15:00+00:00", "agent-a");
+
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert_eq!((r.commits_attributed, r.commits_unattributed), (2, 1));
+        assert_eq!(r.cross_held_commits.len(), 1, "{:?}", r.cross_held_commits);
+        assert_eq!(r.cross_held_commits[0].committer_agent, "rogue");
     }
 
     #[test]

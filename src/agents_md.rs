@@ -200,6 +200,15 @@ this protocol whenever you touch shared files or hand off work to others.
   a missed one is self-healing on the next commit. Left uncommitted, every clone
   of this repo starts with no coordination history at all, and nobody can ask
   afterwards who held what or whether two agents ever held one path at once.
+- **Sign your commits with your agent name**: `git commit --trailer
+  Pact-Agent=$PACT_AGENT`. Every agent in a fleet commits under the same git
+  identity, so `git log` cannot say which of you made a change — and without
+  that, `pact audit --check commit-correlation` can only ask whether ANYONE held
+  a path when a commit landed, never whether the agent that made it did. Measured:
+  one agent working with no leases at all had its worst commit (five files, all of
+  them leased by compliant peers at that moment) pass the check clean, because a
+  hold existed. The better everyone else behaves, the better an unleased commit
+  hides. One flag makes it visible.
 - **Everything is scriptable**: every pact command accepts `--json` for
   machine-readable output; prefer it over parsing human-formatted text.
 

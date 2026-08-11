@@ -180,6 +180,79 @@ which are findings:
   answer, since most of a real repository is never leased at any given
   moment and flagging all of it would be pure noise. `--json`'s
   `uncovered_commits`.
+- **A cross-held commit** — a commit that fell inside a hold, but a hold held by
+  a **different agent** than the one that made the commit. A finding, and a
+  louder one than an uncovered commit: committing where nobody held the path
+  risks your own work; committing where somebody else held it corrupts theirs.
+  `--json`'s `cross_held_commits`. Requires attribution — see below.
+
+#### Attribution, and why `covered` was answering the wrong question
+
+`uncovered` asks whether **anyone** held the path across a commit. It never asked
+whether the **committer** did, because git cannot say: every agent in every fleet
+so far commits under one git identity, so `author` is the same string for all of
+them.
+
+That gap is not theoretical, and it fails in the worst possible direction. One
+crucible agent was deliberately told the protocol did not apply to it. It authored
+**zero** of the run's 346 coordination events and committed freely. The check is
+not blind — it flagged three uncovered commits, one genuinely the rogue's. But the
+rogue's **worst** commit was not among them:
+
+```text
+6fa4542  five files in one unleased shot
+  src/ast.rs, src/parser.rs    -> held by agent-05 since 08:55:48
+  src/printer.rs, src/types.rs -> held by agent-02 since 08:57:29
+  src/eval.rs                  -> held by agent-09
+```
+
+A hold covered every path at that instant, so the commit passed. **The rogue's
+most damaging commit was invisible specifically because its peers were
+compliant** — the better the rest of the fleet behaves, the better an unleased
+commit hides. Meanwhile two of the three commits that *were* flagged came from
+honest agents committing seconds after their own lease lapsed.
+
+Cost of the miss: merging that branch conflicted on all five files and could not
+be resolved by taking either side, because the rogue had branched before three
+peers' AST variants landed and take-theirs would have silently deleted their work.
+It needed a hand three-way reconciliation. Detection lag ~13 minutes, and the
+detector was a human running `git merge`.
+
+So a commit can say which agent made it, with a trailer:
+
+```bash
+git commit --trailer Pact-Agent=$PACT_AGENT -m "..."
+```
+
+The protocol block asks agents to do that, and every `pact init` refresh carries
+the line. To make it automatic for a whole checkout, a one-line hook does it
+without anyone remembering:
+
+```bash
+# .git/hooks/prepare-commit-msg  (chmod +x)
+[ -n "$PACT_AGENT" ] && git interpret-trailers --in-place \
+  --trailer "Pact-Agent=$PACT_AGENT" "$1"
+```
+
+**`pact init` does not write that hook**, deliberately. Hooks are a shared,
+user-owned file outside pact's namespace, frequently already occupied (by
+`pre-commit`, for instance), and clobbering one to improve an audit check is a
+worse trade than printing it here.
+
+**Attribution is reported whether or not it is present**, on its own line, clean
+or not:
+
+```
+  0 commit(s) carry a Pact-Agent trailer, 12 do not — with none attributed, a
+  commit counts as covered when ANY agent held the path, so an agent working
+  without a lease is invisible whenever a compliant peer holds it
+```
+
+Every commit that exists today predates the trailer, so an unattributed commit
+behaves **exactly** as it did before this class existed: covered by any hold. It is
+never guessed at from `author`. The counts are what tell a reader which question a
+clean result answered — and they are scope rather than findings, so a clean
+history adds nothing to `--export`'s observations.
 
 **Degrades cleanly when git can't answer.** A brand-new repository with zero
 commits, a `git` that fails to run, or a `.pact/` whose `.git` is not

@@ -39,6 +39,15 @@ pub struct Commit {
     pub author: String,
     pub at: DateTime<Utc>,
     pub paths: Vec<String>,
+    /// The `Pact-Agent:` trailer, when the commit carries one (pact-mqw.10).
+    ///
+    /// `author` cannot answer "which agent made this": under every fleet topology
+    /// so far, every agent commits under the same git identity, so a rogue working
+    /// without a lease is invisible whenever a compliant peer happens to hold the
+    /// path. This is the one field that can tell them apart, and it is `None` for
+    /// every commit made before anyone started writing it — which is most of them,
+    /// and why the check that reads it degrades rather than fails.
+    pub pact_agent: Option<String>,
 }
 
 /// Neither byte is legal in a commit hash, an author name's typical shape, an
@@ -60,7 +69,12 @@ pub fn commits_since(repo_root: &Path, since: Option<DateTime<Utc>>) -> Result<V
         .arg("log")
         .arg("--name-only")
         .arg(format!(
-            "--format={RECORD_SEP}%H{FIELD_SEP}%an{FIELD_SEP}%aI"
+            // `%(trailers:key=Pact-Agent,valueonly)` rather than grepping the
+            // body: git owns the trailer grammar (continuation lines, the
+            // separator, where the trailer block starts), and reimplementing it
+            // here would disagree with `git interpret-trailers` on exactly the
+            // commits somebody hand-edited.
+            "--format={RECORD_SEP}%H{FIELD_SEP}%an{FIELD_SEP}%aI{FIELD_SEP}%(trailers:key=Pact-Agent,valueonly,separator=%x2C)"
         ));
     if let Some(since) = since {
         cmd.arg(format!("--since={}", since.to_rfc3339()));
@@ -207,11 +221,19 @@ fn parse_log(text: &str) -> Vec<Commit> {
         let Some(header) = lines.next() else {
             continue;
         };
-        let mut fields = header.splitn(3, FIELD_SEP);
+        let mut fields = header.splitn(4, FIELD_SEP);
         let (Some(hash), Some(author), Some(at)) = (fields.next(), fields.next(), fields.next())
         else {
             continue;
         };
+        // Absent, or present and empty, both mean "this commit says nothing about
+        // which agent made it". A commit with two Pact-Agent trailers is also
+        // "cannot tell" rather than a guess at which one is authoritative.
+        let pact_agent = fields
+            .next()
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && !t.contains(','))
+            .map(str::to_string);
         let Some(at) = DateTime::parse_from_rfc3339(at)
             .ok()
             .map(|d| d.with_timezone(&Utc))
@@ -227,6 +249,7 @@ fn parse_log(text: &str) -> Vec<Commit> {
             author: author.to_string(),
             at,
             paths,
+            pact_agent,
         });
     }
     commits
