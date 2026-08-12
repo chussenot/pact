@@ -10,6 +10,17 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.7.8 - 2026-08-12
+#### Documentation
+- name watch as the channel that carries interface changes, and quantify exit 2 - (2eab5da) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(audit)** report what contention cost — retry storms, and paths nobody spoke about - (7cfca2b) - Clement HUSSENOT-DESENONGES
+- **(lease)** make a refusal actionable — structured holder facts, and stop polling - (f5a1c35) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- Add interactions & events - (c74f983) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.7.7 - 2026-08-12
 #### Bug Fixes
 - **(audit)** count expired-lease reclaims apart from forced steals - (2e83b84) - Clement HUSSENOT-DESENONGES
