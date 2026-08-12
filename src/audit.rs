@@ -132,6 +132,13 @@ pub enum Check {
     /// The one check that asks the Beads store a question rather than reading only
     /// `.pact/` — see [`ClaimDivergence`] for the caveat that comes with it.
     ClaimLeaseDivergence,
+    /// pact-1gv.3: which agents busy-retried a lease instead of backing off. The
+    /// only check about what the FLEET wasted rather than what pact got wrong.
+    RetryStorm,
+    /// pact-7kv + pact-1gv.7: was a contended path ever communicated about, by
+    /// anybody, before its holder let go? Named for what it reports rather than for
+    /// its subject, because `Contention` is already the summary's stats struct.
+    SilentContention,
 }
 
 /// What `--expect` declares a run's topology should have been.
@@ -198,6 +205,8 @@ impl Check {
             "commit-correlation" => Ok(Check::CommitCorrelation),
             "merge-divergence" => Ok(Check::MergeDivergence),
             "claim-lease-divergence" => Ok(Check::ClaimLeaseDivergence),
+            "retry-storm" => Ok(Check::RetryStorm),
+            "silent-contention" => Ok(Check::SilentContention),
             "topology" => Ok(Check::Topology(match expect {
                 Some(e) => Expect::parse(e)?,
                 // Defaulting to `any` rather than erroring: `--check topology`
@@ -207,7 +216,8 @@ impl Check {
             })),
             other => Err(anyhow::anyhow!(
                 "unknown check \"{other}\"; expected double-win, stale-holds, chain-integrity, \
-                 commit-correlation, merge-divergence, claim-lease-divergence or topology"
+                 commit-correlation, merge-divergence, claim-lease-divergence, retry-storm, \
+                 silent-contention or topology"
             )),
         }
     }
@@ -373,6 +383,268 @@ fn claim_divergences(
             assignee,
             acquired_at: e.at.clone(),
             line: *line,
+        });
+    }
+}
+
+/// How much coordination work a run spent, against what it bought.
+///
+/// From the crucible run, the first with real contention data: 124 refusals for 58
+/// acquires and 5 takeovers — about 2 refusals per successful claim — with 9
+/// (agent, path) pairs refused and never acquired at all, 16 refusals spent on
+/// paths their asker never got.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Contention {
+    pub refusals: usize,
+    /// Acquires plus takeovers: every way a claim actually landed.
+    pub claims: usize,
+    /// Distinct (agent, path) pairs that were refused at least once.
+    pub contended_pairs: usize,
+    /// Pairs refused and never subsequently claimed by that agent — work the fleet
+    /// spent asking for something it never got.
+    pub abandoned_pairs: usize,
+    /// Refusals belonging to those abandoned pairs.
+    pub abandoned_refusals: usize,
+}
+
+/// One (agent, path) that was refused over and over.
+///
+/// The crucible shape: agent-02 refused `src/eval.rs` 33 times, and the retry
+/// spacing was not adaptive-with-jitter but **15 seconds flat** — 27 of 32 gaps
+/// exactly 15, against a median advertised remaining hold of 355 seconds. It
+/// retried roughly 24x more often than the number in its own refusal message told
+/// it to, and the holder's note, quoted back in every single one, said "LONG BEAD,
+/// will renew".
+///
+/// Nothing here broke a rule, which is why the report says the fleet wasted work
+/// rather than that pact was violated.
+#[derive(Debug, Clone, Serialize)]
+pub struct RetryStorm {
+    pub agent: String,
+    pub path: String,
+    pub refusals: usize,
+    /// Seconds between consecutive refusals: the smallest, and the middle one.
+    pub min_gap_secs: Option<i64>,
+    pub median_gap_secs: Option<i64>,
+    /// Median of the holder's remaining lease across those refusals — the number a
+    /// rational wait would be keyed to. `None` for logs written before
+    /// `holder_remaining_secs` was recorded (pact-1gv.1).
+    pub median_holder_remaining_secs: Option<i64>,
+    /// Did this agent ever end up holding the path?
+    pub ever_claimed: bool,
+}
+
+/// How many refusals of one path by one agent stop being contention and start being
+/// a poll loop.
+///
+/// Five, and the number barely matters: the crucible storms were 33, 20, 14, 13 and
+/// 8, while ordinary resolved contention in the same log sat at 1. There is a wide
+/// empty band between the two, so any threshold in it gives the same answer — which
+/// is the argument for having one at all rather than tuning it.
+const RETRY_STORM_REFUSALS: usize = 5;
+
+/// A retry is "impatient" when it comes back in less than this fraction of what the
+/// holder said it had left.
+///
+/// A quarter, chosen to be generous rather than tight: an agent that waits a third
+/// of the remaining hold is doing something defensible, and the shape this exists
+/// to catch is not marginal. agent-02 waited 15 seconds against a median 355 —
+/// about a twenty-fourth.
+const RETRY_IMPATIENCE_RATIO: i64 = 4;
+
+/// Group refusals by (agent, path) and report the ones that hammered.
+///
+/// Two independent shapes, either of which flags:
+///
+/// - **volume** — more than [`RETRY_STORM_REFUSALS`] refusals of one path by one
+///   agent. Works on any log, including every one written before the holder's
+///   remaining lease was recorded.
+/// - **impatience** — median spacing far below the holder's advertised remaining
+///   lease. This is the shape that names the actual mistake, and it needs
+///   `holder_remaining_secs` (pact-1gv.1): before that field, the number was in
+///   English inside `detail`, and a check that regexes its own prose breaks the
+///   next time somebody improves the wording.
+///
+/// Non-agent identities are excluded. `chaos-ghost` is `scripts/chaos.sh` planting
+/// a stale lease, and in the crucible log its single failed acquire would otherwise
+/// be reported as a badly-behaved peer — the fault injector's deliberate skip
+/// counted against the fleet.
+fn retry_storms(events: &[(usize, Event)], report: &mut CheckReport) {
+    let mut by_pair: BTreeMap<(&str, &str), Vec<&Event>> = BTreeMap::new();
+    for (_, e) in events {
+        if e.kind != "refused" || is_injector(&e.agent) {
+            continue;
+        }
+        if let Some(path) = e.path.as_deref() {
+            by_pair.entry((e.agent.as_str(), path)).or_default().push(e);
+        }
+        if e.kind == "refused" && e.holder_remaining_secs.is_none() {
+            report.refusals_without_remaining += 1;
+        }
+    }
+    let claimed: BTreeSet<(&str, &str)> = events
+        .iter()
+        .filter(|(_, e)| opens(&e.kind))
+        .filter_map(|(_, e)| e.path.as_deref().map(|p| (e.agent.as_str(), p)))
+        .collect();
+
+    for ((agent, path), rows) in by_pair {
+        let mut gaps: Vec<i64> = rows
+            .windows(2)
+            .filter_map(|w| {
+                let (a, b) = (parse_at(&w[0].at)?, parse_at(&w[1].at)?);
+                Some((b - a).num_seconds())
+            })
+            .collect();
+        gaps.sort_unstable();
+        let mut remaining: Vec<i64> = rows
+            .iter()
+            .filter_map(|e| e.holder_remaining_secs)
+            .collect();
+        remaining.sort_unstable();
+        let median = |v: &[i64]| v.get(v.len() / 2).copied();
+        let median_gap = median(&gaps);
+        let median_remaining = median(&remaining);
+
+        let by_volume = rows.len() > RETRY_STORM_REFUSALS;
+        // Only when both numbers exist. A missing remaining-lease is scope, not
+        // evidence of patience.
+        let by_impatience = match (median_gap, median_remaining) {
+            (Some(gap), Some(rem)) => rem > 0 && gap * RETRY_IMPATIENCE_RATIO < rem,
+            _ => false,
+        };
+        if !by_volume && !by_impatience {
+            continue;
+        }
+        report.retry_storms.push(RetryStorm {
+            agent: agent.to_string(),
+            path: path.to_string(),
+            refusals: rows.len(),
+            min_gap_secs: gaps.first().copied(),
+            median_gap_secs: median_gap,
+            median_holder_remaining_secs: median_remaining,
+            ever_claimed: claimed.contains(&(agent, path)),
+        });
+    }
+    // Worst first: the loudest offender is what a reader wants at the top.
+    report
+        .retry_storms
+        .sort_by_key(|r| std::cmp::Reverse(r.refusals));
+}
+
+/// Is this "agent" actually the fault injector rather than a fleet member?
+///
+/// `scripts/chaos.sh` acquires as `chaos-ghost` to plant a stale lease, so its
+/// refusals are a rail firing correctly, not a peer misbehaving. Reporting them
+/// would credit the fleet with waste it did not cause.
+fn is_injector(agent: &str) -> bool {
+    agent == "chaos-ghost"
+}
+
+/// A path somebody was refused, whose holder then released it without a word.
+///
+/// **The threshold objection that deferred pact-7kv dissolves once the boundary is
+/// the HOLD.** The check was parked because "communicated in the same window" needed
+/// an arbitrary cutoff, and it does not: a refusal happens while some agent holds the
+/// path, `reconstruct` already computes that hold exactly, and the question becomes
+/// "between the refusal and that holder's release, did anything communicate about
+/// this path". No cutoff, nothing to tune — the same all-or-nothing move that
+/// unblocked pact-ler.5.
+///
+/// Three things count as communication, and the third is the one this run forced:
+///
+/// 1. a `notified` delivery for the path — the holder's release told a subscriber;
+/// 2. a message tagged with the path (the `message_id` on a `notified`, or a
+///    `--to-owner-of` send, both of which land as events);
+/// 3. **the refused agent already held a covering watch at the moment of the
+///    refusal** — it had arranged to be told, which is using the channel that works.
+///
+/// (3) is counted but deliberately does NOT net out of the contention numbers.
+/// 24 of the crucible run's 124 refusals came from an agent that was already
+/// subscribed, and those same agents then polled 13, 6 and 3 more times. Crediting
+/// the subscription while the agent busy-retried would score the run as communicating
+/// well at exactly the moment it wasted the most work — so `refusals_with_a_channel`
+/// is reported alongside, and `--check retry-storm` still says what the agent did
+/// with the channel it had.
+#[derive(Debug, Clone, Serialize)]
+pub struct SilentContention {
+    pub path: String,
+    /// Who was refused, and when.
+    pub refused_agent: String,
+    pub refused_at: String,
+    pub line: usize,
+    /// Who was holding it, and when they let go. `None` when the log never shows the
+    /// hold closing — an open hold has not had its chance to communicate yet, so
+    /// those are skipped rather than reported.
+    pub holder: String,
+    pub holder_released_at: String,
+    /// Was the refused agent subscribed to the path at the time? Reported per
+    /// finding, because "nobody said anything AND they had no channel either" is a
+    /// different situation from "nobody said anything but they were subscribed".
+    pub refused_agent_had_a_channel: bool,
+}
+
+/// Refusals whose holder released without anything communicating about the path.
+fn silent_contentions(
+    repo_root: &std::path::Path,
+    events: &[(usize, Event)],
+    holds: &[Hold],
+    report: &mut CheckReport,
+) {
+    // Point-in-time, not the live registry: a subscription retired afterwards must
+    // not rewrite whether the agent had a channel at the refusal (pact-1gv.7).
+    let (watch_records, _) = crate::watch::records(repo_root).unwrap_or_default();
+
+    for (line, e) in events.iter().filter(|(_, e)| e.kind == "refused") {
+        let Some(path) = e.path.as_deref() else {
+            continue;
+        };
+        if is_injector(&e.agent) {
+            continue;
+        }
+        let had_channel = crate::watch::was_subscribed_at(&watch_records, &e.agent, path, &e.at);
+        if had_channel {
+            report.refusals_with_a_channel += 1;
+        }
+        let Some(refused_at) = parse_at(&e.at) else {
+            continue;
+        };
+        // The hold this refusal collided with: same path, spanning the refusal, held
+        // by somebody else. That hold's close is the deadline to communicate by.
+        let Some(hold) = holds.iter().find(|h| {
+            h.path == path
+                && h.agent != e.agent
+                && parse_at(&h.opened_at).is_some_and(|o| o <= refused_at)
+                && h.closed_at
+                    .as_deref()
+                    .and_then(parse_at)
+                    .is_some_and(|c| c >= refused_at)
+        }) else {
+            // No closed hold covering it. Either the log does not show the hold
+            // closing — it has not had its chance yet — or the refusal collided with
+            // something reconstruct could not pair. Neither is a finding.
+            continue;
+        };
+        let Some(released_at) = hold.closed_at.as_deref().and_then(parse_at) else {
+            continue;
+        };
+        // Did anything at all communicate about this path in that window?
+        let communicated = events.iter().any(|(_, c)| {
+            c.path.as_deref() == Some(path)
+                && (c.kind == "notified" || c.message_id.is_some())
+                && parse_at(&c.at).is_some_and(|t| t >= refused_at && t <= released_at)
+        });
+        if communicated || had_channel {
+            continue;
+        }
+        report.silent_contentions.push(SilentContention {
+            path: path.to_string(),
+            refused_agent: e.agent.clone(),
+            refused_at: e.at.clone(),
+            line: *line,
+            holder: hold.agent.clone(),
+            holder_released_at: hold.closed_at.clone().unwrap_or_default(),
+            refused_agent_had_a_channel: had_channel,
         });
     }
 }
@@ -587,6 +859,15 @@ pub struct Summary {
     /// forced `--steal` over a claim that was still live (pact-mqw.2).
     #[serde(default)]
     pub reclaims: usize,
+    /// Contention, related to what it achieved (pact-1gv.4).
+    ///
+    /// A bare refusal count is uninterpretable: 124 refusals reads equally well as
+    /// "healthy contention that resolved" and "a fleet thrashing", and until this
+    /// there was no way to tell which. The ratio is where the meaning is, and it is
+    /// only useful as a trend, which is why these live on `Summary` — `--compare`'s
+    /// field table is how pact tracks trends across runs.
+    #[serde(default)]
+    pub contention: Contention,
     pub open_holds: usize,
     pub hold_secs: Option<HoldStats>,
     pub top_contended: Vec<Contended>,
@@ -735,6 +1016,19 @@ pub struct CheckReport {
     /// `Check::ClaimLeaseDivergence` only: holds whose note named no bead, so there
     /// was nothing to cross-check. Scope, not a finding.
     pub holds_naming_no_bead: usize,
+    /// `Check::RetryStorm` only.
+    pub retry_storms: Vec<RetryStorm>,
+    /// `Check::RetryStorm` only: refusals carrying no `holder_remaining_secs`, so
+    /// their spacing could not be judged against what the holder advertised.
+    /// Reported, never a finding — every log written before pact-1gv.1 is entirely
+    /// in this state, and the count-based half of the check still works on them.
+    pub refusals_without_remaining: usize,
+    /// `Check::Contention` only.
+    pub silent_contentions: Vec<SilentContention>,
+    /// `Check::Contention` only: refusals where the refused agent already held a
+    /// covering watch, so the channel WAS in place. Not a finding, and not netted
+    /// out of the count either — see [`SilentContention`].
+    pub refusals_with_a_channel: usize,
     /// `Check::Topology` only: events carrying no `invoked_from` at all.
     /// Reported, never a finding — every log written before pact 0.7.0 is
     /// entirely in this state, and flagging it would fail every existing
@@ -754,6 +1048,8 @@ impl CheckReport {
             + self.topology_mismatches.len()
             + self.merge_divergences.len()
             + self.claim_divergences.len()
+            + self.retry_storms.len()
+            + self.silent_contentions.len()
     }
 }
 
@@ -1294,6 +1590,7 @@ pub fn summary(
 
     Ok(Summary {
         events: events.len(),
+        contention: contention_stats(&events),
         excluded_by_annotation: loaded.excluded,
         annotations: loaded.annotations,
         unparseable_lines: unparseable,
@@ -1319,6 +1616,42 @@ pub fn summary(
     })
 }
 
+/// Refusals related to claims, and the pairs that never got what they asked for.
+///
+/// Always reported, zeroes included — the same shape as the `steals`/`reclaims`
+/// counts beside it, and for the same reason: a run that genuinely did not contend
+/// is a measurement, not a gap. megablast recorded zero refusals across 20 agents
+/// with the instrumentation compiled in, and that zero is what
+/// docs/fleet-patterns.md cites as evidence that wave scheduling pre-resolves
+/// contention.
+///
+/// The one thing it cannot distinguish is a log written before the `refused` kind
+/// existed at all, which also reads as zero. `pact_version` on the events is how to
+/// tell, and docs/audit.md says so — making the whole struct optional to encode it
+/// would have cost `--compare` the ability to track the ratio, which is the only
+/// form in which these numbers mean anything.
+fn contention_stats(events: &[(usize, Event)]) -> Contention {
+    let refusals: Vec<(&str, &str)> = events
+        .iter()
+        .filter(|(_, e)| e.kind == "refused")
+        .filter_map(|(_, e)| e.path.as_deref().map(|p| (e.agent.as_str(), p)))
+        .collect();
+    let claimed: BTreeSet<(&str, &str)> = events
+        .iter()
+        .filter(|(_, e)| opens(&e.kind))
+        .filter_map(|(_, e)| e.path.as_deref().map(|p| (e.agent.as_str(), p)))
+        .collect();
+    let pairs: BTreeSet<(&str, &str)> = refusals.iter().copied().collect();
+    let abandoned: BTreeSet<(&str, &str)> = pairs.difference(&claimed).copied().collect();
+    Contention {
+        refusals: refusals.len(),
+        claims: events.iter().filter(|(_, e)| opens(&e.kind)).count(),
+        contended_pairs: pairs.len(),
+        abandoned_pairs: abandoned.len(),
+        abandoned_refusals: refusals.iter().filter(|p| abandoned.contains(p)).count(),
+    }
+}
+
 pub fn run_check(
     repo_root: &std::path::Path,
     check: Check,
@@ -1339,6 +1672,8 @@ pub fn run_check(
             Check::Topology(_) => "topology",
             Check::MergeDivergence => "merge-divergence",
             Check::ClaimLeaseDivergence => "claim-lease-divergence",
+            Check::RetryStorm => "retry-storm",
+            Check::SilentContention => "silent-contention",
         },
         events_scanned: events.len(),
         excluded_by_annotation: loaded.excluded,
@@ -1365,6 +1700,10 @@ pub fn run_check(
         claim_divergences: Vec::new(),
         claim_unavailable: None,
         holds_naming_no_bead: 0,
+        retry_storms: Vec::new(),
+        refusals_without_remaining: 0,
+        silent_contentions: Vec::new(),
+        refusals_with_a_channel: 0,
     };
 
     match check {
@@ -1422,6 +1761,8 @@ pub fn run_check(
             report.divergence_unhashed = unhashed;
         }
         Check::ClaimLeaseDivergence => claim_divergences(repo_root, &events, &mut report),
+        Check::RetryStorm => retry_storms(&events, &mut report),
+        Check::SilentContention => silent_contentions(repo_root, &events, &holds, &mut report),
         Check::Topology(expect) => {
             report.expected_topology = Some(expect.label());
             let mut by_point: BTreeMap<String, usize> = BTreeMap::new();
@@ -1462,6 +1803,10 @@ pub struct ExportReport {
     pub merge_divergence: CheckReport,
     /// pact-mqw.4: holds whose note named a bead assigned to another agent.
     pub claim_lease_divergence: CheckReport,
+    /// pact-1gv.3: agents that busy-retried a lease instead of backing off.
+    pub retry_storm: CheckReport,
+    /// pact-7kv + pact-1gv.7: contended paths nobody communicated about.
+    pub silent_contention: CheckReport,
     /// Run with `--expect any`, so it reports the distribution rather than a
     /// verdict: a stored retrospective should not fail on an expectation
     /// nobody declared when it was written.
@@ -1520,6 +1865,9 @@ pub fn export(
         since,
         include_annotated,
     )?;
+    let retry_storm = run_check(repo_root, Check::RetryStorm, since, include_annotated)?;
+    let silent_contention =
+        run_check(repo_root, Check::SilentContention, since, include_annotated)?;
     let doctor = crate::doctor::checks(repo_root);
 
     // Best-effort by design: a repo with no `.beads/` or no backend on PATH
@@ -1594,6 +1942,21 @@ pub fn export(
     // line in this same list, and the reason a check could not run is scope rather
     // than a finding. `observations` is the findings list — a repo with no backend
     // must not read as a repo with a coordination problem.
+    if silent_contention.findings() > 0 {
+        observations.push(format!(
+            "{} contended path(s) where the holder released without a message or a watch \
+             delivery, leaving the refused agent to find out by asking again.",
+            silent_contention.findings()
+        ));
+    }
+    if retry_storm.findings() > 0 {
+        let wasted: usize = retry_storm.retry_storms.iter().map(|r| r.refusals).sum();
+        observations.push(format!(
+            "{} retry storm(s), {wasted} refusal(s) spent hammering a held lease instead of \
+             backing off or subscribing.",
+            retry_storm.findings()
+        ));
+    }
     if claim_lease_divergence.findings() > 0 {
         observations.push(format!(
             "{} hold(s) named a bead their holder does not own: the bead claim and the file \
@@ -1648,6 +2011,8 @@ pub fn export(
         commit_correlation,
         merge_divergence,
         claim_lease_divergence,
+        retry_storm,
+        silent_contention,
         topology,
         doctor,
         unacknowledged_messages,
@@ -1740,6 +2105,21 @@ const COMPARED: &[(&str, &str, Extract)] = &[
         Extract::Number,
     ),
     ("open holds", "/summary/open_holds", Extract::Number),
+    ("refusals", "/summary/contention/refusals", Extract::Number),
+    (
+        // The RATIO is what carries meaning, but --compare deals in integers, so
+        // both terms go in the table and a reader divides. Inventing a scaled
+        // integer field just to make the ratio comparable would put a derived
+        // number in the report that nothing else uses.
+        "claims (acquire+takeover)",
+        "/summary/contention/claims",
+        Extract::Number,
+    ),
+    (
+        "abandoned pairs",
+        "/summary/contention/abandoned_pairs",
+        Extract::Number,
+    ),
     ("steals (forced)", "/summary/steals", Extract::Number),
     ("reclaims (expired)", "/summary/reclaims", Extract::Number),
     (
@@ -1794,6 +2174,17 @@ const COMPARED: &[(&str, &str, Extract)] = &[
         "claim/lease divergences",
         "/claim_lease_divergence/claim_divergences",
         Extract::Len,
+    ),
+    ("retry storms", "/retry_storm/retry_storms", Extract::Len),
+    (
+        "silent contentions",
+        "/silent_contention/silent_contentions",
+        Extract::Len,
+    ),
+    (
+        "refusals with a channel",
+        "/silent_contention/refusals_with_a_channel",
+        Extract::Number,
     ),
     (
         "unacknowledged messages",
@@ -2197,6 +2588,33 @@ pub fn render_summary(s: &Summary) -> String {
         }
         out.push(format!("  run in {}", parts.join(", ")));
     }
+    if s.contention.refusals > 0 {
+        let c = &s.contention;
+        // The ratio, not just the count: a refusal total on its own cannot
+        // distinguish contention that resolved from a fleet thrashing. Printed only
+        // when something was refused — a line reading "0 refusals" on every quiet
+        // repo is noise, and --json carries the zero for anything that wants it.
+        let per_claim = if c.claims > 0 {
+            format!(
+                "{:.1} per successful claim",
+                c.refusals as f64 / c.claims as f64
+            )
+        } else {
+            "no claim ever landed".to_string()
+        };
+        out.push(format!(
+            "  conten {} refusal(s), {per_claim}{}",
+            c.refusals,
+            if c.abandoned_pairs > 0 {
+                format!(
+                    "; {} path(s) refused and never acquired ({} refusal(s) abandoned)",
+                    c.abandoned_pairs, c.abandoned_refusals
+                )
+            } else {
+                String::new()
+            }
+        ));
+    }
     if s.watches_active > 0 || s.diffs_delivered > 0 || s.deliveries_failed > 0 {
         out.push(format!(
             "  watch  {} active; {} diff(s) delivered{}",
@@ -2373,6 +2791,27 @@ pub fn render_check(r: &CheckReport) -> String {
         ));
     }
 
+    if r.check == "silent-contention" {
+        // Stated clean or not. A run where every refused agent was already
+        // subscribed has NO findings here, and that fact is the interesting one —
+        // silence would read as "nothing to see" rather than "the channel was used".
+        out.push(format!(
+            "  {} refusal(s) came from an agent already subscribed to the path (channel in \
+             place); see --check retry-storm for what they did with it",
+            r.refusals_with_a_channel
+        ));
+    }
+
+    if r.check == "retry-storm" {
+        // Scope before verdict, clean or not: the impatience half of this check
+        // cannot speak to a refusal whose holder-remaining was never recorded.
+        out.push(format!(
+            "  {} refusal(s) carry no holder-remaining, so only their COUNT could be \
+             judged (logs written before pact recorded it are entirely in this state)",
+            r.refusals_without_remaining
+        ));
+    }
+
     if r.check == "commit-correlation" {
         if let Some(reason) = &r.git_unavailable {
             out.push(format!(
@@ -2415,6 +2854,16 @@ pub fn render_check(r: &CheckReport) -> String {
                 "every context-stamped event matches --expect {}",
                 r.expected_topology.unwrap_or("any")
             ),
+            "silent-contention" => {
+                "every contended path was communicated about before its holder let go — by a \
+                 watch delivery, a message, or the refused agent's own subscription"
+                    .to_string()
+            }
+            "retry-storm" => {
+                "no agent hammered a lease it was refused — every retry was either rare or \
+                 spaced against what the holder advertised"
+                    .to_string()
+            }
             "claim-lease-divergence" => {
                 "every hold whose note named a bead was held by that bead's own assignee"
                     .to_string()
@@ -2621,6 +3070,62 @@ pub fn render_check(r: &CheckReport) -> String {
              this usually means agents edited in their worktrees but ran pact from the main \n\
              checkout, so the lease/edit binding rests on convention — see \n\
              docs/fleet-patterns.md."
+                .to_string(),
+        );
+    }
+
+    for sc in &r.silent_contentions {
+        out.push(String::new());
+        out.push(format!(
+            "SILENT CONTENTION on {}: {} was refused at {} (line {}), and {} released it at {} \
+             without a message or a watch delivery about it",
+            sc.path, sc.refused_agent, sc.refused_at, sc.line, sc.holder, sc.holder_released_at
+        ));
+    }
+    if !r.silent_contentions.is_empty() {
+        out.push(String::new());
+        out.push(
+            "Somebody wanted a path, was told no, and learned nothing when it came free. The \n\
+             cheapest fix is not a message: `pact watch add <path>` makes the next release tell \n\
+             them automatically, and delivery rides `lease release`, which agents perform \n\
+             reliably. Four fleet runs produced 0 voluntary agent-to-agent messages and 64 watch \n\
+             deliveries — see docs/watch.md."
+                .to_string(),
+        );
+    }
+
+    for st in &r.retry_storms {
+        out.push(String::new());
+        out.push(format!(
+            "RETRY STORM: {} refused {} {} time(s){}{}",
+            st.agent,
+            st.path,
+            st.refusals,
+            match (st.median_gap_secs, st.median_holder_remaining_secs) {
+                (Some(g), Some(rem)) => format!(
+                    ", retrying every ~{} against a median {} of holder lease left",
+                    secs(g),
+                    secs(rem)
+                ),
+                (Some(g), None) => format!(", retrying every ~{}", secs(g)),
+                _ => String::new(),
+            },
+            if st.ever_claimed {
+                String::new()
+            } else {
+                " — and NEVER got the path".to_string()
+            }
+        ));
+    }
+    if !r.retry_storms.is_empty() {
+        out.push(String::new());
+        out.push(
+            "Nothing here broke a rule: a refused agent is entitled to ask again. It is work \n\
+             the fleet spent for nothing. The refusal message states how long the holder has \n\
+             left; an agent that waits on that order of magnitude — or better, subscribes with \n\
+             `pact watch add <path>` and picks up other ready work — spends none of it. One \n\
+             fleet retried every 15 seconds, 33 times, against a median 355 seconds of \n\
+             remaining hold whose note said it would renew."
                 .to_string(),
         );
     }
@@ -2855,6 +3360,406 @@ mod tests {
             "{}",
             render_check(&r)
         );
+    }
+
+    /// A refusal with the holder's remaining lease recorded (pact-1gv.1), so the
+    /// impatience half of retry-storm has something to judge.
+    fn ev_refused(at: &str, agent: &str, path: &str, holder: &str, remaining: i64) -> String {
+        // ONE line. The log is line-delimited, so a pretty-printed record is two
+        // torn lines rather than one event — which is exactly how the first cut of
+        // these tests reported zero findings against a log full of refusals.
+        format!(
+            r#"{{"at":"{at}","agent":"{agent}","kind":"refused","path":"{path}","holder":"{holder}","holder_remaining_secs":{remaining}}}"#
+        )
+    }
+
+    /// pact-1gv.3, the crucible shape reproduced: agent-02 refused src/eval.rs 33
+    /// times at 15-second intervals against a median 355s of holder lease left.
+    #[test]
+    fn retry_storm_names_the_agent_that_hammered_a_held_lease() {
+        let mut lines: Vec<String> = vec![ev(
+            "2026-08-11T08:00:00Z",
+            "agent-06",
+            "acquired",
+            "src/eval.rs",
+        )];
+        // 33 refusals, 15 seconds apart, holder always with minutes to spare.
+        for i in 0..33 {
+            lines.push(ev_refused(
+                &format!("2026-08-11T08:{:02}:{:02}Z", (i * 15) / 60, (i * 15) % 60),
+                "agent-02",
+                "src/eval.rs",
+                "agent-06",
+                355,
+            ));
+        }
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let tmp = with_log(&refs);
+
+        let r = run_check(tmp.path(), Check::RetryStorm, None, false).unwrap();
+        assert_eq!(r.findings(), 1, "{:?}", r.retry_storms);
+        let st = &r.retry_storms[0];
+        assert_eq!(
+            (st.agent.as_str(), st.path.as_str()),
+            ("agent-02", "src/eval.rs")
+        );
+        assert_eq!(st.refusals, 33);
+        assert_eq!(st.median_gap_secs, Some(15));
+        assert_eq!(st.median_holder_remaining_secs, Some(355));
+        assert!(!st.ever_claimed, "it never got the path: {st:?}");
+        assert_eq!(r.refusals_without_remaining, 0);
+
+        let text = render_check(&r);
+        assert!(
+            text.contains("RETRY STORM: agent-02 refused src/eval.rs 33 time(s)"),
+            "{text}"
+        );
+        assert!(text.contains("NEVER got the path"), "{text}");
+        // The verdict must say the fleet wasted work, not that pact was violated —
+        // asking again is allowed.
+        assert!(text.contains("Nothing here broke a rule"), "{text}");
+    }
+
+    /// Contention that RESOLVED must not be reported. An agent refused once or twice
+    /// and then granted the lease is the protocol working, and flagging it is how a
+    /// check trains people to ignore it.
+    #[test]
+    fn retry_storm_ignores_a_refusal_that_resolved_at_a_sane_interval() {
+        let tmp = with_log(&[
+            &ev("2026-08-11T08:00:00Z", "holder", "acquired", "p.rs"),
+            // Two polite retries: each waits most of the advertised remaining.
+            &ev_refused("2026-08-11T08:00:10Z", "waiter", "p.rs", "holder", 120),
+            &ev_refused("2026-08-11T08:02:10Z", "waiter", "p.rs", "holder", 10),
+            &ev("2026-08-11T08:02:30Z", "holder", "released", "p.rs"),
+            &ev("2026-08-11T08:02:31Z", "waiter", "acquired", "p.rs"),
+        ]);
+        let r = run_check(tmp.path(), Check::RetryStorm, None, false).unwrap();
+        assert_eq!(r.findings(), 0, "{:?}", r.retry_storms);
+        assert!(
+            render_check(&r).contains("no agent hammered a lease"),
+            "{}",
+            render_check(&r)
+        );
+    }
+
+    /// The impatience half flags a SHORT storm the volume half would miss — three
+    /// retries is not a lot, but three retries at 5s against 600s of remaining hold
+    /// is the same mistake.
+    #[test]
+    fn retry_storm_flags_impatience_even_below_the_volume_threshold() {
+        let tmp = with_log(&[
+            &ev("2026-08-11T08:00:00Z", "holder", "acquired", "p.rs"),
+            &ev_refused("2026-08-11T08:00:05Z", "waiter", "p.rs", "holder", 600),
+            &ev_refused("2026-08-11T08:00:10Z", "waiter", "p.rs", "holder", 595),
+            &ev_refused("2026-08-11T08:00:15Z", "waiter", "p.rs", "holder", 590),
+        ]);
+        let r = run_check(tmp.path(), Check::RetryStorm, None, false).unwrap();
+        assert_eq!(r.findings(), 1, "{:?}", r.retry_storms);
+        assert_eq!(r.retry_storms[0].median_gap_secs, Some(5));
+    }
+
+    /// `chaos-ghost` is scripts/chaos.sh planting a stale lease. Its failed acquire
+    /// is a rail firing correctly, and counting it would credit the fleet with waste
+    /// the fault injector caused deliberately.
+    #[test]
+    fn retry_storm_never_reports_the_fault_injector_as_a_bad_peer() {
+        let mut lines = vec![ev(
+            "2026-08-11T08:00:00Z",
+            "agent-05",
+            "acquired",
+            "src/printer.rs",
+        )];
+        for i in 0..9 {
+            lines.push(ev_refused(
+                &format!("2026-08-11T08:00:{:02}Z", i * 5),
+                "chaos-ghost",
+                "src/printer.rs",
+                "agent-05",
+                600,
+            ));
+        }
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let tmp = with_log(&refs);
+        let r = run_check(tmp.path(), Check::RetryStorm, None, false).unwrap();
+        assert_eq!(r.findings(), 0, "{:?}", r.retry_storms);
+    }
+
+    /// A log written before `holder_remaining_secs` existed can still be judged on
+    /// COUNT, and the report must say which half it could run. Silence here would let
+    /// a clean result read as a stronger claim than it is.
+    #[test]
+    fn retry_storm_still_counts_on_a_log_that_predates_the_holder_fields() {
+        let mut lines = vec![ev("2026-08-11T08:00:00Z", "holder", "acquired", "p.rs")];
+        for i in 0..7 {
+            lines.push(ev(
+                &format!("2026-08-11T08:00:{:02}Z", i * 5),
+                "waiter",
+                "refused",
+                "p.rs",
+            ));
+        }
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let tmp = with_log(&refs);
+        let r = run_check(tmp.path(), Check::RetryStorm, None, false).unwrap();
+        assert_eq!(
+            r.findings(),
+            1,
+            "volume alone must still flag: {:?}",
+            r.retry_storms
+        );
+        assert_eq!(r.retry_storms[0].median_holder_remaining_secs, None);
+        assert_eq!(r.refusals_without_remaining, 7);
+        assert!(
+            render_check(&r).contains("7 refusal(s) carry no holder-remaining"),
+            "{}",
+            render_check(&r)
+        );
+    }
+
+    /// pact-1gv.4: the ratio, and the pairs that never got what they asked for.
+    #[test]
+    fn the_summary_relates_refusals_to_what_they_bought() {
+        let tmp = with_log(&[
+            &ev("2026-08-11T08:00:00Z", "a", "acquired", "p.rs"),
+            &ev_refused("2026-08-11T08:00:10Z", "b", "p.rs", "a", 100),
+            &ev("2026-08-11T08:01:00Z", "a", "released", "p.rs"),
+            // b eventually got it: contention that resolved.
+            &ev("2026-08-11T08:01:01Z", "b", "acquired", "p.rs"),
+            // c asked twice for a path it never held: abandoned.
+            &ev_refused("2026-08-11T08:01:10Z", "c", "p.rs", "b", 90),
+            &ev_refused("2026-08-11T08:01:20Z", "c", "p.rs", "b", 80),
+        ]);
+        let s = summary(tmp.path(), None, false).unwrap();
+        let c = &s.contention;
+        assert_eq!(c.refusals, 3);
+        assert_eq!(
+            c.claims, 2,
+            "a's acquire and b's, the only two claims that landed"
+        );
+        assert_eq!(c.contended_pairs, 2, "(b,p.rs) and (c,p.rs)");
+        assert_eq!(c.abandoned_pairs, 1, "only c never got it");
+        assert_eq!(c.abandoned_refusals, 2);
+
+        let text = render_summary(&s);
+        assert!(text.contains("3 refusal(s)"), "{text}");
+        assert!(text.contains("per successful claim"), "{text}");
+        assert!(
+            text.contains("1 path(s) refused and never acquired"),
+            "{text}"
+        );
+    }
+
+    /// A quiet run must not print a contention line at all — "0 refusals" on every
+    /// repo that never contended is noise. The zero still rides in --json so
+    /// --compare can track it.
+    #[test]
+    fn a_run_with_no_refusals_reports_zero_without_a_line() {
+        let tmp = with_log(&[
+            &ev("2026-08-11T08:00:00Z", "a", "acquired", "p.rs"),
+            &ev("2026-08-11T08:01:00Z", "a", "released", "p.rs"),
+        ]);
+        let s = summary(tmp.path(), None, false).unwrap();
+        assert_eq!(s.contention.refusals, 0);
+        assert_eq!(s.contention.abandoned_pairs, 0);
+        assert!(
+            !render_summary(&s).contains("refusal(s)"),
+            "{}",
+            render_summary(&s)
+        );
+    }
+
+    /// Plant watch records beside an existing log, so a fixture can say what an agent
+    /// was subscribed to and WHEN.
+    fn with_watches(tmp: &tempfile::TempDir, lines: &[&str]) {
+        std::fs::write(
+            tmp.path().join(".pact").join("watches.jsonl"),
+            lines.join("\n"),
+        )
+        .unwrap();
+    }
+
+    fn watch_rec(at: &str, agent: &str, kind: &str, path: &str) -> String {
+        format!(r#"{{"at":"{at}","agent":"{agent}","kind":"{kind}","path":"{path}"}}"#)
+    }
+
+    /// pact-7kv: somebody wanted a path, was told no, and learned nothing when it
+    /// came free.
+    ///
+    /// The threshold objection that deferred this bead dissolves once the boundary is
+    /// the HOLD: no cutoff to tune, because the holder's own release is the deadline.
+    #[test]
+    fn silent_contention_flags_a_holder_that_released_without_a_word() {
+        let tmp = with_log(&[
+            &ev("2026-08-11T08:00:00Z", "holder", "acquired", "src/token.rs"),
+            &ev_refused(
+                "2026-08-11T08:01:00Z",
+                "waiter",
+                "src/token.rs",
+                "holder",
+                540,
+            ),
+            &ev("2026-08-11T08:05:00Z", "holder", "released", "src/token.rs"),
+        ]);
+        let r = run_check(tmp.path(), Check::SilentContention, None, false).unwrap();
+        assert_eq!(r.findings(), 1, "{:?}", r.silent_contentions);
+        let sc = &r.silent_contentions[0];
+        assert_eq!(sc.path, "src/token.rs");
+        assert_eq!(sc.refused_agent, "waiter");
+        assert_eq!(sc.holder, "holder");
+        assert!(!sc.refused_agent_had_a_channel);
+
+        let text = render_check(&r);
+        assert!(text.contains("SILENT CONTENTION on src/token.rs"), "{text}");
+        // The remedy must be the channel that works, not a plea to send messages.
+        assert!(text.contains("pact watch add"), "{text}");
+    }
+
+    /// A watch delivery about the path, inside the hold, IS communication — that is
+    /// spec item 4 of pact-8qu, which asked that notified deliveries count.
+    #[test]
+    fn a_watch_delivery_inside_the_hold_counts_as_communication() {
+        let tmp = with_log(&[
+            &ev("2026-08-11T08:00:00Z", "holder", "acquired", "src/token.rs"),
+            &ev_refused(
+                "2026-08-11T08:01:00Z",
+                "waiter",
+                "src/token.rs",
+                "holder",
+                540,
+            ),
+            &ev("2026-08-11T08:04:00Z", "holder", "notified", "src/token.rs"),
+            &ev("2026-08-11T08:05:00Z", "holder", "released", "src/token.rs"),
+        ]);
+        let r = run_check(tmp.path(), Check::SilentContention, None, false).unwrap();
+        assert_eq!(r.findings(), 0, "{:?}", r.silent_contentions);
+    }
+
+    /// pact-1gv.7: the refused agent's OWN subscription counts as using the channel —
+    /// and is counted separately rather than netted out, because the same agents then
+    /// polled anyway. Crediting the subscription while it busy-retries would score the
+    /// run as communicating well at the moment it wasted the most work.
+    #[test]
+    fn a_refused_agents_own_subscription_counts_and_is_reported_separately() {
+        let tmp = with_log(&[
+            &ev("2026-08-11T08:00:00Z", "holder", "acquired", "src/ast.rs"),
+            &ev_refused(
+                "2026-08-11T08:01:00Z",
+                "waiter",
+                "src/ast.rs",
+                "holder",
+                540,
+            ),
+            &ev("2026-08-11T08:05:00Z", "holder", "released", "src/ast.rs"),
+        ]);
+        with_watches(
+            &tmp,
+            &[&watch_rec(
+                "2026-08-11T07:59:00Z",
+                "waiter",
+                "watch",
+                "src/ast.rs",
+            )],
+        );
+        let r = run_check(tmp.path(), Check::SilentContention, None, false).unwrap();
+        assert_eq!(
+            r.findings(),
+            0,
+            "the channel was in place: {:?}",
+            r.silent_contentions
+        );
+        assert_eq!(r.refusals_with_a_channel, 1);
+        // Stated even when clean — a run where every refused agent was subscribed has
+        // no findings, and THAT is the interesting fact.
+        assert!(
+            render_check(&r).contains("1 refusal(s) came from an agent already subscribed"),
+            "{}",
+            render_check(&r)
+        );
+    }
+
+    /// Point-in-time, not the live registry. A subscription added AFTER the refusal
+    /// must not retroactively excuse it, and one retired before the refusal must not
+    /// count either — otherwise a later `watch rm` rewrites history.
+    #[test]
+    fn a_subscription_only_counts_if_it_was_in_force_at_the_refusal() {
+        let base = [
+            ev("2026-08-11T08:00:00Z", "holder", "acquired", "src/ast.rs"),
+            ev_refused(
+                "2026-08-11T08:01:00Z",
+                "waiter",
+                "src/ast.rs",
+                "holder",
+                540,
+            ),
+            ev("2026-08-11T08:05:00Z", "holder", "released", "src/ast.rs"),
+        ];
+        let refs: Vec<&str> = base.iter().map(String::as_str).collect();
+
+        // Subscribed only AFTER the refusal: does not count.
+        let late = with_log(&refs);
+        with_watches(
+            &late,
+            &[&watch_rec(
+                "2026-08-11T08:02:00Z",
+                "waiter",
+                "watch",
+                "src/ast.rs",
+            )],
+        );
+        let r = run_check(late.path(), Check::SilentContention, None, false).unwrap();
+        assert_eq!(
+            r.refusals_with_a_channel, 0,
+            "a later subscription is not a channel then"
+        );
+        assert_eq!(r.findings(), 1);
+
+        // Subscribed, then unsubscribed BEFORE the refusal: does not count.
+        let gone = with_log(&refs);
+        with_watches(
+            &gone,
+            &[
+                &watch_rec("2026-08-11T07:50:00Z", "waiter", "watch", "src/ast.rs"),
+                &watch_rec("2026-08-11T07:55:00Z", "waiter", "unwatch", "src/ast.rs"),
+            ],
+        );
+        let r = run_check(gone.path(), Check::SilentContention, None, false).unwrap();
+        assert_eq!(
+            r.refusals_with_a_channel, 0,
+            "a retired subscription is not a channel"
+        );
+        assert_eq!(r.findings(), 1);
+
+        // And a re-add after the unwatch, still before the refusal, counts again.
+        let back = with_log(&refs);
+        with_watches(
+            &back,
+            &[
+                &watch_rec("2026-08-11T07:50:00Z", "waiter", "watch", "src/ast.rs"),
+                &watch_rec("2026-08-11T07:55:00Z", "waiter", "unwatch", "src/ast.rs"),
+                &watch_rec("2026-08-11T07:58:00Z", "waiter", "watch", "src/ast.rs"),
+            ],
+        );
+        let r = run_check(back.path(), Check::SilentContention, None, false).unwrap();
+        assert_eq!(r.refusals_with_a_channel, 1);
+        assert_eq!(r.findings(), 0);
+    }
+
+    /// An OPEN hold has not had its chance to communicate yet. Reporting it would
+    /// flag a fleet mid-run for something it may be about to do.
+    #[test]
+    fn silent_contention_ignores_a_hold_the_log_never_shows_closing() {
+        let tmp = with_log(&[
+            &ev("2026-08-11T08:00:00Z", "holder", "acquired", "src/ast.rs"),
+            &ev_refused(
+                "2026-08-11T08:01:00Z",
+                "waiter",
+                "src/ast.rs",
+                "holder",
+                540,
+            ),
+        ]);
+        let r = run_check(tmp.path(), Check::SilentContention, None, false).unwrap();
+        assert_eq!(r.findings(), 0, "{:?}", r.silent_contentions);
     }
 
     #[test]
@@ -3666,6 +4571,10 @@ mod tests {
             message_id: None,
             protocol_hash: None,
             head: None,
+            holder: None,
+            holder_remaining_secs: None,
+            holder_branch: None,
+            holder_worktree: None,
         }
     }
 

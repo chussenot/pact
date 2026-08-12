@@ -500,6 +500,8 @@ fn subcommand_name(command: &Command) -> &'static str {
             Some("commit-correlation") => "audit commit-correlation",
             Some("merge-divergence") => "audit merge-divergence",
             Some("claim-lease-divergence") => "audit claim-lease-divergence",
+            Some("retry-storm") => "audit retry-storm",
+            Some("silent-contention") => "audit silent-contention",
             Some("topology") => "audit topology",
             // One literal for anything else, including a bad value: the argument
             // is user text and must never reach a span name.
@@ -670,6 +672,10 @@ fn run_watch(cwd: &Path, agent_flag: Option<&str>, json: bool, action: WatchActi
                     message_id: None,
                     protocol_hash: None,
                     head: None,
+                    holder: None,
+                    holder_remaining_secs: None,
+                    holder_branch: None,
+                    holder_worktree: None,
                 },
             );
             #[derive(serde::Serialize)]
@@ -723,6 +729,10 @@ fn run_watch(cwd: &Path, agent_flag: Option<&str>, json: bool, action: WatchActi
                         message_id: None,
                         protocol_hash: None,
                         head: None,
+                        holder: None,
+                        holder_remaining_secs: None,
+                        holder_branch: None,
+                        holder_worktree: None,
                     },
                 );
             }

@@ -45,6 +45,29 @@ nobody can act on, and an invitation to implement the guard file on suspicion.
 command's `--help` names the bead. If it ever exits 1, its output **is** the
 evidence the bead is waiting for.
 
+## What the summary says about contention
+
+Before any named check, the summary relates contention to what it bought:
+
+```
+  conten 124 refusal(s), 2.0 per successful claim; 9 path(s) refused and never acquired (16 refusal(s) abandoned)
+```
+
+A bare refusal count is uninterpretable — 124 reads equally well as "healthy
+contention that resolved" and "a fleet thrashing". The **ratio** is where the meaning
+is, and the abandoned count is where the waste is: nine (agent, path) pairs were
+refused and never claimed, sixteen refusals spent asking for something their asker
+never got.
+
+The line prints only when something was refused; `--json` carries the zeroes either
+way so [`--compare`](#--compare) can track the trend, which is the only form in which
+these numbers mean much. The three earlier field runs recorded **zero** refusals
+between them — wave scheduling pre-resolved contention entirely — so this is the first
+run there was anything to relate.
+
+One thing it cannot distinguish: a log written before the `refused` kind existed also
+reads as zero refusals. `pact_version` on the events is how to tell.
+
 ## The checks
 
 ### `--check double-win`
@@ -379,6 +402,79 @@ This is the second place audit reaches outside `.pact/`, after
 `--check commit-correlation` reached for `git`. Same rule both times: the
 invariant is *never touch the Beads DB directly, only its CLI*, which this obeys —
 `--export` already asks bd a question for `unacknowledged_messages`.
+
+### `--check retry-storm`
+
+**The only check about what the fleet wasted, rather than what pact got wrong.**
+Nothing it reports broke a rule: a refused agent is entitled to ask again.
+
+The crucible run is the first with real contention data — 124 refusals, where the
+three runs before it produced zero — and it shows agents busy-polling:
+
+| agent | path | refusals | retry spacing | holder's remaining |
+|---|---|---|---|---|
+| agent-02 | `src/eval.rs` | 33 | **15s flat** | median 355s |
+| agent-03-r2 | `src/ast.rs` | 20 | ~13s | — |
+| agent-06 | `src/types.rs` | 8 | ~15s | — *(never got it)* |
+
+The spacing is the finding. Twenty-seven of agent-02's thirty-two gaps were
+*exactly* 15 seconds — a hardcoded poll loop, not adaptive retry with jitter — while
+the refusal message in front of it said the holder had minutes left, and the holder's
+own note, quoted back in every single one, said "LONG BEAD, will renew". It retried
+roughly 24× more often than its own screen told it to.
+
+Two independent shapes flag, and either is enough:
+
+- **volume** — more than 5 refusals of one path by one agent. Works on any log,
+  including every one written before the holder's remaining lease was recorded.
+- **impatience** — median spacing below a quarter of the holder's advertised
+  remaining lease. This is the shape that names the mistake, and it needs
+  `holder_remaining_secs`.
+
+Both thresholds are deliberately crude, because the data does not need precision:
+the storms were 33, 20, 14, 13 and 8 refusals while ordinary resolved contention sat
+at **1**. There is a wide empty band between them, so any threshold inside it gives
+the same answer — which is the argument for having one rather than tuning it.
+
+`chaos-ghost` is excluded. That is [`scripts/chaos.sh`](testing.md) planting a stale
+lease, and its failed acquire is a rail firing correctly; counting it would credit
+the fleet with waste the fault injector caused on purpose.
+
+Refusals with no recorded holder-remaining are reported on their own line, clean or
+not, so a reader knows which half of the check could run.
+
+### `--check silent-contention`
+
+Somebody wanted a path, was told no, and learned nothing when it came free.
+
+This check was deferred for months because "communicated in the same window" seemed
+to need an arbitrary cutoff. **It does not, once the boundary is the hold itself.** A
+refusal happens while some agent holds the path, `reconstruct` already computes that
+hold exactly, and the question becomes: *between the refusal and that holder's
+release, did anything communicate about this path?* No cutoff, nothing to tune — the
+same all-or-nothing move that unblocked `--check topology`.
+
+Three things count as communication:
+
+1. a `notified` delivery for the path — the holder's release told a subscriber;
+2. a message tagged with the path;
+3. **the refused agent already held a covering watch at the moment of the refusal** —
+   it had arranged to be told, which is using the channel that works.
+
+(3) is counted and reported, but deliberately **does not net out of the contention
+numbers**. Twenty-four of crucible's 124 refusals came from an agent that was already
+subscribed — and those same agents then polled 13, 6 and 3 more times. Crediting the
+subscription while the agent busy-retries would score the run as communicating well
+at exactly the moment it wasted the most work. So the count sits beside the findings,
+and `--check retry-storm` says what the agent did with the channel it had.
+
+Subscriptions are judged **at the refusal**, by replaying `watches.jsonl` to that
+instant rather than reading the live registry — otherwise a later `watch rm` rewrites
+whether the agent had a channel, the same way judging a hold against today's default
+TTL would rewrite whether it was stale.
+
+An **open** hold is skipped: it has not had its chance to communicate yet, and
+flagging a fleet mid-run for something it may be about to do is noise.
 
 ## Where the run actually happened
 
