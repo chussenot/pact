@@ -97,6 +97,32 @@ So the accurate claim is narrower than "messaging is rarely needed":
   `pact msg send --to-owner-of <path>` is for, and waves do nothing to remove
   the need.
 
+### But the channel that actually carries it is `pact watch`
+
+Four fleet runs have now produced **zero** voluntary agent-to-agent messages. The
+fourth produced **64 watch notifications** in the same window.
+
+That is not a close call, and it is not a story about lazy agents. `pact watch`
+delivery rides `lease release` — a command those runs performed 31 times out of 31 —
+so it costs an agent nothing at announce time. Messaging asks an agent to remember,
+at the moment it is finishing something else, and four runs say it will not.
+
+So under an orchestrated fleet, treat it this way:
+
+| You want | Use |
+|---|---|
+| to be told when an interface you depend on changes | `pact watch add <path>`, once, at task start |
+| an answer, a decision, or something you cannot do yourself | `pact msg send` |
+
+Peer messaging remains load-bearing for exactly the cases watch cannot cover — a
+decision you need back, a file you neither own nor watch, a cross-fleet hand-off —
+and megablast's single surviving message, the one that kept a `write_buffer` overflow
+from shipping, is still the proof. What changed is which one is the *default*.
+
+[`pact audit --check silent-contention`](audit.md#--check-silent-contention) reports
+contended paths where neither channel was used, and counts refusals where the asker
+had already subscribed.
+
 ### Acknowledge what you act on
 
 Of those four messages, **three were never read by the agent they were

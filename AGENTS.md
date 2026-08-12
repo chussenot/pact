@@ -138,7 +138,7 @@ bd prime                # Refresh Beads context
 **Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
 <!-- END BEADS CODEX SETUP -->
 
-<!-- pact:begin hash:bd931510 -->
+<!-- pact:begin hash:eeb1e18f -->
 ## pact coordination protocol
 
 pact coordinates multiple coding agents working in this repository. Follow
@@ -213,6 +213,13 @@ this protocol whenever you touch shared files or hand off work to others.
   resolved to has exited. So when you are handing off work, address the FILE.
   And read what `pact lease acquire` tells you before you edit: a message
   waiting on a path is usually the reason the last agent stopped.
+- **On exit 2, use the number in the refusal — do not poll.** The refusal tells you
+  how long the holder has left. Wait on THAT order of magnitude, or better, take the
+  advice pact prints with it: subscribe with `pact watch add <path>` and pick up
+  other ready work, and the next release will tell you. Measured on one fleet: an
+  agent retried every 15 seconds, 33 times, against a median 355 seconds of
+  remaining hold whose note said it would renew — and 24 refusals in that run came
+  from agents that had ALREADY subscribed and polled anyway.
 - **A path someone else holds exits 2** — branch on that, not on the message
   text. `pact lease ls` names the holder; message them and pick up something
   else, which is what announcing early bought you. `pact lease acquire --steal`
