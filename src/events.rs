@@ -209,6 +209,46 @@ pub struct Event {
     /// only to name a commit in a truncated watch diff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<String>,
+    /// On a `refused` row: who was holding the path, how much of their lease was
+    /// left, and where they were holding it from (pact-1gv.1).
+    ///
+    /// Every one of these facts was already in the refusal — inside `detail`, in
+    /// English. That made them unusable by anything except a human:
+    ///
+    /// ```text
+    /// "held by agent-01 on branch crucible/agent-01 in worktree agent-01
+    ///  (9s old, 591s remaining), use --steal to override — my note: ..."
+    /// ```
+    ///
+    /// The trap is `ttl_secs`, which a reader naturally takes for the holder's
+    /// remaining time and is not: it is the ttl the REFUSED agent asked for. In
+    /// the crucible log it reads 600 on all 33 of agent-02's refusals of
+    /// `src/eval.rs` while the holder's advertised remaining ranged 96–597s
+    /// (median 355). An agent — or a check — that trusted `ttl_secs` to decide how
+    /// long to wait would learn nothing, and agent-02 duly retried every 15
+    /// seconds, 33 times, against a median 355s of remaining hold.
+    ///
+    /// So these are stamped from the same resolution that composes the prose, at
+    /// the same moment, and the prose is unchanged. Two representations of one
+    /// fact that cannot drift, rather than one representation only a regex can
+    /// reach — the same reasoning `displaced` was added under (pact-m7j.2.6).
+    ///
+    /// `None` on every other kind, and on `refused` rows written before this
+    /// shipped. Backfill is impossible, so absence means "not recorded", never
+    /// zero — the discipline `chain_untracked` and `topology_unstamped` follow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
+    /// Seconds left on the holder's lease at the moment of the refusal. See
+    /// [`Event::holder`] — this is the number `ttl_secs` is mistaken for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_remaining_secs: Option<i64>,
+    /// The holder's branch, when the lock recorded one. Distinct from
+    /// `invoked_from`, which is the REFUSED agent's own worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_branch: Option<String>,
+    /// The holder's worktree, when the lock recorded one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_worktree: Option<String>,
 }
 
 /// For appending: creates `.pact/` if needed.
@@ -945,6 +985,10 @@ mod tests {
             message_id: None,
             protocol_hash: None,
             head: None,
+            holder: None,
+            holder_remaining_secs: None,
+            holder_branch: None,
+            holder_worktree: None,
         }
     }
 

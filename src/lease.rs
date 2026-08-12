@@ -1090,6 +1090,10 @@ fn log_event(
             message_id: None,
             protocol_hash: None,
             head: None,
+            holder: None,
+            holder_remaining_secs: None,
+            holder_branch: None,
+            holder_worktree: None,
         },
     );
 }
@@ -1688,19 +1692,73 @@ fn acquire_inner(
                     .as_deref()
                     .map(|n| format!(" — my note: {n}"))
                     .unwrap_or_default();
-                log_event(
+                // Not `log_event`: the holder's four facts have no parameter
+                // there, and they are the whole point of pact-1gv.1 — every one
+                // of them was already in the prose below and reachable only by
+                // regex. Composed from the SAME `existing`/`remaining` this
+                // message reads, in one place, so the two representations cannot
+                // disagree.
+                //
+                // `ttl_secs` stays the REFUSED agent's requested ttl, which is
+                // what it has always been. It is the field a reader mistakes for
+                // the holder's remaining time; `holder_remaining_secs` is the one
+                // that answers that, and the two differ by a factor of 24 in the
+                // run this came from.
+                events::append(
                     repo_root,
-                    agent,
-                    "refused",
-                    &relative,
-                    Some(format!(
-                        "held by {} ({age}s old, {remaining}s remaining), use --steal to \
-                         override{note_suffix}",
-                        holder_location(&existing)
-                    )),
-                    ttl_secs,
-                    None,
+                    &events::Event {
+                        at: Utc::now().to_rfc3339(),
+                        agent: agent.to_string(),
+                        kind: "refused".to_string(),
+                        path: Some(relative.clone()),
+                        detail: Some(format!(
+                            "held by {} ({age}s old, {remaining}s remaining), use --steal to \
+                             override{note_suffix}",
+                            holder_location(&existing)
+                        )),
+                        ttl_secs: Some(ttl_secs),
+                        covers_lines: None,
+                        actor: None,
+                        displaced: None,
+                        // append() computes the real value; see Event::chain_hash.
+                        chain_hash: None,
+                        // Likewise stamped by append().
+                        invoked_from: None,
+                        scope: None,
+                        pact_version: None,
+                        content_hash: None,
+                        subscriber: None,
+                        message_id: None,
+                        protocol_hash: None,
+                        head: None,
+                        holder: Some(existing.agent.clone()),
+                        holder_remaining_secs: Some(remaining),
+                        holder_branch: existing.branch.clone(),
+                        holder_worktree: existing.worktree.clone(),
+                    },
                 );
+                // The one thing a refused agent most needs and was never told:
+                // whether it has already arranged to be notified when this path
+                // comes free (pact-1gv.2). Printed BEFORE the error, because the
+                // error is what a reader stops at.
+                //
+                // Advisory and best-effort — an unreadable registry says nothing
+                // rather than guessing, and neither branch can change the exit
+                // code, which stays 2 as the protocol contract requires.
+                if watch::is_subscribed(repo_root, agent, &relative) {
+                    crate::output::warn(&format!(
+                        "note: you already watch {relative} — pact will send you the diff when \
+                         {} releases it ({}s left on their lease). Pick up other ready work; do \
+                         NOT poll for this path",
+                        existing.agent, remaining
+                    ));
+                } else {
+                    crate::output::warn(&format!(
+                        "note: `pact watch add {relative}` and pact will tell you when {} \
+                         releases it, instead of you asking again",
+                        existing.agent
+                    ));
+                }
                 // The holder's LOCATION, not just their name. A peer in another
                 // worktree is editing a checkout this reader cannot see, so
                 // "held by agent-a" alone invites them to inspect their own copy,
@@ -1974,6 +2032,10 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                     message_id: None,
                     protocol_hash: None,
                     head: None,
+                    holder: None,
+                    holder_remaining_secs: None,
+                    holder_branch: None,
+                    holder_worktree: None,
                 },
             );
             count_transition("force_released");
@@ -2055,6 +2117,10 @@ fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<
                     message_id: None,
                     protocol_hash: None,
                     head: None,
+                    holder: None,
+                    holder_remaining_secs: None,
+                    holder_branch: None,
+                    holder_worktree: None,
                 },
             );
             count_transition("force_released");
@@ -2664,6 +2730,10 @@ mod tests {
                 message_id: None,
                 protocol_hash: None,
                 head: None,
+                holder: None,
+                holder_remaining_secs: None,
+                holder_branch: None,
+                holder_worktree: None,
             },
         );
         let (suspect, silent) = suspect_of("printer.rs");
@@ -2723,6 +2793,10 @@ mod tests {
                 message_id: None,
                 protocol_hash: None,
                 head: None,
+                holder: None,
+                holder_remaining_secs: None,
+                holder_branch: None,
+                holder_worktree: None,
             },
         );
         assert!(

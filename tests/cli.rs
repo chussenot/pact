@@ -59,6 +59,17 @@ fn stdout_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Every event in the log, parsed. The log is the only place several of these
+/// tests can check what pact recorded rather than what it printed.
+fn events(repo: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(repo.join(".pact/events.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
 fn stderr_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
@@ -2917,6 +2928,113 @@ fn acquiring_a_copy_the_last_holder_never_left_warns_and_still_succeeds() {
     assert_eq!(found[0]["path"], "printer.rs");
     assert_eq!(found[0]["released_by"], "agent-b");
     assert_eq!(found[0]["acquired_by"], "agent-c");
+}
+
+/// pact-1gv.1 + .2: what a refusal tells you, and in what form.
+///
+/// Every fact a refused agent needs was already in the message and reachable only
+/// by regex, and the one structured number that looked like an answer was the wrong
+/// one: `ttl_secs` on a refusal is the ttl the REFUSED agent asked for, not the
+/// holder's remaining time. In the crucible log it read 600 on all 33 of agent-02's
+/// refusals of src/eval.rs while the holder's advertised remaining ranged 96–597s
+/// (median 355). agent-02 retried every 15 seconds, 33 times.
+#[test]
+fn a_refusal_records_the_holders_facts_structurally_and_says_what_to_do_next() {
+    let tmp = init_repo();
+    let repo = tmp.path();
+    assert_ok(&pact(
+        repo,
+        "holder",
+        &["lease", "acquire", "src/eval.rs", "--ttl", "600"],
+    ));
+
+    // Asking for a DIFFERENT ttl than the holder's, so a test that confused the two
+    // numbers could not pass by coincidence.
+    let refused = pact(
+        repo,
+        "waiter",
+        &["lease", "acquire", "src/eval.rs", "--ttl", "120"],
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "the exit-code contract is unchanged: {}",
+        stderr_of(&refused)
+    );
+
+    let ev = events(repo);
+    let row = ev
+        .iter()
+        .rev()
+        .find(|e| e["kind"] == "refused")
+        .unwrap_or_else(|| panic!("no refused event: {ev:?}"));
+
+    assert_eq!(row["holder"], "holder", "{row}");
+    assert_eq!(
+        row["ttl_secs"], 120,
+        "ttl_secs is the REQUESTER's ask, unchanged: {row}"
+    );
+    let remaining = row["holder_remaining_secs"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("holder_remaining_secs must be recorded: {row}"));
+    assert!(
+        (500..=600).contains(&remaining),
+        "and must be the HOLDER's remaining, not the requester's ttl: {row}"
+    );
+    // The two representations must agree — that is the whole reason they are
+    // stamped from one place.
+    let detail = row["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains(&format!("{remaining}s remaining")),
+        "the structured number and the prose must not drift: {detail}"
+    );
+
+    // .2: with no subscription, the refusal offers the channel.
+    let err = stderr_of(&refused);
+    assert!(
+        err.contains("pact watch add src/eval.rs"),
+        "a refused agent must be offered the channel that works: {err}"
+    );
+
+    // And once subscribed, it is told to stop polling rather than to keep asking.
+    assert_ok(&pact(repo, "waiter", &["watch", "add", "src/eval.rs"]));
+    let again = pact(repo, "waiter", &["lease", "acquire", "src/eval.rs"]);
+    assert_eq!(again.status.code(), Some(2));
+    let err = stderr_of(&again);
+    assert!(
+        err.contains("you already watch src/eval.rs") && err.contains("do NOT poll"),
+        "an already-subscribed agent must be told to stop polling: {err}"
+    );
+    assert!(
+        err.contains("holder"),
+        "and told who it is waiting on: {err}"
+    );
+    assert!(
+        !err.contains("pact watch add src/eval.rs"),
+        "it must not be told to subscribe to something it already watches: {err}"
+    );
+}
+
+/// A COVERING PREFIX watch counts too — `watch add src/` is the documented way to
+/// subscribe to a module, and an agent that used it must not be told to poll.
+#[test]
+fn a_prefix_watch_also_stops_the_refusal_suggesting_a_subscription() {
+    let tmp = init_repo();
+    let repo = tmp.path();
+    assert_ok(&pact(
+        repo,
+        "holder",
+        &["lease", "acquire", "src/deep/a.rs"],
+    ));
+    assert_ok(&pact(repo, "waiter", &["watch", "add", "src/"]));
+
+    let refused = pact(repo, "waiter", &["lease", "acquire", "src/deep/a.rs"]);
+    assert_eq!(refused.status.code(), Some(2));
+    let err = stderr_of(&refused);
+    assert!(
+        err.contains("you already watch src/deep/a.rs"),
+        "a covering prefix subscription is a subscription: {err}"
+    );
 }
 
 /// pact-mqw.4: two locks, two halves of one question, no cross-check.

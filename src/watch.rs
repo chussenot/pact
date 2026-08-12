@@ -166,6 +166,61 @@ fn covers(watch: &ActiveWatch, released: &str) -> bool {
     watch.prefix && released.starts_with(&format!("{}/", watch.path.trim_end_matches('/')))
 }
 
+/// Was `agent` subscribed to `path` **as of `at`**, replaying the registry to that
+/// instant?
+///
+/// `pact audit` cannot use the live registry (pact-1gv.7): a subscription retired
+/// after the fact would rewrite history, reporting an agent as having had no channel
+/// when it did. Same discipline as judging a hold against the TTL it recorded rather
+/// than today's default.
+///
+/// Last record wins per (agent, path) up to `at`, exactly like [`active`] — so an
+/// `unwatch` before `at` counts as unsubscribed and a re-`add` after it counts as
+/// subscribed again.
+pub fn was_subscribed_at(records: &[WatchRecord], agent: &str, path: &str, at: &str) -> bool {
+    // Parsed instants, never raw strings (pact-rnc.20): two writers reach these
+    // stamps — bd's `Z` and pact's chrono `+00:00` — and `'+'` sorts before `'Z'`,
+    // so a string compare calls an older `Z` stamp newer. An unparsable stamp on
+    // either side is treated as out of range rather than guessed at.
+    let Some(cutoff) = chrono::DateTime::parse_from_rfc3339(at).ok() else {
+        return false;
+    };
+    let mut subscribed = false;
+    for r in records.iter().filter(|r| {
+        r.agent == agent && chrono::DateTime::parse_from_rfc3339(&r.at).is_ok_and(|t| t <= cutoff)
+    }) {
+        let w = ActiveWatch {
+            agent: r.agent.clone(),
+            path: r.path.clone(),
+            prefix: r.prefix,
+            since: r.at.clone(),
+        };
+        if covers(&w, path) {
+            subscribed = r.kind == "watch";
+        }
+    }
+    subscribed
+}
+
+/// Does `agent` already subscribe to `path`, exactly or by a covering prefix?
+///
+/// The question `lease acquire` asks when it has just refused somebody
+/// (pact-1gv.2). A refusal used to be a dead end with exactly one advertised
+/// escape — `--steal` — which is the one action the refused agent should not take.
+/// So polling was the only move it had been told about, and it polled: 24 of the
+/// crucible run's 124 refusals came from an agent that had ALREADY registered a
+/// watch on the path it was being refused. agent-03-r2 asked 13 times for
+/// something it had arranged to be told about.
+///
+/// pact knew. The registry is right here, and the acquire path already reads
+/// neighbouring state to compose its prior-claim and pending-message notes. It
+/// simply never said so at the one moment the answer would have stopped a loop.
+pub fn is_subscribed(repo_root: &Path, agent: &str, path: &str) -> bool {
+    active(repo_root)
+        .map(|ws| ws.iter().any(|w| w.agent == agent && covers(w, path)))
+        .unwrap_or(false)
+}
+
 /// Who should be told that `released` changed, excluding `holder`.
 ///
 /// Excluding the holder is not a nicety: an agent that subscribes to a
@@ -434,6 +489,10 @@ pub fn notify_release(repo_root: &Path, holder: &str, released: &str, old_hash: 
                         message_id: id,
                         protocol_hash: None,
                         head: None,
+                        holder: None,
+                        holder_remaining_secs: None,
+                        holder_branch: None,
+                        holder_worktree: None,
                     },
                 );
             }
@@ -474,6 +533,10 @@ fn log_failure(repo_root: &Path, holder: &str, released: &str, sub: Option<&str>
             message_id: None,
             protocol_hash: None,
             head: None,
+            holder: None,
+            holder_remaining_secs: None,
+            holder_branch: None,
+            holder_worktree: None,
         },
     );
 }
