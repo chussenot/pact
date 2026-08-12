@@ -10,6 +10,27 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.7.7 - 2026-08-12
+#### Bug Fixes
+- **(audit)** count expired-lease reclaims apart from forced steals - (2e83b84) - Clement HUSSENOT-DESENONGES
+- **(audit,lease)** close the displaced holder's window on a takeover - (43ce4f7) - Clement HUSSENOT-DESENONGES
+- **(chaos)** give a once-per-run fault as many attempts as it needs - (7f09cad) - Clement HUSSENOT-DESENONGES
+- **(lease)** release must say whether you actually held it, and take many paths - (c3f766d) - Clement HUSSENOT-DESENONGES
+- **(msg)** recognise the watch notices that predate the watch-notice tag - (167d056) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- **(leases)** write down the successor procedure the protocol asks agents to run - (014ddff) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(audit)** tell a commit made inside somebody else's hold from an unleased one - (ee573cb) - Clement HUSSENOT-DESENONGES
+- **(lease)** flag a lease whose holder has gone quiet for half its ttl - (07d1641) - Clement HUSSENOT-DESENONGES
+- **(lease,audit)** cross-check the bead claim against the file lease - (542adfc) - Clement HUSSENOT-DESENONGES
+- **(lease,audit)** warn when a lease starts from a copy the last holder never left - (e29bcda) - Clement HUSSENOT-DESENONGES
+- **(msg)** keep watch notices out of the inbox agents read for correspondence - (54dba7b) - Clement HUSSENOT-DESENONGES
+- **(scripts)** add chaos.sh, a fault injector with bounded blast radius - (9860a92) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- Add interactions and events - (16f6446) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.7.6 - 2026-08-10
 #### Bug Fixes
 - **(release)** drop the retired macos-13 leg and ship one asset per platform - (90ec727) - Clement HUSSENOT-DESENONGES
