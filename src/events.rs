@@ -15,8 +15,13 @@
 //!   * Garbage lines are skipped, not fatal, exactly as `lease::list` skips
 //!     unparsable lock files.
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+
+/// Only the corrupt-line test writes to the log by hand now that the append
+/// itself lives in [`jsonl`], which brings its own `Write`.
+#[cfg(test)]
+use std::io::Write;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -348,48 +353,265 @@ pub fn chain_hash_of(prev_chain_point: &str, event_json_without_chain_hash: &str
     format!("{hash:016x}")
 }
 
+impl jsonl::Chained for Event {
+    fn chain_hash(&self) -> Option<&str> {
+        self.chain_hash.as_deref()
+    }
+
+    fn set_chain_hash(&mut self, hash: Option<String>) {
+        self.chain_hash = hash;
+    }
+}
+
 /// What `ev`'s `chain_hash` should be, given the chain point it binds to.
 ///
-/// The ONE place this computation happens — [`append_bounded`] calls it to
+/// The ONE place this computation happens — [`jsonl::append`] calls it to
 /// write a new line's hash, and `audit::run_check`'s chain-integrity check
 /// (via [`verify_chain`]) calls it again to recompute what an existing line's
 /// hash should have been. Two implementations of this one rule could drift
 /// apart silently; one function cannot (pact-m7j.2.5).
 fn expected_chain_hash(prev_chain_point: &str, ev: &Event) -> Result<String> {
-    // Cleared, not merely ignored: `ev` may already carry a `chain_hash` (an
-    // event read back from the log, in `verify_chain`'s case), and hashing
-    // over a value that includes itself would make the hash a function of
-    // whatever happened to be there rather than of the event's real content.
-    let mut cleared = ev.clone();
-    cleared.chain_hash = None;
-    let canonical = serde_json::to_string(&cleared)?;
-    Ok(chain_hash_of(prev_chain_point, &canonical))
+    jsonl::expected_hash(prev_chain_point, ev)
 }
 
-/// The chain point the NEXT append should bind to: the nearest line at the
-/// end of the file that parses as an `Event`, and that line's own
-/// `chain_hash` if it has one, or [`CHAIN_GENESIS`] if it does not (an empty
-/// file, one with no chain-tracked lines yet, or whose most recent parseable
-/// line predates chain tracking).
+/// The append-only JSONL discipline, once, for every file that keeps one
+/// (pact-as5.1).
 ///
-/// Deliberately does NOT search further back past that nearest parseable line
-/// for an earlier line that DOES have a `chain_hash`: a torn tail or garbage
-/// line is skipped (it never parses), but a well-formed, untracked line
-/// resets the chain to [`CHAIN_GENESIS`] for whatever comes after it. That
-/// matches how a mixed-age log actually reads: an untracked line is real
-/// history this feature knows nothing about, not a gap to see through.
-fn last_chain_point(path: &Path) -> Result<String> {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(CHAIN_GENESIS.to_string()),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    Ok(contents
-        .lines()
-        .rev()
-        .find_map(|l| serde_json::from_str::<Event>(l).ok())
-        .and_then(|e| e.chain_hash)
-        .unwrap_or_else(|| CHAIN_GENESIS.to_string()))
+/// `.pact/events.jsonl` grew it first; `.pact/watches.jsonl` hand-rolled a
+/// second, weaker copy of it in `watch.rs`; `.pact/messages.jsonl` would have
+/// been a third. So the parts that are the same for all of them live here —
+/// the flock, the chain hash over the previous line, severing a torn tail,
+/// the temp-file-and-rename trim, and the tolerant numbered read — and
+/// everything that genuinely differs is a parameter: the record type, and the
+/// line caps (`None` for a file that is never trimmed, because a subscription
+/// registry and a message store have nothing to do with an event log's
+/// volume).
+///
+/// Deliberately a submodule of `events.rs` rather than a `src/jsonl.rs`:
+/// every primitive it needs — [`chain_hash_of`], [`CHAIN_GENESIS`],
+/// [`unique_temp_name`], [`ends_without_newline`], [`AppendLock`] — is already
+/// here and already carries the doc comment explaining the incident behind it.
+/// Moving them would be a large diff that changed no behaviour and stranded
+/// the reasoning from the code.
+pub(crate) mod jsonl {
+    use std::io::Write;
+    use std::path::Path;
+
+    use anyhow::{Context, Result};
+    use serde::{de::DeserializeOwned, Serialize};
+
+    use super::{chain_hash_of, ends_without_newline, unique_temp_name, AppendLock, CHAIN_GENESIS};
+
+    /// A record that carries its own link to the line physically before it in
+    /// the file.
+    ///
+    /// Two accessors rather than a `&mut Option<String>`, so the field can be
+    /// named or shaped however each record likes; the only thing this discipline
+    /// requires is that a record can be read back and rewritten with its hash
+    /// cleared.
+    pub(crate) trait Chained: Serialize + DeserializeOwned + Clone {
+        fn chain_hash(&self) -> Option<&str>;
+        fn set_chain_hash(&mut self, hash: Option<String>);
+    }
+
+    /// How many lines a file may reach before an append trims it, and how many
+    /// survive the trim. `None` never trims — the right answer for a file whose
+    /// records are not history to be forgotten.
+    ///
+    /// Passed in rather than baked in: the caps are a per-file policy question
+    /// (see [`super::MAX_LINES`] for the event log's, and why the slack between
+    /// the two numbers is what stops every append past the cap from rewriting).
+    pub(crate) type Caps = Option<(usize, usize)>;
+
+    /// What `record`'s `chain_hash` should be, given the chain point it binds
+    /// to.
+    pub(crate) fn expected_hash<T: Chained>(prev_chain_point: &str, record: &T) -> Result<String> {
+        // Cleared, not merely ignored: `record` may already carry a
+        // `chain_hash` (one read back from the file, in `verify_chain`'s case),
+        // and hashing over a value that includes itself would make the hash a
+        // function of whatever happened to be there rather than of the
+        // record's real content.
+        let mut cleared = record.clone();
+        cleared.set_chain_hash(None);
+        let canonical = serde_json::to_string(&cleared)?;
+        Ok(chain_hash_of(prev_chain_point, &canonical))
+    }
+
+    /// The chain point the NEXT append should bind to: the nearest line at the
+    /// end of the file that parses as a `T`, and that line's own `chain_hash`
+    /// if it has one, or [`CHAIN_GENESIS`] if it does not (an empty file, one
+    /// with no chain-tracked lines yet, or whose most recent parseable line
+    /// predates chain tracking).
+    ///
+    /// Deliberately does NOT search further back past that nearest parseable
+    /// line for an earlier line that DOES have a `chain_hash`: a torn tail or
+    /// garbage line is skipped (it never parses), but a well-formed, untracked
+    /// line resets the chain to [`CHAIN_GENESIS`] for whatever comes after it.
+    /// That matches how a mixed-age file actually reads: an untracked line is
+    /// real history this feature knows nothing about, not a gap to see through.
+    pub(crate) fn last_chain_point<T: Chained>(path: &Path) -> Result<String> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(CHAIN_GENESIS.to_string())
+            }
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        Ok(contents
+            .lines()
+            .rev()
+            .find_map(|l| serde_json::from_str::<T>(l).ok())
+            .and_then(|r| r.chain_hash().map(str::to_string))
+            .unwrap_or_else(|| CHAIN_GENESIS.to_string()))
+    }
+
+    /// Append one chained record to `path`, trimming afterwards if `caps` says
+    /// to.
+    ///
+    /// Locking here is shared/exclusive, not "trim-only": a plain append takes
+    /// a cheap **shared** lock (any number of appenders hold it at once, so
+    /// they never serialize against each other — the common case still pays
+    /// only one extra `flock` syscall, not a queue), and the trim's
+    /// read-modify-rename takes an **exclusive** one. A first pass guarded only
+    /// the trim branch, on the theory that `O_APPEND` writes need no
+    /// coordination at all — true for two plain appends racing each other, but
+    /// not for a plain append racing a CONCURRENT trim's rename: a write
+    /// landing in the gap between the trim's fresh read and its rename goes to
+    /// the inode the rename is about to orphan, and is silently gone once the
+    /// rename swaps the directory entry to the freshly-written one. A test with
+    /// real concurrent writers reproduced that loss reliably even with the
+    /// trim-only guard, which is what the shared lock on the plain append
+    /// actually closes.
+    pub(crate) fn append<T: Chained>(path: &Path, record: &T, caps: Caps) -> Result<()> {
+        {
+            // Shared: blocks only while a trim (below) holds the exclusive
+            // lock, and does not serialize against other appenders holding
+            // this same shared lock.
+            let _guard = AppendLock::acquire_shared(path)?;
+            // The torn-tail check happens under the lock too, so it never reads
+            // a file mid-rewrite by a concurrent trim.
+            let sever_torn_tail = ends_without_newline(path)?;
+            // ponytail: read under the SHARED lock, so this still races another
+            // appender that is also (legitimately) holding a shared lock at the
+            // same instant — shared locks don't serialize against each other by
+            // design, see above. Two truly simultaneous appends can each read
+            // the same prior chain point and both chain from it, which
+            // `events::verify_chain` then reads as a broken link on one of them
+            // even though both writes are genuine. Closing it means computing
+            // the chain point under the EXCLUSIVE lock instead, which would
+            // serialize every append and undo the throughput property the
+            // shared lock above exists to provide — not a trade worth making
+            // for an informational-only check (pact-m7j.2.5) against a race
+            // that needs two writers hitting the very same repo in the very
+            // same instant, which real pact usage does not do (lease ops run at
+            // agent speed, not in a tight loop). Upgrade path if that ever
+            // stops being true: fold this read into the exclusive-lock section
+            // below.
+            let prev_chain_point = last_chain_point::<T>(path)?;
+            let mut chained = record.clone();
+            chained.set_chain_hash(Some(expected_hash(&prev_chain_point, &chained)?));
+            let line = serde_json::to_string(&chained)?;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("opening {}", path.display()))?;
+            // One `write_all` call, not `writeln!` (which would emit the line
+            // and the trailing newline as two separate `write_str`/`write`
+            // calls): a shared lock deliberately allows other appenders to hold
+            // it at the same time, and `O_APPEND` only makes a SINGLE
+            // `write(2)` atomic with respect to them — two separate writes for
+            // one logical line leaves a window where a concurrent appender's
+            // write lands between them, gluing two records into one unparseable
+            // line with no lock able to prevent it. A leading `\n` (severing a
+            // torn tail from a prior failed write, see `ends_without_newline`)
+            // is folded into the same buffer for the same reason.
+            let mut buf = String::with_capacity(line.len() + 2);
+            if sever_torn_tail {
+                buf.push('\n');
+            }
+            buf.push_str(&line);
+            buf.push('\n');
+            f.write_all(buf.as_bytes())
+                .with_context(|| format!("appending to {}", path.display()))?;
+        }
+
+        let Some((max_lines, keep_lines)) = caps else {
+            return Ok(());
+        };
+        // Reading the file back on every append is a few hundred microseconds
+        // at these caps, and the operations that log happen at agent speed, not
+        // in a loop. This is a cheap, UNLOCKED read purely to decide whether
+        // trimming is worth even trying — the exclusive lock below is only
+        // taken when it is.
+        let contents = std::fs::read_to_string(path)?;
+        if contents.lines().count() > max_lines {
+            // Two writers racing this branch used to each snapshot the file,
+            // trim their own stale copy, and rename over each other — the
+            // loser's rename replaced the directory entry with a file built
+            // before the winner's record existed, discarding it with no error
+            // and no signal. The exclusive lock makes the two rewrites mutually
+            // exclusive, and also excludes any plain append from landing
+            // mid-rewrite (see the shared lock above).
+            let _guard = AppendLock::acquire_exclusive(path)?;
+            // Re-read now that we hold the lock: any append that landed between
+            // the unlocked read above and here must be picked up before we
+            // decide what to keep.
+            let fresh = std::fs::read_to_string(path)?;
+            let fresh_lines = fresh.lines().count();
+            if fresh_lines > max_lines {
+                let kept: Vec<&str> = fresh
+                    .lines()
+                    .skip(fresh_lines.saturating_sub(keep_lines))
+                    .collect();
+                // Rewrite via temp + rename so a reader never sees a
+                // half-trimmed file.
+                let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("jsonl");
+                let tmp = path.with_file_name(unique_temp_name(&format!("{stem}.tmp")));
+                std::fs::write(&tmp, kept.join("\n") + "\n")?;
+                std::fs::rename(&tmp, path)?;
+            }
+            // else: a concurrent trim (seen in the fresh read) already brought
+            // the file back under the cap; nothing left to do.
+        }
+        Ok(())
+    }
+
+    /// Every record in `path` paired with its 1-based line number, plus how
+    /// many lines could not be parsed at all.
+    ///
+    /// The line number **is** the record id for files that have no other one.
+    /// Inventing an identifier would mean rewriting a file whose only virtue is
+    /// being append-only — whereas "line 47 of .pact/events.jsonl" is stable
+    /// for a given file and a human can go and look at it.
+    ///
+    /// Unparseable lines are counted rather than discarded silently. An
+    /// append-only file gets cut mid-write, so a truncated final line is
+    /// expected rather than corrupt; the count lets a reader tell "this has a
+    /// torn tail" from "this is full of junk". Blank lines are neither returned
+    /// nor counted — they are not a record and not a failure to parse one. A
+    /// missing file is an empty file, not an error; any OTHER read failure is
+    /// reported, because "I could not read it" and "there is nothing in it" are
+    /// different answers.
+    pub(crate) fn read<T: DeserializeOwned>(path: &Path) -> Result<(Vec<(usize, T)>, usize)> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let mut out = Vec::new();
+        let mut skipped = 0;
+        for (i, line) in contents.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<T>(line) {
+                Ok(r) => out.push((i + 1, r)),
+                Err(_) => skipped += 1,
+            }
+        }
+        Ok((out, skipped))
+    }
 }
 
 /// One line whose `chain_hash` does not match what [`expected_chain_hash`]
@@ -509,133 +731,41 @@ pub fn append(repo_root: &Path, ev: &Event) {
 /// The fallible body of [`append`], with the cap injected so tests don't have
 /// to write 5000 lines to exercise trimming.
 ///
-/// Locking here is shared/exclusive, not "trim-only": a plain append takes a
-/// cheap **shared** lock (any number of appenders hold it at once, so they
-/// never serialize against each other — the common case still pays only one
-/// extra `flock` syscall, not a queue), and the trim's read-modify-rename
-/// takes an **exclusive** one. A first pass guarded only the trim branch, on
-/// the theory that `O_APPEND` writes need no coordination at all — true for
-/// two plain appends racing each other, but not for a plain append racing a
-/// CONCURRENT trim's rename: a write landing in the gap between the trim's
-/// fresh read and its rename goes to the inode the rename is about to orphan,
-/// and is silently gone once the rename swaps the directory entry to the
-/// freshly-written one. A test with real concurrent writers reproduced that
-/// loss reliably even with the trim-only guard, which is what the shared lock
-/// on the plain append actually closes.
+/// Everything about the write itself — the lock, the chain hash, the torn
+/// tail, the trim — lives in [`jsonl::append`], which `watch.rs` and the
+/// message store share. What is left here is the part that is only true of the
+/// event log: where the file is, its caps, and the invocation context every
+/// event carries.
 fn append_bounded(repo_root: &Path, ev: &Event, max_lines: usize, keep_lines: usize) -> Result<()> {
     let path = events_file(repo_root)?;
-
-    {
-        // Shared: blocks only while a trim (below) holds the exclusive lock,
-        // and does not serialize against other appenders holding this same
-        // shared lock.
-        let _guard = EventsFileLock::acquire_shared(&path)?;
-        // The torn-tail check happens under the lock too, so it never reads a
-        // file mid-rewrite by a concurrent trim.
-        let sever_torn_tail = ends_without_newline(&path)?;
-        // ponytail: read under the SHARED lock, so this still races another
-        // appender that is also (legitimately) holding a shared lock at the
-        // same instant — shared locks don't serialize against each other by
-        // design, see above. Two truly simultaneous appends can each read the
-        // same prior chain point and both chain from it, which
-        // `audit::verify_chain` then reads as a broken link on one of them
-        // even though both writes are genuine. Closing it means computing the
-        // chain point under the EXCLUSIVE lock instead, which would serialize
-        // every append and undo the throughput property the shared lock above
-        // exists to provide — not a trade worth making for an
-        // informational-only check (pact-m7j.2.5) against a race that needs
-        // two writers hitting the very same repo in the very same instant,
-        // which real pact usage does not do (lease ops run at agent speed,
-        // not in a tight loop). Upgrade path if that ever stops being true:
-        // fold this read into the exclusive-lock section below.
-        let prev_chain_point = last_chain_point(&path)?;
-        let mut chained = ev.clone();
-        // Stamped HERE, in the one funnel every event of every kind passes
-        // through, and before the chain hash is computed (pact-ler.1).
-        //
-        // Not at the call sites: `log_event` is the common path but not the
-        // only one — `release_fs`'s force-release bypasses it to set
-        // `displaced`, and any future kind is one more place to forget. A
-        // field documented as unconditional has to be unforgettable, and a
-        // per-call-site stamp is exactly how `branch`/`worktree` ended up
-        // conditional in the first place.
-        stamp_context(repo_root, &mut chained);
-        // Over `chained`, not `ev`: the context fields are part of what the
-        // chain attests to, so a forged line cannot strip or rewrite them and
-        // still verify.
-        chained.chain_hash = Some(expected_chain_hash(&prev_chain_point, &chained)?);
-        let line = serde_json::to_string(&chained)?;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
-        // One `write_all` call, not `writeln!` (which would emit the line and
-        // the trailing newline as two separate `write_str`/`write` calls): a
-        // shared lock deliberately allows other appenders to hold it at the
-        // same time, and `O_APPEND` only makes a SINGLE `write(2)` atomic with
-        // respect to them — two separate writes for one logical line leaves a
-        // window where a concurrent appender's write lands between them,
-        // gluing two events into one unparseable line with no lock able to
-        // prevent it. A leading `\n` (severing a torn tail from a prior
-        // failed write, see `ends_without_newline`) is folded into the same
-        // buffer for the same reason.
-        let mut buf = String::with_capacity(line.len() + 2);
-        if sever_torn_tail {
-            buf.push('\n');
-        }
-        buf.push_str(&line);
-        buf.push('\n');
-        f.write_all(buf.as_bytes())
-            .with_context(|| format!("appending to {}", path.display()))?;
-    }
-
-    // Reading the file back on every append is a few hundred microseconds at
-    // this cap, and lease operations happen at agent speed, not in a loop.
-    // This is a cheap, UNLOCKED read purely to decide whether trimming is
-    // worth even trying — the exclusive lock below is only taken when it is.
-    let contents = std::fs::read_to_string(&path)?;
-    if contents.lines().count() > max_lines {
-        // Two writers racing this branch used to each snapshot the file, trim
-        // their own stale copy, and rename over each other — the loser's
-        // rename replaced the directory entry with a file built before the
-        // winner's event existed, discarding it with no error and no signal.
-        // The exclusive lock makes the two rewrites mutually exclusive, and
-        // also excludes any plain append from landing mid-rewrite (see the
-        // shared lock above).
-        let _guard = EventsFileLock::acquire_exclusive(&path)?;
-        // Re-read now that we hold the lock: any append that landed between
-        // the unlocked read above and here must be picked up before we decide
-        // what to keep.
-        let fresh = std::fs::read_to_string(&path)?;
-        let fresh_lines = fresh.lines().count();
-        if fresh_lines > max_lines {
-            let kept: Vec<&str> = fresh
-                .lines()
-                .skip(fresh_lines.saturating_sub(keep_lines))
-                .collect();
-            // Rewrite via temp + rename so a reader never sees a half-trimmed
-            // file.
-            let tmp = path.with_file_name(unique_temp_name("events.jsonl.tmp"));
-            std::fs::write(&tmp, kept.join("\n") + "\n")?;
-            std::fs::rename(&tmp, &path)?;
-        }
-        // else: a concurrent trim (seen in the fresh read) already brought the
-        // file back under the cap; nothing left to do.
-    }
-    Ok(())
+    let mut stamped = ev.clone();
+    // Stamped HERE, in the one funnel every event of every kind passes
+    // through, and before the chain hash is computed (pact-ler.1).
+    //
+    // Not at the call sites: `log_event` is the common path but not the
+    // only one — `release_fs`'s force-release bypasses it to set
+    // `displaced`, and any future kind is one more place to forget. A
+    // field documented as unconditional has to be unforgettable, and a
+    // per-call-site stamp is exactly how `branch`/`worktree` ended up
+    // conditional in the first place.
+    //
+    // Before `jsonl::append`, never after: the context fields are part of what
+    // the chain attests to, so a forged line cannot strip or rewrite them and
+    // still verify.
+    stamp_context(repo_root, &mut stamped);
+    jsonl::append(&path, &stamped, Some((max_lines, keep_lines)))
 }
 
-/// Guards `append_bounded`'s write path against its own trim: shared while
+/// Guards [`jsonl::append`]'s write path against its own trim: shared while
 /// appending, exclusive while trimming, so the two can never interleave.
 ///
-/// A dedicated sidecar file (`events.jsonl.trimlock`), never `events.jsonl`
-/// itself: `flock` exclusivity is per-inode, and the trim branch replaces
-/// `events.jsonl`'s inode via `rename`, so locking the path being renamed
-/// would stop protecting anything the instant the rename happened — a holder
-/// with the old inode open and a newcomer who just opened the new one would
-/// hold unrelated locks. The sidecar's inode never changes, so every caller's
-/// lock is always on the same target.
+/// A dedicated sidecar file (`<file>.jsonl.trimlock`), never the jsonl file
+/// itself: `flock` exclusivity is per-inode, and the trim branch replaces that
+/// file's inode via `rename`, so locking the path being renamed would stop
+/// protecting anything the instant the rename happened — a holder with the old
+/// inode open and a newcomer who just opened the new one would hold unrelated
+/// locks. The sidecar's inode never changes, so every caller's lock is always
+/// on the same target.
 ///
 /// Deliberately NOT `lease.rs`'s `WriteGuard`, despite being the same
 /// `flock(2)` pattern: importing it here would couple two unrelated
@@ -645,12 +775,12 @@ fn append_bounded(repo_root: &Path, ev: &Event, max_lines: usize, keep_lines: us
 /// `WriteGuard`'s guard file never is (see its doc comment in lease.rs):
 /// unlinking a live flock target while another waiter might be about to open
 /// that same name reopens the exact race this exists to prevent.
-struct EventsFileLock {
+struct AppendLock {
     _file: std::fs::File,
 }
 
 #[cfg(unix)]
-mod events_lock_ffi {
+mod append_lock_ffi {
     use std::os::unix::io::RawFd;
 
     extern "C" {
@@ -674,10 +804,10 @@ mod events_lock_ffi {
     }
 }
 
-impl EventsFileLock {
+impl AppendLock {
     #[cfg(unix)]
-    fn acquire(events_path: &Path, operation: i32) -> Result<Self> {
-        let mut lock_name = events_path.as_os_str().to_owned();
+    fn acquire(jsonl_path: &Path, operation: i32) -> Result<Self> {
+        let mut lock_name = jsonl_path.as_os_str().to_owned();
         lock_name.push(".trimlock");
         let path = PathBuf::from(lock_name);
         // Never `create_new`: every writer opens this SAME file concurrently
@@ -689,31 +819,31 @@ impl EventsFileLock {
             .truncate(false)
             .write(true)
             .open(&path)
-            .with_context(|| format!("opening events lock {}", path.display()))?;
+            .with_context(|| format!("opening append lock {}", path.display()))?;
         use std::os::unix::io::AsRawFd;
-        events_lock_ffi::lock(file.as_raw_fd(), operation)
+        append_lock_ffi::lock(file.as_raw_fd(), operation)
             .with_context(|| format!("locking {}", path.display()))?;
         Ok(Self { _file: file })
     }
 
     #[cfg(unix)]
-    fn acquire_shared(events_path: &Path) -> Result<Self> {
-        Self::acquire(events_path, events_lock_ffi::LOCK_SH)
+    fn acquire_shared(jsonl_path: &Path) -> Result<Self> {
+        Self::acquire(jsonl_path, append_lock_ffi::LOCK_SH)
     }
 
     #[cfg(unix)]
-    fn acquire_exclusive(events_path: &Path) -> Result<Self> {
-        Self::acquire(events_path, events_lock_ffi::LOCK_EX)
+    fn acquire_exclusive(jsonl_path: &Path) -> Result<Self> {
+        Self::acquire(jsonl_path, append_lock_ffi::LOCK_EX)
     }
 
     #[cfg(not(unix))]
-    fn acquire_shared(_events_path: &Path) -> Result<Self> {
-        compile_error!("EventsFileLock requires flock(2); pact does not build on non-Unix");
+    fn acquire_shared(_jsonl_path: &Path) -> Result<Self> {
+        compile_error!("AppendLock requires flock(2); pact does not build on non-Unix");
     }
 
     #[cfg(not(unix))]
-    fn acquire_exclusive(_events_path: &Path) -> Result<Self> {
-        compile_error!("EventsFileLock requires flock(2); pact does not build on non-Unix");
+    fn acquire_exclusive(_jsonl_path: &Path) -> Result<Self> {
+        compile_error!("AppendLock requires flock(2); pact does not build on non-Unix");
     }
 }
 
@@ -721,17 +851,7 @@ impl EventsFileLock {
 /// like a log), at most `limit`. A missing file is an empty feed, not an error.
 /// Unparsable lines are skipped.
 pub fn recent(repo_root: &Path, limit: usize) -> Result<Vec<Event>> {
-    let path = events_file_path(repo_root);
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-
-    let events: Vec<Event> = contents
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
+    let events = all(repo_root)?;
     let start = events.len().saturating_sub(limit);
     Ok(events[start..].to_vec())
 }
@@ -973,24 +1093,7 @@ fn all(repo_root: &Path) -> Result<Vec<Event>> {
 /// corrupt; `pact audit` reports the count so a reader can tell "the log has a
 /// torn tail" from "the log is full of junk".
 pub(crate) fn numbered(repo_root: &Path) -> Result<(Vec<(usize, Event)>, usize)> {
-    let path = events_file_path(repo_root);
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let mut out = Vec::new();
-    let mut skipped = 0;
-    for (i, line) in contents.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<Event>(line) {
-            Ok(e) => out.push((i + 1, e)),
-            Err(_) => skipped += 1,
-        }
-    }
-    Ok((out, skipped))
+    jsonl::read(&events_file_path(repo_root))
 }
 
 #[cfg(test)]

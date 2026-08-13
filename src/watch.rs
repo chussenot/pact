@@ -48,14 +48,16 @@
 //! from agents that no longer exist.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::events::{chain_hash_of, CHAIN_GENESIS};
+/// Only the chain-hash test reaches for this directly now that the append
+/// itself is shared — see `events::jsonl`.
+#[cfg(test)]
+use crate::events::chain_hash_of;
 
 /// One append to the registry: a subscription, or the tombstone retiring it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +89,16 @@ pub struct WatchRecord {
     pub chain_hash: Option<String>,
 }
 
+impl crate::events::jsonl::Chained for WatchRecord {
+    fn chain_hash(&self) -> Option<&str> {
+        self.chain_hash.as_deref()
+    }
+
+    fn set_chain_hash(&mut self, hash: Option<String>) {
+        self.chain_hash = hash;
+    }
+}
+
 /// A subscription that is currently in force.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ActiveWatch {
@@ -111,23 +123,21 @@ fn watches_file_path(repo_root: &Path) -> PathBuf {
 /// Every record in the file, oldest first, plus how many lines were
 /// unreadable.
 ///
-/// Tolerant in the same two ways the event log is: a torn final line from an
-/// interrupted append is expected rather than corrupt, and an unknown `kind`
-/// parses fine and is simply ignored by [`active`].
+/// Tolerant in the same two ways the event log is, because it is now literally
+/// the same read (`events::jsonl::read`): a torn final line from an interrupted
+/// append is expected rather than corrupt, and an unknown `kind` parses fine
+/// and is simply ignored by [`active`].
+///
+/// `unwrap_or_default` where the event log propagates: a registry that cannot
+/// be read means "nobody is watching", because every caller here — `watch ls`,
+/// `lease release`'s fanout, `pact audit` — has a sensible answer for an empty
+/// registry and none at all for an error. Line numbers are dropped: a
+/// subscription is identified by `(agent, path)`, never by where it landed in
+/// the file.
 pub fn records(repo_root: &Path) -> Result<(Vec<WatchRecord>, usize)> {
-    let path = watches_file_path(repo_root);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok((Vec::new(), 0));
-    };
-    let mut out = Vec::new();
-    let mut skipped = 0;
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        match serde_json::from_str::<WatchRecord>(line) {
-            Ok(r) => out.push(r),
-            Err(_) => skipped += 1,
-        }
-    }
-    Ok((out, skipped))
+    let (rows, skipped) = crate::events::jsonl::read::<WatchRecord>(&watches_file_path(repo_root))
+        .unwrap_or_default();
+    Ok((rows.into_iter().map(|(_, r)| r).collect(), skipped))
 }
 
 /// The subscriptions in force, resolved by replaying the log.
@@ -238,45 +248,14 @@ pub fn subscribers_for(repo_root: &Path, released: &str, holder: &str) -> Result
 }
 
 /// Append one record, chained to whatever is already at the end of the file.
-fn append(repo_root: &Path, mut record: WatchRecord) -> Result<()> {
-    let path = watches_file(repo_root)?;
-    let prev = last_chain_point(&path);
-    let mut unchained = record.clone();
-    unchained.chain_hash = None;
-    let canonical = serde_json::to_string(&unchained)?;
-    record.chain_hash = Some(chain_hash_of(&prev, &canonical));
-
-    let line = serde_json::to_string(&record)?;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    // One `write_all`, never `writeln!`: `O_APPEND` makes a single `write(2)`
-    // atomic against other appenders, and two calls leaves a window where a
-    // concurrent writer's line lands between them. Same reasoning, and the
-    // same bug, as `events::append_bounded`.
-    let mut buf = String::with_capacity(line.len() + 1);
-    buf.push_str(&line);
-    buf.push('\n');
-    f.write_all(buf.as_bytes())
-        .with_context(|| format!("appending to {}", path.display()))?;
-    Ok(())
-}
-
-/// The chain point the next append binds to: the last parseable line's own
-/// hash, or [`CHAIN_GENESIS`]. Identical rule to the event log's, so a run of
-/// untracked lines resets the chain rather than reaching back past them.
-fn last_chain_point(path: &Path) -> String {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return CHAIN_GENESIS.to_string();
-    };
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<WatchRecord>(l).ok())
-        .next_back()
-        .and_then(|r| r.chain_hash)
-        .unwrap_or_else(|| CHAIN_GENESIS.to_string())
+///
+/// `None` caps: this file is never trimmed. A subscription is not history that
+/// grows without bound — it is one line per `watch add`/`watch rm` from a
+/// fleet's worth of agents, and forgetting the oldest of them would silently
+/// unsubscribe somebody rather than merely losing a statistic. The event log's
+/// bound is a policy about ITS volume, which is why the caps are a parameter.
+fn append(repo_root: &Path, record: WatchRecord) -> Result<()> {
+    crate::events::jsonl::append(&watches_file(repo_root)?, &record, None)
 }
 
 /// Subscribe `agent` to `raw_path`.
