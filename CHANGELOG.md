@@ -10,6 +10,27 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.9.0 - 2026-08-13
+#### Bug Fixes
+- **(msg)** commit the message store, as the design says - (4000384) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- pact has no runtime backend, and every page said otherwise - (26c3974) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(bench)** measure the lease hot path, and find a subprocess on it - (d5442aa) - Clement HUSSENOT-DESENONGES
+- **(msg)** own the message store, so pact needs no runtime backend - (72d5523) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(pact)** commit this fleet's coordination record - (304c122) - Clement HUSSENOT-DESENONGES
+#### Performance Improvements
+- **(lease)** resolve HEAD once per command, and parse the event log once - (983876c) - Clement HUSSENOT-DESENONGES
+#### Refactoring
+- **(audit)** read claim assignees from the committed beads export - (d4ed339) - Clement HUSSENOT-DESENONGES
+- **(beads)** demote bd to a task tracker pact only reads - (bee71aa) - Clement HUSSENOT-DESENONGES
+- **(events)** extract the append-only jsonl discipline once - (e0246a1) - Clement HUSSENOT-DESENONGES
+#### Tests
+- **(canary)** prove read tolerance against real bd exports, not send round-trips - (40b8558) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.8.0 - 2026-08-13
 #### Features
 - **(beads)** drop br support; 0.7.9 was the last release that had it - (4212cfa) - Clement HUSSENOT-DESENONGES
