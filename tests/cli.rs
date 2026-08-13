@@ -2485,6 +2485,76 @@ fn json_shapes_of_every_msg_command() {
 
 // -------------------------------------------------------------- exit codes
 
+/// Exit 3 is RETIRED, and this is what "retired" has to mean: no command raises
+/// it, not merely no `msg` command.
+///
+/// It meant "Beads backend unavailable", and until 0.9.0 every `pact msg` located
+/// and ran a Beads CLI first, so it was the routine answer to no `bd` on `PATH`.
+/// The single site that returns it is `BeadsCli::locate`, and all four of its
+/// callers now catch it: `doctor` turns it into a check, `whoami` into a problem it
+/// exits 0 despite, and `pact ui` into a line in its status pane.
+///
+/// The code is not recycled for a new meaning, so this test pins absence rather
+/// than a replacement: a wrapper written against 0.8.x still tests for 3, and a
+/// re-used code is how such a wrapper silently starts doing the wrong thing.
+///
+/// bd is hidden but git is KEPT. pact needs git — repo resolution, and HEAD for a
+/// watch notice's diff — so a wholly empty PATH would prove something else.
+#[test]
+fn no_command_exits_3_with_no_beads_cli_on_path() {
+    let tmp = init_repo();
+    let repo = tmp.path();
+    let nobd = repo.join("no-bd");
+    std::fs::create_dir_all(&nobd).unwrap();
+    if let Ok(git) = which_git() {
+        std::os::unix::fs::symlink(git, nobd.join("git")).ok();
+    }
+    std::fs::write(repo.join("f.txt"), "x\n").unwrap();
+    // A Beads store present but unreadable-by-subprocess is the tempting case: it is
+    // what makes a lazy implementation reach for `bd`.
+    std::fs::create_dir_all(repo.join(".beads")).unwrap();
+    std::fs::write(
+        repo.join(".beads/interactions.jsonl"),
+        "{\"kind\":\"field_change\",\"issue_id\":\"x-abc\",\"created_at\":\"2026-08-13T00:00:00Z\",\"extra\":{\"field\":\"assignee\",\"new_value\":\"someone\"}}\n",
+    )
+    .unwrap();
+
+    let surface: &[&[&str]] = &[
+        &["whoami"],
+        &["doctor"],
+        &["init", "--no-commit"],
+        &["agents"],
+        &["log"],
+        &["lease", "ls"],
+        &["lease", "acquire", "f.txt", "--note", "x-abc: probing"],
+        &["lease", "renew", "f.txt"],
+        &["msg", "inbox"],
+        &["msg", "inbox", "--include-watch"],
+        &["msg", "sent"],
+        &["msg", "send", "--to", "peer", "body"],
+        &["msg", "read", "pact-msg-nosuch"],
+        &["watch", "add", "f.txt"],
+        &["watch", "ls"],
+        &["watch", "rm", "f.txt"],
+        &["lease", "release", "--all"],
+        &["audit"],
+        &["audit", "--check", "claim-lease-divergence"],
+        &["audit", "--check", "double-win"],
+    ];
+    for args in surface {
+        let mut cmd = pact_cmd(repo, args);
+        cmd.env("PACT_AGENT", "exit3-agent").env("PATH", &nobd);
+        let out = cmd.output().expect("failed to run pact binary");
+        assert_ne!(
+            out.status.code(),
+            Some(3),
+            "`pact {}` exited 3, which is retired\nstderr: {}",
+            args.join(" "),
+            stderr_of(&out)
+        );
+    }
+}
+
 /// Exit 2 is documented as "lease held by another agent", and the protocol
 /// block tells agents to branch on the code rather than the message text. clap
 /// also exits 2 for any usage error, so that instruction was unfollowable: two
@@ -5300,4 +5370,15 @@ fn watch_events_carry_no_head_but_hold_boundaries_do() {
             _ => assert!(!has_head, "{kind} must not carry head: {e}"),
         }
     }
+}
+
+/// The real `git`, for a PATH that hides `bd` but must not hide git.
+fn which_git() -> Result<std::path::PathBuf, ()> {
+    std::env::var_os("PATH")
+        .and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join("git"))
+                .find(|c| c.is_file())
+        })
+        .ok_or(())
 }
