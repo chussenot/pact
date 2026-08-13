@@ -289,33 +289,27 @@ may edit the **files**. They are separate locks, and pact grants the second with
 consulting the first — so an agent that *lost* the bead claim can still be handed
 every lease that bead names.
 
-That is not hypothetical. From one run, verbatim:
-
-> a race let me briefly hold `src/main.rs`+`src/lib.rs` for `crucible-2o3.27`
-> after `bd update --claim` had already lost that bead to agent-07 — pact granted
-> the lease with no cross-check against bd claim state. I released immediately and
-> told agent-07.
-
-It self-corrected because an agent noticed. Two more agents hit the same shape in
-the same run.
+It has happened in a real run, three times, and self-corrected only because an
+agent noticed and volunteered a release
+([evidence](studies/field-runs.md#run-4-crucible-built-to-hurt)).
 
 The protocol says claim first, lease second, which makes the claim look like the
 serialization point. **It is not** — the lease is what protects the file. So when
 an acquire note names a bead, pact looks it up:
 
 ```
-note: your lease note names crucible-2o3.27, which bd says is assigned to
-agent-07, not agent-06 — the bead claim and the file lease are separate locks,
-and pact just granted you the second without the first. If you lost
-`bd update --claim` for this bead, release and tell agent-07
-(`pact msg send --to agent-07`) rather than editing behind them
+note: your lease note names proj-abc, which bd says is assigned to agent-b, not
+agent-a — the bead claim and the file lease are separate locks, and pact just
+granted you the second without the first. If you lost `bd update --claim` for
+this bead, release and tell agent-b (`pact msg send --to agent-b`) rather than
+editing behind them
 ```
 
 One lookup per `acquire` command, not per path, since the note is shared across a
 batch. It is **silent on every failure** — no note, no bead id in it, no backend,
-no such bead, no assignee, or an assignee that is you. Three Beads outages happened
-in that one run, and a warning that fires when the store is down is a warning
-agents learn to ignore.
+no such bead, no assignee, or an assignee that is you. Backend outages are normal —
+three happened in that one run — and a warning that fires when the store is down is
+a warning agents learn to ignore.
 
 Which is also why this is a note and not a refusal. pact cannot know whether the
 assignee is stale, whether the bead was handed over verbally, or whether bd is
@@ -341,23 +335,22 @@ Both leases were honoured. Neither agent broke the protocol. **The conflict is
 deferred to a merge performed later, by someone else, with no lease held by
 anyone and pact not involved** — and that merge is where the corruption lands.
 
-Three instances in one 85-minute run: duplicate match arms in `src/printer.rs`,
-six duplicate test functions in `src/parser.rs` (E0428), and a near-miss where a
-successor agent found that applying a stashed diff would have silently reverted a
-peer's `Expr::If`. **No conflict marker was ever produced in any of them.** git
-merged both insertions cleanly because they were textually non-adjacent — exactly
-the shape an additive change to a shared enum or `match` has, which is the shape
-this topology encourages and a designed hot file attracts.
+**git will usually merge both edits with no conflict marker**, because an additive
+change to a shared `enum` or `match` is textually non-adjacent — which is exactly
+the shape this topology encourages and a designed hot file attracts. One run
+produced three instances that way, including duplicate match arms and six
+duplicate test functions, none of them conflicting
+([evidence](studies/field-runs.md#run-4-crucible-built-to-hurt)).
 
 So `lease acquire` compares the path's content hash in *your* worktree against the
 hash the last agent left when they released it, and says so when they differ:
 
 ```
-warning: your copy of src/printer.rs is NOT the copy agent-05 left when they
+warning: your copy of src/render.rs is NOT the copy agent-b left when they
 released it at 2026-08-11T09:10:00Z — a lease is exclusive in time, not across
 worktrees, so you may be about to edit a branch that never contained their
 change. git will often merge both edits with no conflict marker. Reconcile first
-(`git merge`/`git rebase`, or `pact msg send --to-owner-of src/printer.rs`)
+(`git merge`/`git rebase`, or `pact msg send --to-owner-of src/render.rs`)
 rather than at merge time, when both plans are sunk cost.
 ```
 
@@ -434,20 +427,16 @@ TTL (default 2700 seconds, 45 minutes) plus a fixed 30-second grace period that
 absorbs clock drift between machines — a lease is only treated as expired once
 `now > acquired_at + ttl + 30s`.
 
-That default is **calibrated, not chosen**. It was 900s until 2026-08-06, when
-`pact audit` measured this repository's own 147 preserved events: median hold
-842s, p90 1455s, longest 2166s — and **one renewal in the whole history**. So the
-p90 agent was running 9 minutes past expiry and the longest 21 minutes past, each
-one stealable while its holder was still working. The protocol asks agents to
-renew; the data says they do not, once, ever. Rather than demand ceremony that is
-demonstrably skipped, the default now covers the work agents actually do: 1.85x
-the measured p90, 1.25x the longest hold ever recorded.
+That default is **calibrated, not chosen.** It was 900s until measurement showed
+the p90 agent running nine minutes past expiry and the longest twenty-one minutes
+past, each one stealable while its holder was still working — against exactly *one*
+renewal in the whole recorded history. The protocol asks agents to renew; the data
+says they do not. Rather than demand ceremony that is demonstrably skipped, the
+default covers the work agents actually do
+([the numbers](studies/dogfooding.md), and the caveat that no peer had ever
+actually reclaimed one of those holds).
 
-One honest limit on that evidence: there are **zero** expiry events in that
-history. Holds did outrun their TTL, but no peer ever actually reclaimed one. The
-bump closes a demonstrated exposure window, not a demonstrated collision.
-
-Recalibrating is now a measurement rather than a guess, and safely so:
+Recalibrating is a measurement rather than a guess, and safely so:
 [`pact audit --check stale-holds`](audit.md#--check-stale-holds) judges each hold
 against the TTL **it recorded**, so moving the default cannot rewrite the past.
 
@@ -484,18 +473,15 @@ looking — see [The event log](#the-event-log) below.
 three different situations, one of which was "you have not held this for the last
 ninety seconds".
 
-That is the crucible sequence, verbatim: agent-08's lease lapsed at 09:12:32Z and
-a peer's `lease ls` collected the lock. The agent committed at 09:14:01Z, released,
-was told it had released cleanly, and found out otherwise only by reading
-`events.jsonl` afterwards.
-
-The reason that matters is not tidiness. **`release` is where an agent confirms it
-played by the rules, and the binding rule is commit-before-release.** An agent that
-overruns its TTL, commits, and releases sees an unbroken success path and concludes
-it complied. It did not: for ninety seconds the path was free, and any peer could
-have taken it and edited from a different worktree — the
-[divergence hazard](#a-lease-is-exclusive-in-time-not-across-worktrees) below.
-Nobody did, and that was luck, not coordination.
+**`release` is where an agent confirms it played by the rules, and the binding rule
+is commit-before-release.** An agent whose TTL ran out under it, which then commits
+and releases, saw an unbroken success path and concluded it had complied. It had
+not: the path was free for that whole window, and any peer could have taken it and
+edited from a different worktree — the
+[divergence hazard](#a-lease-is-exclusive-in-time-not-across-worktrees) above. It
+happened in a real run for ninety seconds
+([evidence](studies/field-runs.md#run-4-crucible-built-to-hurt)), nobody took it,
+and that was luck rather than coordination.
 
 So the four outcomes now read differently, and all of them still **exit 0** —
 an idempotent release is a feature, it is just not a release:
@@ -518,10 +504,9 @@ expiry on record" rather than as a claim that none happened.
 
 ### Releasing several paths
 
-`pact lease release <path>...` takes many paths, like `acquire`. Four agents in
-one run hit `error: unexpected argument 'tests/cases' found` and released one path
-per call; the run's own brief had written the usage as `release <path>...` by
-analogy with `acquire`, which is how they all found it.
+`pact lease release <path>...` takes many paths, like `acquire` — because four
+agents in one run assumed it already did, by analogy, and each had to release one
+path per call.
 
 **It is deliberately NOT all-or-nothing, unlike `acquire`.** Holding half of what
 you need is useless, so `acquire` rolls back; releasing three of four is strictly
@@ -547,17 +532,14 @@ implementation, both surfaces, so the dashboard and the CLI can't disagree.
 
 #### `SUSPECT`: a stalled holder is worse than a crashed one
 
-A crashed holder's lease expires and a peer reclaims it. That happened three
-times in the crucible run and worked every time. **A stalled holder is worse**: it
-renews nothing, releases nothing, and blocks peers who are correctly declining to
-steal a lease that still reads as live.
+A crashed holder's lease expires and a peer reclaims it, which works. **A stalled
+holder is worse**: it renews nothing, releases nothing, and blocks peers who are
+correctly declining to steal a lease that still reads as live. In one run seven of
+ten agents stalled, one of them holding a file that `lease ls` reported as `active`
+with a live holder — and it cost more fleet time than every injected fault combined
+([evidence](studies/field-runs.md#run-4-crucible-built-to-hurt)).
 
-Seven of ten agents in that run ended their turn early waiting on a poller that
-could not wake them. One sat stopped for minutes *while holding* `src/printer.rs`,
-and to `pact lease ls` that lease was `active` and its holder alive. It cost more
-fleet time than every injected fault combined.
-
-pact had only the TTL, and the TTL is the slowest possible detector — it says
+The TTL is the slowest possible detector — it says
 nothing until the whole lease is over. So `lease ls` now derives a second signal
 from data pact was already writing: **every command an agent runs appends an
 event**, so the age of a holder's most recent event is how long since anything
@@ -763,10 +745,10 @@ purpose, one agent as far as leases are concerned).
 The protocol tells you to pick up after a peer that died. No single command does
 it, so here is the procedure, in the order that costs you least if you are wrong.
 
-Measured against three SIGKILLed holders in one run: **the lease half worked every
-time**, and the reference sequence is below. It is written down because the two
-successors each had to reconstruct it, and one of them nearly reverted a peer's
-work doing so.
+Exercised against three SIGKILLed holders in one run, where **the lease half
+worked every time**. It is written down because each successor had to reconstruct
+the sequence, and one of them nearly reverted a peer's work doing so
+([evidence](studies/field-runs.md#run-4-crucible-built-to-hurt)).
 
 **1. Look in the dead agent's worktree before you touch a lease.** Its uncommitted
 work is the only thing here that is not recoverable from a log. A SIGKILL leaves
@@ -788,17 +770,16 @@ it tells you what pact knows:
 
 ```
 $ pact lease acquire src/ast.rs src/parser.rs --ttl 600 --note '...'
-error: lease on src/ast.rs is held by agent-04 on branch crucible/agent-04
-in worktree agent-04 (377s old, 223s remaining); use --steal to override
+error: lease on src/ast.rs is held by agent-b on branch fleet/agent-b
+in worktree agent-b (377s old, 223s remaining); use --steal to override
 [exit 2]
 ```
 
 The branch and worktree are the useful part: they tell you *where* to go looking
 for step 1.
 
-**A dead holder may have left nothing to reclaim.** One of the three killed
-agents had already released cleanly before the signal landed, so its successor
-found no lease at all. Exit 0 on a plain acquire is a normal outcome of this
+**A dead holder may have left nothing to reclaim.** One killed agent had already
+released cleanly before the signal landed, so its successor found no lease at all. Exit 0 on a plain acquire is a normal outcome of this
 procedure, not a sign you misread the situation.
 
 **4. `--steal` is the carve-out for a holder you know is dead.** Not for one that
@@ -806,10 +787,10 @@ is merely slow, and not for impatience:
 
 ```
 $ pact lease acquire src/ast.rs src/parser.rs --steal --ttl 600 --note '...'
-warning: stealing non-expired lease on src/ast.rs held by agent-04 on branch
-crucible/agent-04 in worktree agent-04 (advisory override via --steal)
-note: src/ast.rs was last acquired by agent-04 (6m57s ago) — their note: ...
-note: 2 unread message(s) about src/ast.rs, oldest from agent-01 ...
+warning: stealing non-expired lease on src/ast.rs held by agent-b on branch
+fleet/agent-b in worktree agent-b (advisory override via --steal)
+note: src/ast.rs was last acquired by agent-b (6m57s ago) — their note: ...
+note: 2 unread message(s) about src/ast.rs, oldest from agent-c ...
 [exit 0]
 ```
 
@@ -832,7 +813,7 @@ Routine reclaim is what TTLs are *for* and needs no justification.
 confirmed dead:
 
 ```
-Error claiming crucible-2o3.14: issue already claimed by agent-03
+Error claiming proj-abc: issue already claimed by agent-b
 [exit 1]
 ```
 

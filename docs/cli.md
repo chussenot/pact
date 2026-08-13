@@ -16,17 +16,35 @@ binary's `--help` in both directions, so a subcommand or long flag that exists
 in one and not the other fails CI. Do not hand-edit it to match a change you
 have not made.
 
+## Who runs what
+
+pact has two audiences and they barely overlap. **Agents** coordinate — claim a
+path, hand off a change, subscribe to an interface. **Humans** set the repository
+up and read the run back afterwards. Knowing which side a command is on tells you
+whether it belongs in a protocol block or in your own terminal.
+
+| | Agents | Humans |
+|---|---|---|
+| **run these** | `lease`, `msg`, `watch` | `init`, `doctor`, `ui`, `audit`, `completion` |
+| **why** | to coordinate while working | to set up, observe, and review |
+| **frequency** | many times per task | once per repo, or after a run |
+
+`whoami`, `log` and `agents` are for both: an agent orients with them at task
+start, and a human uses the same three to see whether the fleet is moving.
+
+**The dividing line is who bears the consequence.** An agent's `lease acquire` is
+a promise it will keep; a human's `audit` is a question about promises already
+made. That is also why the MCP server is read-only — see
+[mcp.md](mcp.md).
+
 ## Commands
 
 ```
-pact init [--print] [--no-commit] [--force]
-pact whoami
-pact agents
+# ─── agents run these, while they work ───────────────────────────────────────
 pact lease acquire <path>... [--ttl <seconds>] [--steal] [--note <text>]
 pact lease renew <path>
 pact lease release <path>... [--force]
 pact lease release --all
-pact lease ls [--all]
 pact msg send (--to <agent>... | --to-owner-of <path>...) [--thread <id>] [--subject <text>] [--skip <agent>...] (<body> | --body-file <path|->)
 pact msg inbox [--unread-only] [--full] [--include-watch | --watch-only]
 pact msg sent
@@ -34,13 +52,27 @@ pact msg read <id>
 pact watch add <path>
 pact watch rm <path>
 pact watch ls
-pact log [-n | --limit <count>]
+
+# ─── humans run these, around a run ──────────────────────────────────────────
+pact init [--print] [--no-commit] [--force]
 pact doctor
-pact completion <bash|zsh|fish|elvish|powershell>
 pact audit [--check <double-win|stale-holds|chain-integrity|commit-correlation|merge-divergence|claim-lease-divergence|retry-storm|silent-contention|topology>] [--expect <worktrees|main|any>] [--since <rfc3339|duration>] [--include-annotated] [--compare <path>] [--export <path>]
 pact ui
+pact completion <bash|zsh|fish|elvish|powershell>
 pact mcp serve
+
+# ─── both ────────────────────────────────────────────────────────────────────
+pact whoami
+pact agents
+pact lease ls [--all]
+pact log [-n | --limit <count>]
 ```
+
+The grouping is a reading aid, not a permission boundary: nothing stops a human
+taking a lease or an agent running `pact audit`. It is one fenced block on
+purpose — `scripts/check-docs.sh` reads the first fence after this heading and
+stops at its close, so splitting it into three would leave two thirds of the CLI
+unchecked.
 
 Plus `pact -V` (bare version) and `pact --version` (version plus build stamp —
 see [install.md](install.md#which-binary-am-i-running)).

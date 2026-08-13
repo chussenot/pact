@@ -217,29 +217,13 @@ so far commits under one git identity, so `author` is the same string for all of
 them.
 
 That gap is not theoretical, and it fails in the worst possible direction. One
-crucible agent was deliberately told the protocol did not apply to it. It authored
-**zero** of the run's 346 coordination events and committed freely. The check is
-not blind — it flagged three uncovered commits, one genuinely the rogue's. But the
-rogue's **worst** commit was not among them:
-
-```text
-6fa4542  five files in one unleased shot
-  src/ast.rs, src/parser.rs    -> held by agent-05 since 08:55:48
-  src/printer.rs, src/types.rs -> held by agent-02 since 08:57:29
-  src/eval.rs                  -> held by agent-09
-```
-
-A hold covered every path at that instant, so the commit passed. **The rogue's
-most damaging commit was invisible specifically because its peers were
-compliant** — the better the rest of the fleet behaves, the better an unleased
-commit hides. Meanwhile two of the three commits that *were* flagged came from
-honest agents committing seconds after their own lease lapsed.
-
-Cost of the miss: merging that branch conflicted on all five files and could not
-be resolved by taking either side, because the rogue had branched before three
-peers' AST variants landed and take-theirs would have silently deleted their work.
-It needed a hand three-way reconciliation. Detection lag ~13 minutes, and the
-detector was a human running `git merge`.
+agent working without a lease is invisible whenever a compliant peer happens to
+hold the path — and in a real run that is exactly what happened. A rogue agent's
+worst commit touched five files in one unleased shot and **passed clean**, because
+at that instant every one of those five paths was under an active lease held by a
+compliant peer. **The better the rest of the fleet behaves, the better a rogue
+hides**, and the miss cost a hand three-way merge reconciliation
+([evidence](studies/field-runs.md#run-4-crucible-built-to-hurt)).
 
 So a commit can say which agent made it, with a trailer:
 
@@ -319,14 +303,11 @@ Both leases were honoured. The conflict is deferred to a merge performed later,
 by someone else, with no lease held by anyone and pact not involved — and the
 merge window is where the corruption lands.
 
-Three instances in one 85-minute crucible run: duplicate match arms in
-`src/printer.rs`, six duplicate test functions in `src/parser.rs` (E0428), and a
-near-miss where a successor found that applying a stashed diff would have
-silently reverted a peer's `Expr::If`. **No conflict marker was ever produced in
-any of them.** git merged both insertions cleanly because they were textually
-non-adjacent — precisely the edit shape this topology encourages and a designed
-hot file attracts. Two were caught by reading a diff and by a later compile
-failure; none by pact.
+One run produced three instances — duplicate match arms, six duplicate test
+functions, and a near-miss that would have silently reverted a peer's change — and
+**no conflict marker in any of them**, because git merges textually non-adjacent
+insertions cleanly. Two were caught by a diff review and a compile failure; none by
+pact ([evidence](studies/field-runs.md#run-4-crucible-built-to-hurt)).
 
 pact cannot fix git. What it can do is compare the content hash a releasing agent
 left against the hash the next acquirer's own copy has, which is a fact both
@@ -366,15 +347,9 @@ halves of one question**:
 | `pact lease acquire` | who may edit the FILES |
 
 Neither consulted the other. Nothing prevented agent A holding the bead while
-agent B held every file that bead names — and it happened. agent-06, verbatim:
-
-> a race let me briefly hold `src/main.rs`+`src/lib.rs` for `crucible-2o3.27`
-> after `bd update --claim` had already lost that bead to agent-07 — pact granted
-> the lease with no cross-check against bd claim state. I released immediately and
-> told agent-07.
-
-Corroborated twice more in the same run. It self-corrected only because an agent
-noticed and volunteered a release.
+agent B held every file that bead names — and it happened three times in one run,
+self-correcting only because an agent noticed and volunteered a release
+([evidence](studies/field-runs.md#run-4-crucible-built-to-hurt)).
 
 The protocol tells agents to claim first and lease second, which makes the bead
 claim *look* like the serialization point. It is not: the lease is what actually
@@ -408,20 +383,14 @@ invariant is *never touch the Beads DB directly, only its CLI*, which this obeys
 **The only check about what the fleet wasted, rather than what pact got wrong.**
 Nothing it reports broke a rule: a refused agent is entitled to ask again.
 
-The crucible run is the first with real contention data — 124 refusals, where the
-three runs before it produced zero — and it shows agents busy-polling:
-
-| agent | path | refusals | retry spacing | holder's remaining |
-|---|---|---|---|---|
-| agent-02 | `src/eval.rs` | 33 | **15s flat** | median 355s |
-| agent-03-r2 | `src/ast.rs` | 20 | ~13s | — |
-| agent-06 | `src/types.rs` | 8 | ~15s | — *(never got it)* |
-
-The spacing is the finding. Twenty-seven of agent-02's thirty-two gaps were
-*exactly* 15 seconds — a hardcoded poll loop, not adaptive retry with jitter — while
-the refusal message in front of it said the holder had minutes left, and the holder's
-own note, quoted back in every single one, said "LONG BEAD, will renew". It retried
-roughly 24× more often than its own screen told it to.
+One run supplied the first real contention data — 124 refusals, where the three
+runs before it produced zero between them — and it shows agents busy-polling. The
+worst offender refused one path **33 times**, and the spacing is the finding:
+twenty-seven of its thirty-two gaps were *exactly 15 seconds*, a hardcoded poll
+loop rather than adaptive retry, while the refusal in front of it said the holder
+had a median 355 seconds left and the holder's own note said it would renew. It
+retried roughly 24x more often than its own screen told it to
+([evidence](studies/field-runs.md#run-4-crucible-built-to-hurt)).
 
 Two independent shapes flag, and either is enough:
 
@@ -432,9 +401,10 @@ Two independent shapes flag, and either is enough:
   `holder_remaining_secs`.
 
 Both thresholds are deliberately crude, because the data does not need precision:
-the storms were 33, 20, 14, 13 and 8 refusals while ordinary resolved contention sat
-at **1**. There is a wide empty band between them, so any threshold inside it gives
-the same answer — which is the argument for having one rather than tuning it.
+the observed storms were 33, 20, 14, 13 and 8 refusals while ordinary resolved
+contention sat at **1**. There is a wide empty band between them, so any threshold
+inside it gives the same answer — which is the argument for having one rather than
+tuning it.
 
 `chaos-ghost` is excluded. That is [`scripts/chaos.sh`](testing.md) planting a stale
 lease, and its failed acquire is a rail firing correctly; counting it would credit
@@ -462,7 +432,7 @@ Three things count as communication:
    it had arranged to be told, which is using the channel that works.
 
 (3) is counted and reported, but deliberately **does not net out of the contention
-numbers**. Twenty-four of crucible's 124 refusals came from an agent that was already
+numbers**. In one run, 24 of 124 refusals came from an agent that was already
 subscribed — and those same agents then polled 13, 6 and 3 more times. Crediting the
 subscription while the agent busy-retries would score the run as communicating well
 at exactly the moment it wasted the most work. So the count sits beside the findings,
@@ -846,20 +816,16 @@ from the available data, in either direction", because bd writes a
 true. The conclusion was not.
 
 `bd update --claim` "sets assignee to you, status to `in_progress`" — and bd
-logs **assignee** changes as interactions of their own. A self-claim has a
-distinctive shape: `actor` equals the new value, with an empty old value. Two
-fleet runs carry it plainly:
+logs **assignee** changes as interactions of their own, with a distinctive
+self-claim shape. It was measurable all along, through a field nobody had looked
+at, and the per-run figures show one run claiming almost every bead and the next
+claiming none while still closing them all
+([the numbers](studies/field-runs.md#how-to-read-a-number-on-this-page)).
 
-| run | assignee interactions | status/closed | claim adherence |
-|---|---|---|---|
-| megablast | 22 | 23 | 22/23 |
-| grimcast | **0** | 22 | **0/22** |
-
-So it was measurable all along, through the wrong field — and the third run
-regressed to zero claims while closing every bead. The likeliest source of the
-original scratch-store result is that `--claim` is documented as **idempotent**:
-claiming an issue already assigned to you changes nothing, so it logs nothing.
-Testing the no-op path and generalising from it is the mistake.
+The likeliest source of the original scratch-store result is that `--claim` is
+documented as **idempotent**: claiming an issue already assigned to you changes
+nothing, so it logs nothing. Testing the no-op path and generalising from it is
+the mistake.
 
 The lesson this bullet exists for still stands, just aimed one step further
 back: a metric that returns the same answer regardless of behaviour is worse

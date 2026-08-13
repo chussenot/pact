@@ -474,12 +474,11 @@ counted at the bottom, per path, and shown by
 `pact msg inbox --include-watch` lists them, `--watch-only` shows only them
 ```
 
-This is not a preference about tidiness. In the crucible run, one release of the
-designed hot file emitted **nine messages in nine seconds**, one per watcher, and
-`lease acquire` reported `32 unread message(s) about src/ast.rs`. Sampled across
-that window: 12 messages, **11 of them automatic release notices and exactly one
-authored by an agent** — a warning about six duplicate test functions that a peer
-needed to read.
+This is not a preference about tidiness. In one run a single release of the busiest
+file emitted **nine messages in nine seconds**, one per watcher, and `lease acquire`
+reported `32 unread message(s)` on that one path. Sampled across the window: 11
+automatic notices to **one** authored message — and the authored one was a warning a
+peer needed to read ([evidence](studies/field-runs.md#run-4-crucible-built-to-hurt)).
 
 The fleet was not undisciplined. It was *compliant*: [watch.md](watch.md) tells
 agents to subscribe to interfaces they depend on but do not own, and the cost of
@@ -498,11 +497,11 @@ Three properties make the split safe to rely on:
 #### Notices that predate the label
 
 Tagging at creation is forward-only, and on a real store that cost the whole
-point. Measured across nine agents' inboxes in an existing fleet store: `inbox`
-and `inbox --include-watch` returned **identical** counts for every one of them,
-`--watch-only` answered "no watch notices" for inboxes that were mostly notices,
-and one agent's 14 authored rows were 12 machine notices and 2 pieces of real
-correspondence. The burial was exactly as bad as before the fix.
+point. Measured across nine agents' inboxes in an existing store, `inbox` and
+`inbox --include-watch` returned **identical** counts for every one of them, and
+`--watch-only` answered "no watch notices" for inboxes that were mostly notices —
+so on an existing store the burial was exactly as bad as before the fix
+([evidence](studies/field-runs.md#run-4-crucible-built-to-hurt)).
 
 Those are recoverable because **pact wrote them**: their shape is a format string,
 not user text. An untagged message is treated as a notice only when all three of
@@ -516,7 +515,7 @@ these hold:
 
 Anchored to the full shape rather than a substring, because the cost of a false
 positive here is precisely what this feature exists to prevent: filing a real
-warning as machine noise. "src/ast.rs changed — released by agent-01, please
+warning as machine noise. "src/render.rs changed — released by agent-b, please
 re-read it" fails the second condition and stays in the inbox.
 
 The label always wins and is checked first, so anything written since it shipped is

@@ -12,8 +12,12 @@ same repository without stepping on each other.
 
 New here: download a binary or `cargo install` — [docs/install.md](docs/install.md)
 — then run `pact init` in a repo.
-Everything below is *why* pact is built the way it is; the reference material
-lives in [docs/](#documentation).
+
+Everything below is *why* pact is built the way it is. The reference material —
+what each command does and how to use it — lives in [docs/](#documentation), and
+the evidence behind the design lives in
+[the studies](#where-these-features-came-from). Some pact commands are for the
+agents, some are for you; [cli.md](docs/cli.md#who-runs-what) says which.
 
 ## The problem
 
@@ -171,29 +175,35 @@ The reasoning and the boundaries are in
 
 ## Where these features came from
 
-Almost nothing here was designed on a whiteboard. pact was used to coordinate a
-real fleet of agents building something else in this repo, and then a second
-fleet was pointed at pact itself — every agent required to report, with quoted
-commands and exit codes, what pact had actually done to it. The findings are
-beads in this repo's database; each cites evidence rather than an opinion.
+Almost nothing here was designed on a whiteboard. Four repositories have been
+built by agent fleets coordinating through pact, and a fifth fleet was pointed at
+pact itself — every agent required to report, with quoted commands and exit codes,
+what pact had actually done to it. Every finding became a tracked issue citing
+evidence rather than an opinion.
 
-The shape of that evidence matters more than the list:
+Four examples of the shape that takes:
 
-- `pact lease ls` used to lead with remaining TTL. A lease 80 seconds old
-  printed `3520s`, an operator read that as "long-held", and force-released a
-  live agent's claim. Hence age first, an explicit state, and the holder's note —
-  "what is this agent doing" is the question you have right before you reach for
-  `--force`.
+- `pact lease ls` used to lead with remaining TTL. A lease 80 seconds old printed
+  `3520s`, an operator read that as "long-held", and force-released a live agent's
+  claim. Hence age first, an explicit state, and the holder's note.
 - `pact msg inbox` used to print every body in full and never showed a sender.
   Seven messages were ~9KB of an agent's context. Hence one line each.
-- `pact msg inbox | head -1` panicked and exited 101. The message had already
-  been sent; the agent read the status, concluded failure, and sent again. Hence
-  a closed pipe that changes nothing about the exit code.
+- `pact msg inbox | head -1` panicked and exited 101. The message had already been
+  sent; the agent read the status, concluded failure, and sent again. Hence a
+  closed pipe that changes nothing about the exit code.
 - 51 of 59 messages in one run were never read, because they were addressed to
   agents that had already exited. Hence delivery that follows the file.
 
-The habit is the point: if you run agents against your own repo, ask each one
+**The habit is the point:** if you run agents against your own repo, ask each one
 what the tooling did to it, and require a quoted command as evidence.
+
+The full evidence, and the design decisions each run forced, is in the studies:
+
+| | |
+|---|---|
+| [studies/field-runs.md](docs/studies/field-runs.md) | the four repositories built on pact — [arkanoid](https://github.com/chussenot/arkanoid), [megablast](https://github.com/chussenot/megablast), [grimcast](https://github.com/chussenot/grimcast), [crucible](https://github.com/chussenot/crucible) — what each measured and what changed |
+| [studies/dogfooding.md](docs/studies/dogfooding.md) | building pact with pact: the CLI findings, and the two protocol reversals that overshot in both directions |
+| [studies/experiments.md](docs/studies/experiments.md) | the soak, the fault injector, TLA+ and the property search — what each bounds, and why a green run alone proves nothing |
 
 ## Documentation
 
@@ -210,7 +220,11 @@ what the tooling did to it, and require a quoted command as evidence.
 | [telemetry.md](docs/telemetry.md) | the optional OpenTelemetry export: what leaves the machine and what never does |
 | [watch.md](docs/watch.md) | `pact watch`: subscribing to paths, and why interface notification rides `lease release` instead of asking |
 | [audit.md](docs/audit.md) | `pact audit`: what each check proves, and what it deliberately cannot see |
-| [fleet-patterns.md](docs/fleet-patterns.md) | the one fleet topology that has been measured twice, and what the numbers said — including where they contradicted the assumption |
-| [testing.md](docs/testing.md) | the fleet soak: scripted workers at concurrency, and what it cannot prove |
+| [fleet-patterns.md](docs/fleet-patterns.md) | how to run a fleet: the orchestrated-wave topology, and the two rules that make its record trustworthy |
+| [testing.md](docs/testing.md) | the fleet soak and the fault injector: how to run each, and what they cannot prove |
 | [development.md](docs/development.md) | build, test, the CI gates and why each exists, the upstream canary |
 | [mascot-animations.md](docs/mascot-animations.md) | the mascot in `pact ui`: gestures, triggers, frame data |
+
+Those pages answer *what* and *how*. For *what happened when this was used for
+real* — the four field runs, the dogfooding findings, the synthetic harnesses —
+see [the studies](#where-these-features-came-from) above.

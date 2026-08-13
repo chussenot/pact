@@ -188,39 +188,15 @@ double-win forensics and the event log as artifacts, then files or comments on o
 
 ## A finding the harness produced on its first run
 
-Worth recording, because it is the kind of thing the harness exists for and it is
-not a bug in pact.
+Three of four exit-2 conflicts sent no message, because the workers had followed
+the protocol block's instruction to address the *file* — and `--to-owner-of`
+resolves the **last agent to act** on a path, which at exit 2 is often the asker
+itself. Two fixes came out of it, and one general lesson: the failure was
+diagnosable only because the worker captured `msg send`'s stderr, and a harness
+that discards the evidence for its own findings is half a harness.
 
-Three of four exit-2 conflicts sent no message, with what pact printed at the
-time:
-
-```
-note: you are yourself the last agent to work on notify/iface.txt; not adding a recipient
-error: no recipients resolved — nothing to send
-```
-
-The workers had used `pact msg send --to-owner-of <path>`, following the protocol
-block's instruction to address the *file* rather than the name. But
-`--to-owner-of` resolves the **last agent to act** on a path from the event log,
-which is right for a handoff and wrong at exit 2: a worker that previously held
-and released that path *is* the last actor, so it resolved to itself, and pact
-then treated a self-resolution as no recipient at all and refused the send.
-
-That second line is gone — a send whose every `--to-owner-of` path resolves to
-the sender now falls back to `human` and still tags the path
-([why](messaging.md#when-every-path-resolves-to-you)). The finding stands
-regardless: the message the worker wanted to send was for whoever holds the path
-*now*, and no addressing trick reaches them from the event log.
-
-The protocol block contains both idioms, and for contention the other sentence is
-the correct one — "`pact lease ls` names the holder; message them". The workers do
-that now, with `--to-owner-of` as the fallback for when the holder has already
-gone. Conflicts messaged went from 1 in 4 to 7 in 8, the remainder being the
-benign already-released race.
-
-Two lessons, one general: the failure was diagnosable only because the worker
-captured `msg send`'s stderr. The first version discarded it with `2>&1`, and a
-harness that throws away the evidence for its own finding is half a harness.
+The full account is in
+[studies/experiments.md](studies/experiments.md#what-the-soak-found-on-its-first-run).
 
 ## Fault injection
 
@@ -314,12 +290,12 @@ silently is a rail nobody can audit.
 when the fault actually executes, not when the planner schedules it — and the
 difference cost a whole run's worth of coverage before it was fixed.
 
-In the crucible run, `stale-lock` drew one path from `--paths-hint`, found a live
-agent holding it, logged one skip and left the pool. The run planted **zero**
-stale leases. It is the only fault that exercises expired-lease takeover against
-a lock pact itself wrote, and every path worth listing in a hint file is a hot
-path a busy fleet holds nearly all the time — so the highest-value fault was also
-the likeliest to no-op, and likelier the busier the fleet was. Exactly backwards.
+A real run caught this: `stale-lock` drew one path, found a live agent holding it,
+and left the pool — so the run planted **zero** stale leases. Every path worth
+listing in a hint file is a hot path a busy fleet holds nearly all the time, which
+made the highest-value fault the likeliest to no-op, and likelier the busier the
+fleet was. Exactly backwards
+([evidence](studies/experiments.md#fault-injection-recovery-not-mechanics)).
 
 Two changes, together:
 

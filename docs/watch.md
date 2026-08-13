@@ -31,15 +31,13 @@ done" — to a recipient who reads a dashboard, not a mailbox. A real
 that noise.
 
 **Restrained, they went silent.** So the block was changed: the lease note IS
-the announcement, and messages are reserved for what needs something back.
-Across the three fleet runs since, **28 agents sent 4 messages between them** —
-pact's own fleet 0, arkanoid 3, megablast 1.
+the announcement, and messages are reserved for what needs something back. Across
+the three fleet runs after that change, **28 agents sent 4 messages between them**.
 
-And the collapse took the load-bearing messages with it. megablast's single
-surviving message is the only reason a `write_buffer` overflow did not ship: an
-agent that had changed a constant in a file it owned told the owner of a
-*different* file which term to update. Three of those four messages were never
-read by the agent they were addressed to.
+And the collapse took the load-bearing messages with it: one of those four is the
+only reason a `write_buffer` overflow did not ship, and three of the four were
+never read by the agent they were addressed to
+([the per-run counts](studies/field-runs.md#what-the-four-runs-actually-say-about-messaging)).
 
 The conclusion is not that agents are lazy. It is that **voluntary messaging is
 bimodal under prose — spam or silence, with no reachable middle.** Exhortation
