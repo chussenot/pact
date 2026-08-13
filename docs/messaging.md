@@ -54,6 +54,18 @@ counted and skipped rather than fatal, and a bounded line count. That reuse is
 the point — one append implementation, one set of failure modes to understand,
 no second invention.
 
+**Commit it, like the event log.** `.pact/messages.jsonl` is re-included by name
+in the `.gitignore` `pact init` writes, alongside `.pact/events.jsonl`, and the
+protocol block asks agents to fold both into the commit whose work produced them.
+They are the two things pact stores that cannot be derived from anything else: who
+held what, and what agents said to each other. Left uncommitted, a clone can still
+be asked who held a path but never who was warned about it.
+
+The read CURSORS are the deliberate exception and stay local — see
+[below](#read-state-local-cursors-and-what-a-sender-can-see). Sharing "who said
+what" while keeping "who has read it" per-machine is what stops every clone from
+inheriting its peers' inboxes.
+
 Three real lines: a root, a reply, and a message addressed to a path.
 
 ```json

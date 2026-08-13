@@ -27,6 +27,7 @@ tmp/*
 # EXCEPT the append-only event log, which is history and belongs in git.
 .pact/*
 !.pact/events.jsonl
+!.pact/messages.jsonl
 
 antithesis
 .claude/skills/*

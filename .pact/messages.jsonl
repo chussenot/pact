@@ -1,0 +1,1 @@
+{"id":"pact-msg-8bb7cef0f53ef23f","at":"2026-08-13T14:52:13.146088379+00:00","from":"orchestrator","to":["human"],"subject":"0.9.0 handoff","body":"native store live; bump is yours","thread":"pact-msg-8bb7cef0f53ef23f","kind":"mail","chain_hash":"59ab8a168778fa45"}

@@ -70,7 +70,7 @@ below.
 | `.pact/leases/*.lock` | one JSON file per active lease | no |
 | `.pact/waits/*` | conflict breadcrumbs, so a wait can be measured across two processes | no |
 | `.pact/watches.jsonl` | who subscribed to which path, append-only with tombstones | no |
-| `.pact/messages.jsonl` | append-only message store behind `pact msg`, bounded | no |
+| `.pact/messages.jsonl` | append-only message store behind `pact msg`, bounded | **yes** |
 | `.pact/read/<agent>.json` | one agent's read positions, id → when they read it | no |
 | `.pact/events.jsonl` | append-only lease-event log behind `pact log`, bounded | **yes** |
 | `AGENTS.md` (managed block) | the coordination protocol, for agents to read | yes |

@@ -138,7 +138,7 @@ bd prime                # Refresh Beads context
 **Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
 <!-- END BEADS CODEX SETUP -->
 
-<!-- pact:begin hash:68b60960 -->
+<!-- pact:begin hash:19775bc9 -->
 ## pact coordination protocol
 
 pact coordinates multiple coding agents working in this repository. Follow
@@ -265,16 +265,16 @@ this protocol whenever you touch shared files or hand off work to others.
 - **Orient with `pact log`**: one chronological feed of who leased what and
   who said what. Read it when you join, and when you need to know whether a
   peer is still moving.
-- **Commit `.pact/events.jsonl` when you commit your work.** It is the
-  append-only record behind `pact log`, it is the one thing under `.pact/` that
-  is NOT gitignored, and it is the only thing pact stores that it cannot derive
-  from anything else. `.pact/leases/`, `.pact/waits/`, `.pact/messages.jsonl`
-  and `.pact/read/` stay local — live runtime state and ephemeral mail, and
-  committing them would have you fighting over peers' in-flight claims and
-  inboxes. Fold the log into the commit whose work produced the events;
-  a missed one is self-healing on the next commit. Left uncommitted, every clone
-  of this repo starts with no coordination history at all, and nobody can ask
-  afterwards who held what or whether two agents ever held one path at once.
+- **Commit `.pact/events.jsonl` AND `.pact/messages.jsonl` when you commit your
+  work.** They are the two things pact stores that it cannot derive from anything
+  else: who held what, and what agents said to each other. `.pact/leases/`,
+  `.pact/waits/` and `.pact/read/` stay local — live runtime state and per-machine
+  read positions, and committing those would have you fighting over peers'
+  in-flight claims and inboxes. Fold both into the commit whose work produced
+  them; a missed one is self-healing on the next commit. Left uncommitted, every
+  clone of this repo starts with no coordination history at all, and nobody can ask
+  afterwards who held what, who was warned about it, or whether two agents ever
+  held one path at once.
 - **Sign your commits with your agent name**: `git commit --trailer
   Pact-Agent=$PACT_AGENT`. Every agent in a fleet commits under the same git
   identity, so `git log` cannot say which of you made a change — and without
