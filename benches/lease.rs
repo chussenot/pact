@@ -47,6 +47,29 @@
 //! been in use — which is the operating point worth quoting, and it makes the
 //! benchmarks comparable to each other.
 //!
+//! ## One CLI invocation per iteration, because the HEAD cache is per process
+//!
+//! `git_history` memoises `head_short` per repository (pact-hxy), which makes a
+//! batched acquire spawn one `git rev-parse` instead of N. A benchmark is one long
+//! process, so left alone it would resolve once and reuse it for every iteration —
+//! reporting a cost no real user pays, because `pact lease acquire` is a fresh
+//! process each time.
+//!
+//! So every benchmark that models ONE CLI invocation calls
+//! `git_history::forget_head()` in its untimed setup. `acquire_many` keeps the
+//! cache within an iteration, because there a single invocation genuinely does
+//! write N events. `roundtrip_acquire_release` forgets before each half, because
+//! `acquire` and `release` really are two separate processes.
+//!
+//! The `head_cache` pair below measures the difference directly, so the value of
+//! that optimisation is a number here rather than an inference.
+//!
+//! Every one of those setups uses `BatchSize::PerIteration`, and that is
+//! load-bearing rather than a default. `SmallInput` runs ALL the setups in a batch
+//! and then all the routines, so clearing the HEAD cache N times up front leaves
+//! only the FIRST routine cold and the other N-1 warm — which measured a warm
+//! cache and reported it as a cold one, understating a boundary append by 7x.
+//!
 //! ## The one place a subprocess IS on the acquire path
 //!
 //! `lease acquire` stamps the path's git blob id so `pact watch` can diff against
@@ -178,6 +201,15 @@ fn unlock(root: &Path, path: &str) {
     let _ = lease::release(root, "bench-a", path, true);
 }
 
+/// Put the process back to how a freshly-spawned `pact` starts: no cached HEAD.
+///
+/// Called from untimed setup, so what gets measured is one CLI invocation rather
+/// than the second one in a loop.
+fn fresh_command(root: &Path, path: &str) {
+    unlock(root, path);
+    git_history::forget_head(root);
+}
+
 // ---------------------------------------------------------------- acquire/release
 
 fn bench_lease_ops(c: &mut Criterion) {
@@ -190,12 +222,12 @@ fn bench_lease_ops(c: &mut Criterion) {
     let tmp = plain_repo();
     group.bench_function("acquire_clean", |b| {
         b.iter_batched(
-            || unlock(tmp.path(), "src/bench.rs"),
+            || fresh_command(tmp.path(), "src/bench.rs"),
             |_| {
                 lease::acquire(tmp.path(), "bench-a", "src/bench.rs", 900, false, None)
                     .expect("acquire")
             },
-            criterion::BatchSize::SmallInput,
+            criterion::BatchSize::PerIteration,
         )
     });
 
@@ -228,21 +260,37 @@ fn bench_lease_ops(c: &mut Criterion) {
             || {
                 lease::acquire(rel.path(), "bench-a", "src/drop.rs", 900, false, None)
                     .expect("setup acquire");
+                git_history::forget_head(rel.path());
             },
             |_| lease::release(rel.path(), "bench-a", "src/drop.rs", false).expect("release"),
-            criterion::BatchSize::SmallInput,
+            criterion::BatchSize::PerIteration,
         )
     });
 
-    // THE BUDGETED ONE. A full claim-and-hand-back cycle is what an agent
-    // actually costs the fleet per file it touches, so it is the number
+    // THE BUDGETED ONE. A full claim-and-hand-back cycle is what an agent actually
+    // costs the fleet per file it touches, so it is the number
     // docs/performance.md commits to.
-    let round = plain_repo();
+    //
+    // Deliberately a file that EXISTS, in a real git checkout. In the crucible run
+    // 56 of 58 acquires were of existing files and only 2 were of paths about to be
+    // created, so leasing a non-existent path — which skips both the content hash
+    // and the divergence check — would budget the 3% case. The 97% case costs more,
+    // which is the direction a budget should err in.
+    let round = git_repo();
+    seed_log(round.path(), STEADY_LINES);
+    std::fs::write(round.path().join("src_round.rs"), b"fn main() {}\n").expect("write");
     group.bench_function("roundtrip_acquire_release", |b| {
         b.iter(|| {
-            lease::acquire(round.path(), "bench-a", "src/round.rs", 900, false, None)
+            // Two invalidations, because this is two commands. An agent runs
+            // `pact lease acquire`, works, then runs `pact lease release` — two
+            // processes, each paying its own first HEAD resolve. Folding them into
+            // one cached process would make the budgeted number better than
+            // anything a user sees.
+            git_history::forget_head(round.path());
+            lease::acquire(round.path(), "bench-a", "src_round.rs", 900, false, None)
                 .expect("acquire");
-            lease::release(round.path(), "bench-a", "src/round.rs", false).expect("release")
+            git_history::forget_head(round.path());
+            lease::release(round.path(), "bench-a", "src_round.rs", false).expect("release")
         })
     });
 
@@ -264,12 +312,16 @@ fn bench_acquire_many(c: &mut Criterion) {
                     for p in paths {
                         unlock(tmp.path(), p);
                     }
+                    // Once per invocation, not once per path: a real batched
+                    // acquire resolves HEAD on its first event and reuses it for
+                    // the rest, which is the whole point of the cache.
+                    git_history::forget_head(tmp.path());
                 },
                 |_| {
                     lease::acquire_many(tmp.path(), "bench-a", paths, 900, false, None)
                         .expect("acquire_many")
                 },
-                criterion::BatchSize::SmallInput,
+                criterion::BatchSize::PerIteration,
             )
         });
     }
@@ -307,19 +359,39 @@ fn bench_events_append(c: &mut Criterion) {
     // force-released. Those are the hold boundaries, which is to say the lease hot
     // path. Every other kind skips it.
     //
-    // So this is the same append twice, differing only in `kind`, at the same log
-    // size. The gap is the subprocess, isolated, and it is the reason a fresh
-    // repository's append is not much cheaper than a full one's: the fixed cost
-    // dominates the log read.
+    // The same append twice, differing only in `kind`, at the same log size, with
+    // the HEAD cache cleared before each iteration so a boundary kind really does
+    // spawn. The gap is the subprocess, isolated.
     let tmp = seedless_repo();
     seed_log(tmp.path(), STEADY_LINES);
     for kind in ["acquired", "notified"] {
         let mut ev = seed_event();
         ev.kind = kind.to_string();
         group.bench_with_input(BenchmarkId::new("by_kind", kind), &ev, |b, ev| {
-            b.iter(|| events::append(tmp.path(), ev))
+            b.iter_batched(
+                || git_history::forget_head(tmp.path()),
+                |_| events::append(tmp.path(), ev),
+                criterion::BatchSize::PerIteration,
+            )
         });
     }
+
+    // What the HEAD cache (pact-hxy) is worth, as a number rather than an
+    // inference: the same boundary-kind append cold — a fresh command's first
+    // event — against warm, which is every later event of the same command and
+    // every event after the first in a batch.
+    let ev = seed_event();
+    group.bench_function("head_cache/cold", |b| {
+        b.iter_batched(
+            || git_history::forget_head(tmp.path()),
+            |_| events::append(tmp.path(), &ev),
+            criterion::BatchSize::PerIteration,
+        )
+    });
+    group.bench_function("head_cache/warm", |b| {
+        let _ = git_history::head_short(tmp.path());
+        b.iter(|| events::append(tmp.path(), &ev))
+    });
 
     group.finish();
 }
@@ -428,12 +500,12 @@ fn bench_acquire_with_git_hash(c: &mut Criterion) {
     std::fs::write(tmp.path().join("existing.rs"), b"fn main() {}\n").expect("write");
     group.bench_function("acquire_hashes_an_existing_file", |b| {
         b.iter_batched(
-            || unlock(tmp.path(), "existing.rs"),
+            || fresh_command(tmp.path(), "existing.rs"),
             |_| {
                 lease::acquire(tmp.path(), "bench-a", "existing.rs", 900, false, None)
                     .expect("acquire")
             },
-            criterion::BatchSize::SmallInput,
+            criterion::BatchSize::PerIteration,
         )
     });
 

@@ -306,6 +306,14 @@ impl App {
     }
 
     fn refresh_leases(&mut self) {
+        // The one long-lived process in pact, and therefore the one that must not
+        // trust a cached HEAD (pact-hxy). `git_history` memoises `head_short` per
+        // repo so a batched `acquire`/`release --all` spawns one `git rev-parse`
+        // instead of N — sound because HEAD cannot move inside a command that
+        // exits. This session does not exit, and it can force-release from the
+        // key handler, so the cache is dropped on every tick: staleness is bounded
+        // to one refresh interval rather than to the lifetime of the dashboard.
+        crate::git_history::forget_head(&self.repo_root);
         // peek, not list: this runs on a refresh timer, and a dashboard that
         // garbage-collects expired locks on every tick is deleting the evidence
         // an operator opened it to look at (pact-rnc.19).

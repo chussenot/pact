@@ -26,17 +26,20 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
 
-# 50 ms against a measured baseline of ~12 ms, so ~4x headroom.
+# 100 ms against a measured baseline of ~20 ms, so ~5x headroom.
 #
-# The first proposal was 10 ms, and the measurement rejected it: acquire+release
-# is 11.9 ms on the reference machine because it spawns TWO `git rev-parse`
-# subprocesses and parses the event log three times. A budget under the baseline
-# is not a strict budget, it is a broken one.
+# The budget has moved twice, both times because the measurement moved first.
+# 10 ms was proposed and rejected: the baseline was 11.9 ms. 50 ms held while the
+# budgeted benchmark leased a path that did not exist — then field data showed 56
+# of 58 real acquires are of files that DO exist, the benchmark was corrected to
+# match, and the representative case is 20.3 ms because it also pays a content
+# hash and a divergence check.
 #
-# 4x is chosen for the runner, not for the code: a shared CI box is routinely 2-3x
-# slower on process spawn and I/O than a developer machine, and this must not go
-# red because a neighbour was busy. See docs/performance.md.
-BUDGET_MS="${1:-50}"
+# 5x is for the runner, not the code: the budgeted path now spawns three
+# subprocesses (two `git rev-parse`, one `git hash-object`), and process spawn is
+# the most runner-sensitive thing in the whole measurement. See
+# docs/performance.md.
+BUDGET_MS="${1:-100}"
 BENCH="lease/roundtrip_acquire_release"
 # Criterion slugifies the group and id into a directory pair.
 EST="target/criterion/lease/roundtrip_acquire_release/new/estimates.json"

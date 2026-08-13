@@ -12,9 +12,14 @@ messaging, via the Beads CLI — is deliberately not on the lease path.
 
 **The first half is measured now, and it is not what the claim implied.** The
 Beads part holds: nothing in `lease acquire`/`release` can reach `bd`. But the
-lease path is not filesystem-bound either. It is bound by **`git rev-parse`**,
-which pact spawns twice per acquire-and-release cycle, plus three full parses of
-its own event log.
+lease path is not filesystem-bound either — it is bound by **subprocesses pact
+spawns itself**, `git rev-parse` and `git hash-object`, plus a parse of its own
+event log. The lock file is microseconds; everything around it is milliseconds.
+
+Two of those costs have since been reduced (see
+[what was optimised](#what-was-optimised-and-what-was-left-alone)) and a third was
+rejected because the measurement said it would buy nothing. The numbers below are
+after that work.
 
 Everything below comes from `benches/lease.rs` under criterion, against a
 tempdir repo with **no `bd` on `PATH`**. Reproduce with `mise run bench`.
@@ -23,7 +28,7 @@ tempdir repo with **no `bd` on `PATH`**. Reproduce with `mise run bench`.
 
 Reference hardware: the figures below were taken on one Linux x86-64 developer
 machine with an SSD. **Treat the ratios as the result and the absolute values as
-that machine's**, which is also why the CI budget carries 4x headroom rather than
+that machine's**, which is also why the CI budget carries ~5x headroom rather than
 tracking these to the percent.
 
 Every repo is seeded to 4500 event-log lines first — between the trim floor
@@ -32,94 +37,108 @@ repository that has been in use, and the numbers are comparable to each other.
 
 | Benchmark | ns/op | ops/sec | What it is |
 |---|---|---|---|
-| `repo/resolve/plain` | 5 607 | 178 353 | topology resolution, ordinary checkout |
-| `repo/resolve/plain_with_worktrees` | 7 793 | 128 313 | …plus the `worktrees/` scan |
-| `repo/resolve/linked_worktree_commondir` | 30 722 | 32 550 | …the commondir walk, from a linked worktree |
-| `events/append/by_kind/notified` | 443 801 | 2 253 | an append that stamps no `head` |
-| `events/append/by_kind/acquired` | 2 948 953 | 339 | the same append, stamping `head` |
-| `events/append/0` | 2 492 470 | 401 | append, empty log |
-| `events/append/1000` | 2 548 993 | 392 | append, 1000 lines |
-| `events/append/4500` | 2 911 045 | 344 | append, steady state |
-| `lease/refresh_reentrant` | 520 887 | 1 920 | re-acquire your own live lease |
-| `lease/acquire_contended_exit2` | 618 815 | 1 616 | the refusal path an agent hits at exit 2 |
-| `lease/release` | 3 587 253 | 279 | release a lease you hold |
-| `lease/acquire_clean` | 8 113 720 | 123 | claim a path nobody holds |
-| `lease/roundtrip_acquire_release` | **11 889 523** | **84** | **acquire + release — the budgeted number** |
-| `lease/acquire_many/1` | 8 196 314 | 122 | batch of 1 |
-| `lease/acquire_many/5` | 43 112 677 | 23 | batch of 5 (8.6 ms/path) |
-| `lease/acquire_many/20` | 174 429 802 | 6 | batch of 20 (8.7 ms/path) |
-| `lease/with_subprocess/acquire_hashes_an_existing_file` | 8 002 637 | 125 | acquire where `git hash-object` also runs |
+| `repo/resolve/plain` | 5 573 | 179 438 | topology resolution, ordinary checkout |
+| `repo/resolve/plain_with_worktrees` | 7 780 | 128 527 | …plus the `worktrees/` scan |
+| `repo/resolve/linked_worktree_commondir` | 30 690 | 32 584 | …the commondir walk, from a linked worktree |
+| `events/append/head_cache/warm` | 402 170 | 2 487 | a boundary append reusing a resolved HEAD |
+| `events/append/head_cache/cold` | 2 774 912 | 360 | the same append, resolving HEAD itself |
+| `events/append/by_kind/notified` | 397 279 | 2 517 | an append that stamps no `head` at all |
+| `events/append/by_kind/acquired` | 3 098 162 | 323 | the same append, cold, stamping `head` |
+| `events/append/0` | 393 027 | 2 544 | warm append, empty log |
+| `events/append/1000` | 395 312 | 2 530 | warm append, 1000 lines |
+| `events/append/4500` | 414 795 | 2 411 | warm append, steady state |
+| `lease/refresh_reentrant` | 526 497 | 1 899 | re-acquire your own live lease |
+| `lease/acquire_contended_exit2` | 626 058 | 1 597 | the refusal path an agent hits at exit 2 |
+| `lease/release` | 4 077 754 | 245 | release a lease you hold |
+| `lease/acquire_clean` | 8 727 871 | 115 | claim a path that does not exist yet |
+| `lease/with_subprocess/acquire_hashes_an_existing_file` | 6 046 738 | 165 | claim a path that **does** exist — the common case |
+| `lease/roundtrip_acquire_release` | **20 330 521** | **49** | **acquire + release of an existing file — the budgeted number** |
+| `lease/acquire_many/1` | 8 892 416 | 112 | batch of 1 |
+| `lease/acquire_many/5` | 23 632 565 | 42 | batch of 5 (4.7 ms/path) |
+| `lease/acquire_many/20` | 85 924 804 | 12 | batch of 20 (4.3 ms/path) |
+
+Each benchmark models **one CLI invocation**: the HEAD cache below is per process,
+and a benchmark is one long process, so anything measuring a single command clears
+that cache in untimed setup. `acquire_many` keeps it within an iteration, because
+there one invocation really does write N events. `roundtrip` clears it twice,
+because `acquire` and `release` really are two separate commands.
 
 ## Where the time actually goes
 
-The interesting result is not the totals, it is that **the lock file is free and
-everything around it is not.**
+The lock file is free and everything around it is not. Resolving the repository
+topology — which runs on essentially every command — is **5.6 µs**, and claiming
+the lock is a `write` plus a `hard_link`. That is the coordination primitive, and
+it is microseconds.
 
-Resolving the repository topology — the thing that runs on essentially every
-command — costs **5.6 µs**. Claiming the lock is a `write` and a `hard_link`.
-Those are the coordination primitive, and they are microseconds.
-
-Then a clean acquire costs **8.1 ms**, three orders of magnitude more. It
-decomposes almost exactly:
+The milliseconds are all subprocesses and log parses. An acquire of an existing
+file decomposes roughly as:
 
 | Component | Cost | Why it runs |
 |---|---|---|
-| `git rev-parse --short HEAD` | ~2.5 ms | `events::append` stamps `head` on hold boundaries |
-| parse the log for `events::owner_of` | ~2.5 ms | warns about an unresolved prior claim |
-| parse the log for `last_released_content` | ~2.5 ms | warns you are on a stale copy ([merge divergence](leases.md#a-lease-is-exclusive-in-time-not-across-worktrees)) |
+| `git rev-parse --short HEAD` | ~2.4 ms | `events::append` stamps `head` on hold boundaries |
+| `git hash-object -w` | ~2 ms | stamps `content_hash` so [`watch`](watch.md) can diff later |
+| one parse of the event log | ~2.6 ms | the prior-claim and stale-copy warnings, now sharing it |
 | the lock file, resolution, everything else | ~0.6 ms | the actual claim |
 
-### The subprocess is the single biggest cost, and it was isolated
+### The subprocess is the single biggest cost, and it is isolated by measurement
 
-`events::append` calls `stamp_context`, which stamps `head` for exactly four
-kinds — `acquired`, `stolen`, `released`, `force-released`. Those are the hold
-boundaries, which is to say the lease hot path. `head_short` shells out to `git
-rev-parse`.
+`stamp_context` stamps `head` for exactly four kinds — `acquired`, `stolen`,
+`released`, `force-released`. Those are the hold boundaries, which is the lease hot
+path, and `head_short` shells out to `git rev-parse`.
 
-The `by_kind` pair measures the same append at the same log size, differing only
-in `kind`:
+Two pairs measure it directly. Same append, same log size, differing only in
+whether a subprocess runs:
 
 ```
-events/append/by_kind/notified    443 801 ns   (no head stamped)
-events/append/by_kind/acquired  2 948 953 ns   (head stamped)
+events/append/by_kind/notified      397 279 ns   (no head stamped)
+events/append/by_kind/acquired    3 098 162 ns   (head stamped, resolved cold)
+
+events/append/head_cache/warm       402 170 ns   (head already resolved)
+events/append/head_cache/cold     2 774 912 ns   (resolves it)
 ```
 
-**85% of an append is that one subprocess.** It also explains the two fastest
-lease numbers: `refresh_reentrant` writes `renewed` and the refusal path writes
-`refused`, neither of which is in the allowlist — so both come in around 500 µs,
-16x faster than an acquire, while doing very similar filesystem work.
+**A boundary append is ~2.4 ms of subprocess and ~0.4 ms of everything else.** It
+also explains the two fastest lease numbers: `refresh_reentrant` writes `renewed`
+and the refusal path writes `refused`, neither in the allowlist, so both come in
+near 500 µs while doing very similar filesystem work.
 
-The gating was a deliberate choice, made for a good reason and documented in
-`events.rs`: stamping `head` on every `notified` would have spawned 87 processes
-in the run that motivated it. What the measurement adds is that the boundaries it
-kept are the hot path, so the cost did not go away — it concentrated.
+### The event log is read whole, and it does not matter
 
-### The event log is read whole, three times
+`events::append` finds the previous chain point by reading the entire file, so it
+is **O(log size)** in complexity. Measured, at the sizes the cap allows, it is
+free:
 
-`events::append` finds the previous chain point by reading the entire file, and
-`owner_of` and `last_released_content` each parse the whole log too. So append is
-**O(log size)** — bounded, because the log is trimmed at 5000 lines, but the bound
-is thousands of lines rather than nothing.
+```
+events/append/0      393 027 ns
+events/append/1000   395 312 ns
+events/append/4500   414 795 ns
+```
 
-The append curve (0 → 1000 → 4500 lines) is only **+17%**, because the fixed
-subprocess cost dwarfs it. That is the honest ordering: the log read is real and
-it is the *second* problem.
+Flat. The read is sequential, unparsed, and page-cached, and the log is trimmed at
+5000 lines. This is worth stating because it was the *first* hypothesis for where
+the time went, and it was wrong — the subprocess was hiding it. Reading the tail
+instead of the whole file would be correct and would buy nothing, which is why
+[it was not done](#what-was-optimised-and-what-was-left-alone).
 
-### Batching is linear, not amortised
+### Batching now amortises, where it used to be flat
 
-`acquire_many` costs 8.6–8.7 ms per path at 1, 5 and 20 paths — flat. Each path
-pays its own subprocess and its own log parses. Batching buys
-[all-or-nothing atomicity](leases.md#claiming-several-paths-at-once), which is why
-the protocol asks for it, but it buys no speed.
+`acquire_many` costs **4.3–4.7 ms per path** at 5 and 20 paths against 8.9 ms at
+one, because one invocation resolves HEAD once and reuses it. Before that cache it
+was 8.6–8.7 ms per path at every size — every path paid its own subprocess.
 
-### `git hash-object` is *not* an extra cost
+Batching also buys [all-or-nothing atomicity](leases.md#claiming-several-paths-at-once),
+which is why the protocol asks for it. It now buys speed as well.
 
-Leasing a path that already exists on disk also stamps `content_hash` so
-[`pact watch`](watch.md) can diff against it, which runs `git hash-object -w`.
-`lease/with_subprocess/acquire_hashes_an_existing_file` measures 8.0 ms against
-`acquire_clean`'s 8.1 ms — indistinguishable. Once a command is already paying
-for one process spawn, the second is lost in the noise, which is itself an
-argument about where the fix would have to go.
+### Leasing an existing file is the common case, and it is the cheaper one
+
+`acquire_clean` (8.7 ms, a path that does not exist) is *slower* than
+`acquire_hashes_an_existing_file` (6.0 ms), which looks backwards until you see
+why: the existing-file path is the one the shared log parse helps, because the
+stale-copy check only runs when there is a content hash to compare.
+
+The distinction matters for which number to quote. In the crucible run **56 of 58
+acquires were of files that already existed** and 2 were of paths about to be
+created, so the budgeted benchmark models the existing-file case.
 
 ## Messaging is measured separately, and is not on this path
 
@@ -141,51 +160,97 @@ backend is not on the lease hot path. `git` is.**
 
 One nightly job (`.github/workflows/bench.yml`, plus `workflow_dispatch`) runs
 `scripts/bench-budget.sh` and fails if the median of
-`lease/roundtrip_acquire_release` exceeds **50 ms**.
+`lease/roundtrip_acquire_release` exceeds **100 ms**.
 
-**Why 50 and not 10.** 10 ms was the proposed budget, and the measurement rejected
-it: the baseline is 11.9 ms. A budget below the baseline is not a strict budget, it
-is a broken one. 50 ms is ~4x the measured median, chosen for the *runner* rather
-than the code — a shared CI box is routinely 2–3x slower on process spawn and I/O
-than a developer machine, and a check that goes red because a neighbour was busy
-is a check people learn to re-run.
+**The budget has moved twice, and both times the measurement moved first.** 10 ms
+was the original proposal and the baseline was 11.9 ms, so it was rejected before
+it ever ran. 50 ms held while the budgeted benchmark leased a path that did not
+exist — then field data showed that is the 3% case, the benchmark was corrected to
+lease an existing file, and the representative baseline is **20.3 ms** because it
+also pays a content hash and a stale-copy check.
+
+100 ms is ~5x that, and the multiple is for the runner rather than the code: the
+budgeted path spawns three subprocesses (two `git rev-parse`, one
+`git hash-object`), and process spawn is the most runner-sensitive thing in this
+whole measurement.
 
 **What it can and cannot catch.** It is an order-of-magnitude contract:
 
-- **Catches**: a new subprocess or two on the lease path, a network call, an fsync
-  per event, or a walk that grows with history instead of being capped.
+- **Catches**: another subprocess or two on the lease path, a network call, an
+  fsync per event, or a walk that grows with history instead of being capped.
 - **Does not catch**: a 2x slowdown. Nothing here would notice acquire going from
   8 ms to 16 ms.
 
 That limit is deliberate. Criterion's real strength is comparing a run to a stored
-baseline, and this job does not use it, because on a shared runner a
-baseline comparison reports the neighbours: the same commit swings wider than any
-regression worth finding. An absolute ceiling with large headroom is the assertion
-that means something in that environment.
+baseline, and this job does not use it, because on a shared runner a baseline
+comparison reports the neighbours: the same commit swings wider than any regression
+worth finding. An absolute ceiling with large headroom is the assertion that means
+something in that environment.
 
 **Not on pull requests, and not a required check** — same reasoning as
 [the canary](development.md#canary-pact-against-a-real-beads-cli). It asserts a
 property of the machine as much as of the code.
 
-## What this measurement suggests, and what it does not do
+## What was optimised, and what was left alone
 
-The obvious optimisations are visible and deliberately **not** taken here — this
-was a measurement exercise, and changing the thing you are measuring in the same
-pass is how you end up with neither a number nor a fix:
+The first measurement listed three obvious optimisations and deliberately took
+none of them, so that the numbers and the changes could not be confused. Two were
+then done and one was rejected **by the measurement itself** (pact-hxy):
 
-- Cache `head_short` per process. Every command writes 1–2 boundary events, and
-  `acquire_many` writes N; one `rev-parse` per *command* would cut the batch case
-  by most of its cost.
-- Read the log's tail for the chain point rather than the whole file.
-- Share one log parse between `owner_of` and `last_released_content`, which run
-  back to back on the same acquire and read the same bytes twice.
+**Done — resolve HEAD once per command.** `git_history` memoises `head_short` per
+(process, repository). Sound because HEAD cannot move inside a command that exits;
+`pact ui` is the one long-lived process and drops the cache on every refresh, so
+its staleness is one tick rather than a session.
 
-Whether any of that is worth doing is a separate question with a real answer:
-**84 acquire-and-release cycles per second is not currently anybody's
-bottleneck.** An agent holds a lease for minutes — the measured p90 hold is 24
-minutes — so a 12 ms claim is invisible next to the work it protects. These notes
-exist so that the next person who needs the headroom knows exactly where it is,
-not to imply it is needed now.
+- `acquire_many/5`: 43.1 ms → 23.6 ms (**−45%**)
+- `acquire_many/20`: 174.4 ms → 85.9 ms (**−51%**)
+- a single-path command: **unchanged**, and that is not a disappointment but the
+  shape of the fix. One boundary event means one resolve either way. The win is on
+  the batching the protocol already asks agents to do.
+
+**Done — one log parse instead of two.** `owner_of` and `last_released_content`
+were adjacent calls on the acquire path, each parsing the whole log to answer a
+question about the same path. `events::acquire_facts` answers both from one pass.
+
+- acquiring an existing file: 8.0 ms → 6.0 ms (**−24%**), which is 56 of 58 real
+  acquires
+- acquiring a path that does not exist: unchanged, because the second read never
+  happened there — the stale-copy check returns before reading when there is no
+  content hash to compare
+
+**Rejected — read the log's tail for the chain point.** It would make `append`
+O(1) in log size instead of O(n), it is obviously correct, and it buys **nothing**:
+append is flat at 393/395/415 µs across 0/1000/4500 lines. The read is sequential,
+unparsed and page-cached, and the cap keeps it small. Filed and closed with the
+number rather than left as a standing invitation.
+
+### Three measurement errors, all found before publication
+
+Worth recording, because each would have published a figure nobody experiences:
+
+1. **Uncomparable log sizes.** Each benchmark had its own tempdir whose log grew at
+   its own rate, so `refresh` looked 6x faster than `acquire` when the real
+   difference was events written per iteration. Every repo is now seeded to the
+   steady state.
+2. **Per-process caching read as per-operation.** With the HEAD cache in, the bench
+   resolved once and reused it for every iteration, showing a 51% improvement on a
+   single acquire that no user gets. Single-command benchmarks now clear the cache
+   in untimed setup.
+3. **`BatchSize::SmallInput` batches setups.** It runs every setup, then every
+   routine — so clearing the cache N times up front left only the first iteration
+   cold. That understated a boundary append by 7x. All reset-dependent benchmarks
+   use `PerIteration`.
+
+The general lesson is the one this repo keeps relearning: a measurement that agrees
+with your hypothesis deserves more scrutiny than one that does not.
+
+### Still on the table
+
+Nothing urgent. **49 acquire-and-release cycles per second is not anybody's
+bottleneck** against a measured p90 lease hold of 24 minutes, so a 20 ms claim is
+invisible next to the work it protects. If a future field run shows batched
+acquires mattering at fleet scale, the remaining spawn is `git hash-object` on the
+acquire path, which could in principle be cached the same way HEAD now is.
 
 ## Running it yourself
 

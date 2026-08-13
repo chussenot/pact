@@ -203,11 +203,13 @@ fn holder_location(lease: &LeaseInfo) -> String {
 /// it cannot tell — no prior release on record, a file that does not exist yet, a
 /// release logged before content hashes were stamped. A false alarm on a first
 /// acquire would train agents to ignore the real one.
-fn warn_if_copy_diverged(repo_root: &Path, relative: &str, mine: Option<&str>) {
+fn warn_if_copy_diverged(
+    relative: &str,
+    mine: Option<&str>,
+    left: Option<&events::ReleasedContent>,
+) {
     let Some(mine) = mine else { return };
-    let Ok(Some(left)) = events::last_released_content(repo_root, relative) else {
-        return;
-    };
+    let Some(left) = left else { return };
     if left.hash == mine {
         return;
     }
@@ -1415,14 +1417,19 @@ fn acquire_inner(
             // But the SHARED `events.jsonl` might still show a prior
             // "acquired" for this path with no later released/expired/
             // stolen/force-released row: a claim nothing ever closed out.
-            // Cheap because it reuses the same log scan `events::owner_of`
-            // already does (bounded to events.jsonl's own line cap), not
-            // `audit::reconstruct`'s full-log walk, which answers a broader
-            // question at a much higher cost. A warning, not a refusal — a
-            // doctor-prescribed manual `leases/` wipe produces this exact
-            // shape and is a legitimate recovery, so blocking here would
-            // misfire on precisely the case doctor tells people to run.
-            if let Ok(Some(prior)) = events::owner_of(repo_root, &relative) {
+            // Bounded to events.jsonl's own line cap, not `audit::reconstruct`'s
+            // full-log walk, which answers a broader question at a much higher
+            // cost. A warning, not a refusal — a doctor-prescribed manual
+            // `leases/` wipe produces this exact shape and is a legitimate
+            // recovery, so blocking here would misfire on precisely the case
+            // doctor tells people to run.
+            //
+            // ONE parse for both warnings (pact-hxy). These used to be
+            // `events::owner_of` followed by a second, separate lookup that read
+            // the same bytes twice — measured at 2.6 ms apiece against a claim
+            // that is otherwise microseconds.
+            let facts = events::acquire_facts(repo_root, &relative).unwrap_or_default();
+            if let Some(prior) = &facts.owner {
                 if prior.kind == "acquired" {
                     crate::output::warn(&format!(
                         "warning: the shared event log's last word on {relative} is an \
@@ -1433,7 +1440,11 @@ fn acquire_inner(
                     ));
                 }
             }
-            warn_if_copy_diverged(repo_root, &relative, new_lease.content_hash.as_deref());
+            warn_if_copy_diverged(
+                &relative,
+                new_lease.content_hash.as_deref(),
+                facts.left_behind.as_ref(),
+            );
             log_event(
                 repo_root,
                 agent,

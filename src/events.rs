@@ -828,38 +828,6 @@ pub fn last_custody_by(repo_root: &Path, path: &str, agent: &str) -> Result<Opti
         }))
 }
 
-/// What the last agent to RELEASE `path` left behind: their name, when, and the
-/// content hash of the file at that moment.
-///
-/// The pairing this exists for (pact-mqw.3): a lease is exclusive in TIME, but
-/// under the branch-per-agent worktree topology it is not exclusive across
-/// COPIES. Agent A acquires, edits, commits to branch A, releases — compliant.
-/// Agent B acquires and edits a different copy on branch B that never contained
-/// A's change, commits, releases — also compliant. Both leases were honoured and
-/// the conflict is deferred to a merge nobody holds a lease for.
-///
-/// The hash a releasing agent left is the only fixed point that can detect it, so
-/// comparing it against the acquiring worktree's own hash answers "am I about to
-/// edit a stale copy" at the one moment it is cheap to act on.
-///
-/// `None` when the log has no close for this path, when the closing event predates
-/// content-hash stamping on releases, or when hashing failed at release time.
-/// Every one of those is "cannot tell", which must read as silence rather than as
-/// a warning — a false alarm on every first acquire would train agents to ignore
-/// the real one.
-pub fn last_released_content(repo_root: &Path, path: &str) -> Result<Option<ReleasedContent>> {
-    Ok(all(repo_root)?
-        .into_iter()
-        .rev()
-        .filter(|e| matches!(e.kind.as_str(), "released" | "force-released"))
-        .find(|e| e.path.as_deref() == Some(path) && e.content_hash.is_some())
-        .map(|e| ReleasedContent {
-            agent: e.agent,
-            at: e.at,
-            hash: e.content_hash.unwrap_or_default(),
-        }))
-}
-
 /// The three facts [`last_released_content`] answers with.
 #[derive(Debug, Clone)]
 pub struct ReleasedContent {
@@ -868,6 +836,74 @@ pub struct ReleasedContent {
     pub at: String,
     /// The path's git blob id as the releasing agent left it.
     pub hash: String,
+}
+
+/// Both facts `lease acquire` wants about a path, from ONE parse of the log
+/// (pact-hxy).
+///
+/// The pairing exists because a lease is exclusive in TIME but not across COPIES:
+/// agent A acquires, edits, commits to branch A and releases — compliant — and
+/// agent B then acquires and edits a different copy on branch B that never
+/// contained A's change. Both leases were honoured, and the conflict is deferred
+/// to a merge nobody holds a lease for. The hash a releasing agent left is the only
+/// fixed point that detects it, so `left_behind` is compared against the acquiring
+/// worktree's own hash at the one moment it is cheap to act on (pact-mqw.3).
+///
+/// `left_behind` is `None` for every "cannot tell": no close on record, a close
+/// predating content-hash stamping, or hashing that failed at release time. All of
+/// those must read as silence rather than as a warning — a false alarm on every
+/// first acquire would train agents to ignore the real one.
+///
+/// `owner_of` and `last_released_content` were called back to back on the clean
+/// acquire path, and each parsed the whole log — 2.6 ms apiece at the log's steady
+/// size, against a claim that is otherwise microseconds. They read the same bytes
+/// to answer two questions about the same path, so they now share the read.
+///
+/// Kept as one function rather than a cache: a cache would need invalidating, and
+/// the two callers are adjacent lines in one function. The narrow fix is the whole
+/// fix.
+pub fn acquire_facts(repo_root: &Path, path: &str) -> Result<AcquireFacts> {
+    let mut facts = AcquireFacts::default();
+    // One reverse pass. `owner` wants the last custody event; `left_behind` wants
+    // the last release that recorded content. Those can be different events, so
+    // both are looked for and the walk stops only when both are known.
+    for e in all(repo_root)?.into_iter().rev() {
+        if e.path.as_deref() != Some(path) {
+            continue;
+        }
+        if facts.left_behind.is_none()
+            && matches!(e.kind.as_str(), "released" | "force-released")
+            && e.content_hash.is_some()
+        {
+            facts.left_behind = Some(ReleasedContent {
+                agent: e.agent.clone(),
+                at: e.at.clone(),
+                hash: e.content_hash.clone().unwrap_or_default(),
+            });
+        }
+        if facts.owner.is_none() && is_custody(&e.kind) {
+            facts.owner = Some(Owner {
+                agent: e.agent,
+                at: e.at,
+                kind: e.kind,
+                detail: e.detail,
+            });
+        }
+        if facts.owner.is_some() && facts.left_behind.is_some() {
+            break;
+        }
+    }
+    Ok(facts)
+}
+
+/// What [`acquire_facts`] found. Both fields are independently optional: a path
+/// can have an owner and no recorded release, or neither.
+#[derive(Debug, Default, Clone)]
+pub struct AcquireFacts {
+    /// Identical to what [`owner_of`] would return.
+    pub owner: Option<Owner>,
+    /// The content the last agent to RELEASE this path left behind.
+    pub left_behind: Option<ReleasedContent>,
 }
 
 /// Every path pact has ever seen an event for, with its last owner, most

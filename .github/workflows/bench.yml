@@ -20,7 +20,7 @@ on:
       budget_ms:
         description: "Budget in ms for the acquire+release median"
         required: false
-        default: "50"
+        default: "100"
 
 permissions:
   contents: read
@@ -56,7 +56,7 @@ jobs:
           # default 5s/bench would spend most of the job on benches the budget
           # does not read.
           BENCH_ARGS: "--warm-up-time 1 --measurement-time 3"
-        run: scripts/bench-budget.sh "${{ github.event.inputs.budget_ms || '50' }}"
+        run: scripts/bench-budget.sh "${{ github.event.inputs.budget_ms || '100' }}"
 
       # The full suite, after the assertion, so a failure above is reported
       # against the one benchmark that gates rather than lost in the rest — and

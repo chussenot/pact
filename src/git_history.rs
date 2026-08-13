@@ -26,8 +26,9 @@
 //!   so a commit older than the clone's depth reads as "no commit", not as a
 //!   different kind of unknown.
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -202,6 +203,18 @@ fn relabel(diff: &str, old: &str, new: &str, path: &str) -> String {
 /// The short hash of `HEAD`, so a truncated diff can point at something the
 /// reader can go and look at in full.
 pub fn head_short(repo_root: &Path) -> Option<String> {
+    // Cached per (process, repo). See `HEAD_CACHE` for why that is sound, and for
+    // the one caller that has to opt out.
+    if let Some(hit) = cached_head(repo_root) {
+        return hit;
+    }
+    let fresh = head_short_uncached(repo_root);
+    remember_head(repo_root, fresh.clone());
+    fresh
+}
+
+/// What `head_short` used to be, and still is on a cache miss.
+fn head_short_uncached(repo_root: &Path) -> Option<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -212,6 +225,76 @@ pub fn head_short(repo_root: &Path) -> Option<String> {
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Resolved HEADs, keyed by repository root (pact-hxy).
+///
+/// ## Why this exists
+///
+/// `events::append` stamps `head` on the four hold-boundary kinds, so every
+/// `acquired` and `released` row costs a `git rev-parse`. Measured, that one
+/// subprocess is **85% of an append on the lease hot path**: the same append with
+/// a non-boundary kind is 444 us against 2.95 ms
+/// ([the numbers](../docs/performance.md)).
+///
+/// It buys nothing for a single-path `lease acquire`, which writes one event and
+/// therefore spawns once either way. It buys a lot for the batching the protocol
+/// actually asks agents to do: `lease acquire a b c` writes three `acquired` rows
+/// with a byte-identical head, and `release --all` does the same on the way out.
+/// At twenty paths that was twenty identical subprocesses.
+///
+/// ## Why caching cannot record a stale HEAD
+///
+/// Within one pact command HEAD cannot move: pact never commits, and no command
+/// both writes boundary events and waits for something that might. So the value
+/// is fixed for exactly as long as it is reused.
+///
+/// The exception is `pact ui`, which is the one long-lived process here and can
+/// force-release from its own event loop. It calls [`forget_heads`] on every data
+/// refresh, so its staleness window is one refresh tick rather than the lifetime
+/// of the session — and a human's force-release happens moments after a refresh
+/// they were looking at.
+///
+/// Keyed by root rather than global, because the test suite runs many
+/// repositories in one process and a global slot would hand one tempdir's HEAD to
+/// another's assertions. `None` is cached too: "this is not a git repo with a
+/// commit" is an answer worth not re-deriving twenty times.
+static HEAD_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
+
+fn head_cache() -> &'static Mutex<HashMap<PathBuf, Option<String>>> {
+    HEAD_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `Some(answer)` on a hit — where `answer` may itself be `None`. A poisoned lock
+/// reads as a miss: recomputing is always correct, so a panic in another thread
+/// must not turn this into an error path.
+fn cached_head(repo_root: &Path) -> Option<Option<String>> {
+    head_cache().lock().ok()?.get(repo_root).cloned()
+}
+
+fn remember_head(repo_root: &Path, head: Option<String>) {
+    if let Ok(mut map) = head_cache().lock() {
+        map.insert(repo_root.to_path_buf(), head);
+    }
+}
+
+/// Drop the cached HEAD for ONE repository.
+///
+/// For long-lived processes: a command that exits has nothing to invalidate, and a
+/// process that stays up must not keep answering with a commit that has since
+/// moved. `pact ui` calls this on each refresh, for the repository it is watching.
+///
+/// Scoped to one root rather than clearing the map, and that is not tidiness. A
+/// global clear reaches every OTHER repository in the process, which in a test
+/// binary means every other test: the first version cleared everything, and a
+/// `pact ui` test constructing an `App` wiped this module's own cache assertions
+/// mid-test from another thread. Nothing needs a wider invalidation than the repo
+/// it is looking at, so nothing gets one.
+#[cfg_attr(not(feature = "ui"), allow(dead_code))]
+pub fn forget_head(repo_root: &Path) {
+    if let Ok(mut map) = head_cache().lock() {
+        map.remove(repo_root);
+    }
 }
 
 fn parse_log(text: &str) -> Vec<Commit> {
@@ -345,5 +428,60 @@ mod tests {
         // can decide how to degrade.
         let result = commits_since(tmp.path(), None);
         assert!(result.is_err() || result.unwrap().is_empty());
+    }
+    /// pact-hxy: the cache's three properties, each of which is a way it could
+    /// have been wrong.
+    ///
+    /// The measured win is on batching — `lease acquire a b c` wrote three
+    /// `acquired` rows with a byte-identical head and spawned `git rev-parse`
+    /// three times — so what matters is that reuse is *correct*, not that it is
+    /// fast, which is what these assert.
+    #[test]
+    fn head_is_resolved_once_per_repo_and_forgotten_on_demand() {
+        let a = git_repo();
+        commit(a.path(), "one.txt", "1", "2026-08-13T09:00:00+00:00");
+        let first = head_short(a.path()).expect("a HEAD");
+
+        // 1. A hit returns the same answer.
+        assert_eq!(head_short(a.path()).as_deref(), Some(first.as_str()));
+
+        // 2. Keyed by repo, not global. A second repository must not be handed the
+        //    first one's HEAD — the failure mode that would have quietly corrupted
+        //    the test suite, where many repos share one process.
+        let b = git_repo();
+        commit(b.path(), "two.txt", "2", "2026-08-13T09:01:00+00:00");
+        let b_head = head_short(b.path()).expect("b HEAD");
+        assert_ne!(
+            b_head, first,
+            "two repos with different commits must not share a cached HEAD"
+        );
+        assert_eq!(head_short(a.path()).as_deref(), Some(first.as_str()));
+
+        // 3. `forget_heads` actually re-resolves. Committing again moves HEAD, and
+        //    the cache must not keep answering with the old one — this is the
+        //    property `pact ui` depends on.
+        commit(a.path(), "three.txt", "3", "2026-08-13T09:02:00+00:00");
+        assert_eq!(
+            head_short(a.path()).as_deref(),
+            Some(first.as_str()),
+            "still cached until told otherwise"
+        );
+        forget_head(a.path());
+        let moved = head_short(a.path()).expect("a HEAD after the second commit");
+        assert_ne!(moved, first, "forget_heads must force a re-resolve");
+    }
+
+    /// A repo with no commits caches its `None` rather than re-spawning `git` for
+    /// the same answer — the shape a fresh `git init` has, and the one a bench
+    /// against a tempdir hits constantly.
+    #[test]
+    fn a_repo_with_no_commits_caches_the_absence() {
+        let tmp = git_repo();
+        assert_eq!(head_short(tmp.path()), None);
+        assert_eq!(
+            cached_head(tmp.path()),
+            Some(None),
+            "the miss is remembered"
+        );
     }
 }
