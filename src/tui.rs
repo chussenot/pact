@@ -1075,11 +1075,9 @@ fn render_doctor(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let title = if report.healthy {
-        " all checks passed "
-    } else {
-        " some checks failed "
-    };
+    // Same sentence the CLI prints, count included. Rendering the title from
+    // `healthy` alone showed "all checks passed" above a visible `!`.
+    let title = format!(" {} ", crate::doctor::summary(report));
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         area,

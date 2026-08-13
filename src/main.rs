@@ -2049,23 +2049,8 @@ fn run_doctor(cwd: &Path, json: bool) -> Result<i32> {
                 format!("{glyph} {}: {}", c.name, c.detail)
             })
             .collect();
-        let warnings = r.checks.iter().filter(|c| c.warn).count();
         lines.push(String::new());
-        // The warning count is reported whether or not something else failed.
-        // It used to be dropped on the failure branch, so a repo with both a
-        // broken check and a warning showed only "some checks failed" — and the
-        // `!` line it refers to is exactly the one that scrolls off the top of a
-        // long report, which is why the count exists at all.
-        let head = if r.healthy {
-            "all checks passed"
-        } else {
-            "some checks failed"
-        };
-        lines.push(match warnings {
-            0 => head.to_string(),
-            1 => format!("{head}, 1 warning"),
-            n => format!("{head}, {n} warnings"),
-        });
+        lines.push(doctor::summary(r));
         lines.join("\n")
     });
 

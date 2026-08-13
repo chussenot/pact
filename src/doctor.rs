@@ -29,6 +29,34 @@ pub struct DoctorReport {
     pub checks: Vec<DoctorCheck>,
 }
 
+/// The one-line verdict, spelled ONCE so the CLI and the TUI cannot disagree
+/// about it.
+///
+/// The warning count is the load-bearing part, and it is reported whether or not
+/// something else failed. It used to be dropped on the failure branch, so a repo
+/// with both a broken check and a warning showed only "some checks failed" — and the
+/// `!` line it refers to is exactly the one that scrolls off the top of a long
+/// report, which is why the count exists at all.
+///
+/// `pact ui` rendered its own title from `healthy` alone and so lost the count
+/// entirely, on the surface where scrolling off is MOST likely: a fixed-height panel
+/// with two dozen checks in it, where a human sees "all checks passed" above a
+/// visible `!`. Sharing the function is the fix, in the same spirit as `tab_rects`
+/// being shared by rendering and mouse hit-testing so the two cannot drift.
+pub fn summary(report: &DoctorReport) -> String {
+    let warnings = report.checks.iter().filter(|c| c.warn).count();
+    let head = if report.healthy {
+        "all checks passed"
+    } else {
+        "some checks failed"
+    };
+    match warnings {
+        0 => head.to_string(),
+        1 => format!("{head}, 1 warning"),
+        n => format!("{head}, {n} warnings"),
+    }
+}
+
 /// `root` must already be a resolved repo root (see `repo::find_repo_root`)
 /// — without one, none of these checks mean anything, so callers treat
 /// resolving it as a hard prerequisite rather than folding it into the report.
@@ -1002,6 +1030,45 @@ fn sidecar_check(beads_dir: bool, recording: Option<bool>, sidecar: bool) -> Doc
 
 #[cfg(test)]
 mod tests {
+    fn report(states: &[(bool, bool)]) -> DoctorReport {
+        let checks: Vec<DoctorCheck> = states
+            .iter()
+            .map(|(ok, warn)| DoctorCheck {
+                name: "x",
+                ok: *ok,
+                warn: *warn,
+                detail: String::new(),
+            })
+            .collect();
+        DoctorReport {
+            healthy: checks.iter().all(|c| c.ok),
+            checks,
+        }
+    }
+
+    /// The count must survive a FAILURE, and it must survive being rendered by the
+    /// TUI — `pact ui` built its title from `healthy` alone and so showed
+    /// "all checks passed" above a visible `!` on a panel two dozen checks tall.
+    #[test]
+    fn the_summary_always_counts_the_warnings_it_rendered() {
+        assert_eq!(summary(&report(&[(true, false)])), "all checks passed");
+        assert_eq!(
+            summary(&report(&[(true, false), (true, true)])),
+            "all checks passed, 1 warning"
+        );
+        assert_eq!(
+            summary(&report(&[(true, true), (true, true)])),
+            "all checks passed, 2 warnings"
+        );
+        // A warning next to a failure is the case that regressed before: the count
+        // used to be dropped on this branch entirely.
+        assert_eq!(
+            summary(&report(&[(false, false), (true, true)])),
+            "some checks failed, 1 warning"
+        );
+        assert_eq!(summary(&report(&[(false, false)])), "some checks failed");
+    }
+
     use super::*;
 
     /// (ok, detail) for one check of a fresh report, by value so the caller can
