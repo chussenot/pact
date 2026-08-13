@@ -344,15 +344,34 @@ outside its own prefix, and it does nothing else here. Replies still hang off
 the root in bd's own shape, so a thread reads `pact-msg-<hash>`,
 `pact-msg-<hash>.1`, and so on.
 
-A second, quieter consequence pact corrects for rather than exposes: `bd
-create --id= --force` echoes its OWN call's wall-clock time as `created_at`
-even on a replay that upserts an existing bead and creates nothing — verified
-against a real store, two identical `create` calls report two different
-`created_at`s while `bd show` reports the original throughout. `msg send`'s
-`--json` response re-reads the bead via `show` on the id-bearing path before
-reporting `created_at`, so a retry's own response agrees with what `msg
-inbox`/`msg sent` show moments later, instead of a --json consumer trusting a
-value that would never match history (pact-m7j.6.7).
+A second, quieter consequence pact corrects for rather than exposes: a create's
+own `created_at` is not trustworthy on that path, so `msg send`'s `--json`
+response re-reads the bead via `show` before reporting it. A retry's response
+then agrees with what `msg inbox`/`msg sent` show moments later, instead of a
+`--json` consumer trusting a value that would never match history
+(pact-m7j.6.7).
+
+### What "survives a retry" means depends on your bd version
+
+The guarantee is constant — **one send, one bead, however many times the caller
+retries** — but bd changed how it delivers it, and pact handles both (pact-0re):
+
+| | bd ≤ 1.1 | bd ≥ 1.2 |
+|---|---|---|
+| a replayed `create` with the same `--id` | **upserts**, exit 0 | **refuses**: `already exists; use bd update, or bd import for upsert semantics`, exit 1 |
+| what pact does | takes the success path | reads that refusal as proof the message is already delivered, and returns the existing bead |
+
+The refusal is only ever read as success when it names **pact's own planned id**.
+An "already exists" about any other bead, and every other failure, stays an
+error — because "the bead is already there" and "bd could not write" must not
+collapse into one answer, and only the first is safe to report as a delivered
+message.
+
+Getting that wrong would be worse than the duplicate it replaced. `pact msg
+sent` tells a sender who cannot confirm a send to re-send it, so treating the
+refusal as failure would report *failure for a message that had already been
+delivered* — the same shape as the closed-pipe bug that made agents re-send in
+the first place.
 
 ## Replaying a fan-out that failed partway: `--skip`
 

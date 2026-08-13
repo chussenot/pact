@@ -24,7 +24,12 @@ use crate::otel;
 use crate::output::exit_with;
 
 const TESTED_BD_MIN: (u64, u64, u64) = (1, 1, 0);
-const TESTED_BD_MAX_EXCLUSIVE: (u64, u64, u64) = (1, 2, 0);
+/// Widened to the 1.2 line after pact-0re, which is what testing against 1.2.1
+/// cost: bd 1.2 dropped `create --id --force`'s upsert and refuses with "already
+/// exists" instead, and `bd init` now declines to touch a legacy SQLite (br)
+/// workspace at all. Both are handled, and the handling is version-agnostic —
+/// 1.1's upsert still takes the success path — so the floor stays at 1.1.0.
+const TESTED_BD_MAX_EXCLUSIVE: (u64, u64, u64) = (1, 3, 0);
 /// br's surface was mapped against 0.2.19; it is pre-1.0 and its CLI moves, so
 /// the tested window is the 0.2.x line rather than anything wider.
 const TESTED_BR_MIN: (u64, u64, u64) = (0, 2, 0);
@@ -783,7 +788,11 @@ mod tests {
     fn detects_versions_outside_the_tested_range() {
         assert_eq!(version_compat_warning("bd version 1.1.0"), None);
         assert_eq!(version_compat_warning("bd 1.1.9"), None);
-        assert!(version_compat_warning("bd version 1.2.0")
+        // 1.2 is inside the window as of pact-0re: it behaves DIFFERENTLY from
+        // 1.1 on a replayed create, and pact handles both, which is what being
+        // tested against it means.
+        assert_eq!(version_compat_warning("bd version 1.2.1"), None);
+        assert!(version_compat_warning("bd version 1.3.0")
             .unwrap()
             .contains("outside tested range"));
         assert!(version_compat_warning("bd version 0.9.0")
@@ -810,7 +819,7 @@ mod tests {
         // matches at the start, so nothing here silently widens it.
         assert!(version_compat_warning("bd version 0.2.19")
             .unwrap()
-            .contains("1.1.0 <= version < 1.2.0"));
+            .contains("1.1.0 <= version < 1.3.0"));
     }
 
     fn workspace_in(dir: &std::path::Path, entries: &[&str]) -> Workspace {

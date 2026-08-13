@@ -3544,6 +3544,26 @@ fn msg_inbox_after_bd_init_over_a_live_br_store_still_warns() {
         );
         return;
     }
+
+    // The two-store condition is built on DISK rather than by running `bd init`
+    // over the br store (pact-0re).
+    //
+    // That is how this fixture used to work, and bd 1.2 now refuses it outright:
+    // "historical SQLite workspace detected; explicit migration is required
+    // before this bd version can open or modify the workspace". br refuses the
+    // reverse order too. So neither tool will create this state any more — which
+    // is an upstream fix, and does NOT retire pact's warning: bd's own error
+    // tells the user to preserve `.beads` and migrate, so repositories that were
+    // already in this state stay in it across the upgrade, and those are exactly
+    // the ones the warning is for.
+    //
+    // `conflicting_stores` looks for a Dolt directory beside a `.db` file, both
+    // of which are plain filesystem facts, so a real `bd init` plus a planted
+    // sibling reproduces the condition precisely — and keeps bd's store real, so
+    // the "bd answers and the br message is invisible" half below still means
+    // something.
+    let br_db = tmp.path().join(".beads").join("beads.db");
+    std::fs::remove_dir_all(tmp.path().join(".beads")).ok();
     let bd_init = Command::new("bd")
         .arg("init")
         .current_dir(tmp.path())
@@ -3551,9 +3571,13 @@ fn msg_inbox_after_bd_init_over_a_live_br_store_still_warns() {
         .expect("bd init");
     assert!(
         bd_init.status.success(),
-        "bd init atop a live br store must still succeed (that half of the \
-         behaviour is unchanged by this fix): {}",
+        "bd init on a clean repo must succeed: {}",
         stderr_of(&bd_init)
+    );
+    std::fs::write(&br_db, b"SQLite format 3\0").unwrap();
+    assert!(
+        tmp.path().join(".beads/embeddeddolt").is_dir() && br_db.is_file(),
+        "the fixture must present both stores, or it proves nothing"
     );
 
     let out = pact(tmp.path(), "someone", &["msg", "inbox"]);

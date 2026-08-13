@@ -20,7 +20,8 @@
 //! (a leftover `.pact/read.json` from an older pact is inert, and the single
 //! `.pact/` gitignore line from `agents_md` covers it anyway).
 //!
-//! Verified against bd 1.1.0: `bd list/show --json` hydrate `labels` (there is
+//! Verified against bd 1.1.0 and re-verified against 1.2.1: `bd list/show --json`
+//! hydrate `labels` (there is
 //! a `--skip-labels` to turn that off, which pact never passes), `bd label add`
 //! takes several ids at once and is idempotent — and a child bead *inherits*
 //! its parent's labels unless `--no-inherit-labels` is passed, which is why
@@ -612,11 +613,17 @@ fn fnv1a64(parts: &[&str]) -> u64 {
     hash
 }
 
-/// A deterministic id for bd's `--id`/`--force` upsert, so a retried `create`
-/// after an ambiguous outcome (process killed after bd committed but before
-/// returning, a hung subprocess, a harness that dropped stdout — all three
-/// hit in production, see pact-m7j.6.4) lands on the SAME bead instead of a
-/// second, near-identical one. `sent()`'s own doc comment tells a sender that
+/// A deterministic id, so a retried `create` after an ambiguous outcome (process
+/// killed after bd committed but before returning, a hung subprocess, a harness
+/// that dropped stdout — all three hit in production, see pact-m7j.6.4) lands on
+/// the SAME bead instead of a second, near-identical one.
+///
+/// **What the id buys has survived a change in how it buys it.** bd ≤1.1 upserted
+/// on `--id`/`--force`, so a replay silently rewrote the same bead. bd 1.2 refuses
+/// with "already exists" and exits 1, so [`create`] reads that refusal as proof
+/// the message is already delivered and returns the existing bead (pact-0re).
+/// Either way the guarantee is the same one: one send, one bead, however many
+/// times the caller retries. `sent()`'s own doc comment tells a sender that
 /// cannot confirm a send to re-send it; without this, that documented policy
 /// is what mints the duplicate.
 ///
@@ -749,21 +756,49 @@ fn create(
 ) -> Result<BdIssue> {
     let args = create_args(cli.is_br(), to, parent, agent, title, body, about, notice);
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    let stdout = cli.run(repo_root, &borrowed)?;
-    let issue: BdIssue = serde_json::from_str(&stdout)
-        .with_context(|| format!("parsing `{} create --json` output", cli.binary()))?;
-    // bd's `--id`/`--force` upsert (pact-m7j.6.4, root messages only — see
-    // create_args) echoes THIS call's wall-clock time as `created_at` even
-    // when the id already existed and nothing was actually created: verified
-    // against a real scratch store, `bd create --id= --force` run twice
-    // returns a different `created_at` each time, while `bd show` afterward
-    // still reports the original. There is no field in the response that says
-    // "this was a no-op upsert", so rather than guess, re-read the one field
-    // that can lie from the source that cannot: cheap (one extra `show`, only
-    // on the id-bearing path, never for a reply or for br, which has no `--id`
-    // to replay through), and correct on both a genuine first create and a
-    // replay alike, instead of needing to tell the two apart (pact-m7j.6.7).
-    if !cli.is_br() && parent.is_none() {
+    // Read back out of the argv rather than re-deriving it: this is the id the
+    // call actually carried, so the retry path below cannot drift from
+    // `create_args`' own decision about when to send one.
+    let planned_id: Option<String> = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--id="))
+        .map(str::to_string);
+
+    let issue: BdIssue = match cli.run(repo_root, &borrowed) {
+        Ok(stdout) => serde_json::from_str(&stdout)
+            .with_context(|| format!("parsing `{} create --json` output", cli.binary()))?,
+        // A retry landing on a bead that already exists is SUCCESS, not failure
+        // (pact-0re). bd ≤1.1 upserted here; bd 1.2 refuses with "<id> already
+        // exists; use bd update, or bd import for upsert semantics" and exits 1.
+        //
+        // Treating that as an error would be the worst available answer. The id
+        // is a hash of exactly this send's content, so the bead that exists IS
+        // the message being sent — and `sent()` tells a sender who cannot
+        // confirm a send to re-send it, so the documented policy would then
+        // report failure for a message that had already been delivered. That is
+        // the shape of pact-rnc.26 (a successful send reporting failure, after
+        // which the agent sent again), which is precisely what the deterministic
+        // id exists to prevent.
+        Err(e)
+            if planned_id
+                .as_deref()
+                .is_some_and(|id| is_duplicate_id(&e, id)) =>
+        {
+            // `show` was the plan on this path anyway — see below — so the
+            // recovery is one call, not a new mechanism.
+            return show(cli, repo_root, planned_id.as_deref().unwrap_or_default());
+        }
+        Err(e) => return Err(e),
+    };
+
+    // `created_at` from a create is not trustworthy on the id-bearing path, and
+    // was not under either bd generation: the old upsert echoed THIS call's
+    // wall-clock time even when nothing was created, and nothing in the response
+    // says "this was a no-op". Rather than guess, re-read the one field that can
+    // lie from the source that cannot — cheap (one extra `show`, only here, never
+    // for a reply or for br, which has no `--id` to replay through) and correct
+    // on a first create and a replay alike (pact-m7j.6.7).
+    if planned_id.is_some() {
         let confirmed = show(cli, repo_root, &issue.id)?;
         return Ok(BdIssue {
             created_at: confirmed.created_at,
@@ -771,6 +806,19 @@ fn create(
         });
     }
     Ok(issue)
+}
+
+/// Is this `create` failure bd refusing to overwrite the id we asked for?
+///
+/// Deliberately narrow on both halves. It requires the message to name **our own
+/// planned id**, so an "already exists" about some other bead — a prefix
+/// collision, a hand-run command in the same store — is still an error. And it
+/// matches bd 1.2's wording rather than any non-zero exit, because "the bead is
+/// already there" and "bd could not write" must not collapse into one branch:
+/// only the first is safe to report as a delivered message.
+fn is_duplicate_id(err: &anyhow::Error, planned_id: &str) -> bool {
+    let text = format!("{err:#}");
+    text.contains(planned_id) && text.contains("already exists")
 }
 
 pub fn inbox(
@@ -1815,6 +1863,37 @@ mod tests {
     }
 
     /// `create_args` wires the key through with `--force`, and only for bd —
+    /// pact-0re: the branch that turns bd 1.2's refusal into a delivered message
+    /// has to be narrow in both directions, because "the bead is already there"
+    /// and "bd could not write" must never collapse into one answer — only the
+    /// first is safe to report as a successful send.
+    #[test]
+    fn only_our_own_planned_id_already_existing_counts_as_a_delivered_message() {
+        let id = "pact-msg-bf787ceef4d8f3d3";
+        let refusal = anyhow::anyhow!(
+            "bd [\"create\", \"--id={id}\"] failed (exit status: 1): \
+             {{\"error\": \"{id} already exists; use bd update, or bd import for \
+             upsert semantics\"}}"
+        );
+        assert!(is_duplicate_id(&refusal, id));
+
+        // Someone ELSE's id already existing is a real error: a prefix collision
+        // or a hand-run command in the same store is not proof our message landed.
+        assert!(!is_duplicate_id(&refusal, "pact-msg-0000000000000000"));
+
+        // And any other failure stays a failure, however it exits.
+        for other in [
+            "bd not found on PATH",
+            "database is locked",
+            "prefix mismatch: database uses 'proj-' but ID 'pact-msg-x' doesn't match",
+        ] {
+            assert!(
+                !is_duplicate_id(&anyhow::anyhow!("{other}"), id),
+                "must not read {other:?} as a delivered message"
+            );
+        }
+    }
+
     /// br has no equivalent primitive (module docs) and would reject
     /// `--no-inherit-labels`-adjacent bd-only flags outright.
     #[test]
