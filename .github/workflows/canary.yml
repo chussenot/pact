@@ -1,11 +1,23 @@
 name: Canary
 
-# Exercise pact against a REAL bd release, so upstream CLI drift is found by a
-# machine instead of by a user.
+# Exercise pact's ONE remaining coupling to bd against a REAL bd release, so
+# upstream drift is found by a machine instead of by a user.
 #
-# tests/cli.rs stubs bd, which is right for a unit suite and means nothing
-# checks pact's assumptions about somebody else's CLI: --include-infra, --parent
-# threading, whether --json hydrates labels, and the shapes those return.
+# This used to protect a message round-trip: pact STORED messages as bd beads, so
+# it depended on --include-infra, --parent threading and whether --json hydrated
+# labels. Since 0.9.0 messages live in .pact/messages.jsonl and pact issues no bd
+# writes at all, so none of those assumptions exist to break.
+#
+# What remains is that pact READS the committed .beads/interactions.jsonl export
+# to reconstruct bead assignees for `pact audit --check claim-lease-divergence`.
+# That reader is best-effort and parse-tolerant by contract — a promise about
+# somebody else's file format, which is exactly the kind of assumption that rots
+# quietly. tests/cli.rs covers it against fixtures pact wrote itself; only this
+# job checks it against an export a real bd actually produced.
+#
+# It also asserts that pact's own surface — msg, watch delivery, lease — works
+# with bd removed from PATH entirely, which is the invariant a future subprocess
+# would break.
 #
 # Deliberately NOT part of ci.yml and deliberately not a required check. It
 # depends on a third party's release process and on the network, so it must
@@ -43,7 +55,10 @@ jobs:
     timeout-minutes: 15
     strategy:
       # Both legs always run: "latest passed but pinned failed" is itself a
-      # diagnosis, and fail-fast would hide it.
+      # diagnosis, and fail-fast would hide it. The legs differ only in WHICH bd
+      # gets installed — pact has no tested-version gate to assert against any
+      # more, because it has no runtime dependency to gate. Reading a real export
+      # written by a newer bd is the thing under test.
       fail-fast: false
       matrix:
         leg: [pinned, latest]

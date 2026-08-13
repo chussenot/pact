@@ -1,21 +1,57 @@
 #!/usr/bin/env bash
-# Exercise pact against a REAL bd binary, so upstream CLI drift is found by a
-# machine instead of by a user.
+# Exercise pact's ONE remaining coupling to bd against a REAL bd binary, so
+# upstream drift is found by a machine instead of by a user.
 #
-# tests/cli.rs stubs bd. That is the right call for a unit suite — it is fast
-# and hermetic — but it means nothing checks the assumptions pact makes about
-# somebody else's CLI: `--include-infra`, `--parent` threading, whether `--json`
-# hydrates `labels`, and the shapes those commands return. Every one of those
-# was verified once by hand against one version and then trusted forever.
+# ## What this used to be for, and why it changed
+#
+# pact used to STORE its messages as bd beads, so it depended on somebody else's
+# CLI semantics: `--include-infra`, `--parent` threading, whether `--json`
+# hydrated `labels`, and the exact shapes those commands returned. Each was
+# verified by hand once and then trusted forever, and tests/cli.rs stubs bd — fast
+# and hermetic, and blind to all of it. This canary existed to replay a real send
+# against a real bd and catch the day one of those assumptions moved.
+#
+# Since 0.9.0 pact writes messages to `.pact/messages.jsonl` and issues NO bd
+# writes at all, so there is no send round-trip left to protect and every
+# assumption listed above is gone. Three whole sections went with them:
+#
+#   - the message round-trip, because pact's messages never reach bd;
+#   - actor attribution on pact's writes, because pact makes none (bd's `--actor`
+#     support still matters for the bd commands AGENTS run themselves, which is
+#     what doctor's "Beads actor attribution" check reports on);
+#   - "bd must not touch git in the main worktree" (pact-zid), whose entire
+#     premise was that pact routed mutating bd calls through the main checkout.
+#     It does not route anything any more.
+#
+# ## What it is for now
+#
+# Exactly one coupling remains: pact READS the committed
+# `.beads/interactions.jsonl` export to reconstruct bead assignees for
+# `pact audit --check claim-lease-divergence`. That reader is best-effort and
+# parse-tolerant by contract, which is a promise about somebody else's file
+# format — precisely the kind of assumption that rots quietly.
+#
+# So this canary proves, against an export a real bd actually wrote:
+#
+#   1. pact reconstructs assignees from it and finds a divergence that is really
+#      there;
+#   2. a truncated or corrupted export degrades to "no beads data" and PASSES,
+#      never an error and never a false finding;
+#   3. pact's own surface — msg, watch delivery, lease — works with bd removed
+#      from PATH entirely, which is the invariant a future subprocess would break.
 #
 # Run it locally exactly as CI does:
 #   scripts/canary.sh                 # whatever bd is on PATH
 #   CANARY_LEG=latest scripts/canary.sh
 #
-# CANARY_LEG only affects one assertion: on `latest`, a bd outside pact's tested
-# range MUST produce doctor's version warning. That is the difference between
-# "the warning logic works in a unit test" and "the warning fires on real drift".
+# CANARY_LEG is informational now: pact has no tested-version gate to assert
+# against, because it has no runtime dependency to gate. The legs still differ in
+# WHICH bd gets installed, which is the point — reading a real export written by a
+# newer bd is the thing under test.
 
+first_line() { printf '%s' "${1%%$'\n'*}"; }
+
+need() { command -v "$1" >/dev/null 2>&1 || fail "$1 is required but not on PATH"; }
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -44,19 +80,6 @@ need bd
 need jq
 need git
 
-# ---------------------------------------------------------------- the range
-#
-# Read from src/beads.rs, never restated here. A second copy of this range is a
-# thing that drifts silently from the code it claims to describe, which is the
-# whole failure mode this canary exists to catch.
-read_triplet() {
-	first_line "$(sed -nE "s/^const $1: \(u64, u64, u64\) = \(([0-9]+), ([0-9]+), ([0-9]+)\);/\1.\2.\3/p" src/beads.rs)"
-}
-BD_MIN="$(read_triplet TESTED_BD_MIN)"
-BD_MAX="$(read_triplet TESTED_BD_MAX_EXCLUSIVE)"
-[ -n "$BD_MIN" ] && [ -n "$BD_MAX" ] ||
-	fail "could not read TESTED_BD_MIN/TESTED_BD_MAX_EXCLUSIVE out of src/beads.rs — has the declaration changed shape?"
-
 # Parse the version from ANYWHERE in the output, not from the first line. bd
 # prefixes warnings when it finds something it does not like about the
 # environment — on a CI runner, `.beads has permissions 0755 (recommended:
@@ -69,19 +92,14 @@ BD_VERSION="$(first_line "$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$BD_OUTPUT")")
 # The line that actually carries the version, for the log.
 BD_VERSION_RAW="$(first_line "$(grep -F "$BD_VERSION" <<<"$BD_OUTPUT")")"
 
-# Sort-based comparison: no arithmetic on version parts, no assumptions about
-# how many components there are.
-ver_lt() { [ "$1" != "$2" ] && [ "$(first_line "$(sort -V <<<"$1"$'\n'"$2")")" = "$1" ]; }
-IN_RANGE=yes
-if ver_lt "$BD_VERSION" "$BD_MIN" || [ "$BD_VERSION" = "$BD_MAX" ] || ! ver_lt "$BD_VERSION" "$BD_MAX"; then
-	IN_RANGE=no
-fi
-
 step "environment"
-printf '  leg:          %s\n' "$LEG"
-printf '  bd:           %s\n' "$BD_VERSION_RAW"
-printf '  tested range: %s <= v < %s (from src/beads.rs)\n' "$BD_MIN" "$BD_MAX"
-printf '  in range:     %s\n' "$IN_RANGE"
+printf '  leg: %s\n' "$LEG"
+printf '  bd:  %s\n' "$BD_VERSION_RAW"
+
+# No tested-range assertion. pact deleted TESTED_BD_MIN/MAX and
+# version_compat_warning in 0.9.0: a tested range is a statement about a
+# dependency, and reading one committed JSONL file is not a dependency worth
+# gating a command on. doctor still REPORTS the version it found.
 
 # bd 1.1.x embeds Dolt ("no external server needed" per `bd init --help`), and a
 # fresh `bd init` was verified to succeed with no `dolt` binary on PATH. If a
@@ -138,54 +156,180 @@ BEADS_CHECK="$(jq -c '.checks[] | select(.name == "Beads CLI")' "$DOCTOR_JSON")"
 printf '  %s\n' "$BEADS_CHECK"
 jq -e '.ok' <<<"$BEADS_CHECK" >/dev/null || fail "doctor could not use the real bd: $BEADS_CHECK"
 
-# The assertion that makes the two-leg split worth having. A unit test proves
-# version_compat_warning() returns Some for a made-up string; this proves the
-# whole path fires when a genuinely newer bd is installed.
-if [ "$IN_RANGE" = no ]; then
-	jq -e '.warn' <<<"$BEADS_CHECK" >/dev/null ||
-		fail "bd $BD_VERSION is outside $BD_MIN..$BD_MAX but doctor did not warn: $BEADS_CHECK"
-	printf '  drift detected and warned, as designed\n'
-elif [ "$LEG" = latest ]; then
-	printf '  latest bd is still inside the tested range; nothing to warn about\n'
-fi
+# The sidecar check must reflect reality, both ways — it is what tells a user the
+# claim-lease-divergence check cannot run. Right now the sidecar is OFF (bd's
+# default), so doctor must warn.
+SIDECAR_CHECK="$(jq -c '.checks[] | select(.name == "Beads audit sidecar")' "$DOCTOR_JSON")"
+[ -n "$SIDECAR_CHECK" ] || fail "doctor has no \"Beads audit sidecar\" check: $(cat "$DOCTOR_JSON")"
+printf '  %s\n' "$SIDECAR_CHECK"
+jq -e '.warn' <<<"$SIDECAR_CHECK" >/dev/null ||
+	fail "bd's audit sidecar is off by default, so doctor must warn: $SIDECAR_CHECK"
+printf '  sidecar correctly reported as off\n'
+
+# ---------------------------------------- the real target: reading a real export
+#
+# Everything below runs against an `interactions.jsonl` that a real bd wrote. That
+# is the whole point: pact's reader makes claims about somebody else's file format
+# (rows of kind=field_change carrying extra.field/new_value, replayed in
+# created_at order) and nothing else checks them against a running bd.
+step "bd writes a real export, pact reads it"
+
+bd config set audit.enabled true >/dev/null 2>&1 ||
+	fail "could not enable bd's audit sidecar (bd config set audit.enabled true)"
+jq -n 'true' >/dev/null # keep jq in the required set even if the greps below change
+
+# A real bead, reassigned through real bd commands, so the export's rows are bd's
+# own and not a fixture pact wrote to please itself.
+BEAD="$(BEADS_ACTOR=canary-a bd create --title="canary work" --description="d" \
+	--type=task --priority=2 --json 2>/dev/null | jq -r '.id // empty')"
+[ -n "$BEAD" ] || BEAD="$(bd list --json 2>/dev/null | jq -r '.[0].id // empty')"
+[ -n "$BEAD" ] || fail "could not create a bead with the real bd"
+BEADS_ACTOR=canary-a bd update "$BEAD" --assignee=canary-owner >/dev/null 2>&1 ||
+	fail "bd update --assignee failed"
+BEADS_ACTOR=canary-a bd update "$BEAD" --assignee=canary-final >/dev/null 2>&1 ||
+	fail "second bd update --assignee failed"
+
+EXPORT=".beads/interactions.jsonl"
+[ -f "$EXPORT" ] ||
+	fail "bd wrote no $EXPORT even with audit.enabled — the sidecar's shape or switch has changed"
+printf '  bd wrote %s rows\n' "$(wc -l <"$EXPORT" | tr -d ' ')"
+grep -q '"field":"assignee"' "$EXPORT" || grep -q '"field": "assignee"' "$EXPORT" ||
+	fail "no assignee row in bd's own export — pact's reconstruction key has changed shape:
+$(head -3 "$EXPORT")"
+
+# pact must now see canary-final (the LAST assignment) as the owner, and flag a
+# hold taken by anyone else. A hold whose note names the bead, taken by a
+# different agent, is exactly a divergence.
+PACT_AGENT=canary-other "$PACT" lease acquire src/diverge.rs --note "$BEAD: not my bead" >/dev/null ||
+	fail "lease acquire failed"
+
+DIVERGE="$WORK/diverge.json"
+set +e
+PACT_AGENT=canary-a "$PACT" audit --check claim-lease-divergence --json >"$DIVERGE" 2>"$WORK/diverge.err"
+set -e
+jq -e --arg who canary-final \
+	'any(.claim_divergences[]?; .path == "src/diverge.rs" and .assignee == $who)' \
+	"$DIVERGE" >/dev/null ||
+	fail "pact did not reconstruct '$BEAD' -> canary-final from bd's own export.
+This is the coupling the canary exists for: bd's interactions.jsonl no longer says
+what src/beads.rs's interaction_assignees expects.
+report: $(cat "$DIVERGE")
+stderr: $(cat "$WORK/diverge.err")
+export head: $(head -3 "$EXPORT")"
+printf '  reconstructed the last assignee from a real export, and found the divergence\n'
+PACT_AGENT=canary-other "$PACT" lease release --all >/dev/null || fail "lease release failed"
+
+# ------------------------------------------------------------- read tolerance
+#
+# The contract is that a damaged export degrades to "no beads data" and PASSES.
+# Never an error, never a non-zero exit, never a false finding — a repository with
+# a half-written export does not have a coordination problem.
+step "a damaged export degrades instead of failing"
+
+# <label> <findings: any|none>
+#
+# `any` and `none` are both correct answers, for different damage. A torn final
+# line is SKIPPED and the intact rows above it are still used — that is the
+# tolerance contract, not a degradation — so findings from those rows are real and
+# must not be suppressed. Only when NOTHING parses is there no data to judge
+# against, and then the check must report "no beads data" and find nothing.
+#
+# What is never acceptable, for either shape, is an error: a repository with a
+# half-written export does not have a coordination problem.
+tolerate() {
+	set +e
+	PACT_AGENT=canary-a "$PACT" audit --check claim-lease-divergence --json \
+		>"$WORK/tol.json" 2>"$WORK/tol.err"
+	local code=$?
+	set -e
+	[ "$code" -le 1 ] ||
+		fail "$1: exit $code — a damaged export must never be an error.
+stdout: $(cat "$WORK/tol.json")
+stderr: $(cat "$WORK/tol.err")"
+	jq -e '.' "$WORK/tol.json" >/dev/null ||
+		fail "$1: --json emitted nothing parseable: $(cat "$WORK/tol.err")"
+	if [ "$2" = none ]; then
+		jq -e '.claim_divergences | length == 0' "$WORK/tol.json" >/dev/null ||
+			fail "$1: nothing in the export parses, so any finding is invented: $(cat "$WORK/tol.json")"
+		jq -e '.claim_unavailable != null' "$WORK/tol.json" >/dev/null ||
+			fail "$1: must say WHY it could not check, not pass silently: $(cat "$WORK/tol.json")"
+	fi
+	printf '  %s: exit %s, findings=%s\n' "$1" "$code" \
+		"$(jq '.claim_divergences | length' "$WORK/tol.json")"
+}
+
+cp "$EXPORT" "$WORK/export.bak"
+
+# A torn final line: the shape an interrupted write leaves.
+head -c $(($(wc -c <"$WORK/export.bak") - 20)) "$WORK/export.bak" >"$EXPORT"
+# `any`: the rows ABOVE the tear are intact and still count.
+tolerate "truncated mid-line" any
+
+# Wholly unparseable.
+printf 'not json at all\nnor this\n' >"$EXPORT"
+tolerate "corrupted" none
+
+# Absent entirely — the default bd repo, and the common case.
+rm -f "$EXPORT"
+tolerate "absent" none
+
+cp "$WORK/export.bak" "$EXPORT"
+
+# ------------------------------------------ pact works with bd off PATH entirely
+#
+# The invariant a future subprocess would break, asserted where it is cheap. Unit
+# tests cover it too; this proves it through the real binary in a repo that has a
+# real Beads store sitting right there, which is the case most likely to tempt a
+# regression.
+step "pact needs no bd on PATH"
+# bd removed, git KEPT. pact has always needed git — it resolves the repo root and
+# reads HEAD for the diff a watch notice carries — and this section is about the
+# Beads dependency, not about running pact outside a git checkout. An earlier cut
+# used a wholly empty PATH and watch delivery produced no notice, which read as a
+# messaging failure and was really `git diff` having no git.
+EMPTY="$WORK/no-bd"
+mkdir -p "$EMPTY"
+ln -sf "$(command -v git)" "$EMPTY/git"
+command -v bd >/dev/null && [ ! -e "$EMPTY/bd" ] ||
+	fail "the no-bd PATH must not contain bd"
+nobd() { env PATH="$EMPTY" PACT_AGENT="$1" "$PACT" "${@:2}"; }
+
+# Prove the shim really does hide bd, so a passing section cannot be a PATH that
+# quietly still had it.
+env PATH="$EMPTY" command -v bd >/dev/null 2>&1 &&
+	fail "bd is still reachable on the stripped PATH — this section proves nothing"
+
+nobd canary-a msg send --to canary-b --subject canary "ping with no backend" >/dev/null ||
+	fail "msg send needs a backend again"
+nobd canary-b msg inbox --json >"$WORK/nobd-inbox.json" || fail "msg inbox needs a backend again"
+jq -e 'length == 1' "$WORK/nobd-inbox.json" >/dev/null ||
+	fail "expected 1 message with no bd on PATH: $(cat "$WORK/nobd-inbox.json")"
+NOBD_ID="$(jq -r '.[0].id' "$WORK/nobd-inbox.json")"
+nobd canary-b msg read "$NOBD_ID" >/dev/null || fail "msg read needs a backend again"
+nobd canary-b msg inbox --unread-only --json >"$WORK/nobd-unread.json" || fail "unread-only failed"
+jq -e 'length == 0' "$WORK/nobd-unread.json" >/dev/null ||
+	fail "read state did not persist with no bd: $(cat "$WORK/nobd-unread.json")"
+nobd canary-a msg sent --json >"$WORK/nobd-sent.json" || fail "msg sent failed"
+jq -e --arg id "$NOBD_ID" 'any(.[]; .id == $id and (.read_by | index("canary-b")))' \
+	"$WORK/nobd-sent.json" >/dev/null ||
+	fail "sender cannot see the read with no bd: $(cat "$WORK/nobd-sent.json")"
+printf '  send, inbox, read and sent all round-tripped with an empty PATH\n'
+
+# Watch delivery is the one path that runs without an agent choosing to run it.
+# The file must EXIST before the acquire: a lease records the content hash it
+# found, and a release with nothing to diff against notifies nobody by design.
+mkdir -p src
+printf 'before\n' >src/watched.rs
+nobd canary-c watch add src/watched.rs >/dev/null || fail "watch add failed"
+nobd canary-a lease acquire src/watched.rs >/dev/null || fail "acquire for watch failed"
+printf 'after\n' >src/watched.rs
+nobd canary-a lease release src/watched.rs >/dev/null || fail "release for watch failed"
+nobd canary-c msg inbox --watch-only --json >"$WORK/nobd-notice.json" || fail "watch-only failed"
+jq -e 'length >= 1' "$WORK/nobd-notice.json" >/dev/null ||
+	fail "watch delivery produced no notice with no bd on PATH: $(cat "$WORK/nobd-notice.json")"
+printf '  watch delivery landed a notice with an empty PATH\n'
 
 # ------------------------------------------------------- message round-trip
-# The real target: --include-infra, --parent threading and label hydration are
-# all bd behaviours pact assumes and never verifies against a running bd.
-step "message round-trip"
-PACT_AGENT=canary-a "$PACT" msg send --to canary-b --subject "canary" "ping" >/dev/null ||
-	fail "msg send failed"
-
-INBOX="$WORK/inbox.json"
-PACT_AGENT=canary-b "$PACT" msg inbox --json >"$INBOX" || fail "msg inbox failed"
-jq -e 'length == 1' "$INBOX" >/dev/null ||
-	fail "expected exactly 1 message in canary-b's inbox, got $(jq length "$INBOX"): $(cat "$INBOX")"
-
-MSG="$(jq -c '.[0]' "$INBOX")"
-printf '  %s\n' "$MSG"
-for expr in '.subject == "canary"' '.from == "canary-a"' '.to == "canary-b"' \
-	'.body == "ping"' '(.thread | length) > 0' '(.id | length) > 0' '.read == false'; do
-	jq -e "$expr" <<<"$MSG" >/dev/null || fail "inbox message failed [$expr]: $MSG"
-done
-
-MSG_ID="$(jq -r '.id' <<<"$MSG")"
-PACT_AGENT=canary-b "$PACT" msg read "$MSG_ID" >/dev/null || fail "msg read failed for $MSG_ID"
-
-# Read state lives in bd labels (read-by-<agent>), so this asserts label
-# hydration actually round-tripped through the real binary.
-UNREAD="$WORK/unread.json"
-PACT_AGENT=canary-b "$PACT" msg inbox --unread-only --json >"$UNREAD" ||
-	fail "msg inbox --unread-only failed"
-jq -e 'length == 0' "$UNREAD" >/dev/null ||
-	fail "message stayed unread after msg read — label round-trip broken: $(cat "$UNREAD")"
-
-# The sender's side of the same fact.
-SENT="$WORK/sent.json"
-PACT_AGENT=canary-a "$PACT" msg sent --json >"$SENT" || fail "msg sent failed"
-jq -e --arg id "$MSG_ID" 'any(.[]; .id == $id and (.read_by | index("canary-b")))' "$SENT" >/dev/null ||
-	fail "sender cannot see that canary-b read it: $(cat "$SENT")"
-printf '  read state visible to the sender\n'
-
 # --------------------------------------------------------------- lease smoke
 step "lease smoke"
 PACT_AGENT=canary-a "$PACT" lease acquire src/canary.rs --note "canary run" >/dev/null ||
@@ -199,126 +343,5 @@ PACT_AGENT=canary-a "$PACT" lease release --all >/dev/null || fail "lease releas
 PACT_AGENT=canary-a "$PACT" lease ls --json >"$LS" || fail "lease ls after release failed"
 jq -e 'length == 0' "$LS" >/dev/null || fail "leases remain after release --all: $(cat "$LS")"
 printf '  acquire, list and release round-tripped\n'
-
-# ----------------------------------------------------- actor attribution
-#
-# Every mutating backend call pact makes must be recorded against the AGENT that
-# caused it, not against whoever owns the checkout. Without that, a fleet's whole
-# bead history is attributed to one human and the audit trail cannot answer the
-# only question it exists for: who did this.
-#
-# pact passes `--actor`, whose documented precedence is `--actor` >
-# `$BEADS_ACTOR` > `git user.name` > `$USER`. This asserts the end-to-end result
-# rather than the flag: the canary's git user is deliberately NOT an agent name, so a match on
-# `canary-a` can only come from attribution working.
-step "backend attributes writes to the agent, not the git user"
-GIT_USER="$(git config user.name)"
-[ "$GIT_USER" = "pact canary" ] || fail "expected the scratch repo's git user to be 'pact canary', got '$GIT_USER'"
-
-ACTOR_JSON="$WORK/actor.json"
-if ! bd show "$MSG_ID" --json >"$ACTOR_JSON" 2>&1; then
-	cat "$ACTOR_JSON" >&2
-	fail "could not read $MSG_ID back from the backend"
-fi
-# `show` has returned both a bare object and a single-element array across bd
-# versions, so accept either rather than pinning one shape.
-RECORDED="$(jq -r 'if type == "array" then .[0] else . end | .created_by // ""' "$ACTOR_JSON")"
-printf '  git user.name: %s\n  created_by:    %s\n' "$GIT_USER" "$RECORDED"
-[ "$RECORDED" = "canary-a" ] ||
-	fail "message $MSG_ID is attributed to '$RECORDED', expected 'canary-a'. Either the backend
-stopped honouring --actor, or pact stopped passing it — in both cases every agent's
-bead activity is now recorded as whoever owns the checkout."
-printf '  attributed to the sending agent\n'
-
-# ------------------------------------------- bd must not touch git, still
-#
-# pact routes every bd invocation through the MAIN worktree (see `beads_root` in
-# src/beads.rs), so that all linked worktrees of one repository share one Beads
-# store. That is correct for messaging and it has a consequence: an agent in
-# worktree B causes bd to run inside a checkout where another agent may be
-# actively working.
-#
-# Two hazards were hypothesised (pact-zid): bd racing the main-worktree agent on
-# `.git/index.lock`, and bd's auto-commit sweeping whatever that agent had
-# staged. Measured against bd 1.1.2, neither can happen — bd performs NO git
-# operations for the only mutating subcommands pact issues (`create` and `label
-# add`). So pact deliberately ships no mitigation: a doctor check would warn
-# about a hazard that does not exist, and wrapping bd calls in an internal lease
-# would serialise operations that never conflict.
-#
-# That decision rests entirely on somebody else's behaviour, which is precisely
-# what this canary is for. If a future bd starts committing, the reasoning behind
-# "no mitigation needed" evaporates silently — a sibling worktree would begin
-# rewriting history in a checkout it does not own, and nothing else here would
-# notice.
-step "bd does not touch git in the main worktree"
-
-# The scratch repo has no commit yet (`pact init --no-commit`, above, on purpose).
-# HEAD and `git worktree add` both need one, and this is the only section that
-# cares about git at all, so the commit is made here rather than earlier.
-printf 'tracked before the agent touches it\n' >README-canary.txt
-git add -A >/dev/null 2>&1 || true
-git commit -q -m "canary: baseline" >/dev/null 2>&1 || true
-git rev-parse HEAD >/dev/null 2>&1 || fail "could not create a baseline commit in the scratch repo"
-
-# What a main-worktree agent looks like mid-task: one staged NEW file and one
-# staged MODIFICATION to a tracked one. Both shapes, because a broad `git add`
-# and a `git commit -a` sweep different things — the second only picks up
-# modifications to files git already knows.
-printf 'work in progress\n' >agent-wip.txt
-printf 'edited by the agent\n' >>README-canary.txt
-git add agent-wip.txt README-canary.txt
-HEAD_BEFORE="$(git rev-parse HEAD)"
-STAGED_BEFORE="$(git diff --cached --name-only | sort)"
-[ -n "$STAGED_BEFORE" ] || fail "could not stage the decoy changes"
-
-# Outside the repository, both of them. `$WORK` *is* the scratch repo, so a
-# worktree or a log file placed under it would be untracked content inside the
-# tree being inspected — and a bd that ran `git add -A` would then sweep an
-# entire second checkout into its commit. Found the hard way while proving this
-# guard fails: the diagnostic listed `sibling-wt` and `wt.err` among the swept
-# paths, which is noise the reader has to discount.
-SIBLING="$OUTSIDE/sibling-wt"
-if git worktree add -q -b canary-sibling "$SIBLING" HEAD 2>"$OUTSIDE/wt.err"; then
-	# The end-to-end case: a message SENT FROM the sibling runs bd here.
-	(cd "$SIBLING" && PACT_AGENT=canary-sib "$PACT" msg send --to canary-a "from the sibling" >/dev/null) ||
-		fail "msg send from a linked worktree failed — sibling routing is broken"
-	printf '  sibling worktree sent a message through the main checkout\n'
-else
-	# Not fatal: the point of the section is bd's git behaviour, and the local
-	# calls below exercise it either way.
-	printf '  note: git worktree add failed, testing local bd calls only (%s)\n' \
-		"$(first_line "$(cat "$OUTSIDE/wt.err")")"
-fi
-
-# And the two mutating calls directly, so the assertion holds even if the
-# worktree could not be created.
-PACT_AGENT=canary-a "$PACT" msg send --to canary-b "second" >/dev/null || fail "msg send failed"
-SECOND_ID="$(PACT_AGENT=canary-b "$PACT" msg inbox --json | jq -r '.[-1].id')"
-PACT_AGENT=canary-b "$PACT" msg read "$SECOND_ID" >/dev/null || fail "msg read failed"
-
-HEAD_AFTER="$(git rev-parse HEAD)"
-STAGED_AFTER="$(git diff --cached --name-only | sort)"
-
-if [ "$HEAD_BEFORE" != "$HEAD_AFTER" ]; then
-	printf '\ncommits bd made:\n' >&2
-	git log --oneline --stat "$HEAD_BEFORE..$HEAD_AFTER" >&2
-	fail "bd moved HEAD ($HEAD_BEFORE -> $HEAD_AFTER). bd now performs git operations, so
-pact's routing of bd through the main worktree lets a SIBLING worktree rewrite
-history in a checkout it does not own. Re-open pact-zid: the mitigation options
-are a doctor check recommending bd's no-git-ops mode when has_worktrees, or
-wrapping pact's mutating bd calls in an internal lease on a reserved key."
-fi
-
-if [ "$STAGED_BEFORE" != "$STAGED_AFTER" ]; then
-	printf '\nstaged before:\n%s\nstaged after:\n%s\n' "$STAGED_BEFORE" "$STAGED_AFTER" >&2
-	fail "bd changed what was staged in the main worktree. Even without committing, that
-loses or adds to another agent's in-progress work. See pact-zid."
-fi
-
-[ ! -e .git/index.lock ] || fail "bd left .git/index.lock behind in the main worktree — it is
-now taking the git index lock, which races the main-worktree agent's own commits (pact-zid)."
-
-printf '  HEAD unmoved, staging untouched, no index.lock left behind\n'
 
 printf '\nCANARY PASSED (leg=%s, bd=%s)\n' "$LEG" "$BD_VERSION"
