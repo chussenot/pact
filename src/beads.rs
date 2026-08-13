@@ -1,5 +1,21 @@
-//! Subprocess adapter over the Beads CLI (`bd`: Go, embedded Dolt).
-//! Never reads/writes the Beads database or JSONL directly; always shells out.
+//! What pact still knows about the Beads CLI (`bd`: Go, embedded Dolt), which
+//! since 0.9.0 (pact-as5) is **detection and committed-export reads, and nothing
+//! else**. pact owns its messages in `.pact/messages.jsonl`, so no pact command
+//! depends on `bd` at run time any more: there is no write path here, and the
+//! only subprocess left is `--version` (plus `create --help`), both of which
+//! only ever feed `pact doctor` and `pact whoami` a line of text.
+//!
+//! That is why nothing in here gates on a bd version. pact is exercised against
+//! bd 1.1–1.2.x, which is a fact about the canary (pact-as5.7), not a
+//! compatibility window: bd's CLI semantics can churn freely now — `create --id
+//! --force` losing its upsert in 1.2 is exactly the kind of break that used to
+//! reach pact — because pact no longer calls anything that could break.
+//!
+//! The Beads *store* is never opened, and never was. The one `.beads/` artifact
+//! read here is the committed, append-only `interactions.jsonl` export
+//! ([`interaction_actors`], [`interaction_assignees`]) — same shape of file as
+//! `.pact/events.jsonl`, read-only and parse-tolerant, absence meaning "no
+//! beads data" rather than an error.
 //!
 //! [`BeadsCli::locate`] is more than `which("bd")`, because the store on disk —
 //! not the working directory, and not a preference — decides what pact may talk
@@ -22,14 +38,6 @@ use anyhow::{Context, Result};
 
 use crate::otel;
 use crate::output::exit_with;
-
-const TESTED_BD_MIN: (u64, u64, u64) = (1, 1, 0);
-/// Widened to the 1.2 line after pact-0re, which is what testing against 1.2.1
-/// cost: bd 1.2 dropped `create --id --force`'s upsert and refuses with "already
-/// exists" instead, and `bd init` now declines to touch a legacy SQLite (br)
-/// workspace at all. Both are handled, and the handling is version-agnostic —
-/// 1.1's upsert still takes the success path — so the floor stays at 1.1.0.
-const TESTED_BD_MAX_EXCLUSIVE: (u64, u64, u64) = (1, 3, 0);
 
 /// Default ceiling on how long [`BeadsCli::run`] waits for the child before
 /// treating it as hung, overridable via `PACT_BEADS_TIMEOUT_SECS` — the same
@@ -129,19 +137,73 @@ impl BeadsCli {
         self.binary
     }
 
-    /// `bd --version` output, trimmed, for `pact doctor`.
+    /// `bd --version` output, trimmed, for `pact doctor` and `pact whoami`.
+    ///
+    /// Purely informational: nothing branches on the answer, and nothing warns
+    /// about it (see the module header on why a tested-version window is no
+    /// longer pact's business). It is reported because "which bd is on this
+    /// machine" is the first thing anyone asks when the task tracker misbehaves,
+    /// not because pact needs a particular one.
     pub fn version(&self, repo_root: &Path) -> Result<String> {
         Ok(self.run(repo_root, &["--version"])?.trim().to_string())
+    }
+
+    /// Is bd's audit sidecar actually RECORDING, per bd itself?
+    ///
+    /// `Some(true)`/`Some(false)` from `bd config get audit.enabled`; `None` when bd
+    /// could not be asked at all, which is a different answer from "off" and must not
+    /// be reported as one.
+    ///
+    /// **Why a subprocess is right here and nowhere else.** pact-as5 removed bd from
+    /// every pact command's working path, and [`run`](Self::run) is private to keep it
+    /// that way. `doctor` is the exception by definition: its whole job is reporting
+    /// what is installed and how it is configured, and it already spawns bd for
+    /// [`version`](Self::version), so this adds no new dependency class — one more
+    /// question to a process doctor was going to start anyway.
+    ///
+    /// It exists because file existence is the wrong signal. This repository's own
+    /// sidecar EXISTS, with 264 rows, and `audit.enabled` is `false` — so it stopped
+    /// recording on 2026-08-12 and will never gain another row. An existence check
+    /// calls that healthy, which is the exact silence
+    /// [`interaction_assignees`] cannot afford: a check that reports
+    /// "no assignee history" and passes forever is indistinguishable from
+    /// "your fleet never diverged".
+    ///
+    /// bd prints `(not set)` for a key that was never configured and exits 0, which
+    /// reads as disabled — correct, since off is the default.
+    pub fn audit_sidecar_enabled(&self, repo_root: &Path) -> Option<bool> {
+        let out = self
+            .run(repo_root, &["config", "get", "audit.enabled"])
+            .ok()?;
+        let value = out.trim().to_ascii_lowercase();
+        // Match on the whole trimmed value, not a substring: `contains("true")` would
+        // read bd's own "(not set)" prose or a future "default: true" note as an
+        // answer about this repository.
+        match value.as_str() {
+            "true" => Some(true),
+            _ if value.contains("not set") || value == "false" => Some(false),
+            _ => None,
+        }
     }
 
     /// Run `bd <args>` in `repo_root`, capturing stdout; the backend's own
     /// reason is surfaced on failure, from whichever stream it used.
     ///
-    /// This is the only place pact spawns a Beads process, so it is also the
-    /// only place that has to be instrumented (pact-aw7.6): every message
-    /// command shells out at least once, the TUI's Messages tab once did it per
-    /// refresh tick, and not turning that into ten subprocesses a second was the
-    /// single hardest constraint in the mascot feature — measured by nothing.
+    /// **Private since 0.9.0, and deliberately.** It is the only place pact spawns a
+    /// Beads process, and it has exactly two production callers — both of them
+    /// questions `pact doctor` asks about the installation itself:
+    /// [`version`](Self::version) and
+    /// [`audit_sidecar_enabled`](Self::audit_sidecar_enabled).
+    ///
+    /// Private is the fence, not a coincidence: a `pub` generic subprocess runner is
+    /// an open invitation to put `bd` back on a pact command's working path, which is
+    /// precisely the runtime dependency pact-as5 removed. A new caller needs a reason
+    /// good enough to widen this again, and "doctor reports what is installed" is the
+    /// only reason that has qualified so far.
+    ///
+    /// Instrumented (pact-aw7.6) because it is the one spawn point; the argv
+    /// redaction below is kept for the same fencing reason, so nothing a future
+    /// caller passes can leak into telemetry by default.
     ///
     /// Bounded by [`beads_timeout`] (`PACT_BEADS_TIMEOUT_SECS`, default 30s): a
     /// child that never exits — wedged on a TTY/credential prompt, an internal
@@ -150,7 +212,7 @@ impl BeadsCli {
     /// exit 3, the same "backend unavailable" code `beads_root` already uses
     /// for the bare-repository topology: a hung subprocess is the same class of
     /// problem as no Beads workspace to talk to.
-    pub fn run(&self, repo_root: &Path, args: &[&str]) -> Result<String> {
+    fn run(&self, repo_root: &Path, args: &[&str]) -> Result<String> {
         // One Beads store per repository, not per checkout. A linked worktree
         // has no `.beads/` of its own, so running the backend in the caller's
         // directory would make `msg send` from worktree A invisible to `msg
@@ -495,30 +557,6 @@ impl BeadsCli {
     }
 }
 
-/// Who a bead is assigned to, or `None` for every "cannot tell": no such bead, no
-/// backend, an unparseable answer, or an empty assignee.
-///
-/// Every one of those must be indistinguishable from "not assigned", because the
-/// only caller warns on the answer (pact-mqw.4) and a warning produced by a
-/// missing backend is a warning agents learn to ignore. Three bd outages happened
-/// in the crucible run alone.
-///
-/// One subprocess, and the only thing it reads is the assignee field. `show` is
-/// used rather than `list --assignee=` because the question is about a known id,
-/// not a search.
-pub fn assignee_of(cli: &BeadsCli, repo_root: &Path, id: &str) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct Assigned {
-        #[serde(default)]
-        assignee: Option<String>,
-    }
-    let out = cli.run(repo_root, &["show", id, "--json"]).ok()?;
-    // Both backends return an array even for one id.
-    let issues: Vec<Assigned> = serde_json::from_str(&out).ok()?;
-    let who = issues.into_iter().next()?.assignee?;
-    (!who.trim().is_empty()).then_some(who)
-}
-
 /// The first bead id in a free-text note, if it holds one.
 ///
 /// Deliberately narrow: `<prefix>-<three alnum>` plus optional `.N` suffixes,
@@ -635,7 +673,7 @@ pub fn interaction_actors(repo_root: &Path) -> Option<Vec<String>> {
 }
 
 /// Current assignee per bead, reconstructed by replaying `.beads/interactions.jsonl`
-/// (pact-as5.6) — the offline answer to what [`assignee_of`] asks a subprocess.
+/// (pact-as5.6) — since 0.9.0 the ONLY way pact answers "who owns this bead".
 ///
 /// Read under exactly the same licence as [`interaction_actors`], for the same
 /// reasons: one already-committed append-only audit log, read-only, best-effort,
@@ -655,15 +693,23 @@ pub fn interaction_actors(repo_root: &Path) -> Option<Vec<String>> {
 ///    has no `field=assignee` row and cannot be resolved at all. Measured in this
 ///    repo: 5 of 264 rows are assignee changes, 257 are status.
 /// 2. **The sidecar is opt-in.** bd writes `interactions.jsonl` only when
-///    `audit.enabled: true` is set in `.beads/config.yaml`, and it is off by
-///    default — verified against bd 1.2 by running `bd update --assignee` with and
-///    without it. So in a default bd repository the file never appears and every
-///    caller reports "no beads data" forever.
+///    `audit.enabled` is true, and it is off by default — bd 1.2.1's own `bd audit
+///    --help` says so, and `bd config get audit.enabled` reports `false` in this
+///    repository. So in a default bd repository the file never appears and every
+///    caller reports "no beads data" forever. `pact doctor`'s `Beads audit
+///    sidecar` check exists to say that out loud instead of leaving the reader to
+///    wonder why a check never fires.
 /// 3. Even enabled, it is a committed export and lags the live store, so an
 ///    assignment made in the current session may not be visible yet.
 ///
-/// Those are the price of needing no subprocess. The live cross-check at
-/// `lease acquire` time still asks [`assignee_of`], where the answer is current.
+/// Those are the price of needing no subprocess, and as of 0.9.0 (pact-as5.5) they
+/// are the WHOLE price: there is no live cross-check any more, because the one that
+/// existed at `lease acquire` time spawned `bd show` on the hot path. Measured over
+/// this repository's entire 306-event history, 100 acquire notes named a bead, 8
+/// resolved through this map, and all 8 were acquired by the very agent it names —
+/// so the offline source would have produced zero warnings while charging every
+/// acquire a lookup. `pact audit --check claim-lease-divergence` is where the
+/// question is asked now, offline, where a stale answer costs nothing.
 pub fn interaction_assignees(repo_root: &Path) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
     let Ok(contents) = std::fs::read_to_string(repo_root.join(".beads/interactions.jsonl")) else {
@@ -707,35 +753,6 @@ fn sqlite_db(beads_dir: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file() && p.extension().is_some_and(|e| e == "db"))
 }
 
-/// Warning text for versions outside pact's tested range for that backend.
-pub fn version_compat_warning(version_output: &str) -> Option<String> {
-    let (min, max) = (TESTED_BD_MIN, TESTED_BD_MAX_EXCLUSIVE);
-    let parsed = parse_triplet(version_output)?;
-    if parsed >= min && parsed < max {
-        None
-    } else {
-        Some(format!(
-            "outside tested range {}.{}.{} <= version < {}.{}.{}",
-            min.0, min.1, min.2, max.0, max.1, max.2
-        ))
-    }
-}
-
-fn parse_triplet(s: &str) -> Option<(u64, u64, u64)> {
-    s.split(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .filter(|p| !p.is_empty())
-        .find_map(|part| {
-            let mut it = part.split('.');
-            let major = it.next()?.parse().ok()?;
-            let minor = it.next()?.parse().ok()?;
-            let patch = it.next()?.parse().ok()?;
-            if it.next().is_some() {
-                return None;
-            }
-            Some((major, minor, patch))
-        })
-}
-
 fn which(bin: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -747,9 +764,11 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
 
-    /// The one that matters: `msg send`'s real argv carries the subject and the
-    /// body, and neither may reach a collector (pact-aw7.6). Verbatim from
-    /// `msg::create_args`.
+    /// The redaction rule, against the worst argv pact ever passed: `msg send`'s,
+    /// which carried the subject and the body, and neither may reach a collector
+    /// (pact-aw7.6). That call site is gone as of 0.9.0 — messages are pact's own
+    /// file and `run` is private with `--version` as its only caller — but the
+    /// rule is what makes re-widening `run` safe, so it keeps its test.
     #[test]
     fn the_argv_shape_keeps_flag_names_and_drops_every_value() {
         let args = [
@@ -774,8 +793,8 @@ mod tests {
         }
     }
 
-    /// The other shapes `msg.rs` produces. Ids and `read-by-<agent>` labels are
-    /// positionals: bounded-ish, but nothing about the shape of the call, and
+    /// The other shapes pact used to produce. Ids and `read-by-<agent>` labels
+    /// are positionals: bounded-ish, but nothing about the shape of the call, and
     /// unbounded as a metric dimension.
     #[test]
     fn positionals_are_dropped_but_a_two_word_subcommand_survives() {
@@ -833,39 +852,6 @@ mod tests {
             "plain stdout complaint"
         );
         assert_eq!(failure_reason("", ""), "");
-    }
-
-    #[test]
-    fn detects_versions_outside_the_tested_range() {
-        assert_eq!(version_compat_warning("bd version 1.1.0"), None);
-        assert_eq!(version_compat_warning("bd 1.1.9"), None);
-        // 1.2 is inside the window as of pact-0re: it behaves DIFFERENTLY from
-        // 1.1 on a replayed create, and pact handles both, which is what being
-        // tested against it means.
-        assert_eq!(version_compat_warning("bd version 1.2.1"), None);
-        assert!(version_compat_warning("bd version 1.3.0")
-            .unwrap()
-            .contains("outside tested range"));
-        assert!(version_compat_warning("bd version 0.9.0")
-            .unwrap()
-            .contains("outside tested range"));
-    }
-
-    #[test]
-    fn ignores_unparseable_versions() {
-        assert_eq!(version_compat_warning("beads unknown"), None);
-    }
-
-    /// One backend, one window — and it is read off the version string rather
-    /// than assumed, so a binary that reports something unexpected still gets
-    /// judged against the range pact actually tested.
-    #[test]
-    fn every_version_is_judged_against_bds_window() {
-        // A real string from the binary on this machine, verbatim.
-        assert_eq!(version_compat_warning("bd version 1.1.2 (20e493e56)"), None);
-        assert!(version_compat_warning("bd version 0.2.19")
-            .unwrap()
-            .contains("1.1.0 <= version < 1.3.0"));
     }
 
     fn workspace_in(dir: &std::path::Path, entries: &[&str]) -> Workspace {

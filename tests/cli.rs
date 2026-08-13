@@ -1836,9 +1836,17 @@ fn doctor_flags_a_gitignored_agents_md_that_no_clone_will_ever_see() {
         stdout.contains("! protocol files reach a clone"),
         "warnings render `!`, not `✓`: {stdout}"
     );
+    // The count in the summary must AGREE with the warnings rendered above it, rather
+    // than being pinned to a number. It was `contains("1 warning")`, which quietly
+    // depended on whether the machine running the test had `bd` installed: once a
+    // missing Beads CLI became a warning rather than a failure (0.9.0, since nothing
+    // pact does needs it), this environment had two warnings and the assertion broke
+    // for a reason that had nothing to do with .gitignore.
+    let rendered = stdout.lines().filter(|l| l.starts_with('!')).count();
+    assert!(rendered >= 1, "expected a rendered warning: {stdout}");
     assert!(
-        stdout.contains("1 warning"),
-        "the summary must count warnings: {stdout}"
+        stdout.contains(&format!("{rendered} warning")),
+        "the summary must count the {rendered} warning(s) it rendered: {stdout}"
     );
 }
 
@@ -2832,135 +2840,63 @@ fn a_prefix_watch_also_stops_the_refusal_suggesting_a_subscription() {
     );
 }
 
-/// pact-mqw.4: two locks, two halves of one question, no cross-check.
+/// **Changed by pact-as5.5, replacing
+/// `acquiring_for_a_bead_somebody_else_owns_warns_and_still_succeeds`.**
 ///
-/// `bd update --claim` decides who owns the WORK; `pact lease acquire` decides who
-/// may edit the FILES. Neither consulted the other, so nothing prevented agent A
-/// holding the bead while agent B held every file that bead names. agent-06,
-/// verbatim: "a race let me briefly hold src/main.rs+src/lib.rs for
-/// crucible-2o3.27 after `bd update --claim` had already lost that bead to
-/// agent-07 — pact granted the lease with no cross-check against bd claim state."
-/// It self-corrected only because an agent noticed and volunteered a release.
+/// pact-mqw.4 added a live cross-check here: `bd update --claim` decides who owns
+/// the WORK, `pact lease acquire` decides who may edit the FILES, and neither
+/// consulted the other. agent-06, verbatim: "a race let me briefly hold
+/// src/main.rs+src/lib.rs for crucible-2o3.27 after `bd update --claim` had
+/// already lost that bead to agent-07 — pact granted the lease with no
+/// cross-check against bd claim state." The old test asserted `lease acquire`
+/// warned, naming the bead and its assignee.
 ///
-/// All four bead cases in one test, because they share one expensive fixture.
+/// It no longer does, and the reason is the cost, not the value: the check
+/// resolved the bead by spawning `bd show` on the hot path of the most frequently
+/// run pact command, which is the runtime dependency pact-as5 exists to remove.
+/// Moving it to the committed export instead was the alternative and measures
+/// worthless — over this repository's whole event log, 100 acquire notes named a
+/// bead, 8 resolved through the export, and all 8 were acquired by the agent it
+/// names, so it would have warned zero times.
+///
+/// So the question moved to `pact audit --check claim-lease-divergence`, offline,
+/// and what has to be pinned here is SILENCE. The export is written first and
+/// names somebody else deliberately: that proves acquire consults neither a
+/// subprocess nor the export, and the test needs no `bd` on PATH at all — which
+/// the old one did.
 #[test]
-fn acquiring_for_a_bead_somebody_else_owns_warns_and_still_succeeds() {
-    let Some(tmp) = bd_repo("acquiring_for_a_bead_somebody_else_owns_warns") else {
-        return;
-    };
-    let repo = tmp.path();
+fn acquiring_for_a_bead_somebody_else_owns_is_silent_and_left_to_audit() {
+    let tmp = init_repo();
 
-    // pact-as5.6: the OFFLINE half of this test reads `.beads/interactions.jsonl`,
-    // and bd only writes that sidecar when `audit.enabled` is set — it is off by
-    // default, which is a real limit of the offline check and is why this line has
-    // to exist. The live half below needs nothing but bd itself.
-    let config = repo.join(".beads/config.yaml");
-    let mut yaml = std::fs::read_to_string(&config).expect("bd wrote a config");
-    yaml.push_str("\naudit:\n  enabled: true\n");
-    std::fs::write(&config, yaml).unwrap();
+    // The export bd would have written, with the bead assigned to someone who is
+    // not the acquirer — the exact input `audit` reports a divergence from.
+    std::fs::create_dir_all(tmp.path().join(".beads")).unwrap();
+    std::fs::write(
+        tmp.path().join(".beads/interactions.jsonl"),
+        "{\"kind\":\"field_change\",\"created_at\":\"2026-08-11T08:00:00Z\",\"actor\":\"x\",\"issue_id\":\"pact-abc\",\"extra\":{\"field\":\"assignee\",\"new_value\":\"agent-07\",\"old_value\":\"\"}}\n",
+    )
+    .unwrap();
 
-    // A real bead, assigned to somebody who is not the acquirer.
-    let created = std::process::Command::new("bd")
-        .args([
-            "create",
-            "--title=wire the parser",
-            "--description=why",
-            "--type=task",
-            "--priority=2",
-            "--json",
-        ])
-        .current_dir(repo)
-        .output()
-        .expect("bd create");
-    assert!(created.status.success(), "{}", stderr_of(&created));
-    let id = serde_json::from_slice::<serde_json::Value>(&created.stdout)
-        .ok()
-        .and_then(|v| v["id"].as_str().map(str::to_string))
-        .unwrap_or_else(|| panic!("no id in bd create output: {:?}", created.stdout));
-    assert!(std::process::Command::new("bd")
-        .args(["update", &id, "--assignee=agent-07"])
-        .current_dir(repo)
-        .status()
-        .expect("bd update")
-        .success());
-
-    // 1. A note with no bead id in it: nothing to cross-check, so silent.
-    let plain = pact(
-        repo,
-        "agent-06",
-        &["lease", "acquire", "a.rs", "--note", "wiring the parser"],
-    );
-    assert_ok(&plain);
-    assert!(
-        !stderr_of(&plain).contains("assigned to"),
-        "a note naming no bead must be silent: {}",
-        stderr_of(&plain)
-    );
-
-    // 2. The bead assigned to the acquirer: also silent. This is the compliant
-    //    path and by far the common one, so a warning here would be the noise
-    //    that gets the whole check ignored.
-    assert!(std::process::Command::new("bd")
-        .args(["update", &id, "--assignee=agent-06"])
-        .current_dir(repo)
-        .status()
-        .expect("bd update")
-        .success());
-    let mine = pact(
-        repo,
-        "agent-06",
-        &[
-            "lease",
-            "acquire",
-            "b.rs",
-            "--note",
-            &format!("{id}: wiring"),
-        ],
-    );
-    assert_ok(&mine);
-    assert!(
-        !stderr_of(&mine).contains("assigned to"),
-        "the bead's own assignee must not be warned at: {}",
-        stderr_of(&mine)
-    );
-
-    // 3. The bead assigned to somebody else: warns, names them, exit 0.
-    assert!(std::process::Command::new("bd")
-        .args(["update", &id, "--assignee=agent-07"])
-        .current_dir(repo)
-        .status()
-        .expect("bd update")
-        .success());
     let theirs = pact(
-        repo,
+        tmp.path(),
         "agent-06",
-        &[
-            "lease",
-            "acquire",
-            "c.rs",
-            "--note",
-            &format!("{id}: wiring"),
-        ],
+        &["lease", "acquire", "c.rs", "--note", "pact-abc: wiring"],
     );
     assert_ok(&theirs);
     let err = stderr_of(&theirs);
     assert!(
-        err.contains(&id) && err.contains("agent-07"),
-        "must name the bead and its owner: {err}"
-    );
-    assert!(
-        err.contains("separate locks"),
-        "must say why a granted lease is not a claim: {err}"
+        !err.contains("assigned to") && !err.contains("separate locks"),
+        "acquire must not cross-check bead claims any more: {err}"
     );
     assert!(
         stdout_of(&theirs).contains("acquired lease"),
-        "advisory must never block: {}",
+        "{}",
         stdout_of(&theirs)
     );
 
-    // And the offline half sees the same hold.
+    // And the question is still answered, where a stale answer costs nothing.
     let audit = pact(
-        repo,
+        tmp.path(),
         "auditor",
         &["audit", "--check", "claim-lease-divergence", "--json"],
     );
@@ -2971,39 +2907,13 @@ fn acquiring_for_a_bead_somebody_else_owns_warns_and_still_succeeds() {
         stdout_of(&audit)
     );
     let found = json_stdout(&audit);
-    let rows = found["claim_divergences"].as_array().expect("array");
     assert!(
-        rows.iter()
+        found["claim_divergences"]
+            .as_array()
+            .expect("array")
+            .iter()
             .any(|r| r["path"] == "c.rs" && r["assignee"] == "agent-07"),
         "{found}"
-    );
-
-    // 4. No backend reachable: silent, exit 0. Three bd outages happened in the
-    //    crucible run alone, and a warning that fires when the store is down is a
-    //    warning agents learn to ignore.
-    let blind = pact_cmd(
-        repo,
-        &[
-            "lease",
-            "acquire",
-            "d.rs",
-            "--note",
-            &format!("{id}: wiring"),
-        ],
-    )
-    .env("PACT_AGENT", "agent-06")
-    .env("PATH", "/nonexistent")
-    .output()
-    .expect("run pact");
-    assert!(
-        blind.status.success(),
-        "a missing backend must not fail an acquire: {}",
-        stderr_of(&blind)
-    );
-    assert!(
-        !stderr_of(&blind).contains("assigned to"),
-        "and must not warn: {}",
-        stderr_of(&blind)
     );
 }
 

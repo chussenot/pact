@@ -283,10 +283,14 @@ enum MsgAction {
         /// Read the body from a file, or "-" for stdin. No shell escaping.
         #[arg(long, value_name = "PATH|-")]
         body_file: Option<String>,
-        /// Recipient to leave out of this send; repeat for several. For
-        /// replaying a partially-failed send without re-delivering to whoever
-        /// already got it — read `already_sent` from the failed attempt's
-        /// `--json` error and pass each name here (pact-m7j.6.5).
+        /// Recipient to leave out of this send; repeat for several.
+        ///
+        /// It existed for replaying a partially-failed multi-recipient send
+        /// (pact-m7j.6.5): bd needed one create per recipient, so a send could land
+        /// for some and fail for others, and the `--json` error carried an
+        /// `already_sent` list to pass back here. A send is one append since 0.9.0
+        /// and cannot partially fail, so that shape is gone and this flag means only
+        /// what it says.
         #[arg(long, value_name = "AGENT")]
         skip: Vec<String>,
     },
@@ -1261,38 +1265,19 @@ fn run_whoami(cwd: &Path, agent_flag: Option<&str>, json: bool) -> Result<()> {
 
 /// bd's version plus whatever is wrong with it, for `whoami` to report.
 ///
-/// `bd --version` only answers "is the binary there", which is not the question
-/// an operator has when a pact command just failed: in a repo with no beads
-/// database `bd --version` is perfectly happy while every bd-backed pact command
-/// exits 1. So probe with the query those commands actually run, and report the
-/// failure as a problem rather than an exit code (pact-rnc.12). Deliberately
-/// `cli.run` and not `msg::all_messages`: parsing every message in the repo to
-/// answer "can bd read this database" is far more work than the question needs,
-/// and whoami must stay a cheap read-only probe.
-///
-/// The probe is bare `list --json` and deliberately carries no filter. It used
-/// to pass `--include-infra`, which br rejects outright, so on a br workspace
-/// `pact whoami` reported "bd cannot read this repo's beads database … `pact
-/// msg` will fail" while `pact msg` worked perfectly — a diagnostic that lies
-/// about the thing you ran it to diagnose. Both backends answer the unfiltered
-/// form, and both still fail it when there is no database, which is the only
-/// property this probe needs.
+/// Just `--version` since 0.9.0 (pact-as5.5). It used to also run `bd list
+/// --json` and report "bd cannot read this repo's beads database, so `pact msg`
+/// and the message half of `pact agents` will fail" (pact-rnc.12) — a sentence
+/// that is now simply false: messages live in `.pact/messages.jsonl` and no pact
+/// command asks bd anything. A diagnostic that lies about the thing you ran it to
+/// diagnose is the exact defect that probe was introduced to fix, so it goes
+/// rather than gets reworded, and `pact whoami` spawns one subprocess instead of
+/// two. Whether the agents' own `bd` commands work is a question `bd` answers.
 fn bd_health(bd: &beads::BeadsCli, root: &Path) -> (Option<String>, Vec<String>) {
-    let mut problems = Vec::new();
-    let version = match bd.version(root) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            problems.push(format!("bd found but not runnable: {e:#}"));
-            None
-        }
-    };
-    if let Err(e) = bd.run(root, &["list", "--json"]) {
-        problems.push(format!(
-            "bd cannot read this repo's beads database, so `pact msg` and the message \
-             half of `pact agents` will fail: {e:#}"
-        ));
+    match bd.version(root) {
+        Ok(v) => (Some(v), Vec::new()),
+        Err(e) => (None, vec![format!("bd found but not runnable: {e:#}")]),
     }
-    (version, problems)
 }
 
 fn run_agents(cwd: &Path, json: bool, for_path: Option<&str>) -> Result<()> {
@@ -1438,21 +1423,19 @@ enum MessageCheck {
 /// who had just released it — so the moment someone leases that file is exactly
 /// the moment the message becomes useful again (pact-4tj).
 ///
-/// One [`MessageCheck`] per path, same order as `paths` — except when no
-/// Beads CLI could even be located, which is a property of the whole call and
-/// not any one path, so that case reports once for every path named rather
-/// than repeating an identical "not found on PATH" line per path.
+/// One [`MessageCheck`] per path, same order as `paths`.
 ///
-/// Silent (every path `Clean`) when `.beads/` does not exist at all — checked
-/// BEFORE trying to locate a backend or run anything. A repository that has
-/// never run `bd`/`br init` has given no signal it intends to use messaging,
-/// and `lease acquire` has never depended on the messaging backend for
-/// anything; surfacing "could not check for pending messages" on every single
-/// acquire, forever, for a lease-only repo would be exactly the noise
-/// AGENTS.md's own messaging discipline warns against, for a check that could
-/// not possibly have found anything anyway. Once `.beads/` exists, a failure
-/// to check IS worth surfacing (see [`MessageCheck::Failed`]) — something
-/// that was set up is now unreachable.
+/// **No `.beads/` gate, and no way left to fail.** This used to skip the check
+/// entirely unless `.beads/` existed, because messages were beads: a repo that had
+/// never run `bd init` could not have any, and surfacing "could not check for pending
+/// messages" on every acquire forever would have been exactly the noise AGENTS.md's
+/// own messaging discipline warns against. It also had to report a whole-call failure
+/// when no backend could be located.
+///
+/// Messages are `.pact/messages.jsonl` now. A repository that has never seen the
+/// issue tracker can still have mail waiting on a path, and there is no subprocess
+/// left to be missing — so the gate is gone and [`MessageCheck::Failed`] is reachable
+/// only from a genuinely unreadable store.
 fn messages_about(root: &Path, paths: &[String], agent: &str) -> Vec<MessageCheck> {
     // No `.beads` gate any more: that guard existed because a repo with no Beads
     // store could hold no messages. Messages are pact's own file now, so a repo
@@ -1461,45 +1444,6 @@ fn messages_about(root: &Path, paths: &[String], agent: &str) -> Vec<MessageChec
         .iter()
         .map(|path| check_one_path(msg::about_path(root, path), path, agent))
         .collect()
-}
-
-/// Warn when the bead named in an acquire note belongs to somebody else.
-///
-/// A fleet on this protocol runs **two mutual-exclusion mechanisms answering two
-/// halves of one question** — `bd update --claim` for who owns the WORK, `pact
-/// lease acquire` for who may edit the FILES — and neither consulted the other.
-/// Nothing prevented agent A holding the bead while agent B held every file that
-/// bead names.
-///
-/// It happened. agent-06, verbatim: "a race let me briefly hold
-/// src/main.rs+src/lib.rs for crucible-2o3.27 after `bd update --claim` had
-/// already lost that bead to agent-07 — pact granted the lease with no
-/// cross-check against bd claim state. I released immediately and told agent-07."
-/// Corroborated twice more in the same run, and it self-corrected only because an
-/// agent noticed and volunteered a release.
-///
-/// The protocol tells agents to claim first and lease second, which makes the bead
-/// claim look like the serialization point — but the lease is what actually
-/// protects the file, and it was grantable to whoever lost the claim.
-///
-/// Advisory, and **silent on every failure**: no note, no bead id in the note, no
-/// backend, no such bead, no assignee, or an assignee that is the acquirer. Three
-/// bd outages happened in that run alone, and a warning that fires when the
-/// backend is down is a warning agents learn to ignore.
-fn claim_warning(root: &Path, note: Option<&str>, agent: &str) -> Option<String> {
-    let id = beads::bead_id_in(note?)?;
-    let cli = beads::BeadsCli::locate().ok()?;
-    let assignee = beads::assignee_of(&cli, root, id)?;
-    if assignee == agent {
-        return None;
-    }
-    Some(format!(
-        "note: your lease note names {id}, which bd says is assigned to {assignee}, not \
-         {agent} — the bead claim and the file lease are separate locks, and pact just \
-         granted you the second without the first. If you lost `bd update --claim` for this \
-         bead, release and tell {assignee} (`pact msg send --to {assignee}`) rather than \
-         editing behind them"
-    ))
 }
 
 /// One path's [`MessageCheck`], from its own `about_path` result — split out
@@ -1633,9 +1577,16 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
             // Look up prior owners BEFORE acquiring: the acquire appends its own
             // event, which would make the caller the answer to its own question.
             let prior = prior_owners(&root, &paths, &agent);
-            // Resolved from the note, so it costs one lookup per COMMAND rather
-            // than one per path — the note is shared by every path in a batch.
-            let claim = claim_warning(&root, note.as_deref(), &agent);
+            // No bead-claim cross-check here any more (pact-as5.5). It resolved
+            // the bead in the note and asked `bd show` who owned it — one
+            // subprocess on the hot path of the single most frequently run pact
+            // command, to answer a question `pact audit --check
+            // claim-lease-divergence` answers offline from the committed export.
+            // Moving it to that export instead of deleting it was the other
+            // option and measured worthless: over this repository's whole event
+            // log, 100 acquire notes named a bead, 8 resolved through the export,
+            // and all 8 were acquired by the agent it names — zero warnings, for
+            // a file read per acquire. See beads::interaction_assignees.
             let mut outcomes = lease::acquire_many(&root, &agent, &paths, ttl, steal, note)?;
             // One path renders and serializes exactly as it always did — a
             // script doing `lease acquire f --json | jq .lease.path` must not
@@ -1665,9 +1616,6 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
             // After the success line, never before it: what happened first,
             // then what you should know.
             for line in prior {
-                output::warn(&line);
-            }
-            if let Some(line) = claim {
                 output::warn(&line);
             }
             for check in messages_about(&root, &paths, &agent) {
@@ -2985,19 +2933,25 @@ mod tests {
         assert!(check_recipient("human").is_ok());
     }
 
-    /// pact-rnc.12: `bd --version` passes in a repo with no beads database, the
-    /// exact repo where every bd-backed pact command exits 1. `git` stands in for
-    /// that bd: it answers `--version` and cannot answer the real query.
+    /// **Changed by pact-as5.5, deliberately, replacing
+    /// `bd_health_probes_the_workspace_not_just_the_binary`.** That test asserted
+    /// the opposite: `bd_health` also ran `bd list --json` and reported "bd cannot
+    /// read this repo's beads database, so `pact msg` … will fail" (pact-rnc.12),
+    /// with `git` standing in for a bd that answers `--version` and nothing else.
+    /// The claim it pinned is now false — messages are pact's own file and no pact
+    /// command asks bd anything — so what must be pinned instead is that `whoami`
+    /// reports the version and invents no problem out of a workspace it no longer
+    /// cares about. `git` still stands in: it answers `--version`, and could not
+    /// answer a bd query if one were ever put back.
     #[test]
-    fn bd_health_probes_the_workspace_not_just_the_binary() {
+    fn bd_health_reports_the_version_and_no_longer_probes_the_workspace() {
         let root = std::env::current_dir().unwrap();
         let (version, problems) = bd_health(&beads::BeadsCli { binary: "git" }, &root);
         assert!(
             version.is_some(),
             "--version answered, so bd looks installed"
         );
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("beads database"), "{problems:?}");
+        assert!(problems.is_empty(), "{problems:?}");
     }
 
     /// pact-rnc.25: --body-file promises byte fidelity, so trailing blank lines

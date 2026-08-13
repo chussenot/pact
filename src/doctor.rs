@@ -16,7 +16,8 @@ pub struct DoctorCheck {
     pub ok: bool,
     /// Passes, but you should know. Rendered `!` rather than `✓`, and never
     /// affects `healthy` or the exit code — pact reports the situation instead
-    /// of deciding it is wrong. `bd` outside its tested range is the other one.
+    /// of deciding it is wrong. A `.beads/` with no audit sidecar is another one:
+    /// nothing is broken, but a check the reader may be relying on cannot run.
     #[serde(default)]
     pub warn: bool,
     pub detail: String,
@@ -307,24 +308,36 @@ pub fn checks(root: &Path) -> DoctorReport {
                      against this checkout's git user instead of the agent that caused it",
                 );
             }
-            let compat = beads::version_compat_warning(&version);
-            if let Some(warning) = &compat {
-                detail.push_str(&format!(" — {warning}"));
-            }
             DoctorCheck {
                 name: "Beads CLI",
                 ok: true,
-                // An untested bd usually works; saying so with a green tick hid
-                // the caveat in the tail of the line, where nobody read it.
-                warn: compat.is_some(),
+                // No version warning any more (pact-as5.5). pact used to warn
+                // outside a tested 1.1–1.2 window because bd's CLI semantics
+                // reached pact's own messaging — bd 1.2 dropping `create --id
+                // --force`'s upsert broke four tests with no source change. Since
+                // 0.9.0 the only bd call pact makes is the `--version` printed on
+                // this line, so a version pact has not tested cannot break
+                // anything, and warning about it would be pure noise on every
+                // future bd release.
+                warn: false,
                 detail,
             }
         }
+        // A WARNING, not a failure, since 0.9.0. bd used to be required — messages
+        // were beads, so no bd meant no messaging — and this check failed, which made
+        // `pact doctor` exit 1 on a machine that had simply never installed the issue
+        // tracker. Nothing pact does needs it any more, so a missing bd is a fact
+        // worth reporting and not a broken repository. The one thing it still costs is
+        // named, so the report is actionable rather than merely relaxed.
         Err(e) => DoctorCheck {
             name: "Beads CLI",
-            ok: false,
-            warn: false,
-            detail: format!("{e:#}"),
+            ok: true,
+            warn: true,
+            detail: format!(
+                "{e:#} — nothing pact does needs it, but `pact audit --check \
+                 claim-lease-divergence` has no assignees to check against and \
+                 `pact whoami` cannot name a backend"
+            ),
         },
     });
 
@@ -384,6 +397,40 @@ pub fn checks(root: &Path) -> DoctorReport {
             }
         }
     });
+
+    // pact-as5.5: `pact audit --check claim-lease-divergence` is the only thing
+    // left that asks a Beads-side question, and it reads the committed
+    // `.beads/interactions.jsonl` export. bd writes that sidecar ONLY when
+    // `audit.enabled` is on, and it is OFF BY DEFAULT — bd 1.2.1's own `bd audit
+    // --help` says so ("This optional JSONL sidecar is disabled by default"), and
+    // `bd config get audit.enabled` reports `false` even in this repository, whose
+    // sidecar was enabled at some point and has recorded nothing since.
+    //
+    // So the check is effectively opt-in, and its failure mode is silence: it
+    // reports "no assignee history" and PASSES, forever, which is
+    // indistinguishable from "your fleet never diverged". That is the one thing
+    // doctor exists to prevent, so it says so and names the switch. Warns rather
+    // than fails: the sidecar is genuinely optional and a repo that does not want
+    // it is not broken.
+    //
+    // Existence is the WRONG signal on its own, so bd is asked whether the sidecar
+    // is actually recording. This repository proves why: its sidecar exists with 264
+    // rows AND `audit.enabled` is `false`, so it stopped on 2026-08-12 and will never
+    // gain another. An existence check calls that healthy.
+    //
+    // Asking costs no new dependency class — doctor already spawns bd for its version
+    // on the check above, and reporting what is installed and how it is configured is
+    // doctor's entire job. When bd cannot be asked, existence is the fallback and the
+    // detail says the recording state is unconfirmed rather than implying it is fine.
+    let beads_dir = root.join(".beads");
+    let recording = beads::BeadsCli::locate()
+        .ok()
+        .and_then(|cli| cli.audit_sidecar_enabled(root));
+    checks.push(sidecar_check(
+        beads_dir.is_dir(),
+        recording,
+        beads_dir.join("interactions.jsonl").is_file(),
+    ));
 
     // peek, not list: a diagnostic that mutates is not a diagnostic — running
     // doctor twice used to give two different stale counts because the first run
@@ -874,6 +921,85 @@ fn export(checks: &[DoctorCheck]) {
     }
 }
 
+/// The `Beads audit sidecar` verdict, as a pure function of the three facts it
+/// depends on — so all six states are testable without a bd installation deciding
+/// the answer.
+///
+/// Every state is `ok: true`. The sidecar is genuinely optional and a repo that does
+/// not want it is not broken; what is worth a warning is believing a check runs when
+/// it cannot.
+fn sidecar_check(beads_dir: bool, recording: Option<bool>, sidecar: bool) -> DoctorCheck {
+    let name = "Beads audit sidecar";
+    let switch = "turn it on with `bd config set audit.enabled true`; bd records from that \
+                  point, not retroactively";
+    if !beads_dir {
+        return DoctorCheck {
+            name,
+            ok: true,
+            warn: false,
+            detail: "no .beads/ — not applicable".to_string(),
+        };
+    }
+    let (warn, detail) = match (recording, sidecar) {
+        (Some(true), true) => (
+            false,
+            "on, and .beads/interactions.jsonl is present — `pact audit --check \
+             claim-lease-divergence` has data to read"
+                .to_string(),
+        ),
+        // Recording with nothing written yet: correct, and self-resolving.
+        (Some(true), false) => (
+            false,
+            "on; no .beads/interactions.jsonl yet, which resolves itself on the next bead \
+             change"
+                .to_string(),
+        ),
+        // THE CASE AN EXISTENCE CHECK MISSES, and the reason bd is asked at all: rows on
+        // disk, recording switched off. Every file check calls this healthy. This
+        // repository was in exactly that state — 264 rows, last written 2026-08-12,
+        // `audit.enabled` false.
+        (Some(false), true) => (
+            true,
+            format!(
+                "OFF, but .beads/interactions.jsonl exists — so it holds only history from \
+                 whenever recording last stopped, and `pact audit --check \
+                 claim-lease-divergence` will silently judge new holds against stale \
+                 assignees; {switch}"
+            ),
+        ),
+        (Some(false), false) => (
+            true,
+            format!(
+                "off (the default), so there is no .beads/interactions.jsonl and `pact audit \
+                 --check claim-lease-divergence` can never find anything, nor can `Beads \
+                 actor attribution` above; {switch}"
+            ),
+        ),
+        // bd could not be asked: existence is all there is, and the detail says so rather
+        // than implying the recording state was checked.
+        (None, true) => (
+            false,
+            ".beads/interactions.jsonl present, but bd could not be asked whether it is \
+             still recording — the rows may be history only"
+                .to_string(),
+        ),
+        (None, false) => (
+            true,
+            format!(
+                "no .beads/interactions.jsonl, and bd could not be asked whether the sidecar \
+                 is on; if it is off (the default) `pact audit --check \
+                 claim-lease-divergence` can never find anything — {switch}"
+            ),
+        ),
+    };
+    DoctorCheck {
+        name,
+        ok: true,
+        warn,
+        detail,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1135,6 +1261,78 @@ mod tests {
             .expect("doctor must report Beads actor attribution");
         assert!(c.ok && !c.warn, "{}", c.detail);
         assert!(c.detail.contains("not applicable"), "{}", c.detail);
+    }
+
+    /// All six states of the sidecar verdict, decided without a bd installation getting
+    /// a vote — which is the point of `sidecar_check` being pure. An earlier cut called
+    /// `checks()` and so silently asserted whatever the test machine's own bd config
+    /// happened to say.
+    #[test]
+    fn the_sidecar_verdict_warns_exactly_when_a_check_would_silently_not_run() {
+        // Nothing to say about a repo with no issue tracker.
+        let none = sidecar_check(false, None, false);
+        assert!(none.ok && !none.warn, "{}", none.detail);
+        assert!(none.detail.contains("not applicable"));
+
+        for (recording, sidecar, should_warn, why) in [
+            (
+                Some(true),
+                true,
+                false,
+                "recording, with data: nothing to report",
+            ),
+            (
+                Some(true),
+                false,
+                false,
+                "recording, empty: resolves itself",
+            ),
+            (
+                Some(false),
+                true,
+                true,
+                "OFF with rows on disk — the case an existence check calls healthy",
+            ),
+            (
+                Some(false),
+                false,
+                true,
+                "off and empty: the check can never run",
+            ),
+            (
+                None,
+                true,
+                false,
+                "unasked, with rows: existence is all there is",
+            ),
+            (None, false, true, "unasked and empty: probably off, say so"),
+        ] {
+            let c = sidecar_check(true, recording, sidecar);
+            assert!(c.ok, "an optional sidecar must never FAIL doctor: {why}");
+            assert_eq!(c.warn, should_warn, "{why}: {}", c.detail);
+            if should_warn {
+                assert!(
+                    c.detail.contains("audit.enabled"),
+                    "a warning must name the switch: {}",
+                    c.detail
+                );
+                assert!(
+                    c.detail.contains("claim-lease-divergence"),
+                    "and what cannot run: {}",
+                    c.detail
+                );
+            }
+        }
+
+        // The stale case must not read as the healthy one.
+        let stale = sidecar_check(true, Some(false), true);
+        let live = sidecar_check(true, Some(true), true);
+        assert!(stale.detail.contains("stale"), "{}", stale.detail);
+        assert!(
+            !live.detail.contains("stale"),
+            "a recording sidecar is not stale: {}",
+            live.detail
+        );
     }
 
     /// A solo session legitimately collapses to one identity everywhere —

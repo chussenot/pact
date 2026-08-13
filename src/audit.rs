@@ -350,7 +350,16 @@ pub struct ClaimDivergence {
 /// **It is deliberately less sensitive than the `bd show` version it replaced.**
 /// The export records CHANGES, so a bead assigned at creation and never
 /// reassigned has no assignee row and resolves to nothing — it finds fewer
-/// divergences than a live query would, never more. See
+/// divergences than a live query would, never more. And bd only writes the export
+/// when `audit.enabled` is on, which it is not by default, so on most repositories
+/// this check reports "no beads data" and passes; `pact doctor`'s `Beads audit
+/// sidecar` check names that and how to switch it on.
+///
+/// Since pact-as5.5 this is also the ONLY place pact asks the question. The live
+/// cross-check that used to run at `lease acquire` time is gone: it spawned `bd
+/// show` on the hot path, and measured against this repository's whole event log
+/// it would have warned zero times when moved to this offline source (100 acquire
+/// notes named a bead, 8 resolved, all 8 to their own acquirer). See
 /// [`crate::beads::interaction_assignees`] and `docs/audit.md`.
 fn claim_divergences(
     repo_root: &std::path::Path,

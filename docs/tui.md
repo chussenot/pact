@@ -95,8 +95,7 @@ claim is always an explicit, visible action, never silent. See
 
 ### Messages
 
-Your inbox — the same query `pact msg inbox` runs, which depends on the backend:
-`bd list --assignee=<agent> --include-infra` on a bd workspace,
+Your inbox — the same read `pact msg inbox` does, of `.pact/messages.jsonl`.
 Unread messages are
 marked `*`. `Enter` opens the full
 thread — root message plus replies — in a detail pane and marks it read;
@@ -140,22 +139,14 @@ here that the CLI does not emit, fails CI:
 | `protocol files reach a clone` | warns (`!`) when they are gitignored |
 | `otel export` | built in? configured? actually exporting? warns (`!`) when the answer to the last one is no |
 | `one Beads store` | warns (`!`) when `.beads/` holds two backends' stores |
-| `Beads CLI` | which binary, which version, warning outside the tested range |
+| `Beads CLI` | which binary, which version — informational, since no pact command depends on `bd` at run time |
 | `Beads actor attribution` | warns (`!`) when multiple pact agent identities never appear as any Beads actor — direct `bd` commands bypassing pact's `--actor` |
+| `Beads audit sidecar` | asks bd whether its audit sidecar is RECORDING, not merely whether `.beads/interactions.jsonl` exists. Warns (`!`) when recording is off — including when the file is present but stale, which every existence check reads as healthy — because `pact audit --check claim-lease-divergence` then judges new holds against frozen assignees, or finds nothing at all. Never fails: the sidecar is optional |
 | `stale leases` | how many, without collecting them |
 | `corrupt leases` | lock files pact cannot read, which only a human can clear |
 | `orphaned staging files` | `staging-*`/`tmp-*` debris left by a write that crashed mid-rename |
 | `stale wait markers` | `.pact/waits/` markers a conflict left behind that nobody retried or swept — informational only, never a failure |
 
-Lazy-loaded like Messages (only checked once you visit the tab, or press
-`r`), since it shells out to `bd --version` the same way Messages does.
-
-| Key | Action |
-|---|---|
-| `r` | re-run the checks |
-
-## Quitting
-
-`q` or `Ctrl-C`, from any tab. The terminal is restored even if the app
+Lazy-loaded (only checked once you visit the tab, or press `r`), since it spawns bd twice — `--version`, and `config get audit.enabled` for the sidecar check. Messages is lazy-loaded too, though it no longer needs to be: it reads a file. The terminal is restored even if the app
 panics — a crashed TUI leaving your shell in raw mode is exactly the kind of
 papercut pact tries not to introduce.
