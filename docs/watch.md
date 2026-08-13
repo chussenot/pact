@@ -55,6 +55,12 @@ There is **no daemon, no polling, no background process and nothing that
 waits.** `pact watch` is a registry. `pact lease release` reads it, sends
 whatever messages it implies, and exits.
 
+Since 0.9.0 there is no backend either: a notice is a line appended to
+`.pact/messages.jsonl`, so delivery spawns nothing and cannot fail for want of an
+issue tracker. That matters more here than for authored mail, because this is the
+path nobody chose to be on — an agent releasing a lease did not ask to send nine
+messages, and a delivery failure it never sees is one it cannot retry.
+
 ```mermaid
 sequenceDiagram
     participant W as watcher
@@ -98,9 +104,16 @@ waiting, even if the original subscriber has exited.
 
 ### And it is tagged as a notice, because the cost is watchers × releases
 
-A notice carries a `watch-notice` label, and `pact msg inbox` shows authored
-messages by default with notices counted per path
+A notice is stored with `kind: "watch-notice"`, and `pact msg inbox` shows
+authored messages by default with notices counted per path
 ([why](messaging.md#a-notification-is-not-correspondence)).
+
+`kind` is a **first-class field on the message row**, not an inbox filter and not
+a label. That is what makes the split trustworthy in both directions: every row
+carries it, so nothing has to be classified after the fact by pattern-matching
+its wording. It was a bd label until 0.9.0, and a label could only be applied at
+creation — which left every notice written before the label shipped
+unclassifiable, and a heuristic in the code to guess at them.
 
 That tag exists because this feature's own advice creates the pile. The first
 fleet to follow it — ten agents all watching one designed hot file — turned a
@@ -192,6 +205,13 @@ one missed diff, a stuck lease blocks a peer until its TTL lapses.
 Failures are not silent, only non-fatal — they are recorded as
 `watch-delivery-failed` events, so `pact log` and `pact audit` show them.
 
+**The largest of those failures has been removed rather than reported better.**
+Delivery used to begin by locating a `bd` binary and give up here if there was
+none — so the one part of the protocol that runs *without an agent choosing to
+run it*, on a path an agent is walking away from, depended on somebody having
+installed the issue tracker. What remains is an append to a file under `.pact/`,
+which fails only for the reasons any write to `.pact/` fails.
+
 **Expiry does not deliver.** Only `release` and `--force` release do. A lapsed
 lease means nobody is present to have changed anything deliberately, and the
 content difference is as likely to be a peer's edit as the dead holder's.
@@ -223,7 +243,7 @@ word: it arrives while there is still time to object, which is the point.
 |---|---|
 | `watched` | a subscription was registered |
 | `unwatched` | one was retired |
-| `notified` | a diff was delivered — carries the subscriber and the message bead id |
+| `notified` | a diff was delivered — carries the subscriber and the message id |
 | `watch-delivery-failed` | a delivery did not happen, and why |
 
 None of them is a **custody** event: they say nothing about who held a path.

@@ -31,8 +31,20 @@ One orchestrator, agents in waves, one git worktree per agent per wave.
 4. **The orchestrator merges each worktree at wave end**, one merge commit per
    worktree per wave, then checkpoints `.pact/events.jsonl` and
    `.beads/interactions.jsonl` in a `chore:` commit for the wave.
-5. **The orchestrator acts under its own `PACT_AGENT` and bd actor**, so its
+5. **The orchestrator acts under its own `PACT_AGENT` and `BEADS_ACTOR`**, so its
    merges and checkpoints are not attributed to any worker.
+
+Two files, two reasons, and both need committing. `.pact/events.jsonl` is pact's
+own coordination history and the only thing it cannot derive.
+`.beads/interactions.jsonl` is bd's audit sidecar — and since 0.9.0 it is also the
+**only** thing pact reads from bd, so a wave that forgets it leaves
+[`--check claim-lease-divergence`](audit.md#--check-claim-lease-divergence) with
+nothing to check against. It is off by default in bd; turn it on with
+`audit.enabled: true` in `.beads/config.yaml` before the first wave, not after.
+
+**Messages are not in that list, deliberately.** `.pact/messages.jsonl` and
+`.pact/read/` stay local: mail is ephemeral, and a read position belongs to the
+machine that read it. What survives a wave is the event log and the commits.
 
 ### What it buys
 
@@ -40,6 +52,13 @@ Measured against an unorchestrated build of comparable size: commit provenance
 per agent instead of one squashed commit, one bd actor per agent instead of a
 single collapsed git identity, and worst-case contention down from eight agents on
 one file to three holds on the busiest path.
+
+**One agent per checkout is also what makes read acknowledgement work.** Read
+cursors live under `.pact/read/`, which is shared through the same resolution the
+leases use, so every agent in a wave can see whether a peer has read a message —
+[messaging.md](messaging.md#this-narrows-pact-rnc17-and-says-so-rather-than-inheriting-it-quietly)
+explains why that is a property of the topology rather than a guarantee pact makes
+everywhere. A fleet split across two machines loses it.
 
 **Designing the module tree is fleet planning.** That contention spread was not
 luck — the file layout was chosen so concurrent agents would mostly own different

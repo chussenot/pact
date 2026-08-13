@@ -1,6 +1,6 @@
 ---
 title: Messaging
-description: How messages map onto Beads issues, and why read state is shared rather than local.
+description: How pact stores messages in its own append-only log, what a read cursor can tell a sender, and what upgrading to 0.9.0 costs.
 audience: everyone
 ---
 
@@ -8,9 +8,12 @@ audience: everyone
 
 `pact msg` lets one agent hand context to another — "I renamed this
 function," "here's why I made that call," "your turn" — without a human
-relaying it in chat. Under the hood, a message is just a
-[Beads](https://github.com/gastownhall/beads) issue of type `message`; pact
-doesn't run its own message store.
+relaying it in chat.
+
+**Since 0.9.0 a message is a line in `.pact/messages.jsonl`, pact's own
+append-only log.** Nothing is spawned; there is no backend to be missing. If you
+are upgrading from 0.8.x, read [the cutover](#cutover-from-the-bd-era) first —
+in-flight messages do not come with you.
 
 ## Use case: an interface change
 
@@ -21,177 +24,217 @@ first:
 ```mermaid
 sequenceDiagram
     participant A as Agent A
-    participant BD as bd (Beads)
+    participant S as .pact/messages.jsonl
     participant B as Agent B
 
-    A->>BD: pact msg send --to agent-b "renamed foo() to bar()"
-    BD-->>A: sent msg-123 (thread msg-123)
+    A->>S: pact msg send --to agent-b "renamed foo() to bar()"
+    S-->>A: sent pact-msg-8eaa… (thread pact-msg-8eaa…)
 
     Note over B: starts its next task
-    B->>BD: pact msg inbox
-    BD-->>B: msg-123 — "renamed foo() to bar()"
+    B->>S: pact msg inbox
+    S-->>B: pact-msg-8eaa… — "renamed foo() to bar()"
 
-    B->>BD: pact msg read msg-123
-    BD-->>B: full thread, now marked read
+    B->>S: pact msg read pact-msg-8eaa…
+    S-->>B: full thread, now marked read
 
-    B->>BD: pact msg send --to agent-a --thread msg-123 "thanks, updated my callers"
-    BD-->>B: sent msg-123.1 (thread msg-123)
+    B->>S: pact msg send --to agent-a --thread pact-msg-8eaa… "thanks, updated my callers"
+    S-->>B: sent pact-msg-31c7… (thread pact-msg-8eaa…)
 ```
 
 `pact msg inbox` at the start of a task is exactly the habit the `pact init`
 protocol block asks every agent to build — that's the entire point of having
 a shared inbox instead of a chat log only a human reads.
 
-## How a message maps to a Beads issue
+## How a message is stored
 
-`pact msg send --to agent-b --subject "..." "body"` runs, roughly:
+One JSON object per line in `.pact/messages.jsonl`, under exactly the same
+discipline as [`.pact/events.jsonl`](architecture.md#pacteventsjsonl-is-committed-and-it-is-not-runtime-state):
+appended under a lock, each line chained to the one before it, a torn final line
+counted and skipped rather than fatal, and a bounded line count. That reuse is
+the point — one append implementation, one set of failure modes to understand,
+no second invention.
 
+Three real lines: a root, a reply, and a message addressed to a path.
+
+```json
+{"id":"pact-msg-9c4b3064b6844eb5","at":"2026-08-13T14:08:08.256846411+00:00","from":"msg-fix","to":["docs-writer"],"subject":"src/msg.rs ready: Message.from + all_messages()","body":"src/msg.rs is done and compiles clean on its own. Contract exactly as frozen.","thread":"pact-msg-9c4b3064b6844eb5","kind":"mail","chain_hash":"820a65b0bab59897"}
+{"id":"pact-msg-2ef09ede29a18e52","at":"2026-08-13T14:08:08.267975415+00:00","from":"docs-writer","to":["msg-fix"],"subject":"thanks, updated my callers","body":"thanks, updated my callers","thread":"pact-msg-9c4b3064b6844eb5","kind":"mail","in_reply_to":"pact-msg-9c4b3064b6844eb5","chain_hash":"ead5148d6c704b52"}
+{"id":"pact-msg-0997158707341c2d","at":"2026-08-13T14:08:08.297952878+00:00","from":"second-agent","to":["human"],"subject":"BLOCKER: flush is broken","body":"BLOCKER: flush is broken","thread":"pact-msg-0997158707341c2d","kind":"mail","about":["src/otel.rs"],"chain_hash":"2f2378a19c439af0"}
 ```
-bd create --type=message --title=<subject> --description=<body> \
-           --assignee=agent-b --actor=agent-a --json
-```
 
-| Message concept | Beads field |
+| Field | What |
 |---|---|
-| recipient (`--to`) | `--assignee` |
-| sender (`from`) | `--actor` on the way out, `created_by` on the way back |
-| subject | `--title` (defaults to the first line of the body, truncated, if omitted) |
-| body | `--description` |
-| thread | the root message's own issue id |
-| reply | a child issue, linked via `--parent <thread-id>` |
-| read state | a `read-by-<agent>` label on the message bead, one per reader |
+| `id` | a hash of the message's own content — see [A retried send lands on the same message](#a-retried-send-lands-on-the-same-message) |
+| `at` | when it was sent (`at`, not `ts`, to match `events::Event` rather than invent a second vocabulary) |
+| `from` | the sending agent's resolved `PACT_AGENT` |
+| `to` | **every** recipient of this send, first-seen order — one row for N recipients |
+| `subject` | `--subject`, or the first line of the body truncated |
+| `body` | as written |
+| `thread` | the root message's id; a root's own id for a root |
+| `kind` | `mail` for something an agent wrote, `watch-notice` for what [`pact watch`](watch.md) generated |
+| `in_reply_to` | the message replied to, when `--thread` was given |
+| `about` | paths from `--to-owner-of`, stored **raw** |
+| `chain_hash` | this line's link to the one physically before it |
 
-Every `bd create` pact runs passes `--no-inherit-labels`. Without it a child
-inherits its parent's labels, so a reply to a message you had already read would
-be born carrying your own `read-by-` label and arrive pre-read.
-Every `bd create` also passes `--force`, which sounds alarming and isn't: its
-only effect is to accept an id that doesn't start with this project's bd prefix,
-which pact's message ids deliberately don't — see
-[A retried send lands on the same bead](#a-retried-send-lands-on-the-same-bead).
+Every optional field is omitted when it has nothing to say, so a line stays as
+narrow as its content — the same rule `events.jsonl` follows.
+
+The **public** shape, which `--json` consumers were already pinned to, is not
+this row: it is one `Message` per recipient, keeping `created_at` and the other
+key names unchanged. A row with two recipients still yields two `Message`s, so
+every `--json` shape survived the move byte-compatible.
+
+### One id for a whole fan-out
+
+The bd era gave each recipient of one send a distinct bead id, and stitched them
+into a thread with parent links. A row carries its recipient list instead, so a
+fan-out has **one** id:
+
+```
+$ pact --agent sender msg send --to cli-wire --to human --subject probe "probe body with a table"
+sent 2 message(s) in thread pact-msg-8eaaaae2e91cc78f
+  pact-msg-8eaaaae2e91cc78f → cli-wire
+  pact-msg-8eaaaae2e91cc78f → human
+```
+
+Any recipient's id therefore resolves to the same thread, which is what
+`--thread` wanted all along. It also deletes the whole parent-child fan-out that
+existed only to make N beads read as one conversation — including the rule that
+recipients 2..N had to be parented on the root rather than on each other, because
+the thread walk only ever followed *direct* children.
 
 ### The `from` field
 
-pact always passed the sender as `--actor`, but for a while it never read it
-back, so `inbox` and `read` showed a message with no author. Agents identified
-senders by recognising prose style in the body — which fails exactly when it
-matters, on a short handoff from one of five peers.
+`from` is the sender's own resolved identity, written by pact at send time and
+put through [pact's identity grammar](#unknown-recipients-warn-then-send) on the
+way in. It used to come back from bd's `created_by` and was passed through
+verbatim, so a message bead created outside pact could surface a git user name
+(`Ada Lovelace`) or an empty author rendered as `?`.
 
-`Message.from` is now populated on every path (`inbox`, `read`, and the
-`Message` returned by `send`) from bd's `created_by`, and it is passed through
-**verbatim without validation**. That matters: for a message sent through pact
-it is the pact agent name (`tui-dev`), but a message bead created outside pact
-carries whatever bd recorded — often a git user name (`Ada Lovelace`). A bead
-with no recorded author yields an empty string, which renders as `?`. So `from`
-is a useful label, not a guaranteed pact identity — don't feed it back into
-`--to` without checking it against `pact agents`.
+That cannot happen to a row pact wrote. `pact agents` still marks a name
+`[INVALID]` rather than listing it, because a hand-edited `messages.jsonl` is
+still a file somebody can put anything in — but it is no longer the ordinary
+case it was when any tool with write access to a shared issue tracker could
+create one.
 
-A reply (`pact msg send --thread <id> ...`) passes `--parent=<id>`, which
-Beads records as a `parent-child` dependency. `pact msg read <id>` then
-reconstructs the thread by fetching the root (`bd show <id> --json`) and its
-direct children (`bd list --parent <id> --include-infra --json`), merging
-both by `created_at`.
+### Threading
+
+A reply carries `in_reply_to` and inherits the root's `thread`. `--thread`
+accepts **any** member's id, not just the root's, and resolves it to the root
+before storing — an agent legitimately holds a non-root id, because `msg read`
+prints every id in the thread, and a reply to a reply must join the conversation
+rather than start a sub-thread nobody reading it would see.
+
+Ids are content hashes, so they are longer than anything an agent wants to
+retype: `--thread` and `msg read` both take a **prefix**. An ambiguous prefix is
+an error listing the candidates, never a guess, because picking one would reply
+into the wrong thread.
 
 ```mermaid
 flowchart TB
-    R["msg-123 (root)
-    to: agent-b"] --> C1["msg-123.1 (reply)
-    to: agent-a"]
-    R --> C2["msg-123.2 (reply)
-    to: agent-a"]
+    R["pact-msg-9c4b… (root)
+    from: msg-fix, to: docs-writer"] --> C1["pact-msg-2ef0… (reply)
+    in_reply_to: pact-msg-9c4b…"]
+    R --> C2["pact-msg-a71b… (reply)
+    in_reply_to: pact-msg-9c4b…"]
 ```
 
-### Why not `bd show --thread`?
+## Why this is not in the issue tracker any more
 
-Beads' own `bd show <id> --thread` flag looks purpose-built for exactly this,
-and it was the first thing tried. In the version of `bd` pact targets,
-though, it only ever prints the single issue you asked for — it doesn't
-actually walk parent-child replies into a conversation. That was confirmed by
-creating a root message and a reply against a scratch database and comparing
-`--thread` output against `bd list --parent <id> --include-infra --json`
-(which *does* return the reply correctly). Rather than depend on a flag that
-doesn't do what its name promises, pact reconstructs threads itself from the
-parent-child links, which are reliable.
+Messages used to be `bd` beads: `bd create --type=message` with
+`--parent`/`--assignee`/`--include-infra`, and read state as one
+`read-by-<agent>` label per reader. That made the agents' **task tracker a
+runtime dependency of pact's coordination layer**, and bd 1.2 sent the bill:
+`create --id --force` stopped upserting, four CLI tests broke with no source
+change on pact's side, and `send` grew a duplicate-id recovery path to cope.
 
-`bd list` also has no `--type` filter, so `pact msg inbox` fetches everything
-assigned to you (`bd list --assignee=<agent> --include-infra --json`,
-`--include-infra` because message issues are otherwise hidden from `bd list`
-by default) and filters to `issue_type == "message"` on pact's side.
+The subprocess boundary in `src/beads.rs` insulated pact against bd's **storage**
+churn — Dolt, SQLite, whatever comes next — and never against its **CLI-semantic**
+churn. Messages were the only pact-owned feature exposed to it. That distinction
+is the whole lesson, and
+[architecture.md](architecture.md#one-backend-since-079) is where it is drawn
+out.
 
-## Who a backend write is attributed to
+Four field runs also settled what this traffic is: `pact watch` notices dominate
+it — 87 and 64 deliveries in two runs — while voluntary peer mail is near zero
+([evidence](studies/field-runs.md#what-the-four-runs-actually-say-about-messaging)).
+Ephemeral, pact-shaped traffic, not a backlog of issues.
 
-Every mutating call pact makes passes `--actor=<agent>`, so a bead operation is
-recorded against the agent that caused it rather than against whoever owns the
-checkout. Without it, a fleet of twenty agents produces a bead history entirely
-attributed to one human, and the audit trail cannot answer the one question it
-exists for.
+bd is still here, and is still what agents track work in. pact only ever
+**reads** it now, and only via the committed `.beads/interactions.jsonl` export
+— see [audit.md](audit.md#--check-claim-lease-divergence).
 
-Both backends accept the same flag, checked by running them rather than read off
-a version number:
+### What got better, not just different
 
-| Backend | Mechanism | Precedence it documents |
-|---|---|---|
-| `bd` 1.1.2 | `--actor <string>` | `--actor` > `$BEADS_ACTOR` > `git user.name` > `$USER` |
+- **Replies are idempotent.** The deterministic id protected root messages only,
+  because a bd `create` could not carry `--id` alongside `--parent`. A line in a
+  file has no such restriction, so a replayed reply is a no-op too.
+- **A bare-repo worktree can message.** bd needs a working tree, so the topology
+  that most needs coordination was the one where agents could not talk.
+- **`lease acquire` finds mail waiting on a path with no bd installed**, instead
+  of [admitting it had not looked](#when-that-check-cant-run-it-says-so).
+- **`about` tags store raw paths.** As bd labels they were encoded into
+  `[A-Za-z0-9_:-]`, so `a.b` and `a-b` collapsed onto one tag, and a second
+  fallback query existed for rows written before that charset was narrowed.
+  Encoding, collision and fallback are all gone.
+- **The MCP inbox answers empty instead of unavailable**, and still writes
+  nothing ([mcp.md](mcp.md)).
 
-pact uses the flag rather than any env-var scheme, because one mechanism
-that works everywhere beats two that have to be kept in step. `pact doctor`'s
-**Beads CLI** line says which of the two it found, in either direction — the
-question gets asked when a trail already looks wrong, and an absent line answers
-nothing.
+### Cutover from the bd era
 
-**This only covers calls pact itself makes.** `bd ready`/`bd update --claim`/
-`bd close` — the commands AGENTS.md's own Quick Reference tells an agent to
-run directly for task tracking — never pass through pact at all, so none of
-them carry `--actor`. Confirmed on a real 15-agent build (pact-juz.2): every
-one of 16 `.beads/interactions.jsonl` entries attributed to the operator's own
-`git user.name`, none to any of the 16 distinct pact agent identities that
-`.pact/events.jsonl` correctly tracked for the same run — because nothing set
-`$BEADS_ACTOR`, so every direct `bd` call fell through past it to the next
-tier. `pact whoami` prints `export BEADS_ACTOR=<agent>` whenever an agent
-identity is resolved and `.beads/` exists, so setting it once per shell fixes
-attribution for every direct `bd` command that follows, without needing
-`--actor` typed on each one.
+**Messages are ephemeral, and there is no importer.** A build from 0.9.0 onwards
+cannot see a message bead, and pact will not convert one: the store is capped, so
+mail is lost by design past the cap anyway (below), and an importer would be a
+one-shot migration for data the design already treats as disposable.
 
-What this is **not** doing: setting `git config user.name`. That would mutate a
-checkout other agents share in order to fake attribution for one of them, which
-is the opposite of an audit trail — and in a worktree fleet the checkout being
-mutated belongs to somebody else entirely.
+So, in order:
 
-Where it lands differs by verb, which is worth knowing before trusting a query.
-Measured on `bd` 1.1.2:
+1. **Finish your in-flight threads before you upgrade.** Anything still awaiting
+   a reply when you switch binaries stays in bd, readable with `bd show <id>` and
+   invisible to `pact msg`.
+2. Nothing has to be cleaned up. The old beads are ordinary beads in your
+   tracker; pact simply stops writing more of them, and the `read-by-` labels on
+   them go inert.
 
-| Verb pact issues | Attribution recorded |
-|---|---|
-| `create` (a message) | the bead's `created_by` field |
-| `label add` (marking read) | accepted, but bd logs no interaction for label changes |
+**Nothing detects this for you, deliberately.** A `pact doctor` check was designed
+and rejected: the only observable trigger is "`.beads/` exists and
+`.pact/messages.jsonl` does not", which is also the normal state of every
+repository that adopted pact *after* 0.9.0 and has not sent a message yet — most of
+them, by the field data above. It would fire almost always and mean nothing. pact
+also cannot count what you would be losing: the committed export carries no
+`issue_type`, so a message bead is indistinguishable from a task bead there. A
+one-time fact belongs in a release note, which is where this one is.
 
-So a message's author is attributable today and a *reader* is not, through no
-fault of pact's — the flag is passed either way, so if bd starts logging label
-changes the attribution is already correct rather than needing a second pass. The
-canary asserts the part that is observable: a message sent as `canary-a` must come
-back with `created_by: canary-a` while the scratch repo's git user is deliberately
-something else.
+**Two things this store costs, stated rather than buried.** Past 5000 lines the
+oldest are dropped down to 4000, exactly as `events.jsonl` does — for an event
+log that is lossy history, for messages it is lost mail. And read state is local
+again, which [narrows a property](#read-state-local-cursors-and-what-a-sender-can-see)
+that was deliberately moved *into* bd.
 
-## The backend, and the one that went away
+## Attribution: your bd commands, not pact's
 
-pact speaks to **`bd`** (Go, embedded Dolt). The messaging model is beads:
-message-typed beads, `--parent` threads, `read-by-<agent>` labels. See
-[install.md](install.md#the-beads-cli) for how the store is located.
+pact writes nothing to bd, so nothing pact runs can carry attribution on your
+behalf. That makes the one thing you have to do more important, not less:
+**export `BEADS_ACTOR=$PACT_AGENT` once per shell.**
 
-`pact doctor` names the backend and version it picked, so a puzzling `msg` result
-starts with a one-line answer to "which database am I even looking at":
+`bd ready`/`bd update --claim`/`bd close` — the commands AGENTS.md's own Quick
+Reference tells an agent to run directly — never pass through pact at all. Left
+unset, every one of them falls through bd's precedence chain
+(`--actor` > `$BEADS_ACTOR` > `git user.name` > `$USER`) to your shared
+checkout's git identity. Confirmed on a real 15-agent build (pact-juz.2): all 16
+`.beads/interactions.jsonl` entries attributed to the operator's own
+`git user.name`, none to any of the 16 distinct pact identities
+`.pact/events.jsonl` correctly tracked for the same run. `pact whoami` prints the
+exact `export` line whenever an identity is resolved and `.beads/` exists.
 
-```
-✓ Beads CLI: bd (bd version 1.2.1 (634cbbc4b)), attributes writes to the acting agent (--actor)
-```
+What pact deliberately does **not** do: set `git config user.name`. That would
+mutate a checkout other agents share in order to fake attribution for one of
+them — and in a worktree fleet the checkout being mutated belongs to somebody
+else entirely.
 
-pact used to accept `br` (beads-rust, SQLite) as well, and **0.7.9 was the last
-release that did** — see
-[why it went](install.md#br-beads-rust-is-no-longer-supported). The short version
-belongs here because it is a messaging story: the two CLIs shared the model but
-not the argv, which was affordable, and did not share the *guarantees*, which was
-not. `br` had no `--id`/`--force` equivalent, so a replayed `msg send` duplicated
-the message there — while this page told senders to re-send when they could not
-confirm a send. One page, two contracts, one of them unsafe.
+pact's own messages need none of this. `from` is written from the resolved
+identity on the line itself, so a fleet's message history is attributed correctly
+whatever any environment variable says.
 
 ## One send is one thread, however many recipients
 
@@ -199,28 +242,18 @@ confirm a send. One page, two contracts, one of them unsafe.
 pact msg send --to cli-wire --to tui-dev --to human --subject "…" --body-file -
 ```
 
-`--to` repeats. All the recipients' messages are stitched into a single
-conversation — the first recipient's bead is the thread root, and every other
-recipient's is created with `--parent=<thread root>` — so `pact msg read <root>`
-returns the whole announcement:
-
-```
-$ pact msg send --to cli-wire --to human --subject probe --body-file -
-sent 2 message(s) in thread pact-msg-6e5c288cf14ce99c
-  pact-msg-6e5c288cf14ce99c → cli-wire
-  pact-msg-6e5c288cf14ce99c.1 → human
-```
+`--to` repeats, and one send is one row, one id and one thread — see
+[One id for a whole fan-out](#one-id-for-a-whole-fan-out) for what that prints.
+`--to` used to take a single name, so telling three agents about one interface
+change meant three unrelated threads, none of which contained the others'
+replies.
 
 The thread id is printed **once**, because that is the point: one decision to
-read, one place to reply. `--to` used to take a single name, so telling three
-agents about one interface change meant three unrelated threads, none of which
-contained the others' replies. Recipients 2..N are parented on the thread root
-rather than on the first recipient's message, because `read_thread` walks *direct*
-children only — grandchildren would be invisible in the thread the reader opens,
-which is the exact failure this fixes.
+read, one place to reply.
 
-An empty recipient list is an error before `bd` is ever run. If a send fails part
-way through, the error names who already received it, so nobody re-sends blind.
+An empty recipient list is an error before anything is written. A send cannot
+fail partway through any more — one row, one append — so there is no
+half-delivered state to reconcile.
 
 A single `--to` behaves and prints exactly as before:
 `sent <id> to <who> (thread <id>)`.
@@ -245,13 +278,14 @@ because an earlier fleet produced duplicate messages, so a single command that
 manufactures them would work against the tool's own advice. It is said out loud
 because a caller that repeated a name probably built the list wrongly.
 
-## A retried send lands on the same bead
+## A retried send lands on the same message
 
 `pact msg sent` exists so a sender can check rather than guess. But when the
 outcome of a send is genuinely unknowable, pact's advice is to send it again —
-and until this fix that advice manufactured the duplicate it was meant to
-prevent. `bd create` mints a fresh id on every call, so a retry was a second,
-distinct bead with identical content, and neither `inbox` nor `sent` flagged it.
+and before this existed that advice manufactured the duplicate it was meant to
+prevent: the store minted a fresh id on every call, so a retry was a second,
+distinct message with identical content, and neither `inbox` nor `sent` flagged
+it.
 
 Not hypothetical. In one fleet run a sender's long send came back with no output
 and an exit code it could not trust — its own harness had dropped stdout, no
@@ -260,9 +294,10 @@ same recipient, byte-identical subject, 16 minutes apart. The recipient's inbox
 listed both, and it had to diff two walls of prose by eye to establish they were
 one announcement (`pact-m7j.6.4`).
 
-So on `bd` a **thread root's id is derived from its own content** — a fixed-seed
-hash of sender, recipient, subject and body, passed as `--id=pact-msg-<16 hex>`.
-A byte-identical retry computes the same id and upserts the same bead:
+So **a message's id is derived from its own content** — a fixed-seed hash of
+sender, recipient list, thread, subject and body, rendered `pact-msg-<16 hex>`. A
+byte-identical retry computes the same id, and a duplicate id collapses to the
+first occurrence when the store is read:
 
 ```
 $ pact --agent sender msg send --to recipient --subject "long send" "the harness dropped stdout before I saw the exit code"
@@ -280,130 +315,111 @@ The seed being *fixed* is the whole trick, and is the one line of this worth
 guarding in review: a randomly seeded hash — Rust's default — would give the
 retry a different id from the original and protect nothing.
 
-A replay is not a reset. The `read-by-` labels a recipient already added survive
-it, so re-sending something that has already been read does not make it unread,
-and `pact msg sent` goes on saying the recipient has seen it.
+`send` then reports the row the store **kept**, not the one it just built, so a
+replay's `--json` carries the first delivery's timestamp. Without that a retry
+answers with its own wall clock and a `--json` consumer trusts a value that will
+never match what `inbox` and `sent` show a moment later.
 
-Two limits, both permanent rather than pending:
+A replay is not a reset either: a recipient who had already read the message has
+their read cursor untouched, so re-sending does not make it unread and `pact msg
+sent` goes on saying the recipient has seen it.
 
-- **Thread roots only, even on bd.** `bd create` refuses `--id` and `--parent`
-  together outright (`cannot specify both --id and --parent flags`), because it
-  derives a reply's id from its parent — `<root>.1`, `.2`. So a reply carries no
-  key, and neither do recipients 2..N of a fan-out, which are parented on the
-  root. Narrower than "every send is safe to retry", and deliberately so: the
-  incident was a single long send, and covering replies would mean a second
-  subprocess on *every* reply to protect the rarer case.
-- **Two deliberately identical sends collide into one.** Same sender, same
-  recipient, byte-identical subject and body, no thread — pact cannot tell that
-  from a retry, because the key is a pure function of the send's own arguments
-  and nothing is written under `.pact/` to distinguish them. Keeping the
-  messaging layer stateless is worth more than the distinction, given how
-  rarely two real messages are identical to the byte.
-
-One visible consequence: **a message id no longer looks like your other Beads
-ids.** Every id bd mints carries this project's own bd prefix; a pact thread
-root is `pact-msg-<hash>` whatever that prefix is. That mismatch is the entire
-reason every `bd create` passes `--force` — it is what makes bd accept an id
-outside its own prefix, and it does nothing else here. Replies still hang off
-the root in bd's own shape, so a thread reads `pact-msg-<hash>`,
-`pact-msg-<hash>.1`, and so on.
-
-A second, quieter consequence pact corrects for rather than exposes: a create's
-own `created_at` is not trustworthy on that path, so `msg send`'s `--json`
-response re-reads the bead via `show` before reporting it. A retry's response
-then agrees with what `msg inbox`/`msg sent` show moments later, instead of a
-`--json` consumer trusting a value that would never match history
-(pact-m7j.6.7).
-
-### What "survives a retry" means depends on your bd version
-
-The guarantee is constant — **one send, one bead, however many times the caller
-retries** — but bd changed how it delivers it, and pact handles both (pact-0re):
-
-| | bd ≤ 1.1 | bd ≥ 1.2 |
-|---|---|---|
-| a replayed `create` with the same `--id` | **upserts**, exit 0 | **refuses**: `already exists; use bd update, or bd import for upsert semantics`, exit 1 |
-| what pact does | takes the success path | reads that refusal as proof the message is already delivered, and returns the existing bead |
-
-The refusal is only ever read as success when it names **pact's own planned id**.
-An "already exists" about any other bead, and every other failure, stays an
-error — because "the bead is already there" and "bd could not write" must not
-collapse into one answer, and only the first is safe to report as a delivered
-message.
-
-Getting that wrong would be worse than the duplicate it replaced. `pact msg
-sent` tells a sender who cannot confirm a send to re-send it, so treating the
-refusal as failure would report *failure for a message that had already been
-delivered* — the same shape as the closed-pipe bug that made agents re-send in
-the first place.
-
-## Replaying a fan-out that failed partway: `--skip`
-
-The id trick above only covers a thread's **root** — the first `--to`.
-Recipients 2..N of a fan-out are parented on that root and carry no `--id` of
-their own (see the second limit above), so if `create` fails partway through —
-say, recipient 3 of 4 — an identical retry re-sends to every recipient again,
-duplicating the ones who already got it. The error already names them:
+**Replies are covered too, and did not used to be.** On bd this key could only
+ride a thread root, because `bd create` refused `--id` and `--parent` together
+(`cannot specify both --id and --parent flags`) — it derived a reply's id from its
+parent. A line in a file has no such restriction:
 
 ```
-$ pact msg send --to alice --to bob --to carol "shared decision"
-error: sending to carol: 2 recipient(s) already got this (alice, bob) — replay
-with --skip for them instead of re-sending blind
+$ pact --agent docs-writer msg send --to msg-fix --thread pact-msg-9c4b3064b6844eb5 "thanks, updated my callers"
+sent pact-msg-2ef09ede29a18e52 to msg-fix (thread pact-msg-9c4b3064b6844eb5)
+$ pact --agent docs-writer msg send --to msg-fix --thread pact-msg-9c4b3064b6844eb5 "thanks, updated my callers"
+sent pact-msg-2ef09ede29a18e52 to msg-fix (thread pact-msg-9c4b3064b6844eb5)
 ```
 
-With `--json`, that same fact is a structured shape on **stdout** instead of
-prose on stderr (pact-m7j.5.1 widened this to every `--json` failure, not
-just this one — see [cli.md](cli.md#exit-codes)):
+One limit remains, permanent rather than pending: **two deliberately identical
+sends collide into one.** Same sender, same recipients, same thread,
+byte-identical subject and body — pact cannot tell that from a retry, because the
+key is a pure function of the send's own arguments and the timestamp is
+deliberately not an input. Keeping it a pure function is worth more than the
+distinction, given how rarely two real messages are identical to the byte. That
+trade was already accepted in the bd era and is unchanged.
 
-```json
-{
-  "already_sent": ["alice", "bob"],
-  "failed_at": "carol",
-  "reason": "bd [...] failed (exit status: 1): ..."
-}
-```
-
-Read `already_sent` back and pass each name as `--skip <agent>` (repeatable,
-like `--to`) on the retry — the recipient list stays the same, but pact drops
-the skipped names before sending, so only the recipient that actually failed
-is attempted:
+## `--skip`: leaving a recipient out
 
 ```
 $ pact msg send --to alice --to bob --to carol --skip alice --skip bob "shared decision"
 note: 2 recipient(s) skipped — already sent to them, not re-sending
-sent pact-msg-... to carol (thread pact-msg-...)
+sent pact-msg-3026c6c0dbcafbbc to carol (thread pact-msg-3026c6c0dbcafbbc)
 ```
 
-This is a **new, opt-in path**, not a change to what an identical replay does:
-run the exact same command again with no `--skip`, and alice/bob still
-duplicate exactly as the second limit above describes. `--skip` exists for the
-sender who already knows, from a failed attempt's own error, which recipients
-not to touch again.
+`--skip <agent>` repeats like `--to`, and drops those names after every other
+recipient source (`--to`, `--to-owner-of`, the `human` fallback) has built the
+list — so it behaves the same however a name got in.
 
-## Read state: shared labels, not a local file
+It exists for a failure that can no longer happen. A bd fan-out was N separate
+`create` calls, so recipient 3 of 4 could fail with 1 and 2 already delivered,
+and an identical retry duplicated for them; `--skip` was how a sender replayed
+without re-delivering. **One append cannot partially fail**, so the
+`{"already_sent": …, "failed_at": …, "reason": …}` `--json` error shape that fed
+it is gone, and a `--json` failure here is the ordinary
+`{"error": …, "exit_code": …}` every other command produces
+([cli.md](cli.md#exit-codes)).
 
-An agent that reads a message adds a `read-by-<agent>` label to the bead. That's
-the whole mechanism. `Message.read_by` lists every reader; `read` — the `*` in
-your inbox — is just "does `read_by` contain the agent asking".
+The flag survives because "leave this recipient out of this send" is a useful
+thing to say on its own — a recipient you have already told by other means, or
+one an orchestrator's template added and you do not want.
 
-It used to live in `.pact/read.json`, a local file keyed by agent. That worked for
-the reader and was useless for everyone else: **a sender could not tell whether
-anyone had read a decision.** An agent with no confirmation re-sends, and that is
-where the fleet's duplicate announcements came from — one notice delivered four
-times after a false negative. Read state is a fact about a message, so it now
-lives with the message, where every agent can see it.
+## Read state: local cursors, and what a sender can see
 
-Note what this *removed*: `.pact/read.json` is gone, not shadowed. Keeping both
-would have meant two sources of truth for one fact. A leftover `read.json` from an
-older pact is inert, and the single `.pact/` gitignore line covers it either way.
-There is no migration, so the changeover resets every agent's read flags once —
-an inbox full of things you already handled is expected exactly once.
+One file per agent, `.pact/read/<agent>.json`, mapping message id to when that
+agent read it:
+
+```json
+{"read":{"pact-msg-2ef09ede29a18e52":"2026-08-13T14:08:08.275182811+00:00","pact-msg-9c4b3064b6844eb5":"2026-08-13T14:08:08.275182811+00:00"}}
+```
+
+A **map, not a high-water mark**: a mark cannot say "read 5 but not 3", and an
+inbox that silently marks skipped mail read is worse than one that keeps a
+slightly larger file. `Message.read_by` is assembled by scanning the directory
+once per listing, so an inbox of 200 notices is one directory read rather than
+200; `read` — the `*` in your inbox — is "does the asking agent's cursor contain
+this id".
+
+Cursors are gitignored, like `.pact/leases/`, because a read position is
+per-machine by nature. They are also best-effort on the way in: an unreadable or
+malformed cursor reads as "has read nothing", never as an error, because the cost
+of getting that wrong is showing one message as unread twice — against failing a
+command that had nothing to do with it. Written via a uniquely-named temp and
+renamed, so a reader never sees half a cursor and two agents writing their own
+cannot collide.
 
 `pact msg read <id>` marks every message it displays (the root plus its replies)
 as read for the *current* agent; `agent-b` reading a thread doesn't affect what
-`agent-a` sees. `pact msg inbox --unread-only` filters on the same labels. A
-failed label write degrades to a warning rather than losing the thread body you
-asked for.
+`agent-a` sees. `pact msg inbox --unread-only` filters on the same cursors.
+
+### This narrows pact-rnc.17, and says so rather than inheriting it quietly
+
+Read state used to live in `.pact/read.json`, moved **into** bd as
+`read-by-<agent>` labels, and has now come back to a local file. That is a
+reversal, and the reason for the original move has not been refuted — it has been
+narrowed.
+
+pact-rnc.17 moved it for a real failure: with local state **a sender could not
+tell whether anyone had read a decision**, an agent with no confirmation
+re-sends, and that is where one fleet's duplicate announcements came from — one
+notice delivered four times after a false negative.
+
+What holds now: **a pact fleet shares one checkout**, so every agent's cursor is
+in the same `.pact/read/`, and `read_by` and `pact msg sent` answer honestly
+within the case pact is actually for. What no longer holds: across two machines
+they cannot. pact has never coordinated across machines
+([README](../README.md#what-pact-deliberately-is-not)), so this narrows the
+guarantee to exactly the scope everything else in pact already had — but it is a
+narrowing, not a free move, and it is the one thing to weigh if you were relying
+on `read_by` from a second clone.
+
+The old `.pact/read.json`, and the `read-by-` labels on any bead still in your
+tracker, are both inert. Nothing reads either.
 
 ## Reading your mail: one line each, full text on demand
 
@@ -472,38 +488,21 @@ structurally instead of behaviourally.
 
 Three properties make the split safe to rely on:
 
-- **The distinction is a label, written at creation** (`watch-notice`), not a
-  guess from the wording. An agent that writes "src/ast.rs changed — released by
-  me" by hand is still correspondence, and there is deliberately no flag for
-  sending a message *as* a notice.
+- **The distinction is a stored field**, `kind`, set to `watch-notice` when
+  `pact watch` generates the message and `mail` otherwise. Not a guess from the
+  wording: an agent that writes "src/ast.rs changed — released by me" by hand is
+  still correspondence, and there is deliberately no flag for sending a message
+  *as* a notice.
 
-#### Notices that predate the label
-
-Tagging at creation is forward-only, and on a real store that cost the whole
-point. Measured across nine agents' inboxes in an existing store, `inbox` and
-`inbox --include-watch` returned **identical** counts for every one of them, and
-`--watch-only` answered "no watch notices" for inboxes that were mostly notices —
-so on an existing store the burial was exactly as bad as before the fix
-([evidence](studies/field-runs.md#run-4-crucible-built-to-hurt)).
-
-Those are recoverable because **pact wrote them**: their shape is a format string,
-not user text. An untagged message is treated as a notice only when all three of
-these hold:
-
-- its subject splits on ` changed — released by ` into exactly two halves;
-- neither half contains whitespace, so they are a path and an agent name rather
-  than prose containing the phrase;
-- its body carries `, which you are watching.` — a second, independent piece of the
-  same format string.
-
-Anchored to the full shape rather than a substring, because the cost of a false
-positive here is precisely what this feature exists to prevent: filing a real
-warning as machine noise. "src/render.rs changed — released by agent-b, please
-re-read it" fails the second condition and stays in the inbox.
-
-The label always wins and is checked first, so anything written since it shipped is
-classified by the fact pact recorded rather than by prose — and the heuristic can
-only ever add to what the label already knows.
+  This was a bd **label** (pact-mqw.5), and the difference is worth a sentence
+  because it deleted code. A label had to be applied at creation, so it was
+  forward-only — measured across nine agents' inboxes in an existing store,
+  `inbox` and `inbox --include-watch` returned identical counts for every one of
+  them and `--watch-only` said "no watch notices" for inboxes that were mostly
+  notices ([evidence](studies/field-runs.md#run-4-crucible-built-to-hurt)). A
+  heuristic existed to rescue the untagged ones by pattern-matching English in
+  the subject and body. A field that every row carries needs no such rescue, and
+  that heuristic is gone.
 - **Notices are counted, never hidden.** A count an agent can see makes skipping
   them a decision; silence would make it an accident. An inbox holding nothing
   but notices says so rather than printing `inbox empty`.
@@ -533,8 +532,9 @@ Same shape as the inbox, with `TO` instead of `FROM`, newest first. The marker
 means something different and more useful here: `*` is *the recipient hasn't
 looked*, not "I haven't". `Message.read` is read-by-me, which is trivially true
 for something I sent; the sender's actual question is whether the peer they told
-has seen it. Answering it requires the shared read state above — with a local
-`read.json` there was nothing to show.
+has seen it. Answering it means reading **every** agent's cursor, not just your
+own — which works because a fleet shares one checkout, and is exactly the property
+[narrowed above](#this-narrows-pact-rnc17-and-says-so-rather-than-inheriting-it-quietly).
 
 ### …and `pact audit --export` asks it for everybody
 
@@ -563,13 +563,19 @@ nothing else said a word. Another run had two of three messages read only by
 agents other than their addressee. Reported, never fatal — acting on a message
 without marking it read is untidy, not broken.
 
-**Why not `pact doctor`.** That was the obvious home and it is not available:
-answering this needs a real `bd list`, and `bd` takes a `.beads/.write.lock` to
-serve one, while `pact doctor` is exposed over MCP as `pact_doctor` — which
-[mcp.md](mcp.md) promises is strictly read-only and a test enforces
-byte-for-byte. A doctor check would have quietly broken that guarantee for
-every MCP observer. `--export` is CLI-only, deliberately run at the end of a
-run, and is the retrospective artifact this question belongs in anyway.
+**Why not `pact doctor`.** The original objection is gone and it stays where it
+is anyway. Answering this used to need a real `bd list`, and `bd` takes a
+`.beads/.write.lock` to serve one, while `pact doctor` is exposed over MCP as
+`pact_doctor` — which [mcp.md](mcp.md) promises is strictly read-only and a test
+enforces byte-for-byte. A doctor check would have quietly broken that guarantee
+for every MCP observer.
+
+Reading `.pact/messages.jsonl` and the cursors takes no lock and spawns nothing,
+so that objection no longer applies. It has not been moved because the remaining
+reason was always the better one: this is a **retrospective** question about a
+finished run, and `pact doctor` answers "is this repository set up correctly right
+now". A check that fails because an agent has not read its mail yet would fire
+during every healthy run.
 
 ## Bodies that don't survive a shell: `--body-file`
 
@@ -622,10 +628,10 @@ sent pact-msg-0169b2cf6f0e68f7 to tuidev (thread pact-msg-0169b2cf6f0e68f7)
 **It warns and still sends, and still exits 0.** pact is advisory here for the
 same reason its leases are: a fleet's very first message is legitimately
 addressed to an agent that hasn't acted yet, so a wall would block the exact
-case the protocol asks for. The lookup needs `bd`, and a failed lookup is
-swallowed — a warning must never break a send that would otherwise succeed.
-The warning fires on *every* send to an unseen name, including when nobody at
-all has been seen yet; it doesn't go quiet after the first time.
+case the protocol asks for. A failed lookup is swallowed — a warning must never
+break a send that would otherwise succeed. The warning fires on *every* send to
+an unseen name, including when nobody at all has been seen yet; it doesn't go
+quiet after the first time.
 
 Three things the warning deliberately does not treat as "known":
 
@@ -636,10 +642,12 @@ Three things the warning deliberately does not treat as "known":
   reads pact's output but never runs commands as `human`, so "never acted" is
   normal there.
 - **A name that fails pact's own identity grammar**, even one with real message
-  traffic. `from`/`to` come back from bd, not from this command's own check,
-  so a name planted straight into the shared store by something other than pact
-  can still show up there — `pact agents` marks it `[INVALID]` rather than
-  listing it as an agent, since no `pact` process could ever have sent under it.
+  traffic. `pact agents` reads names back out of the store rather than from this
+  command's check, so a hand-edited `.pact/messages.jsonl` can still show one —
+  `pact agents` marks it `[INVALID]` rather than listing it as an agent, since no
+  `pact` process could ever have sent under it. This used to be routine rather
+  than exotic: anything with write access to a shared issue tracker could plant a
+  name pact would then read back.
 
 One case *is* a hard error rather than a warning: a recipient that violates
 pact's identity grammar (`[a-z0-9][a-z0-9-]{1,31}`). No process could ever run
@@ -665,9 +673,10 @@ Only in a build with `--features otel`, and only once a collector is configured
 | `pact.msg.unread` | gauge | `pact.msg.age_bucket` (`lt_1m`, `1m_5m`, `5m_15m`, `15m_1h`, `gt_1h`) |
 
 **pact exports counts and ages. Never a subject, never a body, never a message
-id, never a recipient's name.** The one thing a Beads span records about the
-subprocess is the *shape* of its argv — flag names truncated at the `=` —
-precisely because `--title=` and `--description=` carry the message you wrote.
+id, never a recipient's name.** There is no longer a subprocess on this path to
+leak one either: the `pact.beads.exec` span that redacted argv down to flag names
+existed because `--title=` and `--description=` carried the message you wrote,
+and `pact msg` no longer spawns anything.
 
 Two details that explain the shapes chosen:
 
@@ -677,9 +686,9 @@ Two details that explain the shapes chosen:
   emitted every time, zeros included: a gauge keeps its last value, so a bucket
   that merely stopped being reported would read as permanently full.
 - **Age is a bucketed attribute rather than a histogram** because the shared
-  histogram bounds top out at 10 s — right for a `bd` subprocess, useless for
-  coordination latency, where the failure worth catching is a message that sat
-  unread for 38 minutes.
+  histogram bounds top out at 10 s — right for the subprocess durations they were
+  chosen for, useless for coordination latency, where the failure worth catching
+  is a message that sat unread for 38 minutes.
 
 `pact.msg.addressing` is read off the process's argv, because by the time
 `msg::send` is called `--to-owner-of <path>` has already been resolved to an
@@ -691,16 +700,15 @@ data point.
 ## Command reference
 
 ```
-pact msg send --to <agent> [--to <agent>...] [--thread <id>] [--subject <text>] [--skip <agent>...] (<body> | --body-file <path|->)
-pact msg inbox [--unread-only] [--full]
+pact msg send (--to <agent>... | --to-owner-of <path>...) [--thread <id>] [--subject <text>] [--skip <agent>...] (<body> | --body-file <path|->)
+pact msg inbox [--unread-only] [--full] [--include-watch | --watch-only]
 pact msg sent
 pact msg read <id>
 ```
 
-All four require `bd` on `PATH` (exit code 3 if
-neither is, naming which one this repo's store needs) and a resolved
-agent identity — `--agent <name>` or `PACT_AGENT` (see the
-[README](../README.md) for identity resolution rules).
+All four need a git repository and a resolved agent identity — `--agent <name>` or
+`PACT_AGENT`. **Nothing else.** No `bd`, no `.beads/`, no network, no subprocess,
+so [exit 3](cli.md#exit-codes) is unreachable from every one of them.
 
 Messages also show up in `pact log`, merged with lease events into one
 chronological feed.
@@ -725,15 +733,15 @@ better address does not help when nobody is home. Eleven of thirteen agents used
 on the first try to a name they did not know — it worked exactly as designed,
 and the designed thing was the wrong thing.
 
-So a message sent with `--to-owner-of` is now **tagged with the path**, as an
-`about-<path>` label on the message bead, and `pact lease acquire` surfaces any
-unread message about a path you are taking:
+So a message sent with `--to-owner-of` is now **tagged with the path**, in the
+row's own `about` field, and `pact lease acquire` surfaces any unread message
+about a path you are taking:
 
 ```
 $ pact lease acquire src/otel.rs
 acquired lease on src/otel.rs for third-agent
-note: 1 unread message(s) about src/otel.rs, oldest from second-agent —
-"BLOCKER: flush is broken". Read it before you edit: `pact msg read pact-msg-870672baca8f64d8`
+note: src/otel.rs was last released by second-agent (0s ago) — their note: wiring flush. `pact log` has the history; `pact msg send --to-owner-of src/otel.rs` reaches them.
+note: 1 unread message(s) about src/otel.rs, oldest from second-agent — "BLOCKER: flush is broken". Read it before you edit: `pact msg read pact-msg-0997158707341c2d`
 ```
 
 The third agent was never the addressee and had read nothing. It gets the
@@ -758,65 +766,57 @@ Two supporting changes:
   merely opening the tab would wipe the unread markers that make the list worth
   having.
 
-### The tag goes on at create time
+### The path is stored raw, on the row that carries the message
 
-The `about-<path>` label is passed to `bd create` in the same call that
-makes the bead, not added by a `label add` afterwards. A second call is a second
+`about` is a field on the message's own line, written by the same append that
+writes the message — not a second call afterwards. A second call is a second
 thing that can fail or be raced, and the window it opened was one where the
-message existed and was findable by name but not by path — exactly the state
-this mechanism exists to close.
+message existed and was findable by name but not by path, exactly the state this
+mechanism exists to close.
 
-The label is `about-` plus the path with `/` as `__` and **every byte outside
-`[A-Za-z0-9_:-]` replaced by `-`**. It is one-way: nothing decodes a label back
-to a path, it only re-encodes the path being queried and compares.
+The path is stored **as pact normalized it**, and nothing else happens to it. As
+a bd label it had to survive a label charset: `about-` plus the path with `/` as
+`__` and every byte outside `[A-Za-z0-9_:-]` replaced by `-`, which collapsed
+`a.b` and `a-b` onto one tag. That encoding was inherited rather than chosen —
+`br` rejected a `.` in a label outright, so before the charset was narrowed every
+tag on a real file path failed there — and narrowing it stranded the tags written
+before it, which is why `about_path` also had to query the pre-narrowing
+encoding as a fallback.
 
-That charset is narrower than bd needs, and it is **inherited rather than
-chosen** — `br` rejected a `.` in a label outright, so before the narrowing every
-tag on a real file path (anything with an extension) failed there and the message
-was delivered untagged with only a swallowed warning to show for it. `br` is
-[gone now](install.md#br-beads-rust-is-no-longer-supported), but the encoding
-stays: every label already written to a live store uses it, and widening it would
-strand them exactly the way the narrowing itself did.
-
-Narrowing it changed what a query for the same path produces — a message
-tagged on a live `bd` store before the narrowing landed used the wider
-encoding, and a fresh query using only the current one would never find it
-again. `about_path` falls back to the pre-narrowing encoding (`/` to `__`,
-nothing else touched) whenever the two differ *and* the current encoding's
-query comes back empty — zero extra cost for the common case (most paths
-have no punctuation the narrowing touches, so the two encodings are
-identical and only one query ever runs), and one extra query only for a
-path that genuinely might still be carrying an old-style tag
-(pact-m7j.10.8).
+Encoding, collision and fallback query are all gone. Both sides normalize once
+and compare strings: `run_msg` canonicalizes `--to-owner-of` before storing it,
+and `about_path` normalizes the path being asked about, so a path typed from a
+subdirectory still matches one stored from the repo root.
 
 ### When that check can't run, it says so
 
-The check runs against a backend that may be absent, wedged, or never installed
-here, so "looked and found nothing" and "could not look" must not render the
-same way. They don't:
+"Looked and found nothing" and "could not look" must not render the same way, and
+they don't:
 
 | Situation | `pact lease acquire` prints |
 |---|---|
-| no `.beads/` in the repo at all | nothing |
-| `.beads/` exists, check ran, nothing unread | nothing |
-| `.beads/` exists, check ran, something unread | the `note: N unread message(s) about …` line above |
-| `.beads/` exists, check could not run | `note: could not check for pending messages about <path>: <why>` |
+| checked, nothing unread | nothing |
+| checked, something unread | the `note: N unread message(s) about …` line above |
+| the store could not be read at all | `note: could not check for pending messages about <path>: <why>` |
 
-The first row took two goes to get right. The check ran unconditionally at
-first, so a repository that had never run `bd init` — the lease-only
-population, who never opted into messaging at all — got "could not check for
-pending messages" on every single acquire, forever, for a lookup that could not
-have found anything. Silence is correct there: nothing was ever set up. Once
-`.beads/` exists, a failure to check is worth a line, because something that
-*was* set up has become unreachable.
+**That table used to have four rows and a `.beads/` gate.** The check needed a
+Beads store, so it was skipped entirely when `.beads/` was absent — because a
+repository that never ran `bd init` could hold no messages, and the alternative
+was "could not check for pending messages" on every single acquire, forever, for
+the lease-only population who never opted into messaging at all. Messages are
+pact's own file now, so the gate is gone with the reason for it: a repository that
+has never seen an issue tracker can still have mail waiting on a path, and the
+lookup can still answer.
+
+The remaining failure row is a real read error — an unreadable file, a broken
+permission — not an absent one. A missing `.pact/messages.jsonl` is an empty
+store, not an error.
 
 None of it moves the exit code. The lease succeeded, and acquiring one has never
-depended on the messaging backend — it must not start now. Each path in a batch
-acquire also resolves on its own, so one path's failed lookup cannot pass for a
-sibling's genuine all-clear, and one path's finding cannot make a failed check
-elsewhere look like it worked. A backend missing from `PATH` is the one
-exception, because it is a property of the call rather than of any path: one
-line naming every path, instead of the same line repeated per path.
+depended on the messaging backend — and now there is no backend for it to depend
+on. Each path in a batch acquire resolves on its own, so one path's failed lookup
+cannot pass for a sibling's genuine all-clear, and one path's finding cannot make
+a failed check elsewhere look like it worked.
 
 ### When every path resolves to you
 

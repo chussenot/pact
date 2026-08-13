@@ -36,8 +36,11 @@ The intended callers are watchers, not workers:
 ## What it is not
 
 **Not a write path.** No lease can be acquired, renewed, released or stolen; no
-message sent, replied to, or marked read; nothing written to `.pact/` or to the
-Beads store. Every mutation stays on the CLI.
+message sent, replied to, or marked read; nothing written to `.pact/` at all.
+Every mutation stays on the CLI. Reading a message here does **not** mark it read,
+so the recipient still owes it a look and the sender still sees it as
+undelivered — that was true when read state was a bd label and is still true now
+it is a cursor under `.pact/read/`.
 
 That is a design decision, not an unfinished feature. A lease is a promise made
 *by a named agent* that it is working on a path, and its whole value is that the
@@ -59,12 +62,13 @@ answer.
 The one difference from the CLI worth stating on its own, because a caller who
 gets it wrong makes a wrong decision rather than getting an error.
 
-`pact msg read <id>` **writes**: it adds a `read-by-<agent>` label to the
-message bead, and that label is what a *sender* checks — via `pact msg sent` —
-to decide whether a decision landed or needs re-sending. See
-[messaging.md](messaging.md) for the model.
+`pact msg read <id>` **writes**: it records the id in the reading agent's cursor at
+`.pact/read/<agent>.json`, and that is what a *sender* checks — via `pact msg
+sent` — to decide whether a decision landed or needs re-sending. See
+[messaging.md](messaging.md#read-state-local-cursors-and-what-a-sender-can-see) for
+the model.
 
-`pact_msg_inbox` and `pact_msg_thread` return full bodies and write no label. So:
+`pact_msg_inbox` and `pact_msg_thread` return full bodies and touch no cursor. So:
 
 | | CLI | MCP |
 |---|---|---|
@@ -101,7 +105,8 @@ a client can filter on without reading prose.
 ```
 
 `openWorldHint: false` because every answer comes from this repository — files
-under `.pact/` and a local Beads CLI; nothing reaches a network.
+under `.pact/`, plus two local `bd` diagnostics for the doctor tool; nothing
+reaches a network.
 `destructiveHint` and `idempotentHint` are deliberately absent: the schema
 documents them as meaningful only when `readOnlyHint` is false, so stating them
 here would invite a reader to wonder which one wins. Clients are required to
@@ -155,12 +160,17 @@ negotiated. An object satisfies both revisions, which is why every tool returns
 one regardless of era.
 
 `pact_msg_inbox` and `pact_msg_thread` add one further key when it applies:
-`store_conflict`, carrying the same sentence `pact doctor` and `pact msg` print
-when `.beads/` holds a leftover SQLite store beside bd's. Simply absent when there is
-nothing to say. These two are the tools that shell out to Beads, and a model
-reading `structuredContent` has no stderr on which to notice a warning — an
-empty inbox caused by a shadowed store would otherwise look exactly like a quiet
-one.
+`store_conflict`, carrying the same sentence `pact doctor` prints when `.beads/`
+holds a leftover SQLite store beside bd's. Simply absent when there is nothing to
+say.
+
+**That key is vestigial and still emitted.** It was added because these two tools
+read a Beads store, and a model reading `structuredContent` has no stderr on which
+to notice a warning — an empty inbox caused by a shadowed store looked exactly
+like a quiet one. Since 0.9.0 they read `.pact/messages.jsonl`, so a shadowed
+Beads store cannot cause an empty inbox. It is still reported rather than removed
+because a second store nobody reads is worth telling an observer about, but do not
+read it as an explanation for what the inbox says.
 
 ## What a session looks like
 
@@ -212,6 +222,10 @@ other in-flight call on the same long-lived session — including `pact_doctor`,
 the one an operator would reach for to diagnose exactly that. JSON-RPC keys
 responses by `id`, so out-of-order delivery is protocol-legal; a client pairing
 by position was already wrong.
+
+The message tools cannot wedge that way any more — they read a file. `pact_doctor`
+still spawns `bd` twice (`--version` and `config get audit.enabled`), so the
+concurrency is not merely historical.
 
 ## Registering it
 
@@ -308,12 +322,15 @@ alongside `structuredContent.message`, so a script-driven client can branch on
 it without regexing the sentence below — which carries no compatibility
 guarantee of its own:
 
-- **exit 3** — the Beads backend is unavailable: no `bd` on `PATH`, or one
-  killed for running past `PACT_BEADS_TIMEOUT_SECS`. Only the two message tools
-  need Beads at all; leases, doctor and the event log are plain files and keep
-  working — which is now true *during* a hung call as well, not only after it.
 - **exit 4** — not spawned inside a git repository. This one fails at startup,
   before any tool call.
+
+**exit 3 used to be listed here and is not reachable any more.** The two message
+tools were the only ones that needed a Beads backend, so an absent or wedged `bd`
+made them the only tools that could fail while leases, doctor and the event log
+kept answering. They read `.pact/messages.jsonl` now, so
+[`pact_msg_inbox` answers empty rather than unavailable](messaging.md#why-this-is-not-in-the-issue-tracker-any-more)
+in a repository with no issue tracker at all — and still writes nothing.
 
 A malformed line gets `-32700` and the session continues. An unknown method or
 unknown tool gets `-32601`. A request declaring a protocol version this server

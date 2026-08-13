@@ -41,15 +41,13 @@ flowchart LR
     B[Agent B] -->|"lease · msg · watch"| P
     P --> G["AGENTS.md<br/>the protocol agents read"]
     P --> F[".pact/<br/>leases · watches · event log"]
-    P --> D["Beads CLI (bd)<br/>messages, as issues"]
-    D --> M[["messages, as issues"]]
-    P -.->|"on lease release,<br/>the diff goes to watchers"| D
+    P --> M[".pact/messages.jsonl<br/>+ read cursors"]
+    P -.->|"on lease release,<br/>the diff goes to watchers"| M
 ```
 
-Everything pact owns is a file in the repository, and the one thing it does not
-own — messages — it hands to a tool that already exists. The dotted edge is the
-only automatic step: releasing a lease delivers what you changed to whoever
-subscribed to that path.
+Every box is a file in the repository — pact needs `git` and a filesystem and
+nothing else. The dotted edge is the only automatic step: releasing a lease
+delivers what you changed to whoever subscribed to that path.
 
 ## Why these four primitives
 
@@ -90,18 +88,26 @@ this, for how long, and what are they doing.
 ### Messaging, because a human relay does not scale
 
 Agents need to hand off context — a renamed function, a changed contract, a
-defect in someone else's file. pact does not run a message store: a message is a
-[Beads](https://github.com/gastownhall/beads) issue, threaded via parent links.
-One less thing to keep consistent, and the messages live where the project's
-other work items already do.
+defect in someone else's file. A message is a line in an append-only file pact
+owns, under the same discipline as its event log.
 
-Three properties came from watching this fail. Read state is shared rather than
-local, because a sender who cannot see whether a decision landed re-sends it.
-A message can be addressed to a *path* rather than a name, because names belong
-to processes that exit while the work stays. And since that first property
-invites a re-send, a new thread's id is derived from its own content on `bd`, so
-the retry lands on the message it is repeating instead of minting a second one —
-advice that manufactures duplicates is worse than no advice.
+It was not always. Messages were issues in [Beads](https://github.com/gastownhall/beads),
+the tracker agents already used for tasks, on the reasoning that a coordination
+tool should not invent a message store. That was wrong in one specific way worth
+stating, because it is a mistake that looks like good taste: it made the agents'
+*task tracker* a runtime dependency of coordination, and when the tracker changed
+what one of its flags meant, pact's tests broke with no change to pact. **A
+subprocess boundary insulates you from how another tool stores things, never from
+what its commands mean**
+([the full argument](docs/architecture.md#and-since-090-no-backend-at-all)).
+
+Three properties came from watching this fail in the field. A message can be
+addressed to a *path* rather than a name, because names belong to processes that
+exit while the work stays. Its id is derived from its own content, so the retry
+pact's own advice invites lands on the message it repeats rather than minting a
+second one. And a sender can see whether a peer read a decision, because one who
+cannot see it re-sends — that last holds within a shared checkout, which is the
+only place pact has ever coordinated anything.
 
 → [docs/messaging.md](docs/messaging.md)
 
@@ -166,9 +172,12 @@ edited from several directories, and isolating their leases would produce
 advisory locks that advise nobody. Two clones on two machines do not, and closing
 that gap needs a consensus story pact has no business inventing.
 
-**No database of its own.** Leases are files, history is an append-only log,
-messages are Beads issues, and identities are derived from all three rather than
-registered. Nothing to migrate, and nothing that can be out of date with itself.
+**No database, and no runtime dependency on anyone else's.** Leases are files,
+history and messages are append-only logs, and identities are derived from those
+rather than registered. Nothing to migrate, nothing that can be out of date with
+itself, and nothing to install before two agents can coordinate. The one thing
+pact reads from another tool is a text file bd has already committed — read-only,
+best-effort, and a clean pass when it is absent.
 
 The reasoning and the boundaries are in
 [docs/architecture.md](docs/architecture.md).
@@ -209,12 +218,12 @@ The full evidence, and the design decisions each run forced, is in the studies:
 
 | | |
 |---|---|
-| [install.md](docs/install.md) | `mise use -g github:chussenot/pact@latest`, downloading a release or building from source, choosing a Beads backend |
+| [install.md](docs/install.md) | `mise use -g github:chussenot/pact@latest`, downloading a release or building from source, and what pact does and does not need installed |
 | [cli.md](docs/cli.md) | every command, flag, exit code and `--json` shape |
 | [onboarding.md](docs/onboarding.md) | what `pact init` writes, to which files, and how to check it |
 | [leases.md](docs/leases.md) | the lease lifecycle: TTL, grace period, steal vs. expiry, path identity |
-| [messaging.md](docs/messaging.md) | how messages map onto Beads issues, threading, read state, addressing a path |
-| [architecture.md](docs/architecture.md) | how pact, agents and Beads fit together, and the non-goals in full |
+| [messaging.md](docs/messaging.md) | the message store, threading, read state, addressing a path, and the 0.9.0 cutover |
+| [architecture.md](docs/architecture.md) | what is stored where, what is committed, and the non-goals in full |
 | [mcp.md](docs/mcp.md) | the optional read-only MCP server: the six tools, and why it cannot write |
 | [tui.md](docs/tui.md) | `pact ui` — tabs, keybindings, and the `ui` build feature |
 | [telemetry.md](docs/telemetry.md) | the optional OpenTelemetry export: what leaves the machine and what never does |

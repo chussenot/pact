@@ -7,11 +7,11 @@ audience: contributors
 # Architecture
 
 pact is a coordinator, not a platform: it has no server, no daemon, and no
-database of its own. Everything it does is either a file it writes under
-`.pact/` at your repo root, or a command it shells out to (a Beads CLI, for
-messaging). This is deliberate — the moment coordination needs its own
-long-running process, it becomes one more thing that can crash, drift out of
-sync, or need babysitting. pact would rather do less and stay honest about it.
+database. **Since 0.9.0 it has no runtime backend either** — everything it does
+is a file it writes under `.pact/` at your repo root. This is deliberate: the
+moment coordination needs its own long-running process, it becomes one more thing
+that can crash, drift out of sync, or need babysitting. pact would rather do less
+and stay honest about it.
 
 ```mermaid
 flowchart TB
@@ -26,30 +26,32 @@ flowchart TB
     P -->|reads/writes| L[".pact/leases/*.lock"]
     P -->|appends/reads| W[".pact/watches.jsonl"]
     P -->|appends/reads| R[".pact/events.jsonl"]
+    P -->|appends/reads| MS[".pact/messages.jsonl
+    + .pact/read/&lt;agent&gt;.json"]
     P -->|writes| M["AGENTS.md
     (managed block)"]
     P -->|writes| C["CLAUDE.md
     (@AGENTS.md import)"]
     P -->|writes| I["GEMINI.md, .cursorrules, …
     (pointers, if already present)"]
-    P -->|shells out to| BD["Beads CLI
-    (bd)"]
-    BD -->|reads/writes| DB[(Beads database)]
+    P -.->|"reads only, best-effort"| BD[".beads/interactions.jsonl
+    (bd's committed export)"]
 
-    W -.->|"a release delivers the diff<br/>to each subscriber"| BD
+    W -.->|"a release delivers the diff<br/>to each subscriber"| MS
 
     style P fill:#4a5568,color:#fff
-    style BD fill:#4a5568,color:#fff
 ```
 
-Every solid edge is a command doing what it was asked. The dotted one is the
-only place pact acts without being asked directly: `lease release` looks up who
-subscribed to the path and sends them the diff, because a step agents have to
-remember is a step they measurably skip ([watch.md](watch.md)).
+Every solid edge is a command doing what it was asked. Two dotted ones are worth
+naming. `lease release` looks up who subscribed to the path and sends them the
+diff without being asked, because a step agents have to remember is a step they
+measurably skip ([watch.md](watch.md)). And the only thing pact reads from the
+issue tracker is a committed text file, best-effort — absent or unparseable means
+"no beads data" and a clean pass, never an error.
 
-Every box other than "pact CLI" and "Beads CLI" is a plain file or an existing
-tool. There's nothing in this diagram pact needs to keep alive between
-invocations.
+Every box other than "pact CLI" is a plain file. There's nothing in this diagram
+pact needs to keep alive between invocations, and nothing it needs installed
+beyond `git`.
 
 ## Where state lives
 
@@ -68,15 +70,23 @@ below.
 | `.pact/leases/*.lock` | one JSON file per active lease | no |
 | `.pact/waits/*` | conflict breadcrumbs, so a wait can be measured across two processes | no |
 | `.pact/watches.jsonl` | who subscribed to which path, append-only with tombstones | no |
+| `.pact/messages.jsonl` | append-only message store behind `pact msg`, bounded | no |
+| `.pact/read/<agent>.json` | one agent's read positions, id → when they read it | no |
 | `.pact/events.jsonl` | append-only lease-event log behind `pact log`, bounded | **yes** |
 | `AGENTS.md` (managed block) | the coordination protocol, for agents to read | yes |
 | `CLAUDE.md` (managed block) | one `@AGENTS.md` import line, because Claude Code loads `CLAUDE.md` and never `AGENTS.md` | yes |
 | `GEMINI.md`, `.github/copilot-instructions.md`, `.cursorrules`, `.windsurfrules`, `.clinerules` (managed block) | a pointer back at `AGENTS.md`, and **only if the file already exists** | yes |
 
-Message read state is deliberately *not* in this table: it lives in `bd`, as a
-`read-by-<agent>` label on the message bead. It used to be `.pact/read.json`, and
-that file is gone rather than kept alongside — see
-[docs/messaging.md](messaging.md).
+**Messages and read state are in that table now, and were not before 0.9.0.**
+They lived in bd — a message bead per recipient, read state as a
+`read-by-<agent>` label. Read state before *that* was `.pact/read.json`, so this
+is the second move for one fact; [messaging.md](messaging.md#this-narrows-pact-rnc17-and-says-so-rather-than-inheriting-it-quietly)
+states what the round trip costs instead of pretending it was free.
+
+Neither is committed. A message is ephemeral by design — the store is capped, so
+mail past the cap is dropped exactly as event-log lines are — and a read position
+is per-machine by nature. `events.jsonl` remains the one exception, for the reason
+its own section below gives.
 
 `pact init` writes two lines — deny everything under `.pact/`, then re-include
 the one file that is history:
@@ -286,44 +296,49 @@ agent-a" alone invites them to check their own working copy, find it untouched,
 and conclude the lease is stale. Both fields are **absent**, not null, in a
 repository with no worktrees, so its lock files stay byte-identical.
 
-**Messages follow the same rule, with one visible consequence.** The Beads store
-lives in the main worktree, so the backend subprocess runs there — otherwise
-`msg send` from one worktree would be invisible to `msg inbox` in another, or
-`bd` would initialise a second empty store in the worktree and report an empty
-inbox. The trade-off, stated rather than hidden: **Beads commits land on the main
-worktree's branch**, whichever branch that happens to be. In the bare-repository
-case there is no main worktree at all, so `pact msg` refuses with exit 3 rather
-than creating a store somewhere nobody will find again; leases and `pact log`
-keep working.
+**Messages follow the same rule, and it now costs nothing.**
+`.pact/messages.jsonl` and `.pact/read/` resolve through the same chain the lease
+files do, so `msg send` from one worktree is visible to `msg inbox` in another
+because they are literally one file — no routing, no second store to accidentally
+create.
 
 #### What that routing does *not* do — and why it is checked weekly
 
-Running the backend in the main worktree means an agent in worktree B causes `bd`
-to run inside a checkout where another agent may be mid-task. Two hazards follow
-naturally from that, and it would be reasonable to assume both:
+**This section describes a hazard that no longer exists. Kept because deleting it
+would lose why the guard was built.**
+
+Until 0.9.0 messages were bd beads, the Beads store lived in the main worktree,
+and the backend subprocess therefore ran *there* — inside a checkout where another
+agent might be mid-task. Two hazards follow naturally from that, and it would be
+reasonable to assume both:
 
 - **index-lock contention** — `bd` racing that agent's own `git add`/`git commit`
 - **staging bleed** — `bd`'s commit sweeping whatever the agent had staged
 
-Measured against `bd` 1.1.2, **neither happens**: `bd` performs no git operations
-at all for the only mutating subcommands pact issues, `create` and `label add`.
-End to end — a sibling worktree sending a message while the main worktree held a
-staged new file and a staged modification — `HEAD` did not move, the staged work
-was neither committed nor altered, and no `.git/index.lock` was left behind.
+Measured against `bd` 1.1.2, **neither happened**: `bd` performed no git
+operations at all for the only mutating subcommands pact issued, `create` and
+`label add`. End to end — a sibling worktree sending a message while the main
+worktree held a staged new file and a staged modification — `HEAD` did not move,
+the staged work was neither committed nor altered, and no `.git/index.lock` was
+left behind. So pact shipped **no mitigation**, deliberately.
 
-So pact ships **no mitigation**, deliberately. A `doctor` check recommending a
-no-git-ops mode would warn about a hazard that does not exist, and wrapping
-pact's `bd` calls in an internal lease would serialise operations that never
-conflict — paying a lock on every message for a measurement that says zero.
+That reasoning rested entirely on somebody else's behaviour, which is why it was
+asserted rather than remembered: `scripts/canary.sh` staged decoy work, sent a
+message from a real linked worktree, and failed if `HEAD` moved, if staging
+changed, or if an index lock was left behind. It was verified in both directions —
+green against real `bd`, red against a deliberately committing `bd` shim whose
+diagnostic correctly listed the agent's swept files.
 
-That reasoning rests entirely on somebody else's behaviour, so it is asserted
-rather than remembered: `scripts/canary.sh` stages decoy work, sends a message
-from a real linked worktree, and fails if `HEAD` moved, if staging changed, or if
-an index lock was left behind. The failure message names the two mitigations to
-reach for. The guard was verified in both directions — green against real `bd`,
-and red against a deliberately committing `bd` shim, whose diagnostic correctly
-listed the agent's swept files. If `bd` changes its mind, the canary says so
-before a user does.
+**pact issues no mutating bd subcommand at all now**, so there is nothing left in
+this shape to race. The one coupling that remains is a *read* of a committed text
+file, and the canary's job moves to proving that read stays tolerant of whatever a
+real bd writes. See [development.md](development.md#canary-pact-against-a-real-beads-cli)
+for what it asserts today.
+
+There is a second, better lesson underneath. The subprocess boundary was doing
+real work here — it insulated pact from *how* bd stores anything. It never
+insulated pact from what bd's CLI *means*, and that is the distinction the
+[backend section below](#one-backend-since-079) is about.
 
 `PACT_WORKTREE_SCOPE=local` restores per-worktree isolation. It exists for the
 rare case where two worktrees are deliberately unrelated projects, and `pact
@@ -381,47 +396,48 @@ Two commands answer questions *about* pact, and neither adds state.
 
 `pact whoami` reports the identity it resolved and where it resolved it from,
 the pact binary actually running (`current_exe`), the repo root, `.pact/`, and
-the `bd` it will shell out to. Three properties are deliberate:
+the `bd` it found. Two properties are deliberate:
 
 - **It never fails.** No identity, no `bd`, not in a git repo — each becomes a
   reported problem, and the command still exits 0. You run `whoami` *because*
   something else broke; it must not break too.
-- **It probes the Beads CLI, not just its existence.** `bd --version` is happy in
-  a repo with no reachable Beads database, while every Beads-backed pact command
-  fails. So `whoami` runs a listing — the query those commands actually run —
-  and reports the failure as a problem. The probe is deliberately the plainest
-  form both backends answer (`list --json`, no filters): a probe carrying a
-  bd-only flag failed on the other backend and announced that messaging was broken while
-  `pact msg` worked perfectly, which is a diagnostic lying about the one thing
-  you ran it to diagnose.
 - **It creates nothing**, including `.pact/` — a read-only question shouldn't
   write. It says `(not created yet)` instead.
+
+`whoami` used to *probe* the Beads CLI rather than merely find it, running a
+listing because `bd --version` is happy in a repo with no reachable database while
+every Beads-backed pact command failed. There are no Beads-backed pact commands
+left, so a probe would be reporting the health of something nothing depends on.
+What it still prints is the `export BEADS_ACTOR=` line, because your own `bd`
+commands do depend on it — see
+[messaging.md](messaging.md#attribution-your-bd-commands-not-pacts).
 
 `pact agents` answers "who is working in this repo" with **no registry**: it
 unions the identities already visible in the two places pact writes them —
 lease holders (with `acquired_at`) and message traffic (`from` and `to`) — keyed
 by name, and sorts by most recent sighting. There is nothing to enrol in, and
-nothing to keep in sync with reality, because it *is* the reality. `bd` is
-optional: without it you get the lease half, the same way `pact lease` works
-without `bd`.
+nothing to keep in sync with reality, because it *is* the reality. Both halves
+are pact's own files now, so there is no longer a case where half the answer is
+unavailable because a subprocess would not run.
 
 That derivation is also why `pact agents` distinguishes an identity that has
 *acted* (held a lease or sent a message) from one that has only been *addressed*
 — the latter is what a typo leaves behind, and the command marks it `?` rather
 than confirming it as an agent.
 
-The derivation cuts the other way too: `from`/`to` on a message come back from
-bd, not from pact's own `--to` check, so a name that violates pact's
-identity grammar (`[a-z0-9][a-z0-9-]{1,31}`) can still show up in that traffic
-— planted by a human running `bd create`, another tool, or an older pact build
-with a looser check. `pact agents` flags such a name `[INVALID]` rather than
-listing it like a real one, and `is_known`/`suggest` never treat it as known or
-offer it as a correction, because no `pact` process could ever have run under
-it in the first place.
+The derivation cuts the other way too: `from`/`to` are read back out of the store
+rather than from pact's own `--to` check, so a name that violates pact's identity
+grammar (`[a-z0-9][a-z0-9-]{1,31}`) can still show up in that traffic — from a
+hand-edited `messages.jsonl`, or an older pact build with a looser check. That
+used to be routine rather than exotic, because anything with write access to a
+shared issue tracker could plant one. `pact agents` flags such a name `[INVALID]`
+rather than listing it like a real one, and `is_known`/`suggest` never treat it as
+known or offer it as a correction, because no `pact` process could ever have run
+under it in the first place.
 
 `pact log` follows the same rule from the other direction: it *reads* the two
-places the facts already are (`.pact/events.jsonl` and `bd`) and merges them on
-parsed instants, keeping no third copy and no index.
+places the facts already are — the event log and the message store — and merges
+them on parsed instants, keeping no third copy and no index.
 
 ### One copy of the protocol, however many instruction files
 
@@ -480,15 +496,18 @@ side effect, and asking twice gave two answers. Collecting is now confined to
 
 ## Locating the Beads store: the store decides, not the cwd
 
-`src/beads.rs` is the only place pact shells out to Beads. It walks up for the
-first `.beads/` and reads what made it, rather than trusting the working directory
-— in a linked worktree there is usually no `.beads/` to walk up to, so cwd-based
-detection would find nothing and fall through to a *preference*, opening an empty
-database for a repository whose data is elsewhere. A tool that says "no messages"
-because it opened the wrong store is worse than one that is missing.
+`src/beads.rs` is the only place pact has ever spawned a Beads process, and since
+0.9.0 exactly two things spawn one, both of them diagnostics: `bd --version` and
+`bd config get audit.enabled`, for `pact doctor` (and `--version` for
+`pact whoami`) to report. The subprocess runner behind them is **private**, which is
+a fence rather than a tidy-up: a public generic `bd` runner is an open invitation to
+put the issue tracker back on a pact command's hot path.
 
-So the candidate list is one binary long, and a backend pact cannot serve is an
-honest exit 3 whose message says what to do about it.
+It still walks up for the first `.beads/` and reads what made it, rather than
+trusting the working directory — in a linked worktree there is usually no `.beads/`
+to walk up to, so cwd-based detection would fall through to a *preference* and
+report on a store that is not this repository's. A tool that answers about the
+wrong store is worse than one that is missing.
 
 ### One backend, since 0.7.9
 
@@ -510,6 +529,33 @@ deliberately *not* the "no Beads CLI found" text — `br` is still on the user's
 PATH, and telling them to install what they already have would be the one useless
 answer available. A stray `*.db` beside a bd store is ignored and reported, since a
 second store nobody reads is worth a warning.
+
+#### And since 0.9.0, no backend at all
+
+This section named a risk it could not resolve, and 0.9.0 resolves it. The bet
+above was that a subprocess boundary was enough insulation. It was — against the
+half nobody was worried about.
+
+**Storage churn: insulated.** bd moved from SQLite to embedded Dolt, and pact never
+noticed, because it only ever spoke argv.
+
+**CLI-semantic churn: not insulated, and never was.** bd 1.2 stopped upserting on
+`create --id --force`. Four pact CLI tests broke with **no source change on pact's
+side**, and `msg send` grew a duplicate-id recovery path to cope with a refusal it
+had to read as proof of delivery. No boundary between two processes can protect you
+from the second process changing what its own flags mean.
+
+Messages were the only pact-owned feature standing on that surface — leases,
+watches, the event log and `audit` were always plain files. So they moved to
+`.pact/messages.jsonl` and the surface is gone. What survives is a **read** of
+`.beads/interactions.jsonl`: a committed, append-only text file, parsed
+best-effort, where absent or unparseable means "no beads data" and a clean pass.
+A file format that is already committed to git cannot break pact the way a CLI's
+semantics did — and if it changes, the failure mode is one check reporting less,
+not a command failing.
+
+bd is what it always should have been here: the agents' task tracker, which pact
+reads and never writes.
 
 ### `.beads/interactions.jsonl` is committed, and is not the passive export
 
@@ -557,11 +603,11 @@ tidy-up that mistakes it for the export.
   peer that does not exist. Mutations stay on the CLI.
   This does not soften the line above — the server is a subprocess the client
   spawns, owns, and ends by closing stdin. No port, no daemon, no state.
-- **No direct Beads database or JSONL access.** Messaging always shells out
-  to the Beads CLI, never reads `.beads/*.db`, `.beads/embeddeddolt/` or
-  `issues.jsonl` directly. If Beads changes its storage format, pact doesn't
-  need to know — and this is what made supporting a second backend a matter of
-  argv rather than of storage.
+- **No Beads database access, and no runtime dependency on the Beads CLI.** pact
+  never opens `.beads/*.db`, `.beads/embeddeddolt/`, a Dolt directory or
+  `issues.jsonl`. Since 0.9.0 it also does not *write* through the CLI: the one
+  thing it reads is the committed `.beads/interactions.jsonl`, read-only and
+  best-effort. Every pact command works with no `bd` installed at all.
 - **No mandatory locking.** Leases are advisory — see
   [docs/leases.md](leases.md) for why that's a feature, not a gap.
 - **No config file.** Everything is either a CLI flag, an environment variable
@@ -573,9 +619,9 @@ tidy-up that mistakes it for the export.
   code or write to stdout. [docs/telemetry.md](telemetry.md) states exactly what
   is and is not sent.
 - **No stored state that could be derived.** Exactly one thing is stored that
-  can't be — the lease event log, for the reason given above. Message read state
-  went the other way: it moved *out* of a local file and into the bead it
-  describes.
+  can't be, and is therefore committed: the lease event log, for the reason given
+  above. Messages and read cursors are stored too but deliberately **not**
+  committed — a message is ephemeral and a read position is per-machine.
 
 ## Exit codes are part of the contract
 
@@ -587,13 +633,27 @@ humans, its exit codes are documented behavior, not incidental:
 | 0 | success |
 | 1 | generic error |
 | 2 | lease held by another agent (or you don't hold the lease you're releasing) |
-| 3 | Beads backend unavailable — no `bd`/`br` on `PATH`, or one killed for running past `PACT_BEADS_TIMEOUT_SECS` |
+| 3 | Beads backend unavailable — **no longer reachable from any `pact msg` path** (see below) |
 | 4 | not in a git repository |
 | 5 | usage error — unknown subcommand, bad or missing flag value |
 
 An agent scripting against pact can branch on these without parsing error
 text — check the exit code, and only fall back to reading stderr for the
 human-readable reason.
+
+**3 is reserved, and no longer reachable from a `msg` command.** It existed because
+`pact msg` located and ran a Beads CLI before doing anything, so a missing `bd`, a
+`br`-only workspace or a subprocess killed for running past
+`PACT_BEADS_TIMEOUT_SECS` all failed the send. Messages are pact's own file now, so
+every `msg` command — and watch delivery, and `lease acquire`'s check for mail
+about a path — works with no `bd` installed at all. The two commands that still
+look for `bd`, `pact doctor` and `pact whoami`, **report** what they found instead
+of raising: `doctor` as a check, `whoami` as one of the problems it always exits 0
+despite. Both of the `bd` calls left in pact belong to those two commands.
+
+The code is kept rather than recycled. A caller written against 0.8.x still
+branches on it, and reusing a retired code for a different meaning is how a wrapper
+silently starts doing the wrong thing.
 
 That promise is why 5 exists. clap's own usage-error code is 2, which collided
 with "lease held by another agent", so the one code agents are most likely to
@@ -608,8 +668,8 @@ That table is the whole set, which is why **a closed pipe adds nothing to it**.
 that only reads the status could not distinguish that from "the command failed",
 so it retried an action that had already happened. Output now drops the unwritten
 bytes silently and the process keeps whatever status its work earned. Not even the
-conventional SIGPIPE-emulating 141: by the time anything is printed, the bead has
-been created and the lock file written, so a non-zero status would report a
+conventional SIGPIPE-emulating 141: by the time anything is printed, the message
+has been appended and the lock file written, so a non-zero status would report a
 completed action as failed. A write error that is *not* a broken pipe gets a
 one-line stderr warning and is likewise non-fatal.
 
@@ -624,8 +684,8 @@ every polite heads-up look like a failure.
 
 - [docs/leases.md](leases.md) — the full lease lifecycle: TTL, the
   clock-skew grace period, steal vs. expiry, and the path-encoding caveat.
-- [docs/messaging.md](messaging.md) — how `pact msg` maps onto Beads issues,
-  and why it reconstructs threads itself instead of using `bd show --thread`.
+- [docs/messaging.md](messaging.md) — how a message is stored, what a read cursor
+  can and cannot tell a sender, and what upgrading from the bd era costs.
 - [docs/tui.md](tui.md) — `pact ui`'s tabs and keybindings, and the `ui` Cargo
   feature it lives behind.
 - [docs/telemetry.md](telemetry.md) — the optional `otel` feature: exactly what

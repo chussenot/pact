@@ -83,18 +83,27 @@ to a catch-all (`audit other`) rather than reaching a span name. That is not
 tidiness: a span name is high-cardinality by construction if user text can
 reach it, and `--check`'s value, a path and a `--note` are all user text. The
 same rule governs `pact.beads.exec`, which records the *shape* of the `bd`
-argv and never its values — `--title` and `--description` carry a colleague's
-message subject and body, and shipping those to a collector is not something an
-observability change gets to do quietly.
+argv and never its values.
+
+**That redaction now guards a path with nothing sensitive on it.** It was written
+because `pact msg send` ran `bd create --title=… --description=…`, and `--title` and
+`--description` carry a colleague's message subject and body — shipping those to a
+collector is not something an observability change gets to do quietly. Since 0.9.0
+the only `bd` calls pact makes are two diagnostics, so in practice this span carries
+two shapes, both from `pact doctor` (`--version` alone from `pact whoami`):
 
 ```mermaid
 graph TD
-    R["msg send<br/><i>pact.subcommand, pact.agent,<br/>pact.repo, pact.json, pact.exit_code</i>"]
-    B1["pact.beads.exec<br/><i>argv_shape: create --type --json<br/>--title --description</i>"]
-    B2["pact.beads.exec<br/><i>argv_shape: label</i>"]
+    R["doctor<br/><i>pact.subcommand, pact.agent,<br/>pact.repo, pact.json, pact.exit_code</i>"]
+    B1["pact.beads.exec<br/><i>argv_shape: --version</i>"]
+    B2["pact.beads.exec<br/><i>argv_shape: config get</i>"]
     R --> B1
     R --> B2
 ```
+
+The redaction stays, and deliberately: it is the fence that keeps a future caller's
+arguments out of telemetry by default rather than after somebody notices. A
+`msg send` root span now has no `pact.beads.exec` child at all.
 
 | Span | Attributes |
 |---|---|
@@ -102,7 +111,7 @@ graph TD
 | `usage-error` / `help` | `pact.exit_code` **only** — see below |
 | `pact.lease.acquire` | `pact.path`, `pact.lease.ttl_secs`, `pact.lease.stolen` |
 | `pact.lease.release` | `pact.path` |
-| `pact.beads.exec` | `process.executable.name` (`bd`), `pact.beads.argv_shape`, `pact.beads.subcommand`, `pact.beads.version`, `process.exit.code` |
+| `pact.beads.exec` (`doctor`/`whoami` only) | `process.executable.name` (`bd`), `pact.beads.argv_shape`, `pact.beads.subcommand`, `pact.beads.version`, `process.exit.code` |
 | `pact.init.write` | `pact.instruction_files` (a count) |
 | `pact.init.commit` | — |
 
@@ -162,10 +171,10 @@ who-blocked-whom record.
 
 Never, in any signal:
 
-- **Message bodies and subjects.** `pact.beads.argv_shape` records flag *names*
-  only, truncated at the `=`, precisely because `--title=` and
-  `--description=` carry a colleague's prose. `process.command_args` is
-  unused and must stay unused.
+- **Message bodies and subjects.** Nothing on the `pact msg` path spawns a process
+  any more, so there is no argv for prose to leak into; the surviving
+  `pact.beads.argv_shape` still records flag *names* only, truncated at the `=`.
+  `process.command_args` is unused and must stay unused.
 - **Lease notes.** `--note "refactoring session handling"` is free text.
 - **File contents.** pact never reads the files it leases.
 - **Message ids and thread ids.**

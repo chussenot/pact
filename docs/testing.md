@@ -81,9 +81,12 @@ log. So the verifier exits 1 with both agents, both timestamps and the event ids
 and says where the evidence belongs.
 
 **Message round-trip.** Every exit-2 encounter produced a message that reached
-somebody's inbox — asked through `pact msg inbox` rather than the backend,
-because bd hides message beads without `--include-infra`,
-argv differences pact already encapsulates.
+somebody's inbox — asked through `pact msg inbox` rather than by reading
+`.pact/messages.jsonl`, because the assertion is about what a recipient can
+actually see, and `inbox` is what a recipient runs. (This sentence used to explain
+which `bd list` flag was needed to see a message bead at all; there is no backend
+to work around now, and the reason for going through the CLI survived the reason it
+was mandatory.)
 
 One class of miss is accepted, and pretending otherwise made the assertion
 unachievable rather than strict: if the holder *released* between the exit-2 and
@@ -208,6 +211,13 @@ that no two ever held a path at once. That is the mechanics question.
 fail?** An agent SIGKILLed with three leases open. The Beads CLI gone from
 `PATH` for ninety seconds. A lock file truncated to zero bytes. A lease
 backdated past its own TTL so two agents both believe they can take it.
+
+**`backend-outage` proves much less than it used to, and is worth knowing about
+before you read a green run as evidence.** It hides the `bd` binary, which used to
+break `pact msg` outright and was the whole point. No pact command needs `bd` at
+run time now, so the scenario's honest claim is narrow: a fleet whose agents also
+run `bd` directly for task tracking keeps coordinating through the outage. It is
+kept because that is still worth asserting, not because it still stresses pact.
 
 ```bash
 touch /tmp/fleet/.chaos-armed              # deliberate, and required

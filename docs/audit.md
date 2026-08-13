@@ -355,28 +355,72 @@ The protocol tells agents to claim first and lease second, which makes the bead
 claim *look* like the serialization point. It is not: the lease is what actually
 protects the file, and it was grantable to whoever lost the claim.
 
-So when an acquire note names a bead, `pact lease acquire`
-[warns if that bead belongs to somebody else](leases.md), and this check asks the
-same question over the whole log.
+So this check asks that question over the whole log — and since 0.9.0 it is the
+**only** place pact asks it at all.
 
-**One lookup per distinct bead**, not per hold: a wave of twenty holds naming one
-bead is one subprocess.
+### It reads a committed export, and spawns nothing
 
-**The caveat, which bounds the claim.** `assignee` is the assignee *now*, not at
-acquire time — the log records the note, not the bead's state when it was written.
-A hold that legitimately handed its bead on afterwards therefore appears here too.
-This answers the retrospective question ("whose bead did this hold name, and who
-owns it today"); the live question is answered at acquire time, where the assignee
-really is current.
+The assignee of each bead is reconstructed by replaying `field=assignee` rows from
+`.beads/interactions.jsonl`, the git-tracked audit log bd exports
+([what that file is](architecture.md#beadsinteractionsjsonl-is-committed-and-is-not-the-passive-export)).
+No `bd` subprocess, so this check runs on a machine that has never had the issue
+tracker installed.
 
-Two scope lines, printed clean or not: how many holds named no bead at all, and —
-when the store could not be asked — why. `claim_unavailable` reads as "this check
-could not run", never as "nothing found", the same contract `git_unavailable` has.
+It replaced a live `bd show` per distinct bead, and it is **strictly less
+sensitive than what it replaced**: it finds fewer divergences, never more, and
+never a false one. Three limits, all verified rather than assumed:
+
+1. **The export records CHANGES.** A bead assigned at creation and never
+   reassigned has no `field=assignee` row and cannot be resolved at all. Measured
+   in this repository: 5 of 264 rows are assignee changes; 257 are status.
+2. **The sidecar is opt-in.** bd writes `interactions.jsonl` only when
+   `audit.enabled` is on, and it is **off by default** — verified against bd 1.2.1
+   by running `bd update --assignee` with and without it. In a default bd
+   repository the file never appears and this check reports "no beads data"
+   forever.
+
+   `pact doctor`'s **Beads audit sidecar** check warns when it is not recording,
+   and names the fix (`bd config set audit.enabled true`). Note *recording*, not
+   *present*: it asks bd `config get audit.enabled` rather than looking for the
+   file, because **a sidecar that recorded for a while and then stopped is the
+   dangerous case and looks perfectly healthy to an existence check.** This
+   repository is the proof — 264 rows on disk, `audit.enabled` false, nothing
+   written since 2026-08-12. An existence check calls that clean, and this check
+   would then be judging today's holds against frozen assignees.
+3. **Even recording, it lags.** It is a committed export, so an assignment made in
+   the current session may not be in it yet.
+
+Absent, empty, unparseable, or present with no assignee row at all: one answer,
+"nothing to check against", and all of them **pass**. A single malformed line is
+skipped, never fatal.
+
+`claim_unavailable` carries the reason and reads as "this check could not run",
+never as "nothing found" — the same contract `git_unavailable` has. The other scope
+line, printed clean or not, is how many holds named no bead at all.
+
+### The live cross-check is gone, and losing it cost nothing measurable
+
+`pact lease acquire` used to run the same lookup at claim time and warn when the
+bead in your note belonged to somebody else. That was a `bd show` **on the lease
+hot path** — a subprocess between an agent and the file it is about to edit, which
+is exactly the runtime dependency 0.9.0 removed everywhere else.
+
+It was dropped rather than repointed at the offline source, and the number is why:
+replayed against this repository's entire event log, the offline version would have
+warned **zero** times. 100 acquire notes named a bead, 8 of those beads resolved to
+an assignee in the export, and all 8 resolved to their own acquirer. And that is the
+generous reading — in a default bd repository the sidecar does not exist at all, so
+it would have been 0 of 100 forever, for a file read on every acquire.
+
+**So the retrospective answer is the only one now, and it is honest about being
+retrospective.** `assignee` is the assignee *when you run audit*, not at acquire
+time — the log records the note, not the bead's state when it was written — so a
+hold that legitimately handed its bead on afterwards appears here too.
 
 This is the second place audit reaches outside `.pact/`, after
-`--check commit-correlation` reached for `git`. Same rule both times: the
-invariant is *never touch the Beads DB directly, only its CLI*, which this obeys —
-`--export` already asks bd a question for `unacknowledged_messages`.
+`--check commit-correlation` reached for `git`. Same rule both times, and this one
+obeys it more strictly than its predecessor did: it never opens the Beads DB, and
+now never even runs its CLI.
 
 ### `--check retry-storm`
 
@@ -597,9 +641,9 @@ pact actually being used, and where does it fall down".
 read, distinguishing "nobody has read it" from "read only by someone who was
 not the addressee" — see
 [messaging.md](messaging.md#and-pact-audit---export-asks-it-for-everybody),
-which also explains why this cannot live in `pact doctor` (it needs a `bd
-list`, which takes a write lock, and doctor is served over MCP as strictly
-read-only).
+which also explains why it stays here rather than moving to `pact doctor` now that
+the original obstacle (it needed a `bd list`, which takes a write lock, and doctor
+is served over MCP as strictly read-only) is gone.
 
 A top-level `observations` array pulls out short, human-readable highlights
 — a nonzero finding count from any check, or a `doctor` check that is not a
@@ -757,22 +801,29 @@ botched write nobody has seen is not history.
 
 ## What audit deliberately cannot see
 
-**The Beads side.** Audit never opens `.beads/`, a Dolt directory, a SQLite
-file or a JSONL export. pact's whole messaging design rests on "never touch
-the backend store directly, only the CLI", and an analytics command is
-exactly where that would be convenient to break, because the data is right
-there in a file. Messages, read state, claim discipline and bead provenance
-are therefore **not** audit's subject; they live in
+**The Beads store.** Audit never opens `.beads/`, a Dolt directory or a SQLite
+file, and never will: an analytics command is exactly where that would be
+convenient to break, because the data is right there. Bead titles, labels, types
+and provenance are therefore **not** audit's subject; they live in
 [`scripts/beads-retro.sh`](../scripts/beads-retro.sh), which is best-effort,
 jq-based, and says so in its own header.
 
-This is a different invariant from `--check commit-correlation` reading git
-history directly (above). `git` is a hard requirement of running pact at
-all — not a store pact promises to only ever touch through an indirection
-layer — so reading its history breaks nothing the Beads rule protects.
-`repo.rs` and `doctor.rs` already shell out to `git` directly for other
-checks; commit-correlation is the same read, applied to history instead of
-working-tree state.
+**One `.beads/` file is an exception, and it is the committed one.**
+`--check claim-lease-divergence` reads `.beads/interactions.jsonl`: an append-only,
+already-committed audit log, read-only, parse-tolerant, and the same *kind* of file
+`.pact/events.jsonl` is on pact's own side. It is read as a file rather than
+through a subprocess because neither bd nor br exposes "list every actor that has
+ever acted" as a query — this is the one source that has it. The rule that matters
+is about live transactional state, which this is not.
+
+`--check commit-correlation` reads git history the same way, for the same reason
+scaled differently: `git` is a hard requirement of running pact at all, not a store
+pact reaches through an indirection layer, and `repo.rs` and `doctor.rs` already
+shell out to it for other checks.
+
+**Messages and read state are no longer on the Beads side at all**, so audit reads
+them directly — `--export`'s `unacknowledged_messages` is a read of
+`.pact/messages.jsonl` and `.pact/read/`, exactly like every other check.
 
 **Anything before the history was preserved.** `.pact/` used to be gitignored
 wholesale, so every clone started with an empty log

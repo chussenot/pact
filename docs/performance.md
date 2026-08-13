@@ -7,14 +7,15 @@ audience: contributors
 # Performance
 
 pact's performance claim has always been a *design* claim: coordination is files
-on one filesystem, and the only part that shells out to another program —
-messaging, via the Beads CLI — is deliberately not on the lease path.
+on one filesystem, and the one part that shelled out to another program —
+messaging, via the Beads CLI — was deliberately not on the lease path.
 
 **The first half is measured now, and it is not what the claim implied.** The
-Beads part holds: nothing in `lease acquire`/`release` can reach `bd`. But the
-lease path is not filesystem-bound either — it is bound by **subprocesses pact
-spawns itself**, `git rev-parse` and `git hash-object`, plus a parse of its own
-event log. The lock file is microseconds; everything around it is milliseconds.
+Beads part holds, and since 0.9.0 holds trivially: `pact msg` spawns nothing
+either, so there is no Beads call anywhere for the lease path to avoid. But the
+lease path is not filesystem-bound — it is bound by **subprocesses pact spawns
+itself**, `git rev-parse` and `git hash-object`, plus a parse of its own event
+log. The lock file is microseconds; everything around it is milliseconds.
 
 Two of those costs have since been reduced (see
 [what was optimised](#what-was-optimised-and-what-was-left-alone)) and a third was
@@ -140,11 +141,11 @@ The distinction matters for which number to quote. In the crucible run **56 of 5
 acquires were of files that already existed** and 2 were of paths about to be
 created, so the budgeted benchmark models the existing-file case.
 
-## Messaging is measured separately, and is not on this path
+## Messaging is not on this path, and no longer costs a subprocess anywhere
 
-`pact msg` spawns the Beads CLI, which is tens of milliseconds — a different order
-of magnitude, for a different reason, on a path a lease never touches. That
-separation is real and it is enforced by construction, not by convention:
+`pact msg` used to spawn the Beads CLI — tens of milliseconds, a different order of
+magnitude, for a different reason, on a path a lease never touches. That separation
+was enforced by construction rather than convention:
 
 - Every benchmark here runs with **no `bd` on `PATH`**. If any lease operation
   reached the backend, these benchmarks would fail rather than slow down.
@@ -153,8 +154,21 @@ separation is real and it is enforced by construction, not by convention:
   is looked up *after* the lock is gone and the event written, and is skipped
   entirely when nothing subscribes to the path.
 
-So the design claim survives, narrowed to what was actually measured: **the Beads
-backend is not on the lease hot path. `git` is.**
+**Since 0.9.0 there is no Beads call to keep off the path.** A message is an append
+to `.pact/messages.jsonl`, the same order of cost as an event-log append. The
+benchmarks are unchanged and still run with no `bd` on `PATH` — that guard now
+proves something weaker than it used to, because there is no longer a subprocess
+for it to catch.
+
+Two consequences worth knowing rather than measuring. Watch delivery at release
+time is now an append per subscriber instead of a `bd create` per subscriber, so
+the release-time cost of a hot file with nine watchers dropped by roughly the
+difference between a file append and nine process spawns. And `lease acquire`'s
+check for mail about a path went from a subprocess to a read of the same file, so
+it is no longer the reason to think twice about that check.
+
+So the design claim survives, narrowed to what was actually measured: **`git` is
+the lease hot path's cost. Nothing else is.**
 
 ## The CI budget
 

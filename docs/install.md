@@ -1,15 +1,18 @@
 ---
 title: Installing pact
-description: Installing with mise or by hand, what a release contains and why it is one binary per platform, and choosing a Beads backend.
+description: Installing with mise or by hand, what a release contains and why it is one binary per platform, and what pact does and does not need installed alongside it.
 audience: operators
 ---
 
 # Installing pact
 
-pact is one binary with no runtime of its own. The only external thing it needs
-is a Beads CLI, and only for the `msg` subcommands — the README explains why
-messaging is layered on somebody else's issue tracker instead of a store pact
-would have to maintain.
+pact is one binary with no runtime of its own. **Since 0.9.0 it needs nothing
+external but `git`** — no daemon, no database, and no Beads CLI. Every command,
+`msg` included, works on a machine that has never had `bd` installed.
+
+`bd` is still worth having, because it is what agents track work in and because
+one `pact audit` check reads its committed audit log
+([the Beads CLI](#the-beads-cli), below). It is no longer a prerequisite.
 
 ## Download a release
 
@@ -212,39 +215,46 @@ config.
 
 ## The Beads CLI
 
-Requires **[`bd`](https://github.com/gastownhall/beads)** on `PATH` for the `msg`
-subcommands; `init`, `lease`, `whoami`, `agents`, `watch`, `log` and `doctor`
-(partially — everything but the backend half) work without one.
-
-`bd` is Go with an embedded Dolt database, and its store is `.beads/embeddeddolt/`.
-pact walks up from the working directory for the first `.beads/` and uses the
-backend that made it, so a linked worktree finds the same store as the main
-checkout rather than a fresh empty one.
-
-Exit code `3` means the Beads backend is unavailable — usually no `bd` on `PATH`,
-and it is also what you get when a `bd` call had to be killed for not exiting
-(see [cli.md](cli.md#exit-codes)).
-
-The tested range is `1.1.0 <= v < 1.3.0`. Outside it everything still runs while
-`pact doctor` adds a warning, since a Beads CLI that changed its output is the
-likeliest cause of a puzzling `msg` failure:
+**Optional since 0.9.0.** No pact command requires
+[`bd`](https://github.com/gastownhall/beads) at run time — `msg` included, which
+was the last holdout. `pact doctor` reports which `bd` it found and its version,
+informationally, because "which bd is on this machine" is the first thing anyone
+asks when the task tracker misbehaves:
 
 ```
 ✓ Beads CLI: bd (bd version 1.2.1 (634cbbc4b)), attributes writes to the acting agent (--actor)
 ```
 
-That warning has earned its place. bd 1.2 dropped `create --id --force`'s upsert,
-which is what pact's [idempotent send](messaging.md#what-survives-a-retry-means-depends-on-your-bd-version)
-was built on, and it also stopped opening legacy SQLite workspaces at all.
+There is no tested-version window any more, and nothing warns about one. pact used
+to warn outside `1.1.0 <= v < 1.3.0`, and that warning had earned its place: bd 1.2
+dropped `create --id --force`'s upsert, which pact's idempotent `msg send` was
+built on. The only `bd` calls left are two diagnostics that `pact doctor` runs —
+`bd --version` and `bd config get audit.enabled` — so a version pact has not tested
+cannot break anything, and warning about every future bd release would be noise.
+
+**Two reasons to install it anyway.** It is what agents track work in — the
+protocol pact writes into `AGENTS.md` tells them to. And
+[`pact audit --check claim-lease-divergence`](audit.md#--check-claim-lease-divergence)
+reads bd's committed audit sidecar, `.beads/interactions.jsonl`, which bd only
+writes when `audit.enabled` is on — off by default. Without it that check reports
+"no beads data" and passes, which is why `pact doctor` asks bd whether the sidecar
+is *recording* rather than merely whether the file exists: a sidecar that recorded
+for a while and then stopped looks healthy to an existence check and is not.
+`bd config set audit.enabled true` is the fix doctor names.
+
+`bd` is Go with an embedded Dolt database, and its store is `.beads/embeddeddolt/`.
+pact walks up from the working directory for the first `.beads/` and reads what made
+it, so it reports on the same store as the main checkout rather than a fresh empty
+one.
 
 ### `br` (beads-rust) is no longer supported
 
 pact used to accept either backend. **`pact 0.7.9` was the last release that
 supported [`br`](https://github.com/Dicklesworthstone/beads_rust).**
 
-If you point a newer pact at a `br` workspace it refuses with exit `3` and says
-so, rather than reporting a missing CLI — `br` will still be installed and
-working, and the thing that went away is pact's support:
+If you point a newer pact at a `br` workspace, `pact doctor` says so rather than
+reporting a missing CLI — `br` will still be installed and working, and the thing
+that went away is pact's support:
 
 ```
 this repo's .beads/ is a br (beads-rust, SQLite) workspace, and pact no longer
@@ -263,10 +273,17 @@ message, and pact's documented advice to re-send when you cannot confirm a send
 was actively unsafe there. Two backends meant two contracts, one of them weaker,
 described in every doc that touched messaging.
 
-A stray `.beads/<name>.db` left beside a `bd` store is now simply ignored, and
-`pact doctor` plus every `pact msg` call still name it — a second store nobody
-reads is worth a warning, because an agent seeing `inbox empty` in a repo with a
-shadowed store had no hint why.
+That story has a second act worth knowing, because it is why messaging left bd
+entirely a version later: two CLIs diverging on guarantees is the same failure as
+*one* CLI changing its own guarantees between releases, which bd 1.2 then did. See
+[architecture.md](architecture.md#and-since-090-no-backend-at-all).
+
+A stray `.beads/<name>.db` left beside a `bd` store is simply ignored, and
+`pact doctor` names it — a second store nobody reads is worth a warning. It used
+to be named on every `pact msg` call too, because an agent seeing `inbox empty` in
+a repo with a shadowed store had no hint why. `pact msg` does not read a Beads
+store at all now, so a shadowed one cannot explain an empty inbox and saying so
+there would be telling an agent about a dependency the command no longer has.
 
 ## Which binary am I running?
 

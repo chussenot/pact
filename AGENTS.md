@@ -138,7 +138,7 @@ bd prime                # Refresh Beads context
 **Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
 <!-- END BEADS CODEX SETUP -->
 
-<!-- pact:begin hash:eeb1e18f -->
+<!-- pact:begin hash:68b60960 -->
 ## pact coordination protocol
 
 pact coordinates multiple coding agents working in this repository. Follow
@@ -148,14 +148,13 @@ this protocol whenever you touch shared files or hand off work to others.
   variable (or `--agent <name>`). Set one before running pact commands; pact
   never guesses an identity. `pact whoami` shows the identity and paths it
   resolved.
-- **Also export `BEADS_ACTOR=$PACT_AGENT`, once, in the same shell.** pact's
-  own `--actor=<agent>` attribution only covers bd calls pact itself makes —
-  it never reaches `bd ready`/`bd update --claim`/`bd close`, which you run
-  directly. Without this, every one of those commands falls through to bd's
-  own next attribution tier — your shared checkout's `git user.name` — so a
-  15-agent fleet's entire task-tracking history can attribute to one identity
-  while `.pact/events.jsonl` correctly shows sixteen. `pact whoami` prints the
-  exact line to run.
+- **Also export `BEADS_ACTOR=$PACT_AGENT`, once, in the same shell.** pact
+  writes nothing to bd, so nothing pact runs can attribute your task tracking
+  for you: `bd ready`/`bd update --claim`/`bd close` are yours alone. Without
+  this they fall through to bd's next attribution tier — your shared checkout's
+  `git user.name` — so a 15-agent fleet's entire task-tracking history can
+  attribute to one identity while `.pact/events.jsonl` correctly shows sixteen.
+  `pact whoami` prints the exact line to run.
 - **Announce intent before you research, not just before you write.** Your
   first pact commands come *before* you read the first file: `pact msg inbox`
   and `pact lease ls` to see what is already claimed and by whom, then
@@ -178,10 +177,11 @@ this protocol whenever you touch shared files or hand off work to others.
   unread for 38 minutes in the middle of it.
 - **Lease anything you WRITE, not just files you edit.** A lease is on a path,
   so a directory of shared state is leasable too — `pact lease acquire .beads/
-  --note "probing the br CLI"` before you run a tool that might write there.
-  An agent that had correctly leased both source files it edited still
-  corrupted the shared Beads store, because it read the protocol as being about
-  editing files and a CLI wrote a second database behind it at exit 0.
+  --note "running bd against the shared store"` before you run a tool that might
+  write there. An agent that had correctly leased both source files it edited
+  still corrupted the shared Beads store, because it read the protocol as being
+  about editing files and a CLI wrote a second database behind it at exit 0.
+  pact itself never writes to `.beads/`; the commands you run directly do.
 - **Ownership, and its one carve-out, stated together**: lease every file you
   edit that another agent might also touch, and release it when done. The
   single exception is a file that is yours alone by assignment (your own
@@ -268,9 +268,10 @@ this protocol whenever you touch shared files or hand off work to others.
 - **Commit `.pact/events.jsonl` when you commit your work.** It is the
   append-only record behind `pact log`, it is the one thing under `.pact/` that
   is NOT gitignored, and it is the only thing pact stores that it cannot derive
-  from anything else. `.pact/leases/` and `.pact/waits/` stay local — those are
-  live runtime state and committing them would have you fighting over peers'
-  in-flight claims. Fold the log into the commit whose work produced the events;
+  from anything else. `.pact/leases/`, `.pact/waits/`, `.pact/messages.jsonl`
+  and `.pact/read/` stay local — live runtime state and ephemeral mail, and
+  committing them would have you fighting over peers' in-flight claims and
+  inboxes. Fold the log into the commit whose work produced the events;
   a missed one is self-healing on the next commit. Left uncommitted, every clone
   of this repo starts with no coordination history at all, and nobody can ask
   afterwards who held what or whether two agents ever held one path at once.

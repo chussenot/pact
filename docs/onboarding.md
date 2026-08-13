@@ -182,7 +182,7 @@ machine is a legitimate setup, and pact doesn't get to overrule a decision you
 already made — it says so out loud instead. A check left permanently red by a
 deliberate choice is one people learn to skip, which would cost exactly the
 visibility it exists for. The summary counts warnings so a `!` that scrolled off
-the top still gets reported. `bd` outside its tested version range warns the same
+the top still gets reported. bd's audit sidecar being switched off warns the same
 way.
 
 Untracked-but-committable is fine and says nothing at all — that's every repo
@@ -256,6 +256,7 @@ If `worktree` says `not a worktree` from inside one, or `coordination scope`
 reports `local`, your agents are not sharing anything — see
 [the resolution chain](architecture.md#one-coordination-space-per-repository-not-per-checkout).
 
-One trade-off to know: because the Beads store lives in the main worktree, the
-commits `pact msg` produces land on **whatever branch the main worktree has
-checked out**, not on the branch of the worktree that sent the message.
+There used to be a trade-off here worth knowing: the Beads store lived in the main
+worktree, so the commits `pact msg` caused landed on whatever branch that worktree
+had checked out rather than the sender's. `pact msg` writes to `.pact/` and commits
+nothing, so a message from a linked worktree now touches no branch at all.

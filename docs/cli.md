@@ -101,18 +101,21 @@ array), and a single `--to` still prints `sent <id> to <who> (thread <id>)`.
 `lease release --json` now emits an object — `{"path": …, "displaced": …}` — so a
 scripted caller can see whose claim a `--force` destroyed.
 
-A `msg send` to several recipients that fails partway through fails as a
-structured error under `--json` — `{"already_sent": […], "failed_at": …,
-"reason": …}`, on **stdout** — so a retry can pass `--skip <agent>` (repeatable)
-for each already-sent name instead of duplicating delivery to them. See
-[messaging.md](messaging.md#replaying-a-fan-out-that-failed-partway---skip).
+**Every `--json` failure gets `{"error": …, "exit_code": …}` on stdout.** Before
+this, a failure printed only plain text to stderr regardless of `--json` — so the
+single most routine non-zero outcome two agents contending on a file will ever
+produce (a lease conflict, exit 2) gave a `--json` caller an empty stdout to
+parse. Without `--json`, nothing changes: the human-readable text is unchanged and
+still goes to stderr.
 
-**Every other `--json` failure gets `{"error": …, "exit_code": …}`, also on
-stdout.** Before this, a failure printed only plain text to stderr regardless
-of `--json` — so the single most routine non-zero outcome two agents
-contending on a file will ever produce (a lease conflict, exit 2) gave a
-`--json` caller an empty stdout to parse. Without `--json`, nothing changes:
-the human-readable text is unchanged and still goes to stderr.
+**One shape was removed rather than kept for compatibility.** A `msg send` to
+several recipients used to be N writes, so it could fail partway through and
+reported `{"already_sent": […], "failed_at": …, "reason": …}` so a retry could
+`--skip` whoever already had it. A send is now a single append that cannot
+partially fail, so that shape is gone and a failing send returns the ordinary
+`{"error": …, "exit_code": …}`. `--skip <agent>` (repeatable) survives, meaning
+simply "leave this recipient out of this send" —
+[messaging.md](messaging.md#--skip-leaving-a-recipient-out).
 
 `pact completion <shell>` prints a completion script on stdout. It is
 **generated from the same command tree clap parses with**, so it cannot drift
@@ -145,18 +148,24 @@ every other command promises; in human mode it prints the path it wrote. See
 | 0 | success |
 | 1 | generic error — and `pact audit --check …` found something (a finding is a result, not a fault) |
 | 2 | lease conflict — held by another agent, or you don't hold the one you're releasing, or `init` found one on a file it rewrites |
-| 3 | Beads backend unavailable — no `bd` on `PATH`, a `br`-only workspace ([no longer supported](install.md#br-beads-rust-is-no-longer-supported)), or a call killed for running past `PACT_BEADS_TIMEOUT_SECS` |
+| 3 | Beads backend unavailable — **reserved since 0.9.0: no `pact msg`, `lease`, `watch`, `log` or `audit` path can raise it** |
 | 4 | not in a git repository |
 | 5 | usage error — unknown subcommand, bad or missing flag value |
 
-**3 covers every way the backend can be unusable.** A `bd` that never
-exits — wedged on a credential prompt, a backend write lock, an internal bug —
-used to hang the pact command that called it, and everything built on it,
-forever. That wait is now bounded: past `PACT_BEADS_TIMEOUT_SECS` (default 30
-seconds — `DEFAULT_BEADS_TIMEOUT_SECS` in `src/beads.rs`) the child is killed and
-the error names the variable to raise. A subprocess that never comes back is the
-same class of problem as one that was never there, so it reuses 3 rather than
-adding a code every caller would have to learn.
+**3 is the one code that got quieter rather than clearer.** Until 0.9.0 every
+`pact msg` command located and ran a Beads CLI first, so exit 3 was the routine
+answer to no `bd` on `PATH`, a `br`-only workspace
+([no longer supported](install.md#br-beads-rust-is-no-longer-supported)), or a
+call killed for running past `PACT_BEADS_TIMEOUT_SECS`. Messages now live in
+`.pact/messages.jsonl`, so `msg send`/`inbox`/`read`/`sent`, watch delivery and
+`lease acquire`'s check for mail about a path all work with **no `bd` installed at
+all** ([messaging.md](messaging.md#why-this-is-not-in-the-issue-tracker-any-more)).
+
+The two commands that still look for `bd` do not raise it either: `pact doctor`
+reports it as a check and `pact whoami` as one of the problems it always exits 0
+despite. So a wrapper that branches on 3 will not see it — and it stays reserved
+rather than being recycled for something else, because a 0.8.x caller still tests
+for it and a re-used code is how a wrapper silently starts doing the wrong thing.
 
 **5 exists so that 2 means only one thing.** clap emits 2 for any usage error,
 which collided with "lease held by another agent" — and a wrapper branching on 2
@@ -169,8 +178,9 @@ and exits 5, so a script whose variable expanded to nothing cannot read it as
 success.
 
 `pact doctor` exits 1 when a check **fails** (`✗`). A check can also **warn**
-(`!`) — it passed, but you should know: a Beads CLI outside its tested version range,
-or protocol files a clone won't see. Warnings never change the exit code, and
+(`!`) — it passed, but you should know: protocol files a clone won't see, two
+Beads stores in one `.beads/`, or bd's audit sidecar switched off so
+`--check claim-lease-divergence` has nothing to read. Warnings never change the exit code, and
 `--json` carries them as `"warn": true` alongside `"ok": true`, so a script can
 tell the two apart. `pact whoami` is the one command that always exits 0: a
 missing identity, a missing `bd`, or an unreadable repo root are reported as

@@ -4,8 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `pact` is a single Rust binary that coordinates multiple coding agents working
 on one repository: it injects a coordination protocol into `AGENTS.md`, hands
-out advisory file leases, and passes threaded messages between agents by
-shelling out to the Beads CLI (`bd`).
+out advisory file leases, and passes threaded messages between agents through its
+own append-only store. **It has no runtime backend** — `bd` is the agents' task
+tracker, which pact only ever reads, and only via the committed
+`.beads/interactions.jsonl` export.
 
 ## Build & test
 
@@ -44,8 +46,11 @@ because `pact init` from an old build rewrites both with its old rules.
 ## Architecture
 
 `src/main.rs` is CLI parsing and dispatch only; every subcommand delegates to a
-module. `lease.rs` (advisory locks), `msg.rs` (messaging over bd), `beads.rs`
-(the only place that shells out to `bd`), `agents.rs` (who is active),
+module. `lease.rs` (advisory locks), `msg.rs` (messaging over
+`.pact/messages.jsonl`), `beads.rs` (the only place that reads bd — a private
+subprocess runner with two diagnostic callers, `bd --version` and `bd config get
+audit.enabled`, plus two read-only parses of `.beads/interactions.jsonl`),
+`agents.rs` (who is active),
 `events.rs` (the lease-event log behind `pact log`), `agents_md.rs` (the managed
 protocol block), `watch.rs` (path subscriptions, and the diff delivered on
 release), `audit.rs` (offline analysis of the event log) with `git_history.rs`
@@ -59,27 +64,35 @@ Invariants worth knowing, because each was broken at least once:
   A bare `println!` panics on a closed pipe (`… | head -1`) *after* the side
   effect has landed, so a command that succeeded reports failure — which made
   agents re-send messages they had already sent.
-- **Exit codes are API**, documented in README: `0` ok, `1` generic, `2` lease
-  held by another agent, `3` no `bd` on PATH, `4` not in a git repo. Raise them
-  with `output::exit_with`; `main` maps them via `output::code_for`.
+- **Exit codes are API**, documented in `docs/cli.md`: `0` ok, `1` generic, `2`
+  lease held by another agent, `3` no `bd` on PATH (**reserved — unreachable from
+  every `msg` path since 0.9.0**), `4` not in a git repo, `5` usage error. Raise
+  them with `output::exit_with`; `main` maps them via `output::code_for`.
 - **A question must not mutate.** Read-only paths use `repo::pact_dir_path`
   (does not create `.pact/`) and `lease::peek` (does not garbage-collect).
   `lease::list` *does* sweep expired locks — that is `lease ls`'s documented job.
-- **Never touch the Beads DB directly** — always shell out via `beads.rs`. Read
-  state lives in bd labels (`read-by-<agent>`), not in a local file, so a sender
-  can see acknowledgement.
+- **Never touch the Beads DB directly**, and do not put `bd` back on a command's
+  hot path — `beads.rs`'s subprocess runner is private for exactly that reason.
+  The one `.beads/` file pact may read is the committed `interactions.jsonl`:
+  read-only, best-effort, absent or unparseable means "no beads data" and a PASS.
+  Read state is `.pact/read/<agent>.json`, local again after a spell in bd labels;
+  a sender can still see acknowledgement because a fleet shares one checkout, and
+  `docs/messaging.md` says so rather than inheriting the old guarantee quietly.
 - **`agents_md::managed_block()` is the protocol text.** `is_current()` compares
   against it, so editing the text makes every repo report stale until `pact
   init` — that is the freshness check working, not a bug.
 - **`tui.rs`: `tab_rects` is shared by rendering and mouse hit-testing** so the
   two cannot drift; widening a tab label without it breaks clicks. The event
   loop's poll timeout is `min(data-refresh remaining, next animation frame)` —
-  shortening it naively spawns a `bd` subprocess ~10×/second.
+  shortening it naively re-reads and re-parses the whole event and message store
+  ~10×/second. It used to spawn a `bd` subprocess that often; the reason for the
+  timeout survived the reason for its severity.
 
 ## Documentation
 
 `README.md` carries only *why* — the problem, why each primitive is shaped as it
-is, the non-goals, provenance. Every *how* lives in `docs/`: `install.md`,
+is, the non-goals, provenance. It holds no exit-code table; that contract lives in
+`docs/cli.md`. Every *how* lives in `docs/`: `install.md`,
 `cli.md` (the command/exit-code contract), `onboarding.md`, `leases.md`,
 `messaging.md`, `watch.md`, `architecture.md`, `mcp.md`, `tui.md`,
 `telemetry.md`, `development.md`, `testing.md`, `audit.md`,
@@ -99,7 +112,7 @@ check name to appear in `docs/tui.md`. After a user-visible change, use the
 `docs-curator` agent in `.claude/agents/` rather than editing docs ad hoc — it
 holds the placement rules and the reasons behind them.
 
-<!-- pact:begin hash:eeb1e18f -->
+<!-- pact:begin hash:68b60960 -->
 ## pact coordination protocol
 
 Claude Code loads this file, not `AGENTS.md`, so the protocol is imported

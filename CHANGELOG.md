@@ -475,6 +475,110 @@ reasoning a commit subject cannot.
 - - -
 
 
+## Notes — 0.9.0
+
+**pact no longer has a runtime backend.** Messages were `bd` beads; they are now
+`.pact/messages.jsonl`, pact's own append-only store. `bd` is demoted to what it
+always really was — the agents' task tracker — which pact only ever READS, and only
+via the committed `.beads/interactions.jsonl` export. No pact command spawns a
+`bd` process except `pact doctor`, `pact whoami` and `pact ui`, all of which are
+reporting what is installed rather than depending on it.
+
+Why now: the subprocess boundary insulated pact against bd's *storage* churn (Dolt,
+SQLite, whatever comes next) but never against its *CLI-semantic* churn. bd 1.2
+stopped upserting on `create --id --force` and broke four pact tests with no source
+change on pact's side; `msg send` grew a duplicate-id recovery path to cope.
+Messages were the only pact-owned feature exposed to that, and four field runs say
+this traffic is not issues at all — `pact watch` notices dominate it (87 and 64
+deliveries in two runs) while voluntary peer mail is near zero.
+[docs/architecture.md](docs/architecture.md) carries the full argument, including
+the risk paragraph that named this and can now state its resolution.
+
+### Breaking, and what to do about it
+
+- **In-flight bd-era messages are invisible to 0.9.0, and there is no importer.**
+  Messages are ephemeral by design; an importer for a store nobody will read again
+  is not worth the surface. **Finish open threads before upgrading.** If you have
+  already upgraded, the old beads are intact — read them with `bd` directly.
+- **Exit code 3 ("no Beads CLI on PATH") is unreachable from every `msg` path.**
+  The code still exists and still means the same thing; nothing raises it any more,
+  because nothing pact does needs a backend. Wrappers branching on 3 around
+  `pact msg` can drop that branch. The exit-code contract is in
+  [docs/cli.md](docs/cli.md#exit-codes).
+- **The `--json` `SendFailure` shape is gone** (`already_sent`, `failed_at`,
+  `reason`). A send is one append, so it cannot partially fail and there is nothing
+  partial to report. `--skip` survives, meaning exactly what it says: leave this
+  recipient out.
+- **Message ids are content hashes, not bead ids** — `pact-msg-<hex>`, and
+  addressable by any unambiguous prefix. An ambiguous prefix is an error listing the
+  candidates, never a guess.
+- **Every recipient of one send now shares one id.** The stored row carries the
+  whole recipient list, where a bead needed one row per assignee. The `--json`
+  shape is unchanged — still one entry per recipient, `to` still a single agent
+  name — but two entries of a fan-out are no longer distinguishable by id. Any
+  recipient's id resolves to the same thread, which is what `--thread` always
+  wanted.
+- **Read acknowledgement is visible only within a shared checkout.** Read position
+  lives in `.pact/read/<agent>.json`, gitignored like `.pact/leases/`, because a
+  read position is per-machine by nature. This **narrows pact-rnc.17**, which had
+  moved read state out of a local file and into shared bd labels for a stated
+  reason: with local state a sender structurally could not see whether anyone had
+  read their message. That reasoning is not refuted, it is scoped — a pact fleet
+  shares one checkout, so `read_by` still answers honestly where pact is actually
+  used, and no longer can across machines.
+- **Identical messages in one thread deduplicate.** The id excludes the timestamp,
+  which is what makes a replayed send a no-op. Unchanged from the bd era, where the
+  same trade-off was already accepted and documented; it is restated here because it
+  is now the mechanism rather than a detail of one.
+- **`pact msg inbox` no longer warns about a conflicting `.beads/` store.** It
+  cannot affect an inbox any more. `pact doctor` still reports it.
+
+### Better, not just different
+
+- **Replies are idempotent.** The deterministic id used to protect root messages
+  only, because a bd `create` could not carry `--id` alongside `--parent`. Every
+  reply was unprotected, and `msg sent` tells a sender who cannot confirm a send to
+  re-send it.
+- **A bare-repo worktree can message.** `bd` needs a working tree, so the topology
+  that most needs coordination — several worktrees off one bare clone — was the one
+  where agents could not talk to each other.
+- **`lease acquire` finds mail waiting on a path with no `bd` installed**, instead
+  of admitting it had not looked.
+- **`about`-tags store raw paths.** As bd labels they were encoded — `/` to `__`,
+  every byte outside `[A-Za-z0-9_:-]` to `-` — so `a.b` and `a-b` collapsed onto one
+  tag, and queries needed a second fallback pass in the older encoding. Encoding,
+  collision and fallback are all gone.
+- **The MCP inbox answers "empty" instead of "unavailable"**, and still mutates
+  nothing.
+- **`pact audit` spawns no subprocess at all.** claim-lease-divergence reconstructs
+  assignees from the committed export.
+
+### One thing to know about `pact audit --check claim-lease-divergence`
+
+It is **strictly less sensitive** than the `bd show` version it replaces — fewer
+findings, never more, never a false one — for three reasons, all measured:
+
+1. The export records CHANGES, so a bead assigned at creation and never reassigned
+   has no row and cannot be resolved (here: 5 assignee rows against 257 status ones).
+2. **bd's audit sidecar is opt-in and off by default.** In a default `bd` repo
+   `.beads/interactions.jsonl` never appears, so the check reports "no beads data"
+   and passes — forever, which is indistinguishable from "your fleet never
+   diverged". The new `Beads audit sidecar` doctor check exists to say so, and it
+   asks bd whether the sidecar is *recording* rather than merely present: a file
+   that exists with recording switched off is stale history, and every existence
+   check calls that healthy.
+3. Even recording, it is a committed export and lags the live store.
+
+The live cross-check that used to run at `lease acquire` time is **removed**, not
+moved. Replayed over this repository's whole event log, it would have produced zero
+warnings: of the acquires whose notes named a bead at all, the ones resolvable
+through the export were all already assigned to the agent acquiring them — and in a
+default bd repo it is zero of them, forever. Its own doc comment called it
+"advisory, and silent on every failure"; the question now lives only in `pact
+audit`, offline, where a stale answer costs nothing.
+
+- - -
+
 ## Notes — unreleased
 
 Hand-written, and deliberately not under a version heading: none of this is

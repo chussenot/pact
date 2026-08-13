@@ -14,6 +14,9 @@
 # (see docs/architecture.md).
 .pact/leases/
 .pact/waits/
+# One file per agent, id -> when they read it. Local because a read position is
+# per-machine; committing it would have every clone inherit peers' read state.
+.pact/read/
 
 # Generated agent-workflow scripts (.claude/settings.json is tracked)
 .claude/workflows/

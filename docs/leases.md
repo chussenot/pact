@@ -294,28 +294,31 @@ agent noticed and volunteered a release
 ([evidence](studies/field-runs.md#run-4-crucible-built-to-hurt)).
 
 The protocol says claim first, lease second, which makes the claim look like the
-serialization point. **It is not** — the lease is what protects the file. So when
-an acquire note names a bead, pact looks it up:
+serialization point. **It is not** — the lease is what protects the file.
 
-```
-note: your lease note names proj-abc, which bd says is assigned to agent-b, not
-agent-a — the bead claim and the file lease are separate locks, and pact just
-granted you the second without the first. If you lost `bd update --claim` for
-this bead, release and tell agent-b (`pact msg send --to agent-b`) rather than
-editing behind them
-```
+**pact used to warn about this at acquire time and no longer does.** When a note
+named a bead, `acquire` ran `bd show` and printed a note if the bead was assigned
+to somebody else. That was a subprocess on the lease hot path, between an agent and
+the file it is about to edit, which is the runtime dependency
+[0.9.0 removed everywhere else](architecture.md#and-since-090-no-backend-at-all).
 
-One lookup per `acquire` command, not per path, since the note is shared across a
-batch. It is **silent on every failure** — no note, no bead id in it, no backend,
-no such bead, no assignee, or an assignee that is you. Backend outages are normal —
-three happened in that one run — and a warning that fires when the store is down is
-a warning agents learn to ignore.
+It was dropped rather than repointed at bd's committed export, and the measurement
+is why: replayed over this repository's entire event log, the offline version would
+have warned **zero times** — 100 acquire notes named a bead, 8 of those resolved to
+an assignee at all, and all 8 resolved to their own acquirer. In a default bd
+repository, where the export does not exist unless somebody switched it on, it would
+have been 0 of 100 forever. The check was already silent on every failure (no note,
+no bead id, no backend, no such bead, no assignee, or an assignee that is you)
+precisely because backend outages are normal, and what remained after all that
+silence was nothing.
 
-Which is also why this is a note and not a refusal. pact cannot know whether the
-assignee is stale, whether the bead was handed over verbally, or whether bd is
-simply behind; what it can do is put the contradiction in front of the one agent
-who can resolve it. The retrospective version is
+The question is still asked, once, where it costs nothing and can be read
+carefully:
 [`pact audit --check claim-lease-divergence`](audit.md#--check-claim-lease-divergence).
+That is a note and not a refusal for the same reason the live one was: pact cannot
+know whether an assignee is stale, whether the bead was handed over verbally, or
+whether the export is simply behind. It can only put the contradiction in front of
+somebody who can resolve it.
 
 ### A lease is exclusive in time, not across worktrees
 
@@ -884,9 +887,13 @@ warning: force-released other.rs — destroyed agent-a's live claim; they were
 not notified (`pact msg send --to agent-a`)
 ```
 
-pact does not send that notification itself. It would need `bd`, it can fail,
-and a release must not die because a notification did. The warning names the
-command instead. `--json` carries the same fact for scripted callers, which is
+pact does not send that notification itself. A release must not die because a
+notification did, and one sent automatically would arrive addressed to an agent
+that may already have exited — the failure
+[`--to-owner-of` exists to fix](messaging.md#delivery-follows-the-file-not-the-name).
+The warning names the command instead, so the human or agent doing the displacing
+decides what to say. (It once also needed `bd` to be installed, which is no longer
+true of anything in `pact msg`.) `--json` carries the same fact for scripted callers, which is
 why `release --json` emits an object rather than a bare path:
 
 ```json
@@ -966,8 +973,9 @@ it**. A lease taken and dropped while you looked away left no trace at all.
 
 What keeps it small:
 
-- **Lease events only.** Message events are derivable from `bd` and are
-  deliberately *not* duplicated here.
+- **Lease events only.** Messages have their own append-only file,
+  `.pact/messages.jsonl`, and are deliberately *not* duplicated here — `pact log`
+  merges the two at read time instead.
 - **Writing can't fail the lease.** Appending is infallible by signature; a
   logging error is swallowed, because a lease operation that failed because
   logging failed would be a coordination bug.

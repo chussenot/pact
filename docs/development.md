@@ -46,12 +46,16 @@ them all safe: `otel` exports only when the standard `OTEL_*` variables are set
 
 A third `test` leg runs with **no Beads CLI reachable**, which is the environment
 CI actually has and the one a developer machine cannot reproduce — a developer has
-`bd` installed. That gap is not hypothetical: exit 3 has two causes ("no backend"
-and "a bare worktree cannot message"), a test asserted the topology one, and
-without a backend the other wins. It passed locally and failed on every CI push
-for four days while local runs were reported as green. It is also a supported
-configuration in its own right: `init`, `lease`, `log` and most of `doctor` work
-with no Beads CLI at all.
+`bd` installed. That gap was not hypothetical: exit 3 once had two causes ("no
+backend" and "a bare worktree cannot message"), a test asserted the topology one,
+and without a backend the other won. It passed locally and failed on every CI push
+for four days while local runs were reported as green.
+
+Since 0.9.0 the leg asserts something stronger and simpler: **every pact command
+works with no Beads CLI at all.** A bare worktree can message, `msg` spawns
+nothing, and the only `bd` call left is the `--version` that `doctor` and `whoami`
+report. Keep the leg — it is the only thing standing between that claim and a
+future change that quietly reintroduces the dependency.
 
 The **default** build is still gated locally, not only in CI, because some checks
 exist only there. `lint` runs clippy with every feature and then with none;
@@ -94,10 +98,10 @@ test "$(cargo tree --edges normal,build,dev)" \
 ```
 
 State lives under `.pact/` at the repo root (found by walking up to `.git`):
-`.pact/leases/*.lock` and `.pact/events.jsonl` (the bounded lease-event log
-behind `pact log`). Message read state is not there — it lives in `bd`, as one
-`read-by-<agent>` label per reader. `pact init` gitignores the whole directory
-with a single `.pact/` line, so anything else an agent writes there is covered
+`.pact/leases/*.lock`, `.pact/events.jsonl` (the bounded lease-event log behind
+`pact log`), `.pact/messages.jsonl` and `.pact/read/<agent>.json`. `pact init`
+writes `.pact/*` plus `!.pact/events.jsonl`, so everything under there is ignored
+except the one file that is history — and anything else an agent invents is covered
 without a new rule.
 
 ## Beyond the gates: the fleet soak
@@ -135,6 +139,14 @@ the build it describes.
 
 ## Canary: pact against a real Beads CLI
 
+> **Being repointed (pact-as5.7). Everything below describes what the canary
+> asserted while messages were bd beads.** Most of those assumptions no longer
+> exist: pact does not write to bd, so there is no send round-trip to replay and no
+> version warning to fire. The one coupling left to protect is that pact's *read*
+> of `.beads/interactions.jsonl` stays tolerant of what a real bd writes. Until
+> that bead lands, treat this section as history and expect the `doctor`
+> version-warning leg to fail — the behaviour it asserts was removed in 0.9.0.
+
 `tests/cli.rs` stubs `bd`. That is right for a unit suite, and it means nothing
 checks the assumptions pact makes about *somebody else's* CLI: `--include-infra`,
 `--parent` threading, whether `--json` hydrates `labels`, and the shapes those
@@ -171,17 +183,18 @@ It runs two legs, and the pairing is the diagnosis:
 | **fail** | pass | odd, and worth reading closely — usually a flaky run or a yanked release rather than a real signal. |
 
 *pinned* is the newest release inside pact's tested range; *latest* is whatever
-`bd` shipped most recently. Both are resolved at run time — the range is read
-out of `TESTED_BD_MIN` / `TESTED_BD_MAX_EXCLUSIVE` in `src/beads.rs` rather than
-restated in the workflow, because a second copy of that range is a thing that
-drifts from the code it describes, which is the failure the canary exists to
-catch. While the newest release is still inside the range both legs resolve to
-the same version, which is fine: they separate the moment upstream ships one
-that isn't.
+`bd` shipped most recently. The range used to be read out of `TESTED_BD_MIN` /
+`TESTED_BD_MAX_EXCLUSIVE` in `src/beads.rs` rather than restated in the workflow,
+because a second copy of it drifts from the code it describes — which was the
+failure the canary existed to catch. **Those constants no longer exist**: with no bd
+call on any pact command's path there is nothing for a version window to gate, so
+the two legs are now just "a pinned release" and "the newest release".
 
-On the *latest* leg, a `bd` outside the tested range **must** make `pact doctor`
-emit its version warning. That is the difference between "the warning logic
-passes a unit test" and "the warning fires on real drift".
+The *latest* leg used to assert that a `bd` outside the tested range made
+`pact doctor` emit its version warning — the difference between "the warning logic
+passes a unit test" and "the warning fires on real drift". That warning was removed
+in 0.9.0, so that assertion now fails on a healthy build. It is pact-as5.7's to
+replace.
 
 A failure opens an issue labelled `canary` with the leg, the `bd` version and a
 link to the run — or comments on the open one, so a persistent break is one
