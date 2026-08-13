@@ -10,6 +10,17 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.7.9 - 2026-08-13
+#### Bug Fixes
+- **(msg)** keep a retried send idempotent on bd 1.2, which stopped upserting - (2cf3462) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- move field-run evidence into three studies, and split the CLI by audience - (27f6e62) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- Add events - (966bd48) - Clement HUSSENOT-DESENONGES
+- gitignore bd 1.2.x's .beads.gate.lock - (9891b0b) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.7.8 - 2026-08-12
 #### Documentation
 - name watch as the channel that carries interface changes, and quantify exit 2 - (2eab5da) - Clement HUSSENOT-DESENONGES
