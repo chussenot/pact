@@ -414,13 +414,12 @@ pub fn notify_release(repo_root: &Path, holder: &str, released: &str, old_hash: 
         head.as_deref().unwrap_or("(unknown)")
     );
 
-    let cli = match crate::beads::BeadsCli::locate() {
-        Ok(cli) => cli,
-        Err(e) => {
-            log_failure(repo_root, holder, released, None, &format!("{e:#}"));
-            return;
-        }
-    };
+    // No backend to locate any more (pact-as5.4). Delivery used to begin by finding
+    // a `bd` binary and give up here if there was none — which meant the one part of
+    // the protocol that runs WITHOUT an agent choosing to run it, on a path an agent
+    // is walking away from, depended on somebody having installed the issue tracker.
+    // A notice is now an append to `.pact/messages.jsonl` and cannot fail that way.
+    //
     // One message per subscriber rather than one with several recipients:
     // each is a separate conversation about a file THEY watch, and a shared
     // thread would put unrelated agents into each other's replies.
@@ -438,13 +437,7 @@ pub fn notify_release(repo_root: &Path, holder: &str, released: &str, old_hash: 
             // — see `msg::NOTICE`.
             notice: true,
         };
-        match crate::msg::send(
-            &cli,
-            repo_root,
-            holder,
-            std::slice::from_ref(&sub.agent),
-            draft,
-        ) {
+        match crate::msg::send(repo_root, holder, std::slice::from_ref(&sub.agent), draft) {
             Ok(sent) => {
                 let id = sent.first().map(|m| m.id.clone());
                 crate::events::append(

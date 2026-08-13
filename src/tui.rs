@@ -335,16 +335,15 @@ impl App {
 
     fn refresh_messages(&mut self) {
         self.last_refresh = Instant::now();
-        // Set even on the early returns below: with no agent or no bd there is
-        // no inbox to count, and retrying that every second buys nothing.
+        // Set even on the early return below: with no agent there is no inbox to
+        // count, and retrying that every second buys nothing.
         self.last_unread_refresh = self.last_refresh;
         let Some(agent) = self.agent.clone() else {
             return; // rendered inline by render_messages; nothing to fetch
         };
-        let Ok(cli) = &self.bd else {
-            return; // ditto
-        };
-        match msg::inbox(cli, &self.repo_root, &agent, false) {
+        // No `self.bd` gate (pact-as5.3): the inbox is a pact file, so the message
+        // panes work in a repo that has never seen the issue tracker.
+        match msg::inbox(&self.repo_root, &agent, false) {
             Ok(messages) => {
                 self.messages = messages;
                 self.unread = self.messages.iter().filter(|m| !m.read).count();
@@ -377,9 +376,6 @@ impl App {
         let Some(agent) = self.agent.clone() else {
             return;
         };
-        let Ok(cli) = &self.bd else {
-            return;
-        };
         let Some(m) = self
             .message_list_state
             .selected()
@@ -387,12 +383,12 @@ impl App {
         else {
             return;
         };
-        // Already read, or already done this session: no subprocess.
+        // Already read, or already done this session: no repeated write.
         if m.read || !self.marked_read.insert(m.id.clone()) {
             return;
         }
         let id = m.id.clone();
-        if let Err(e) = msg::mark_read_by_id(cli, &self.repo_root, &agent, &id) {
+        if let Err(e) = msg::mark_read_by_id(&self.repo_root, &agent, &id) {
             // Non-fatal and non-blocking: a dashboard that cannot update read
             // state is still a dashboard. Retrying every tick would be the
             // subprocess storm this guard exists to prevent, so the id stays in
@@ -411,11 +407,7 @@ impl App {
         let Some(agent) = self.agent.clone() else {
             return;
         };
-        let result = match &self.bd {
-            Ok(cli) => msg::read_thread(cli, &self.repo_root, &agent, &id),
-            Err(_) => return,
-        };
-        match result {
+        match msg::read_thread(&self.repo_root, &agent, &id) {
             Ok(thread) => {
                 self.thread = Some(thread);
                 self.mascot.play(Gesture::Peek, Instant::now());

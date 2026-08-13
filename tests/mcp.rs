@@ -298,17 +298,25 @@ fn listing_an_expired_lease_does_not_sweep_it() {
     );
 }
 
-/// With no Beads CLI reachable, the two message tools must fail the way the
-/// CLI's exit code 3 means, keep serving, and still write nothing.
+/// The message tools used to be the one part of this server that could fail for an
+/// environmental reason: they went through `bd`, so an empty `PATH` made
+/// `pact_msg_inbox` and `pact_msg_thread` return a tool error carrying exit 3.
+///
+/// **They cannot fail that way any more.** Messages live in
+/// `.pact/messages.jsonl`, so an observer with no issue tracker installed gets a
+/// real answer — an empty inbox is empty, not unavailable. What still has to hold is
+/// everything this test was really protecting: the server stays up, keeps answering,
+/// and writes nothing.
+///
+/// An empty `PATH` is what makes it deterministic: the machine running the test may
+/// well have `bd` installed, and a test that only proves something where it is absent
+/// proves nothing on the machine that matters.
 #[test]
-fn a_missing_beads_cli_is_a_tool_error_not_a_crash() {
+fn no_backend_on_path_still_answers_and_still_writes_nothing() {
     let tmp = init_repo();
     let repo = tmp.path();
     let before = coordination_state(repo);
 
-    // An empty PATH is what makes this deterministic: the machine running the
-    // test may well have `bd` installed, and a test that passes only where it
-    // is absent proves nothing on the machine that matters.
     let (responses, code, _) = serve(
         repo,
         &[("PACT_AGENT", "observer"), ("PATH", "")],
@@ -320,39 +328,41 @@ fn a_missing_beads_cli_is_a_tool_error_not_a_crash() {
                 serde_json::json!({"agent": "worker-a"}),
             ),
             call(3, "pact_msg_thread", serde_json::json!({"id": "pact-abc"})),
-            // After two failures: still answering, so nothing crashed.
             serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}),
         ],
     );
 
-    assert_eq!(code, 0, "a tool failure must not take the server down");
-    for id in [2, 3] {
-        let r = responses.iter().find(|r| r["id"] == id).expect("response");
-        assert!(
-            r["error"].is_null(),
-            "must be a tool error, not a protocol error: {r:#?}"
-        );
-        assert_eq!(r["result"]["isError"], true, "{r:#?}");
-        let text = r["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("exit 3"),
-            "the error should mirror exit code 3's meaning: {text}"
-        );
-        // pact-m7j.5.2: the exit code must also be machine-readable, not just
-        // embedded in a sentence with no compatibility guarantee — an
-        // orchestrator polling several pact-backed repos needs to branch on
-        // the same number a shell would have gotten from the CLI.
-        assert!(
-            r["result"]["structuredContent"].is_object(),
-            "a tool error should carry structuredContent too: {r:#?}"
-        );
-        assert_eq!(r["result"]["structuredContent"]["exitCode"], 3, "{r:#?}");
-    }
+    assert_eq!(code, 0, "the server must not go down");
+
+    // An inbox with no messages in it: a real, successful, empty answer.
+    let inbox = responses.iter().find(|r| r["id"] == 2).expect("response");
+    assert!(inbox["error"].is_null(), "{inbox:#?}");
+    assert_eq!(
+        inbox["result"]["isError"], false,
+        "a missing backend is no longer an error here: {inbox:#?}"
+    );
+    assert_eq!(
+        inbox["result"]["structuredContent"]["messages"],
+        serde_json::json!([]),
+        "{inbox:#?}"
+    );
+
+    // An unknown thread id is still a tool error — but for the honest reason that no
+    // such message exists, not because a subprocess was missing.
+    let thread = responses.iter().find(|r| r["id"] == 3).expect("response");
+    assert!(thread["error"].is_null(), "{thread:#?}");
+    assert_eq!(thread["result"]["isError"], true, "{thread:#?}");
+    let text = thread["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !text.contains("exit 3"),
+        "exit 3 is unreachable from a msg path now: {text}"
+    );
+
     assert!(responses
         .iter()
         .any(|r| r["id"] == 4 && r["result"]["tools"].is_array()));
 
-    assert_eq!(before, coordination_state(repo), "a failed tool wrote");
+    assert_eq!(before, coordination_state(repo), "a read-only server wrote");
 }
 
 /// The modern era end to end, through the real binary: probe with

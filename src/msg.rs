@@ -1,298 +1,191 @@
-//! Threaded messaging, layered on `bd create --type=message` +
-//! `--parent`/`--assignee`/`--include-infra`.
+//! Threaded messaging over pact's own append-only store, `.pact/messages.jsonl`.
 //!
-//! Flags were confirmed empirically against a scratch `bd` database rather
-//! than assumed: `bd create --type=message` works (message is a real, if
-//! undocumented in `--type`'s help text, issue type used for "infra" beads);
-//! `bd show --thread` does NOT aggregate parent-child replies in this bd
-//! version (it only ever prints the single issue), so thread reconstruction
-//! is done ourselves via `bd list --parent <id> --include-infra --json`
-//! (which does correctly return the children) instead of relying on it.
-//! `bd list` has no `--type` filter, so filtering to `issue_type == "message"`
-//! happens client-side.
+//! ## Why this is not in the issue tracker any more
 //!
-//! Read state lives in bd, as one `read-by-<agent>` label per reader
-//! (pact-rnc.17). It used to be `.pact/read.json`, per-agent *local* state,
-//! which meant a sender structurally could not see whether anyone had read
-//! their message. Labels are shared, so they can: `Message::read_by` lists
-//! every reader and `read` is just "read_by contains the querying agent".
-//! There is no local read state any more, hence no gitignore rule to manage
-//! (a leftover `.pact/read.json` from an older pact is inert, and the single
-//! `.pact/` gitignore line from `agents_md` covers it anyway).
+//! Messages used to be `bd` beads (`bd create --type=message` plus
+//! `--parent`/`--assignee`/`--include-infra`, with read state as one
+//! `read-by-<agent>` label per reader). That made the agents' TASK TRACKER a
+//! runtime dependency of pact's coordination layer, and bd 1.2 showed the bill:
+//! `create --id --force` stopped upserting, four CLI tests broke with no source
+//! change on pact's side, and `send` grew a duplicate-id recovery path to cope.
 //!
-//! Verified against bd 1.1.0 and re-verified against 1.2.1: `bd list/show --json`
-//! hydrate `labels` (there is
-//! a `--skip-labels` to turn that off, which pact never passes), `bd label add`
-//! takes several ids at once and is idempotent — and a child bead *inherits*
-//! its parent's labels unless `--no-inherit-labels` is passed, which is why
-//! every create here passes it. Without it a reply to a message you had
-//! already read would be born carrying your own `read-by-` label.
+//! The subprocess boundary insulated pact against bd's STORAGE churn — Dolt,
+//! SQLite, whatever comes next — but never against its CLI-SEMANTIC churn, and
+//! messages were the only pact-owned feature exposed to it. Four field runs also
+//! settled what this traffic actually is: `pact watch` notices dominate it (87 and
+//! 64 deliveries in two runs) while voluntary peer mail is near zero. That is
+//! pact-shaped ephemeral traffic, not a backlog of issues.
 //!
+//! So pact owns it, under the same discipline as `.pact/events.jsonl`: one JSON
+//! object per line, appended under an exclusive lock, each line chained to the one
+//! before it, a torn final line counted and skipped rather than fatal, and a
+//! bounded line cap. `bd` is now only ever READ, and only via its committed
+//! `.beads/interactions.jsonl` export (see `crate::beads`).
+//!
+//! ## Two things about this store that are deliberate, and cost something
+//!
+//! **Messages are ephemeral, and the cap enforces it.** Past [`MAX_LINES`] the
+//! oldest lines are dropped, exactly as `events.jsonl` does. For an event log that
+//! is lossy history; for messages it is lost mail. That is the intended trade —
+//! nothing here is a record of record, `.pact/events.jsonl` is — but it is a real
+//! cost and it is why there is no importer from the bd era either.
+//!
+//! **Read state is local again, which reverses pact-rnc.17.** Read position lives
+//! in `.pact/read/<agent>.json`, gitignored like `.pact/leases/`, because a read
+//! position is per-machine by nature. pact-rnc.17 moved read state OUT of a local
+//! file and INTO shared bd labels for a stated reason: with local state, a sender
+//! structurally could not see whether anyone had read their message. That
+//! reasoning has not been refuted — it has been narrowed. A pact fleet shares one
+//! checkout, so within the case pact is actually for, `read_by` still answers
+//! honestly; across machines it no longer can.
 
 use std::cmp::Ordering;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::beads::BeadsCli;
 use crate::output;
 use crate::{attrs, otel};
 
-/// Label prefix marking "this agent has read this message".
-const READ_BY: &str = "read-by-";
+/// `kind` for a message an agent wrote.
+const MAIL: &str = "mail";
 
-/// Label marking a message as being ABOUT a path, so delivery can follow the
-/// file instead of stopping at the name the path resolved to.
+/// `kind` for a message [`crate::watch::notify_release`] generated.
 ///
-/// `--to-owner-of` addressed a file and then resolved it to an agent, and
-/// delivery stopped there. Measured over one fleet run: 30 of 44 agent-to-agent
-/// messages went to agents who had already exited, and none of those were ever
-/// read, while every message to a live agent was read. Addressing was never the
-/// failure — deliverability was. Every one of the 30 was about a file, sent to
-/// the agent who had just released it (pact-4tj).
-const ABOUT: &str = "about-";
-
-/// Label marking a message as machine-generated by `pact watch` rather than
-/// written by an agent (pact-mqw.5).
+/// It exists because watch notifications are not correspondence and must not share
+/// an inbox with correspondence. In the crucible run one release of the designed
+/// hot file emitted **nine** messages in nine seconds, one per watcher, and `lease
+/// acquire` reported "32 unread message(s) about src/ast.rs". Sampled over that
+/// window: 12 messages, 11 of them automatic release notices and exactly ONE
+/// authored by an agent — a warning about six duplicate test functions that a peer
+/// needed to read.
 ///
-/// It exists because watch notifications are not correspondence and must not
-/// share an inbox with correspondence. In the crucible run one release of the
-/// designed hot file emitted **nine** messages in nine seconds, one per watcher,
-/// and `lease acquire` reported "32 unread message(s) about src/ast.rs". Sampled
-/// over that window: 12 messages, 11 of them automatic release notices and
-/// exactly ONE authored by an agent — a warning about six duplicate test
-/// functions that a peer needed to read.
+/// The fleet was not undisciplined; it was compliant. docs/watch.md tells agents to
+/// subscribe to interfaces they depend on but do not own, and the cost of following
+/// that advice is watchers × releases. So the better a fleet complies, the deeper it
+/// buries the one message worth reading — the same failure the protocol block warns
+/// about ("a real BLOCKER sat unread for 38 minutes"), reached structurally instead
+/// of behaviourally.
 ///
-/// The fleet was not undisciplined; it was compliant. docs/watch.md tells agents
-/// to subscribe to interfaces they depend on but do not own, and the cost of
-/// following that advice is watchers × releases. So the better a fleet complies,
-/// the deeper it buries the one message worth reading — which is the same
-/// failure the protocol block already warns about ("a real BLOCKER sat unread
-/// for 38 minutes"), reached structurally instead of behaviourally.
-///
-/// Tagged at creation rather than inferred from the body afterwards: a reader
-/// deciding what to skip must not have to pattern-match English.
+/// This was a bd LABEL (`watch-notice`, pact-mqw.5) and is now a stored field. The
+/// difference matters: a label had to be applied at creation and so was
+/// forward-only, which is why there used to be a `looks_like_legacy_notice`
+/// heuristic pattern-matching English in the body to recover the untagged ones. A
+/// field every row carries needs no such rescue, and that heuristic is gone.
 const NOTICE: &str = "watch-notice";
 
-/// The join between the subject `pact watch` writes and the path the inbox
-/// groups notices by.
+/// The join between the subject `pact watch` writes and the path the inbox groups
+/// notices by.
 ///
-/// A const because both sides live in different modules and the format is the
-/// only thing tying them together — [`crate::watch::notify_release`] builds the
-/// subject with it and [`split_notices`] parses the path back out of it. A
-/// notice whose subject does not contain it still counts, it just groups under
-/// its whole subject, so drift degrades the grouping instead of losing messages.
+/// A const because both sides live in different modules and the format is the only
+/// thing tying them together — [`crate::watch::notify_release`] builds the subject
+/// with it and [`split_notices`] parses the path back out of it. A notice whose
+/// subject does not contain it still counts, it just groups under its whole
+/// subject, so drift degrades the grouping instead of losing messages.
 pub const NOTICE_SUBJECT_MARKER: &str = " changed — released by ";
 
-/// The phrase every `pact watch` notice body has opened with since the feature
-/// shipped, used only to corroborate [`looks_like_legacy_notice`].
-const NOTICE_BODY_ANCHOR: &str = ", which you are watching.";
+/// Past this many lines, [`append`] compacts down to [`KEEP_LINES`].
+///
+/// The same pair as `events.jsonl`, on purpose: one discipline, one set of numbers
+/// to reason about. Unlike the event log, what gets dropped here is mail — see the
+/// module docs on why that is accepted rather than merely tolerated.
+const MAX_LINES: usize = 5000;
+const KEEP_LINES: usize = 4000;
 
-/// Is this untagged message one pact itself wrote before the tag existed?
+/// One stored message. The wire format of `.pact/messages.jsonl`.
 ///
-/// [`NOTICE`] is stamped at creation, so it is forward-only — and measured
-/// against the crucible store, that cost the whole point of the fix: for every
-/// one of nine agents, `inbox` and `inbox --include-watch` returned **identical**
-/// counts, `--watch-only` answered "no watch notices" for inboxes that were mostly
-/// notices, and agent-08's 14 authored rows were 12 machine notices and 2 pieces of
-/// real correspondence. On an existing store the burial was exactly as bad as
-/// before (pact-mqw.11).
+/// Field names follow `events::Event` rather than inventing a second vocabulary
+/// (`at`, not `ts`), so anyone who can read one file can read the other. The
+/// PUBLIC shape agents see is [`Message`], which keeps `created_at` and the rest of
+/// the keys `--json` consumers were already pinned to.
 ///
-/// Recovering those relies on the fact that **pact wrote them**, so their shape is
-/// a format string rather than user text. Anchored to the FULL shape, not a loose
-/// substring, because the cost of a false positive here is the one thing this whole
-/// feature exists to prevent: silently filing a real warning as machine noise.
-/// Three conditions, all required:
-///
-/// - the subject splits on [`NOTICE_SUBJECT_MARKER`] into exactly two halves;
-/// - neither half contains whitespace, so they are a path and an agent name rather
-///   than prose that happens to contain the phrase;
-/// - the body carries [`NOTICE_BODY_ANCHOR`], which is a second independent piece
-///   of the same format string.
-///
-/// An agent writing "src/ast.rs changed — released by agent-01, please re-read it"
-/// fails the second condition and stays in the inbox where it belongs.
-///
-/// Applies to untagged messages only. Anything written after [`NOTICE`] shipped is
-/// classified by its label alone, so this heuristic can never override a real tag
-/// and needs no maintenance as the notice text evolves.
-fn looks_like_legacy_notice(subject: Option<&str>, body: &str) -> bool {
-    let Some(subject) = subject else { return false };
-    let mut halves = subject.split(NOTICE_SUBJECT_MARKER);
-    let (Some(path), Some(holder), None) = (halves.next(), halves.next(), halves.next()) else {
-        return false;
-    };
-    !path.is_empty()
-        && !holder.is_empty()
-        && !path.contains(char::is_whitespace)
-        && !holder.contains(char::is_whitespace)
-        && body.contains(NOTICE_BODY_ANCHOR)
+/// Every optional field is `skip_serializing_if`, so a line stays as narrow as what
+/// it actually says — the same rule every field added to `Event` has followed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Record {
+    /// Content hash, from [`message_id`]. Not a counter and not random: see that
+    /// function for the three production incidents that bought this property.
+    pub id: String,
+    pub at: String,
+    /// The sending agent's `PACT_AGENT`.
+    pub from: String,
+    /// Every recipient of this send, first-seen order.
+    ///
+    /// ONE row for N recipients, where bd needed N beads because a bead has exactly
+    /// one assignee. That deletes the whole parent-child fan-out that existed only
+    /// to make N beads read as one thread.
+    pub to: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    pub body: String,
+    /// The thread this belongs to; a root message's own id.
+    pub thread: String,
+    /// [`MAIL`] or [`NOTICE`].
+    pub kind: String,
+    /// The message this replies to, when it is a reply to a specific one rather
+    /// than to the thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    /// Paths this message is ABOUT, from `--to-owner-of`.
+    ///
+    /// RAW paths. As bd labels these had to be encoded — `/` to `__`, and every
+    /// byte outside `[A-Za-z0-9_:-]` to `-`, because br rejected a `.` outright and
+    /// so every real filename silently failed to tag. That encoding was lossy, not
+    /// reversible, and had to be applied identically at write and query time with a
+    /// legacy-encoding fallback for rows written before it was narrowed. A JSON
+    /// string needs none of it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub about: Vec<String>,
+    /// This line's link to the one before it. `None` on a line written before chain
+    /// tracking, which is history this feature knows nothing about rather than a gap
+    /// to see through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_hash: Option<String>,
 }
 
-/// A path as a label-safe token: `/` to `__`, the same convention lease lock
-/// files use — but, unlike a lock filename, this token is never written to a
-/// filesystem, only compared against itself inside a bd/br label. So it goes
-/// one step further: every byte outside `[A-Za-z0-9_:-]` (that still leaves
-/// `/`, just replaced above) becomes `-`. Confirmed necessary against a real
-/// br 0.2.19 store: `br create --labels`/`br label add` both reject a `.` with
-/// "invalid characters (only alphanumeric, hyphen, underscore, colon
-/// allowed)" — exit 4 — which meant every real file path (anything with an
-/// extension) silently failed to tag on br, before this. bd tolerates the
-/// original punctuation fine, so this narrower charset is a bd-compatible
-/// subset, not a second encoding to keep in sync.
+/// One message as every `--json` consumer already knows it.
 ///
-/// Not reversible, and does not need to be: nothing ever decodes a label back
-/// into a path, only re-encodes a query path the same way and compares. Two
-/// distinct paths differing only in the punctuation this collapses (`a.b` and
-/// `a-b`, say) would produce the same label — the same class of accepted
-/// collision the `/` → `__` step already carries, and unlikely in a real tree.
-fn encode_path(path: &str) -> String {
-    path.replace('/', "__")
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
-/// [`encode_path`]'s charset before it was narrowed (pact-m7j.10.1/6efc338):
-/// `/` to `__`, nothing else touched. A message tagged on a live `bd` store
-/// before that fix used this wider encoding — `about_path` querying only the
-/// current, narrower encoding would never find it again for a path
-/// containing any of the punctuation the narrowing now collapses
-/// (pact-m7j.10.8). `br` never had this problem: the same punctuation was
-/// already rejected outright there, so nothing was ever tagged with it on
-/// `br` to begin with.
-fn encode_path_legacy(path: &str) -> String {
-    path.replace('/', "__")
-}
-
-/// How far [`walk_to_root`] follows `parent` links before giving up. pact only
-/// ever creates depth-1 threads; the cap exists so hand-edited or cyclic parent
-/// data cannot spin forever, not because deep threads are expected.
-const MAX_THREAD_DEPTH: usize = 16;
-
+/// Deliberately NOT the stored shape. A [`Record`] with `to: [a, b]` fans out to one
+/// `Message` per recipient, so `to` stays a single agent name and `msg send`'s array
+/// still has one entry per recipient. The alternative — one object with the
+/// recipients joined into a string — would break `jq -r .to` silently, which is the
+/// worst of the available failures.
 #[derive(Debug, Serialize)]
 pub struct Message {
+    /// The stored row's content hash. Shared by every fanned-out copy, where the bd
+    /// era gave each recipient a distinct bead id: any recipient's id now resolves
+    /// to the same thread, which is what `--thread` wanted all along.
     pub id: String,
     pub thread: String,
-    /// bd's `created_by`: whoever bd recorded as the author. That is the pact
-    /// agent name when `send()` passed `--actor` ("tui-dev"), but a git user
-    /// name ("Ada Lovelace") for beads created outside pact, so it is passed
-    /// through verbatim and is NOT guaranteed to be a pact identity. Empty
-    /// string when bd reports no author.
     pub from: String,
     pub to: String,
     pub subject: Option<String>,
     pub body: String,
     pub created_at: String,
-    /// Read by the querying agent (for `all_messages()`, which has no querying
-    /// agent, read by its own recipient).
+    /// Read by the querying agent (for [`all_messages`], which has no querying
+    /// agent, read by this copy's own recipient).
     pub read: bool,
-    /// Every agent that has read this message, from its `read-by-` labels.
+    /// Every agent that has read this message, from the read cursors under
+    /// `.pact/read/`.
     pub read_by: Vec<String>,
-    /// Machine-generated by `pact watch`, from its [`NOTICE`] label. See that
-    /// constant for why the distinction is stored rather than guessed.
+    /// Machine-generated by `pact watch`, from [`Record::kind`].
     pub notice: bool,
 }
 
-/// The subset of `bd`'s issue JSON we care about.
-#[derive(Debug, Deserialize)]
-struct BdIssue {
-    id: String,
-    title: String,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    assignee: Option<String>,
-    #[serde(default)]
-    created_by: Option<String>,
-    created_at: String,
-    #[serde(default)]
-    issue_type: String,
-    #[serde(default)]
-    parent: Option<String>,
-    /// bd emits `"labels": null` for an unlabelled bead, so this is an Option
-    /// rather than a `#[serde(default)] Vec` (which would fail on null).
-    #[serde(default)]
-    labels: Option<Vec<String>>,
-}
-
-impl BdIssue {
-    /// The one BdIssue -> Message mapping, shared by every read path so `from`
-    /// and `read_by` cannot go missing on just one of them. `thread` pins the
-    /// thread id (read_thread pins every row to the root); otherwise it is the
-    /// parent, falling back to the message's own id for a thread root.
-    /// `viewer` is the agent asking; `None` means "resolve `read` against each
-    /// message's own recipient", which is what a recipient-agnostic listing
-    /// wants.
-    fn into_message(self, thread: Option<&str>, viewer: Option<&str>) -> Message {
-        let labels = self.labels.unwrap_or_default();
-        let read_by: Vec<String> = labels
-            .iter()
-            .filter_map(|l| l.strip_prefix(READ_BY).map(str::to_string))
-            .collect();
-        let body = self.description.unwrap_or_default();
-        // The label first, and the legacy shape only when there is no label —
-        // never the other way round, so a tagged message is classified by the fact
-        // pact recorded rather than by prose.
-        let notice = labels.iter().any(|l| l == NOTICE)
-            || looks_like_legacy_notice(Some(self.title.as_str()), &body);
-        let to = self.assignee.unwrap_or_default();
-        let read = read_by.iter().any(|a| a == viewer.unwrap_or(&to));
-        Message {
-            thread: thread
-                .map(str::to_string)
-                .or(self.parent)
-                .unwrap_or_else(|| self.id.clone()),
-            from: self.created_by.unwrap_or_default(),
-            to,
-            subject: Some(self.title),
-            body,
-            created_at: self.created_at,
-            id: self.id,
-            read,
-            read_by,
-            notice,
-        }
-    }
-}
-
-/// Send one message to one or more recipients (pact-rnc.4).
-///
-/// bd assigns exactly one assignee per bead, so N recipients means N beads —
-/// but they are made into ONE readable thread instead of N unrelated ones:
-/// recipients 2..N are created as children of the thread root (the first
-/// recipient's bead for a new thread, or `thread` itself when this send is a
-/// reply), which is exactly how replies already work, so `read_thread()` shows
-/// the whole announcement as one conversation. Children of the root rather than
-/// of each other because `read_thread()` returns *direct* children only —
-/// grandchildren would be invisible in the thread a reader actually opens,
-/// which is the bug this fixes.
-///
-/// Returns one Message per recipient, root first. An empty recipient list is an
-/// error. Not atomic — bd has no transaction across N creates — so a failure
-/// part-way through leaves the earlier recipients' messages sent; the error is
-/// a [`SendFailure`] naming exactly which (`sent()` also lists them), and a
-/// caller with `--json` can retry with `--skip` for those recipients instead
-/// of re-sending to them blind (pact-m7j.6.5).
 /// Everything about a message except who it goes to.
 ///
-/// A struct rather than four more parameters: `send` was already at the limit,
-/// and "the message" is a real thing with parts, not an argument list.
+/// A struct rather than four more parameters: `send` was already at the limit, and
+/// "the message" is a real thing with parts, not an argument list.
 pub struct Draft<'a> {
     /// Reply within an existing thread; `None` starts a new one.
     pub thread: Option<&'a str>,
     pub subject: Option<&'a str>,
     pub body: &'a str,
-    /// Paths this message is ABOUT, from `--to-owner-of`. Recorded as labels so
-    /// delivery can follow the file after the agent it resolved to has exited.
+    /// Paths this message is ABOUT, from `--to-owner-of`. Recorded so delivery can
+    /// follow the file after the agent it resolved to has exited.
     pub about: &'a [String],
     /// Machine-generated by `pact watch`, not written by an agent. Set only by
     /// [`crate::watch::notify_release`]; every CLI path leaves it false, because
@@ -300,61 +193,292 @@ pub struct Draft<'a> {
     pub notice: bool,
 }
 
-/// `send()` failed partway through a multi-recipient fan-out (pact-m7j.6.5).
-/// `already_sent` is exactly the recipients who already got this message —
-/// re-sending the identical command without `--skip` for them duplicates
-/// delivery, since only the thread ROOT (the first recipient) is protected by
-/// [`idempotency_key`]'s upsert; recipients 2..N are not. Exposed as
-/// `--json`'s error shape so a caller can retry with `--skip <agent>` for each
-/// name here instead of parsing prose, per this session's design decision to
-/// keep messaging's retry story flag-based rather than content-addressed (the
-/// same choice pact-m7j.6.4 made for the single-recipient case).
-///
-/// `reason` is a one-shot text snapshot of the underlying failure, for a
-/// `--json` reader who wants "why" without a second command. It is NOT how the
-/// human-readable path learns that text: `send()` attaches this struct via
-/// `anyhow::Error::context`, not `map_err`, so the original error survives as
-/// this error's source — `{:#}` prints it via the normal chain, and, more
-/// importantly, `output::code_for`'s `downcast_ref::<ExitError>()` still finds
-/// a nested `ExitError` (a bare-repo topology, a missing backend) through that
-/// chain. Replacing the error outright silently downgraded every such failure
-/// to the generic exit code 1, which broke `pact`'s documented exit-code
-/// contract for exactly the callers it exists to help.
-#[derive(Debug, Serialize)]
-pub struct SendFailure {
-    pub already_sent: Vec<String>,
-    pub failed_at: String,
-    pub reason: String,
+// ------------------------------------------------------------------ the store
+
+fn messages_file_path(repo_root: &Path) -> PathBuf {
+    crate::repo::pact_dir_path(repo_root).join("messages.jsonl")
 }
 
-impl std::fmt::Display for SendFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.already_sent.is_empty() {
-            write!(f, "sending to {}: nothing was sent", self.failed_at)
-        } else {
-            write!(
-                f,
-                "sending to {}: {} recipient(s) already got this ({}) — replay with \
-                 --skip for them instead of re-sending blind",
-                self.failed_at,
-                self.already_sent.len(),
-                self.already_sent.join(", "),
-            )
-        }
+/// The store's path, creating `.pact/` if it is not there yet.
+///
+/// Split from [`messages_file_path`] because "a question must not mutate"
+/// (CLAUDE.md): every read path resolves the path without creating anything, and
+/// only [`append`] uses this one.
+fn messages_file(repo_root: &Path) -> Result<PathBuf> {
+    Ok(crate::repo::pact_dir(repo_root)?.join("messages.jsonl"))
+}
+
+/// The store's half of the shared append-only discipline (`events::jsonl`).
+///
+/// `chain_hash` is spelled as a plain field here and reached through the trait,
+/// which is what lets `events.jsonl`, `.pact/watches.jsonl` and this file share one
+/// append implementation instead of keeping three copies of the same locking,
+/// chaining and trimming logic in step by hand.
+impl crate::events::jsonl::Chained for Record {
+    fn chain_hash(&self) -> Option<&str> {
+        self.chain_hash.as_deref()
+    }
+
+    fn set_chain_hash(&mut self, hash: Option<String>) {
+        self.chain_hash = hash;
     }
 }
 
-impl std::error::Error for SendFailure {}
-
-/// If `err` is a [`SendFailure`], its `--json` shape — for a caller that wants
-/// to retry with `--skip` rather than parse the human-readable text. `None`
-/// for every other error, so a generic failure still prints as plain text.
-pub fn json_send_failure(err: &anyhow::Error) -> Option<String> {
-    serde_json::to_string_pretty(err.downcast_ref::<SendFailure>()?).ok()
+/// Every stored message, oldest first, plus how many lines were unparseable.
+///
+/// Tolerant by contract, not by accident: a torn final line — an append that wrote
+/// part of a line and then failed — is counted and skipped, exactly as
+/// `events::all` and `watch::records` treat theirs. Duplicate ids collapse to the
+/// first occurrence, which is what makes a re-sent message a no-op instead of a
+/// second delivery.
+pub fn records(repo_root: &Path) -> Result<(Vec<Record>, usize)> {
+    let (rows, skipped) = crate::events::jsonl::read::<Record>(&messages_file_path(repo_root))?;
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for (_, r) in rows {
+        // First occurrence wins. A duplicate id is a replayed send, and the earlier
+        // line is the one whose `at` reflects when the message really was first
+        // delivered — which is what makes a retry a no-op rather than a second,
+        // later-stamped delivery.
+        if seen.insert(r.id.clone()) {
+            out.push(r);
+        }
+    }
+    out.sort_by_key(|r| parse_ts(&r.at));
+    Ok((out, skipped))
 }
 
+/// Append one message, chained to the line before it, under the shared lock.
+///
+/// Fallible, unlike `events::append`, and that difference is intentional: an event is
+/// a side-record of something that already happened, so losing one must never fail
+/// the operation it describes, whereas a message that was not written was not sent
+/// and the sender has to be told.
+fn append(repo_root: &Path, record: &Record) -> Result<()> {
+    let path = messages_file(repo_root)?;
+    crate::events::jsonl::append(&path, record, Some((MAX_LINES, KEEP_LINES)))
+}
+
+// ------------------------------------------------------------- read cursors
+
+/// Where one agent's read positions live.
+///
+/// Agent names are `[a-z0-9][a-z0-9-]{1,31}` (`identity::validate`), so they are
+/// filename-safe by construction — but a RECIPIENT name arrives from `--to` and is
+/// not put through that gate, so anything outside the safe set is collapsed here
+/// rather than trusted into a path. A trust boundary is not a place to save three
+/// lines.
+fn cursor_path(repo_root: &Path, agent: &str) -> PathBuf {
+    let safe: String = agent
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    crate::repo::pact_dir_path(repo_root)
+        .join("read")
+        .join(format!("{safe}.json"))
+}
+
+/// One agent's read positions: message id -> when they read it.
+///
+/// A map, not a high-water mark. A mark cannot say "read 5 but not 3", which the
+/// `read-by-` labels could, and an inbox that silently marks skipped mail read is
+/// worse than one that keeps a slightly larger file.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Cursor {
+    #[serde(default)]
+    read: BTreeMap<String, String>,
+}
+
+/// Best-effort: an unreadable or malformed cursor reads as "has read nothing".
+///
+/// Never an error. This is local, regenerable state, and the cost of getting it
+/// wrong in that direction is showing a message as unread twice — against failing a
+/// command that had nothing to do with it.
+fn cursor(repo_root: &Path, agent: &str) -> Cursor {
+    std::fs::read_to_string(cursor_path(repo_root, agent))
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default()
+}
+
+/// Record `ids` as read by `agent`, at `now`. Idempotent.
+fn remember_read(repo_root: &Path, agent: &str, ids: &[String], now: &str) -> Result<()> {
+    let mut cur = cursor(repo_root, agent);
+    let mut changed = false;
+    for id in ids {
+        changed |= cur.read.insert(id.clone(), now.to_string()).is_none();
+    }
+    if !changed {
+        return Ok(());
+    }
+    let path = cursor_path(repo_root, agent);
+    let dir = path.parent().context("read cursor has no parent")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    // Written via a uniquely-named temp and renamed, so a reader never sees a
+    // half-written cursor and two agents writing their own cursors cannot collide
+    // on the temp name. Same reasoning as the event log's append.
+    let tmp = dir.join(crate::events::unique_temp_name("read"));
+    std::fs::write(&tmp, serde_json::to_string(&cur)?)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(())
+}
+
+/// Which agents have read each message, across every cursor in the repo.
+///
+/// One directory scan for the whole listing rather than one per message: an inbox of
+/// 200 notices must not become 200 file reads.
+fn readers(repo_root: &Path) -> BTreeMap<String, Vec<String>> {
+    let dir = crate::repo::pact_dir_path(repo_root).join("read");
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let Some(agent) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(cur) = serde_json::from_str::<Cursor>(&text) else {
+            continue;
+        };
+        for id in cur.read.keys() {
+            out.entry(id.clone()).or_default().push(agent.to_string());
+        }
+    }
+    for agents in out.values_mut() {
+        agents.sort();
+        agents.dedup();
+    }
+    out
+}
+
+// --------------------------------------------------------------- ids and fan-out
+
+/// Non-cryptographic FNV-1a 64-bit mix of the parts, with a separator between them.
+fn fnv1a64(parts: &[&str]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for part in parts {
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        // A separator between parts, so ("ab", "c") and ("a", "bc") — which would
+        // otherwise concatenate to the same byte stream — hash differently.
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// A message's id: a hash of its own content, so a retried send lands on the SAME
+/// message instead of a second, near-identical one.
+///
+/// This is not a new idea for this store — it is `idempotency_key`, kept. It was
+/// built after three production incidents in which a send's outcome was ambiguous
+/// and the retry minted a duplicate: a process killed after bd committed but before
+/// returning, a hung subprocess, and a harness that dropped stdout (pact-m7j.6.4).
+/// `sent()`'s own doc tells a sender who cannot confirm a send to re-send it, so
+/// without this the documented policy is what mints the duplicate.
+///
+/// Two things changed by moving off bd, both improvements:
+///
+/// - It now covers REPLIES too. On bd this key could only ride a root message,
+///   because a `create` could not carry `--id` alongside `--parent`, so every reply
+///   was unprotected. A row in a file has no such restriction.
+/// - The recovery is gone with the mechanism that needed it. bd ≤1.1 upserted on
+///   `--id`/`--force`; bd 1.2 refuses with "already exists" and exits 1, so `send`
+///   had to read that refusal as proof of delivery (pact-0re). Here a duplicate is
+///   simply a line [`records`] collapses.
+///
+/// `at` is deliberately NOT an input, which is the whole point — and the accepted
+/// trade-off, unchanged from the bd era: two SEPARATE, genuinely identical sends
+/// (same sender, same recipients, same thread, byte-identical subject and body)
+/// collapse into one message rather than two. For the mostly-unique text real
+/// messages carry that is a good bargain against a duplicate that already happened
+/// in production. It is not a content-addressed store's collision resistance and
+/// was never asked to be.
+fn message_id(
+    from: &str,
+    to: &[String],
+    thread: Option<&str>,
+    subject: &str,
+    body: &str,
+) -> String {
+    let recipients = to.join(",");
+    let hash = fnv1a64(&[from, &recipients, thread.unwrap_or(""), subject, body]);
+    format!("pact-msg-{hash:016x}")
+}
+
+/// One [`Record`] as one [`Message`] per recipient, in stored recipient order.
+///
+/// `viewer` is the agent asking; `None` means "resolve `read` against each copy's
+/// own recipient", which is what a recipient-agnostic listing wants.
+fn fan_out(
+    record: &Record,
+    viewer: Option<&str>,
+    readers: &BTreeMap<String, Vec<String>>,
+) -> Vec<Message> {
+    let read_by = readers.get(&record.id).cloned().unwrap_or_default();
+    record
+        .to
+        .iter()
+        .map(|recipient| Message {
+            id: record.id.clone(),
+            thread: record.thread.clone(),
+            from: record.from.clone(),
+            to: recipient.clone(),
+            subject: record.subject.clone(),
+            body: record.body.clone(),
+            created_at: record.at.clone(),
+            read: read_by.iter().any(|a| a == viewer.unwrap_or(recipient)),
+            read_by: read_by.clone(),
+            notice: record.kind == NOTICE,
+        })
+        .collect()
+}
+
+/// Every stored message fanned out, oldest first.
+fn all(repo_root: &Path, viewer: Option<&str>) -> Result<Vec<Message>> {
+    let (records, _) = records(repo_root)?;
+    let readers = readers(repo_root);
+    let mut out: Vec<Message> = records
+        .iter()
+        .flat_map(|r| fan_out(r, viewer, &readers))
+        .collect();
+    out.sort_by(oldest_first);
+    Ok(out)
+}
+
+// ------------------------------------------------------------------ the API
+
+/// Send one message to one or more recipients, as ONE thread.
+///
+/// One row, however many recipients. The bd era needed N beads for N recipients
+/// (a bead has exactly one assignee) and then made them read as one conversation by
+/// parenting recipients 2..N on the thread root — children of the root rather than
+/// of each other, because `read_thread` returned direct children only and a
+/// grandchild was invisible in the thread a reader actually opened. None of that
+/// machinery survives: a row carries its whole recipient list and its own thread id.
+///
+/// Atomic, which the bd version could not be. There is no partial fan-out to report
+/// any more, so [`Draft`]'s send either happened or errored — which is why the
+/// `SendFailure`/`already_sent` JSON error shape is gone.
 pub fn send(
-    cli: &BeadsCli,
     repo_root: &Path,
     agent: &str,
     to: &[String],
@@ -371,102 +495,81 @@ pub fn send(
         anyhow::bail!("no recipients — `msg send` needs at least one --to");
     }
     // One recipient named twice is one recipient. Without this, `--to a --to a`
-    // created two beads in one thread and delivered the same message to the
-    // same inbox twice — reproducible, and silent, because pact has no
-    // uniqueness constraint to trip over. Agent Mail hit the same case hard
-    // enough to get a composite-primary-key IntegrityError and fixed it by
-    // deduping before building the recipient rows (c66e54f, #190).
+    // delivered the same message to the same inbox twice — reproducible, and
+    // silent, because pact has no uniqueness constraint to trip over.
     //
-    // The realistic caller is not a human typing the flag twice: the protocol
-    // block tells agents to repeat `--to` for a multi-recipient decision, so a
-    // list built from `pact agents --json` or an orchestrator template can
-    // repeat a name. And `pact msg sent` exists precisely because a previous
-    // fleet produced duplicate messages, so a command that manufactures them
-    // works against the tool's own advice.
+    // The realistic caller is not a human typing the flag twice: the protocol block
+    // tells agents to repeat `--to` for a multi-recipient decision, so a list built
+    // from `pact agents --json` or an orchestrator template can repeat a name. And
+    // `pact msg sent` exists precisely because a previous fleet produced duplicate
+    // messages, so a command that manufactures them works against the tool's own
+    // advice.
     //
-    // First-seen order is preserved: the printed thread root must not move
-    // because a later duplicate was dropped.
+    // First-seen order is preserved: the recipient list a reader sees must not be
+    // reordered because a later duplicate was dropped.
     let mut seen = std::collections::HashSet::new();
     let deduped: Vec<String> = to.iter().filter(|r| seen.insert(*r)).cloned().collect();
     let dropped = to.len() - deduped.len();
     if dropped > 0 {
-        // Said out loud, not swallowed: a caller that repeated a name probably
-        // built the list wrongly and should find out now.
+        // Said out loud, not swallowed: a caller that repeated a name probably built
+        // the list wrongly and should find out now.
         output::warn(&format!(
             "note: {dropped} duplicate recipient(s) collapsed — sending one message per distinct agent"
         ));
     }
-    let to: &[String] = &deduped;
+    let to = deduped;
     let title = subject
         .map(str::to_string)
         .unwrap_or_else(|| default_subject(body));
 
-    // Parent for the next bead: the caller's thread if this is a reply,
-    // otherwise (first iteration) nothing — and from then on the root's id, so
-    // recipients 2..N hang off the same bead `read_thread` is asked about.
-    //
-    // `thread` is resolved to the thread ROOT rather than used verbatim, because
-    // an agent legitimately holds a non-root member id: `msg send` prints one id
-    // per recipient, and recipients 2..N of a fan-out see their own child id.
-    // Parenting a reply on one of those makes a grandchild, and `read_thread`
-    // returns direct children only — so the reply is invisible to everyone
-    // reading the thread, which is exactly the fragmentation pact-rnc.4 exists
-    // to prevent.
-    let mut thread_id = match thread {
-        Some(t) => Some(thread_root(cli, repo_root, t)?.id),
+    // Resolved to the thread ROOT rather than used verbatim. An agent legitimately
+    // holds a non-root member id — `msg read` prints the ids in a thread — and a
+    // reply must join the thread rather than start a sub-thread nobody reading the
+    // conversation would see. Prefix-resolved, so the id an agent copied off a
+    // listing works whether or not they took all of it.
+    let parent = match thread {
+        Some(t) => Some(resolve_id(repo_root, t)?),
         None => None,
     };
-    let mut messages: Vec<Message> = Vec::with_capacity(to.len());
-    // Read once, not per recipient: it is a property of the command line, and
-    // every bead this send creates was addressed the same way.
+    let thread_id = parent.as_ref().map(|r| r.thread.clone());
+    // `about` arrives ALREADY normalized, and must not be normalized again here.
+    // `run_msg` canonicalizes `--to-owner-of` before it does anything with it
+    // (pact-m7j.8.6) because it needs that spelling for its own `events::owner_of`
+    // lookup too; `normalize_path` resolves against the process CWD, so applying it
+    // to a path that is already repo-relative mangles it whenever the caller is not
+    // sitting at the repo root. `about_path` normalizes its QUERY, which is the other
+    // half of the same contract.
+    let id = message_id(agent, &to, thread_id.as_deref(), &title, body);
+    let record = Record {
+        thread: thread_id.clone().unwrap_or_else(|| id.clone()),
+        id,
+        at: Utc::now().to_rfc3339(),
+        from: agent.to_string(),
+        to,
+        subject: Some(title),
+        body: body.to_string(),
+        kind: if notice { NOTICE } else { MAIL }.to_string(),
+        in_reply_to: parent.map(|r| r.id),
+        about: about.to_vec(),
+        chain_hash: None,
+    };
+    append(repo_root, &record)?;
+    // Read back the PERSISTED row rather than reporting the one just built. On a
+    // replay the store keeps the FIRST delivery's line, so the freshly-built record's
+    // `at` is this call's wall clock and not when the message was really sent — and
+    // `--json` reporting the retry's own timestamp is exactly the confusion the
+    // deterministic id exists to prevent (pact-m7j.6.7 made the same fix against bd's
+    // `create` echo). Falls back to the local record if the read cannot find it,
+    // because a send that landed must not report failure.
+    let stored = records(repo_root)
+        .ok()
+        .and_then(|(rows, _)| rows.into_iter().find(|r| r.id == record.id))
+        .unwrap_or(record);
+    let record = stored;
+
     let addressing = addressing_mode();
     let is_reply = thread.is_some();
-    for recipient in to {
-        let issue = match create(
-            cli,
-            repo_root,
-            agent,
-            recipient,
-            thread_id.as_deref(),
-            &title,
-            body,
-            about,
-            notice,
-        ) {
-            Ok(issue) => issue,
-            Err(e) => {
-                // Captured before `e` is moved into `context`: the source
-                // chain still carries this text (and anything under it, like
-                // an `ExitError`'s code), but the JSON shape wants it as a
-                // plain string, not something a reader has to re-derive from
-                // the chain.
-                let reason = format!("{e:#}");
-                return Err(e.context(SendFailure {
-                    already_sent: messages.iter().map(|m| m.to.clone()).collect(),
-                    failed_at: recipient.clone(),
-                    reason,
-                }));
-            }
-        };
-        let id = issue.id;
-        let thread = thread_id.get_or_insert_with(|| id.clone()).clone();
-        messages.push(Message {
-            id,
-            thread,
-            // The calling agent, not bd's echo: create() always passes --actor.
-            from: agent.to_string(),
-            to: recipient.clone(),
-            subject: Some(title.clone()),
-            body: body.to_string(),
-            created_at: issue.created_at,
-            read: false,
-            read_by: Vec::new(),
-            notice,
-        });
-        // One bead created, so one message sent. Counted here rather than after
-        // the loop because a partial fan-out failure returns early, and the
-        // recipients who *did* get it are exactly what a sender must not
-        // re-send to (see `SendFailure::already_sent` above).
+    for _ in &record.to {
         otel::count(
             "pact.msg.sent",
             1,
@@ -476,300 +579,44 @@ pub fn send(
             ],
         );
     }
-
-    // The about-<path> labels are already on every bead above: create_args
-    // folds them into the same `create` call (pact-m7j.10.1), so there is no
-    // second, separate tagging step left here to fail — and so no window in
-    // which a bead exists but `about_path` cannot see what it is about yet.
-    Ok(messages)
+    Ok(fan_out(&record, None, &readers(repo_root)))
 }
 
-/// Unread messages tagged as being about `path`, for any recipient.
+/// Messages tagged as being about `path`, for any recipient, oldest first.
 ///
 /// This is what makes `--to-owner-of` a delivery mechanism rather than an
-/// address-book lookup. It deliberately ignores who a message was addressed to:
-/// the point is that a message about `src/otel.rs` reaches whoever picks up
-/// `src/otel.rs`, even — especially — when the agent it was addressed to has
-/// exited. Reading it is the recipient's job; noticing it is the file's.
+/// address-book lookup. It deliberately ignores who a message was addressed to: the
+/// point is that a message about `src/otel.rs` reaches whoever picks up
+/// `src/otel.rs`, even — especially — when the agent it was addressed to has exited.
+/// Reading it is the recipient's job; noticing it is the file's.
 ///
-/// Filtered server-side via `--label=`, not fetched whole and filtered here
-/// (pact-m7j.4.7): this used to call `list_issues` unfiltered and then keep
-/// only the one label it wanted, so every message bead in the repo — every
-/// other path's traffic, every thread, everything — was fetched (and, on br,
-/// individually `show`n) just to throw almost all of it away. Both backends
-/// bound `list --json` to one label directly; see `list_issues`.
-pub fn about_path(cli: &BeadsCli, repo_root: &Path, path: &str) -> Result<Vec<Message>> {
-    // Normalized exactly here, once, before comparison — pact-m7j.8.6: `path`
-    // arrives as whatever the caller's own CWD made of it (`messages_about`'s
-    // `path` is the raw `lease acquire` argument), while the label this
-    // queries against was written from a create-time call that normalizes
-    // its own `about` list the same way (see `send`). One file must produce
-    // one label however either command line spelled it.
+/// `--to-owner-of` addressed a file and then resolved it to an agent, and delivery
+/// stopped there. Measured over one fleet run: 30 of 44 agent-to-agent messages went
+/// to agents who had already exited, and none of those were ever read, while every
+/// message to a live agent was read. Addressing was never the failure —
+/// deliverability was. Every one of the 30 was about a file, sent to the agent who
+/// had just released it (pact-4tj).
+pub fn about_path(repo_root: &Path, path: &str) -> Result<Vec<Message>> {
     let relative = crate::lease::normalize_path(repo_root, path);
-    let current = encode_path(&relative);
-    let label = format!("{ABOUT}{current}");
-    let issues = list_issues(cli, repo_root, None, Some(&label))?;
-    if !issues.is_empty() {
-        return Ok(to_messages(issues, None));
-    }
-    // pact-m7j.10.8: a message tagged before the charset narrowing used the
-    // wider, legacy encoding. Only worth a second call when that encoding
-    // would actually differ — most paths have no punctuation the narrowing
-    // touches, so `legacy == current` and this never fires — and only after
-    // the current encoding's query already came back empty, so a path with
-    // genuine current-encoding traffic never pays for a query it doesn't
-    // need.
-    let legacy = encode_path_legacy(&relative);
-    if legacy == current {
-        return Ok(Vec::new());
-    }
-    let legacy_label = format!("{ABOUT}{legacy}");
-    let issues = list_issues(cli, repo_root, None, Some(&legacy_label))?;
-    Ok(to_messages(issues, None))
-}
-
-/// FNV-1a, 64-bit: a fixed-seed, non-cryptographic hash, deliberately NOT
-/// `std::collections::hash_map::DefaultHasher` — that one's `RandomState` seed
-/// is randomized per PROCESS, so the same content would hash differently on
-/// the retry than it did on the original send, defeating the entire point of
-/// [`idempotency_key`]. FNV-1a needs no dependency for a few lines of stable,
-/// deterministic mixing, and cryptographic strength buys nothing here: the
-/// risk this key accepts is two DELIBERATELY identical messages colliding
-/// (see `idempotency_key`'s own doc comment), not an adversary finding one.
-fn fnv1a64(parts: &[&str]) -> u64 {
-    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET_BASIS;
-    for part in parts {
-        for byte in part.as_bytes() {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(PRIME);
-        }
-        // A separator between parts, so ("ab", "c") and ("a", "bc") — which
-        // would otherwise concatenate to the same byte stream — hash
-        // differently.
-        hash ^= 0xff;
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
-}
-
-/// A deterministic id, so a retried `create` after an ambiguous outcome (process
-/// killed after bd committed but before returning, a hung subprocess, a harness
-/// that dropped stdout — all three hit in production, see pact-m7j.6.4) lands on
-/// the SAME bead instead of a second, near-identical one.
-///
-/// **What the id buys has survived a change in how it buys it.** bd ≤1.1 upserted
-/// on `--id`/`--force`, so a replay silently rewrote the same bead. bd 1.2 refuses
-/// with "already exists" and exits 1, so [`create`] reads that refusal as proof
-/// the message is already delivered and returns the existing bead (pact-0re).
-/// Either way the guarantee is the same one: one send, one bead, however many
-/// times the caller retries. `sent()`'s own doc comment tells a sender that
-/// cannot confirm a send to re-send it; without this, that documented policy
-/// is what mints the duplicate.
-///
-/// Deliberately a pure function of the send's own arguments — no counter, no
-/// nonce, nothing written to `.pact/` — because pact's messaging layer keeps
-/// zero local state by design and this key must not become the first
-/// exception. That purity is also the accepted trade-off: two SEPARATE,
-/// genuinely identical sends (same agent, same recipient, same thread
-/// context, byte-identical title and body) collide into one bead rather than
-/// two, same as a real retry would. For the routine, mostly-unique text real
-/// messages carry, that is a good bargain against a duplicate that already
-/// happened in production; it is not a content-addressed store's collision
-/// resistance, and was not asked to be.
-///
-/// bd-only: `br` has no equivalent primitive on `create` at all (confirmed
-/// against `br --help` and a real create-twice run — no `--id`, no
-/// `--dedupe`; the only lever, a slug, still gets a random uniquifying
-/// suffix every call), so a `br` retry is unprotected until `br` grows one.
-///
-/// Root messages only, even on bd: see [`create_args`] for why a reply
-/// cannot carry this key alongside `--parent`.
-fn idempotency_key(agent: &str, to: &str, parent: Option<&str>, title: &str, body: &str) -> String {
-    let hash = fnv1a64(&[agent, to, parent.unwrap_or(""), title, body]);
-    format!("pact-msg-{hash:016x}")
-}
-
-/// `create` args for one message bead. Owned Strings because they are all
-/// interpolated; see the module docs for why `--no-inherit-labels` is not
-/// optional on bd — and why br neither accepts nor needs it.
-///
-/// `about` is passed through to `--labels` so a bead is born already tagged
-/// with the paths it is about (pact-m7j.10.1): both bd and br accept `-l` /
-/// `--labels` at create time, and doing it here — rather than a second
-/// `label add` after the bead exists — closes the window in which the bead is
-/// visible to `about_path` without its label. `--no-inherit-labels` (bd-only,
-/// above) does not fight this: it only suppresses labels inherited from
-/// `--parent`, and an explicit `--labels` list is unaffected by it either way
-/// — confirmed against a real bd store with both flags on the same call.
-#[allow(clippy::too_many_arguments)]
-fn create_args(
-    to: &str,
-    parent: Option<&str>,
-    agent: &str,
-    title: &str,
-    body: &str,
-    about: &[String],
-    notice: bool,
-) -> Vec<String> {
-    let mut args = vec![
-        "create".to_string(),
-        "--type=message".to_string(),
-        "--json".to_string(),
-    ];
-    // A child must not inherit the parent's read-by-* labels, or a reply
-    // would be born already "read" by whoever read the message above it.
-    args.push("--no-inherit-labels".to_string());
-    // `--force` overrides bd's project-prefix guard (confirmed against
-    // `bd create --help` and a real scratch run). Needed unconditionally,
-    // not just alongside `--id`: bd auto-derives a REPLY's id from its
-    // parent (`<parent-id>.1`, `.2`, ...), and once the root carries our
-    // synthetic `pact-msg-` id, every child's auto-derived id fails the
-    // same prefix check even though the reply itself never passes `--id`
-    // — confirmed by reproducing the exact "prefix mismatch" error on a
-    // plain `--parent=pact-msg-...` create with no `--id` at all.
-    args.push("--force".to_string());
-    // Idempotency key: root messages only. `bd create` rejects `--id`
-    // together with `--parent` outright ("cannot specify both --id and
-    // --parent flags", confirmed against a real scratch run) — bd derives
-    // a child's id from its parent, and an explicit id conflicts with
-    // that. So a reply, or recipients 2..N of a fan-out, are unprotected
-    // by this key; only the first create in a `send()` call (thread root,
-    // no parent yet) gets one. Narrower than every create being safe to
-    // retry, but it is the shape the reported incident actually was — a
-    // single long send, not a reply — and reparenting after an id-only
-    // create would double the subprocess calls on the common path
-    // (every reply) to protect the uncommon one.
-    if parent.is_none() {
-        args.push(format!(
-            "--id={}",
-            idempotency_key(agent, to, parent, title, body)
-        ));
-    }
-    args.extend([
-        format!("--title={title}"),
-        format!("--description={body}"),
-        format!("--assignee={to}"),
-        // Records who (in pact's own identity scheme) sent this, in the
-        // backend's audit trail — what `from` and `sent()` read back.
-        format!("--actor={agent}"),
-    ]);
-    if let Some(p) = parent {
-        args.push(format!("--parent={p}"));
-    }
-    // One `--labels=` for both kinds, because they must ride the SAME create
-    // call: a second `label add` afterwards leaves a window in which the bead
-    // exists and is neither findable by path nor recognisable as a notice
-    // (pact-m7j.10.1 for the first half, pact-mqw.5 for the second).
-    let mut labels: Vec<String> = about
+    let (records, _) = records(repo_root)?;
+    let readers = readers(repo_root);
+    let mut out: Vec<Message> = records
         .iter()
-        .map(|p| format!("{ABOUT}{}", encode_path(p)))
+        .filter(|r| r.about.contains(&relative))
+        .flat_map(|r| fan_out(r, None, &readers))
         .collect();
-    if notice {
-        labels.push(NOTICE.to_string());
-    }
-    if !labels.is_empty() {
-        args.push(format!("--labels={}", labels.join(",")));
-    }
-    args
+    out.sort_by(oldest_first);
+    Ok(out)
 }
 
-// One more argument than clippy's default likes, all of them genuinely
-// distinct pieces of one bead (who it is to/from/about and what it says) —
-// bundling them into a struct here would trade a lint suppression for a type
-// with exactly one caller.
-#[allow(clippy::too_many_arguments)]
-fn create(
-    cli: &BeadsCli,
-    repo_root: &Path,
-    agent: &str,
-    to: &str,
-    parent: Option<&str>,
-    title: &str,
-    body: &str,
-    about: &[String],
-    notice: bool,
-) -> Result<BdIssue> {
-    let args = create_args(to, parent, agent, title, body, about, notice);
-    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    // Read back out of the argv rather than re-deriving it: this is the id the
-    // call actually carried, so the retry path below cannot drift from
-    // `create_args`' own decision about when to send one.
-    let planned_id: Option<String> = args
-        .iter()
-        .find_map(|a| a.strip_prefix("--id="))
-        .map(str::to_string);
+/// Messages addressed to `agent`, oldest first.
+pub fn inbox(repo_root: &Path, agent: &str, unread_only: bool) -> Result<Vec<Message>> {
+    let mut messages = all(repo_root, Some(agent))?;
+    messages.retain(|m| m.to == agent);
 
-    let issue: BdIssue = match cli.run(repo_root, &borrowed) {
-        Ok(stdout) => serde_json::from_str(&stdout)
-            .with_context(|| format!("parsing `{} create --json` output", cli.binary()))?,
-        // A retry landing on a bead that already exists is SUCCESS, not failure
-        // (pact-0re). bd ≤1.1 upserted here; bd 1.2 refuses with "<id> already
-        // exists; use bd update, or bd import for upsert semantics" and exits 1.
-        //
-        // Treating that as an error would be the worst available answer. The id
-        // is a hash of exactly this send's content, so the bead that exists IS
-        // the message being sent — and `sent()` tells a sender who cannot
-        // confirm a send to re-send it, so the documented policy would then
-        // report failure for a message that had already been delivered. That is
-        // the shape of pact-rnc.26 (a successful send reporting failure, after
-        // which the agent sent again), which is precisely what the deterministic
-        // id exists to prevent.
-        Err(e)
-            if planned_id
-                .as_deref()
-                .is_some_and(|id| is_duplicate_id(&e, id)) =>
-        {
-            // `show` was the plan on this path anyway — see below — so the
-            // recovery is one call, not a new mechanism.
-            return show(cli, repo_root, planned_id.as_deref().unwrap_or_default());
-        }
-        Err(e) => return Err(e),
-    };
-
-    // `created_at` from a create is not trustworthy on the id-bearing path, and
-    // was not under either bd generation: the old upsert echoed THIS call's
-    // wall-clock time even when nothing was created, and nothing in the response
-    // says "this was a no-op". Rather than guess, re-read the one field that can
-    // lie from the source that cannot — cheap (one extra `show`, only here, never
-    // for a reply or for br, which has no `--id` to replay through) and correct
-    // on a first create and a replay alike (pact-m7j.6.7).
-    if planned_id.is_some() {
-        let confirmed = show(cli, repo_root, &issue.id)?;
-        return Ok(BdIssue {
-            created_at: confirmed.created_at,
-            ..issue
-        });
-    }
-    Ok(issue)
-}
-
-/// Is this `create` failure bd refusing to overwrite the id we asked for?
-///
-/// Deliberately narrow on both halves. It requires the message to name **our own
-/// planned id**, so an "already exists" about some other bead — a prefix
-/// collision, a hand-run command in the same store — is still an error. And it
-/// matches bd 1.2's wording rather than any non-zero exit, because "the bead is
-/// already there" and "bd could not write" must not collapse into one branch:
-/// only the first is safe to report as a delivered message.
-fn is_duplicate_id(err: &anyhow::Error, planned_id: &str) -> bool {
-    let text = format!("{err:#}");
-    text.contains(planned_id) && text.contains("already exists")
-}
-
-pub fn inbox(
-    cli: &BeadsCli,
-    repo_root: &Path,
-    agent: &str,
-    unread_only: bool,
-) -> Result<Vec<Message>> {
-    let issues = list_issues(cli, repo_root, Some(agent), None)?;
-    let mut messages = to_messages(issues, Some(agent));
-
-    // Before the filter, so `--unread-only` and a plain listing report the same
-    // queue depth. This is the observation pact-aw7.4 exists for: nobody can
-    // see a mailbox rotting from inside the process that is not reading it.
+    // Before the filter, so `--unread-only` and a plain listing report the same queue
+    // depth. This is the observation pact-aw7.4 exists for: nobody can see a mailbox
+    // rotting from inside the process that is not reading it.
     record_unread(&messages, Utc::now());
 
     if unread_only {
@@ -778,12 +625,179 @@ pub fn inbox(
     Ok(messages)
 }
 
+/// Messages `agent` sent, newest first, and whether they were read.
+pub fn sent(repo_root: &Path, agent: &str) -> Result<Vec<Message>> {
+    let mut messages = all(repo_root, None)?;
+    messages.retain(|m| m.from == agent);
+    messages.reverse(); // `all` is oldest-first
+    Ok(messages)
+}
+
+/// Every message in the repo, regardless of recipient, oldest first.
+///
+/// There is no querying agent here, so `read` is resolved against each copy's own
+/// recipient.
+pub fn all_messages(repo_root: &Path) -> Result<Vec<Message>> {
+    all(repo_root, None)
+}
+
+/// Messages whose own recipient never marked them read, oldest first.
+///
+/// Leans on [`all_messages`] resolving `read` against each copy's own recipient, so
+/// this is exactly "nobody the message was addressed to has acknowledged it", not "I
+/// have not read it".
+///
+/// Why this is worth a check of its own: `pact msg sent` already shows a sender
+/// whether their message landed, but only that sender, only for their own messages,
+/// and only if they think to look. A fleet field run (megablast) ended with one
+/// message unacknowledged — an agent warning the owner of a file it did not own that
+/// a constant it had just changed would panic at runtime if `MAX_QUADS` was not
+/// updated with it. The warning was acted on, correctly, but never marked read, so
+/// `pact msg sent` reported it undelivered permanently and nothing anywhere said so.
+pub fn unacknowledged(repo_root: &Path) -> Result<Vec<Message>> {
+    let mut messages = all_messages(repo_root)?;
+    messages.retain(|m| !m.read);
+    Ok(messages)
+}
+
+/// Resolve a possibly-abbreviated id to exactly one stored message id.
+///
+/// Ids are content hashes now, not `pact-abc` bead ids, so they are longer than
+/// anything an agent wants to retype — which makes prefix addressing a requirement
+/// rather than a convenience. An ambiguous prefix is an ERROR listing the
+/// candidates, never a guess: picking one would silently reply into the wrong
+/// thread.
+fn resolve_id(repo_root: &Path, id: &str) -> Result<Record> {
+    let (records, _) = records(repo_root)?;
+    if let Some(exact) = records.iter().find(|r| r.id == id) {
+        return Ok(exact.clone());
+    }
+    let mut hits: Vec<&Record> = records.iter().filter(|r| r.id.starts_with(id)).collect();
+    match hits.len() {
+        1 => Ok(hits.remove(0).clone()),
+        0 => anyhow::bail!("no message matching {id}"),
+        n => anyhow::bail!(
+            "{id} matches {n} messages — use more of the id: {}",
+            hits.iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The thread id `id` belongs to.
+///
+/// Every member of a thread must resolve to the SAME thread id, on every surface
+/// (pact-rnc.4): `msg inbox` reports the thread, so `msg read` reporting the queried
+/// id meant two pact commands disagreeing, and the id `msg read` prints is a
+/// recipient's only source. A stored `thread` field makes that one field read instead
+/// of a parent walk with a depth cap.
+fn resolve_thread(repo_root: &Path, id: &str) -> Result<String> {
+    Ok(resolve_id(repo_root, id)?.thread)
+}
+
+/// Every message in the thread `id` belongs to, oldest first, WITHOUT marking
+/// anything read.
+///
+/// The non-marking twin of [`read_thread`], for the read-only MCP server (`pact mcp
+/// serve`), where answering "what is in this thread" must not change delivery state.
+/// `read_thread` writes a read cursor, and that cursor is what a *sender* checks with
+/// `msg sent` to decide whether a decision landed — so an observer who marked threads
+/// read while looking at them would silently tell every sender their message had been
+/// received by an agent that never saw it.
+///
+/// `viewer` only decides whose `read` flag is reported; passing `None` reports the
+/// recipient's own.
+///
+/// Gated on the feature that uses it, or the default build warns it dead. That is not
+/// a formality — `mark_read_by_id` shipped ungated, went red in CI on the default
+/// build only, and was missed locally because `mise run check` was running with
+/// `--features ui` and nothing else.
+#[cfg(feature = "mcp")]
+pub fn peek_thread(repo_root: &Path, viewer: Option<&str>, id: &str) -> Result<Vec<Message>> {
+    let thread = resolve_thread(repo_root, id)?;
+    let (records, _) = records(repo_root)?;
+    let readers = readers(repo_root);
+    Ok(records
+        .iter()
+        .filter(|r| r.thread == thread)
+        .flat_map(|r| fan_out(r, viewer, &readers))
+        .collect())
+}
+
+/// Every message in the thread `id` belongs to, oldest first. Marks them read for
+/// `agent`.
+pub fn read_thread(repo_root: &Path, agent: &str, id: &str) -> Result<Vec<Message>> {
+    let thread = resolve_thread(repo_root, id)?;
+    let (records, _) = records(repo_root)?;
+    let shown: Vec<&Record> = records.iter().filter(|r| r.thread == thread).collect();
+    let ids: Vec<String> = shown.iter().map(|r| r.id.clone()).collect();
+
+    let now = Utc::now();
+    // Bookkeeping must not destroy the thread the caller came for: if the cursor
+    // write fails, warn and show the messages anyway. They stay unread, so the next
+    // read retries. Same reasoning as pact-rnc.26 — never fail work that already
+    // succeeded.
+    //
+    // The bd version verified the write by re-fetching every bead and confirming the
+    // label had landed, because a subprocess exiting 0 is not proof that the specific
+    // change it was asked to make is the one that landed (the same argument
+    // `lease::verify_own_lease` makes). A local file write that returns `Ok` IS that
+    // proof, so the verification pass goes with the subprocess it was guarding.
+    let marked = match remember_read(repo_root, agent, &ids, &now.to_rfc3339()) {
+        Ok(()) => true,
+        Err(e) => {
+            output::warn(&format!(
+                "warning: could not mark thread {thread} read: {e:#}"
+            ));
+            false
+        }
+    };
+
+    let readers = readers(repo_root);
+    Ok(shown
+        .iter()
+        .flat_map(|r| fan_out(r, Some(agent), &readers))
+        .map(|mut m| {
+            // Just recorded, so a snapshot taken before the write would not show it.
+            if marked && !m.read {
+                m.read = true;
+                m.read_by.push(agent.to_string());
+                m.read_by.sort();
+                m.read_by.dedup();
+                // This branch *is* "first read by this agent" — re-reading a thread
+                // takes the other one — so it is the event to count, and the
+                // message's age here is how long the sender waited.
+                otel::count("pact.msg.read", 1, &attrs![]);
+                if let Some(ms) = age_ms(&m.created_at, now) {
+                    otel::record_ms("pact.msg.read_latency", ms, &attrs![]);
+                }
+            }
+            m
+        })
+        .collect())
+}
+
+/// Mark one message read by id, for a caller that has the id but not the thread.
+///
+/// `pact ui` needs this: the dashboard is the human's inbox, and until it could
+/// record a read the sender's `pact msg sent` said "unread" forever (pact-4tj).
+/// `pact ui` is the only caller, so this is dead code in a default build — gated
+/// rather than `allow`ed, because an `allow` would also hide the day it stops being
+/// called at all.
+#[cfg(feature = "ui")]
+pub fn mark_read_by_id(repo_root: &Path, agent: &str, id: &str) -> Result<()> {
+    let record = resolve_id(repo_root, id)?;
+    remember_read(repo_root, agent, &[record.id], &Utc::now().to_rfc3339())
+}
+
 /// Which `pact watch` notices an inbox listing should include.
 ///
-/// `Authored` is the default, and that is the whole point of the type: a
-/// notification is a side effect of a peer doing its job, and an inbox is where
-/// an agent looks for things addressed to it *by somebody*. See [`NOTICE`] for
-/// the run that made the distinction necessary.
+/// `Authored` is the default, and that is the whole point of the type: a notification
+/// is a side effect of a peer doing its job, and an inbox is where an agent looks for
+/// things addressed to it *by somebody*. See [`NOTICE`] for the run that made the
+/// distinction necessary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WatchView {
     /// Authored messages only, with notices reported as a trailing count.
@@ -797,11 +811,11 @@ pub enum WatchView {
 
 /// Consecutive unread notices for one path, collapsed into one entry.
 ///
-/// The count is what a reader needs; the individual bodies are not. Nine diffs
-/// of one file, delivered nine seconds apart, answer one question — "what did
-/// this file become" — and only the last of them answers it. The earlier eight
-/// are superseded by the time anyone reads them, which is exactly why they are
-/// summarised rather than listed.
+/// The count is what a reader needs; the individual bodies are not. Nine diffs of one
+/// file, delivered nine seconds apart, answer one question — "what did this file
+/// become" — and only the last of them answers it. The earlier eight are superseded
+/// by the time anyone reads them, which is exactly why they are summarised rather
+/// than listed.
 #[derive(Debug, Serialize)]
 pub struct NoticeGroup {
     /// The path, parsed out of the subject via [`NOTICE_SUBJECT_MARKER`], or the
@@ -811,8 +825,8 @@ pub struct NoticeGroup {
     pub count: usize,
     /// The most recent releaser — the one whose diff is still current.
     pub latest_from: String,
-    /// The most recent notice's id, so `pact msg read <id>` reaches the diff
-    /// that has not been superseded.
+    /// The most recent notice's id, so `pact msg read <id>` reaches the diff that has
+    /// not been superseded.
     pub latest_id: String,
     pub latest_at: String,
     /// How many of the group are unread by the viewer.
@@ -821,10 +835,10 @@ pub struct NoticeGroup {
 
 /// Split a listing into authored messages and per-path notice groups.
 ///
-/// Pure, so the grouping is unit-testable without a backend, and shared by every
-/// renderer rather than reimplemented per surface. Input order is oldest-first
-/// (`to_messages` sorts it), so "latest" is the last one seen per path and the
-/// returned groups keep first-notice order — a stable listing across runs.
+/// Pure, so the grouping is unit-testable without a store, and shared by every
+/// renderer rather than reimplemented per surface. Input order is oldest-first, so
+/// "latest" is the last one seen per path and the returned groups keep first-notice
+/// order — a stable listing across runs.
 pub fn split_notices(messages: &[Message]) -> (Vec<&Message>, Vec<NoticeGroup>) {
     let mut authored = Vec::new();
     let mut groups: Vec<NoticeGroup> = Vec::new();
@@ -861,391 +875,14 @@ pub fn split_notices(messages: &[Message]) -> (Vec<&Message>, Vec<NoticeGroup>) 
     (authored, groups)
 }
 
-/// The exact argv [`list_issues`] hands to the backend, factored out so the
-/// filters it decides to send are unit-testable without a real subprocess
-/// (pact-m7j.4.7) — the same reasoning [`create_args`] is split out for.
-fn list_args(assignee: Option<&str>, label: Option<&str>) -> Vec<String> {
-    let mut args: Vec<String> = vec!["list".into(), "--include-infra".into(), "--json".into()];
-    if let Some(a) = assignee {
-        args.push(format!("--assignee={a}"));
-    }
-    if let Some(l) = label {
-        args.push(format!("--label={l}"));
-    }
-    args
-}
+// --------------------------------------------------------------------- helpers
 
-/// Every message bead the backend will admit to, optionally narrowed to one
-/// assignee and/or one label.
-///
-/// `label` is passed straight through as `--label=`, not applied after the fact
-/// (pact-m7j.4.7): `about_path` used to fetch every message bead here and filter
-/// client-side for the one label it wanted, paying for every OTHER path's traffic
-/// too. bd supports `-l/--label` as an exact-match filter (`bd list --help`:
-/// "Filter by labels (AND: must have ALL)"), so bounding the query there bounds
-/// the response.
-fn list_issues(
-    cli: &BeadsCli,
-    repo_root: &Path,
-    assignee: Option<&str>,
-    label: Option<&str>,
-) -> Result<Vec<BdIssue>> {
-    let args = list_args(assignee, label);
-    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    parse_issues(&cli.run(repo_root, &borrowed)?, cli, repo_root)
-}
-
-/// `show <id>… --json`, which returns an array even for a single id.
-fn show_many(cli: &BeadsCli, repo_root: &Path, ids: &[&str]) -> Result<Vec<BdIssue>> {
-    let mut args = vec!["show"];
-    args.extend_from_slice(ids);
-    args.push("--json");
-    let out = cli.run(repo_root, &args)?;
-    serde_json::from_str(&out)
-        .with_context(|| format!("parsing `{} show --json` output", cli.binary()))
-}
-
-/// Messages this agent sent, newest first (pact-rnc.7). A sender that cannot
-/// confirm a send re-sends it — this is how an agent checks instead of guessing
-/// (notably after the broken-pipe bug, pact-rnc.26, exits non-zero on a send
-/// that actually landed).
-pub fn sent(cli: &BeadsCli, repo_root: &Path, agent: &str) -> Result<Vec<Message>> {
-    let mut messages = all_messages(cli, repo_root)?;
-    messages.retain(|m| m.from == agent);
-    messages.reverse(); // all_messages is oldest-first
-    Ok(messages)
-}
-
-/// One `show <id> --json`, which returns an array even for a single id.
-fn show(cli: &BeadsCli, repo_root: &Path, id: &str) -> Result<BdIssue> {
-    show_many(cli, repo_root, &[id])?
-        .pop()
-        .ok_or_else(|| anyhow::anyhow!("message {id} not found"))
-}
-
-/// The root of the thread `id` belongs to. Every member of a thread must resolve
-/// to the SAME thread id, on every surface (pact-rnc.4): `msg inbox` reports the
-/// root, so `msg read` reporting the queried id meant two pact commands
-/// disagreeing, and the id `msg read` prints is a recipient's only source.
-fn thread_root(cli: &BeadsCli, repo_root: &Path, id: &str) -> Result<BdIssue> {
-    let start = show(cli, repo_root, id)?;
-    Ok(walk_to_root(start, |parent| {
-        show(cli, repo_root, parent).ok()
-    }))
-}
-
-/// The `parent` walk itself, with the fetch injected so it is testable without a
-/// `bd` on PATH. Stops at a bead with no parent, at a parent bd cannot produce,
-/// after [`MAX_THREAD_DEPTH`] hops, and at a *non-message* parent — hanging a
-/// message off a real issue (`--thread pact-rnc.4`) is deliberate, and that
-/// issue is not itself part of the conversation.
-fn walk_to_root(start: BdIssue, mut fetch: impl FnMut(&str) -> Option<BdIssue>) -> BdIssue {
-    let mut issue = start;
-    for _ in 0..MAX_THREAD_DEPTH {
-        let Some(parent_id) = issue.parent.clone() else {
-            break;
-        };
-        let Some(parent) = fetch(&parent_id) else {
-            break;
-        };
-        if parent.issue_type != "message" {
-            break;
-        }
-        issue = parent;
-    }
-    issue
-}
-
-/// Every message of the thread `id` belongs to, oldest first, and the root's id.
-///
-/// `id` may be any member of the thread, not just its root: a non-first recipient
-/// of a fan-out send only ever sees her own child id, and reading it must give
-/// her the whole conversation — and the root's id as the thread — rather than a
-/// one-message "thread" whose id produces invisible grandchild replies.
-///
-/// Split out of [`read_thread`] so that [`peek_thread`] can answer with the same
-/// records and no read-marking. The two must not each grow their own half-right
-/// idea of what a thread contains: everything below the split is the *labelling*,
-/// which is the only part an observer must not do.
-fn gather_thread(cli: &BeadsCli, repo_root: &Path, id: &str) -> Result<(String, Vec<BdIssue>)> {
-    let root = thread_root(cli, repo_root, id)?;
-    let root_id = root.id.clone();
-
-    let replies = replies_of(cli, repo_root, &root)?;
-
-    let mut all = vec![root];
-    all.extend(replies.into_iter().filter(|i| i.issue_type == "message"));
-    // `msg read <id>` must always show <id>. It is normally the root or one of
-    // its direct children and already here; a message parented on a *non-root*
-    // member is not (older pact could create those, and bd data can be edited by
-    // hand), and silently omitting the message the caller asked for is worse than
-    // showing it alongside the thread. One extra `bd show` in that rare case only.
-    if !all.iter().any(|i| i.id == id) {
-        if let Ok(requested) = show(cli, repo_root, id) {
-            all.push(requested);
-        }
-    }
-    all.sort_by_key(|i| parse_ts(&i.created_at));
-    Ok((root_id, all))
-}
-
-/// The thread `id` belongs to, **without marking anything read** — the twin of
-/// [`read_thread`], in the same spirit as [`crate::lease::peek`] beside
-/// `lease::list`.
-///
-/// This exists for the read-only MCP server (`pact mcp serve`), where answering
-/// "what is in this thread" must not change delivery state. `read_thread` writes
-/// a `read-by-<agent>` label, and that label is what a *sender* checks with `msg
-/// sent` to decide whether a decision landed — so an observer who marked threads
-/// read while looking at them would silently tell every sender their message had
-/// been received by an agent that never saw it.
-///
-/// `viewer` only decides whose `read` flag is reported; passing `None` reports
-/// the recipient's own.
-///
-/// Gated on the feature that uses it, or the default build warns it dead. That
-/// is not a formality — `mark_read_by_id` shipped ungated, went red in CI on the
-/// default build only, and was missed locally because `mise run check` was
-/// running with `--features ui` and nothing else. `lint` compiles every feature
-/// set now, which is what caught this one before it left the machine.
-#[cfg(feature = "mcp")]
-pub fn peek_thread(
-    cli: &BeadsCli,
-    repo_root: &Path,
-    viewer: Option<&str>,
-    id: &str,
-) -> Result<Vec<Message>> {
-    let (root_id, all) = gather_thread(cli, repo_root, id)?;
-    Ok(all
-        .into_iter()
-        .map(|i| i.into_message(Some(&root_id), viewer))
-        .collect())
-}
-
-/// The root message plus its direct replies, oldest first. Marks everything
-/// shown as read for `agent`.
-pub fn read_thread(
-    cli: &BeadsCli,
-    repo_root: &Path,
-    agent: &str,
-    id: &str,
-) -> Result<Vec<Message>> {
-    let (root_id, all) = gather_thread(cli, repo_root, id)?;
-
-    // Bookkeeping must not destroy the thread the caller came for: if the
-    // label write loses a race with another agent's bd write, warn and show the
-    // messages anyway (they stay unread, so the next read retries). Same
-    // reasoning as pact-rnc.26 — never fail work that already succeeded.
-    let marked = match mark_read(cli, repo_root, agent, &all) {
-        Ok(()) => true,
-        Err(e) => {
-            output::warn(&format!(
-                "warning: could not mark thread {root_id} read: {e:#}"
-            ));
-            false
-        }
-    };
-
-    let now = Utc::now();
-    Ok(all
-        .into_iter()
-        .map(|i| {
-            let mut m = i.into_message(Some(&root_id), Some(agent));
-            // Just labelled, so the pre-read snapshot above doesn't show it yet.
-            if marked && !m.read {
-                m.read = true;
-                m.read_by.push(agent.to_string());
-                // This branch *is* "first read by this agent" — re-reading a
-                // thread takes the other one — so it is the event to count, and
-                // the message's age here is how long the sender waited.
-                otel::count("pact.msg.read", 1, &attrs![]);
-                if let Some(ms) = age_ms(&m.created_at, now) {
-                    otel::record_ms("pact.msg.read_latency", ms, &attrs![]);
-                }
-            }
-            m
-        })
-        .collect())
-}
-
-/// The direct replies to `root`, unfiltered by type.
-///
-/// A fresh `list --parent=<id>` every time rather than `show --json`'s own
-/// `dependents` field, which is a snapshot from whenever `root` was fetched — so
-/// a reply created after that fetch stayed invisible until something re-fetched
-/// the root (pact-m7j.6.1).
-fn replies_of(cli: &BeadsCli, repo_root: &Path, root: &BdIssue) -> Result<Vec<BdIssue>> {
-    let parent_arg = format!("--parent={}", root.id);
-    let out = cli.run(
-        repo_root,
-        &["list", "--include-infra", "--json", &parent_arg],
-    )?;
-    parse_issues(&out, cli, repo_root)
-}
-
-/// The one place the `read-by-` label is spelled for writing; `into_message`
-/// is the one place it is spelled for reading.
-fn read_label(agent: &str) -> String {
-    format!("{READ_BY}{agent}")
-}
-
-/// `bd label add <id>... read-by-<agent>` — one call for the whole thread, and
-/// idempotent, so re-reading a thread is a no-op rather than a duplicate.
-/// Mark one message read by id, for a caller that has the id but not the bead.
-///
-/// `pact ui` needs this: the dashboard is the human's inbox, and until it could
-/// record a read the sender's `pact msg sent` said "unread" forever (pact-4tj).
-/// `pact ui` is the only caller, so this is dead code in a default build —
-/// gated rather than `allow`ed, because an `allow` would also hide the day it
-/// stops being called at all.
-#[cfg(feature = "ui")]
-pub fn mark_read_by_id(cli: &BeadsCli, repo_root: &Path, agent: &str, id: &str) -> Result<()> {
-    let label = read_label(agent);
-    let actor = actor_arg(agent);
-    cli.run(repo_root, &["label", "add", id, &label, &actor])
-        .map(|_| ())
-}
-
-/// `verify_own_lease` (`lease.rs`) exists because "a rename... reporting
-/// success is not proof you're the one who ends up holding it" — a
-/// contested write's exit code says the subprocess didn't error, not that
-/// the specific change it was asked to make is the one that landed. This
-/// mirrors that shape for `label add`: after `cli.run` returns `Ok`, re-fetch
-/// every issue and confirm `read_label(agent)` is actually on it before
-/// reporting success (pact-m7j.6.6). Extensive direct testing against live
-/// bd/br (190+ and 160+ concurrent real-backend calls respectively, see the
-/// bead) found zero silent losses — both backends serialize writes
-/// internally — so this is a regression guard against that assumption
-/// changing under a future backend upgrade, not a fix for an observed loss.
-fn mark_read(cli: &BeadsCli, repo_root: &Path, agent: &str, issues: &[BdIssue]) -> Result<()> {
-    if issues.is_empty() {
-        return Ok(());
-    }
-    let label = read_label(agent);
-    let actor = actor_arg(agent);
-    let ids: Vec<&str> = issues.iter().map(|i| i.id.as_str()).collect();
-    let mut args = vec!["label", "add"];
-    args.extend(ids.iter().copied());
-    args.push(&label);
-    args.push(&actor);
-    cli.run(repo_root, &args)?;
-
-    let confirmed = show_many(cli, repo_root, &ids)?;
-    let missing: Vec<&str> = confirmed
-        .iter()
-        .filter(|i| {
-            !i.labels
-                .as_deref()
-                .unwrap_or(&[])
-                .iter()
-                .any(|l| l == &label)
-        })
-        .map(|i| i.id.as_str())
-        .collect();
-    if !missing.is_empty() {
-        anyhow::bail!(
-            "label add exited 0 but {label} did not land on: {}",
-            missing.join(", ")
-        );
-    }
-    Ok(())
-}
-
-/// `--actor=<agent>`, so a backend write is attributed to the agent that caused
-/// it rather than to whoever owns the checkout.
-///
-/// Without it every bead mutation from every agent in a fleet is recorded as the
-/// human's `git user.name`, which makes the audit trail useless for exactly the
-/// question it exists to answer: who did this. `send` has always passed it — this
-/// is for the calls that did not.
-///
-/// Both backends accept the same flag, verified rather than assumed:
-///
-/// - `bd` 1.1.2 — `--actor string`, documented precedence `--actor` >
-///   `$BEADS_ACTOR` > `git user.name` > `$USER`.
-/// - `br` 0.2.19 — `--actor <ACTOR>`, alongside a richer per-agent scheme
-///   (`BR_AGENT_NAME`, `BR_HARNESS`, `BR_MODEL`) that pact does not use, because
-///   one flag that works on both beats two mechanisms to keep in step.
-///
-/// Deliberately NOT done by setting `git config user.name`: that would mutate a
-/// checkout other agents share to fake attribution for one of them, which is the
-/// opposite of an audit trail.
-fn actor_arg(agent: &str) -> String {
-    format!("--actor={agent}")
-}
-
-/// Every message bead in the repo, regardless of recipient, oldest first.
-///
-/// `bd list` hides message beads unless `--include-infra` is passed and has no
-/// `--type` filter, so `issue_type == "message"` is filtered client-side; br
-/// has the filter but no `--include-infra`, and the client-side pass is kept for
-/// both so one backend cannot quietly leak non-messages the other rejects.
-/// There is no querying agent here, so `read` is resolved against each
-/// message's own recipient.
-pub fn all_messages(cli: &BeadsCli, repo_root: &Path) -> Result<Vec<Message>> {
-    Ok(to_messages(list_issues(cli, repo_root, None, None)?, None))
-}
-
-/// Messages whose own recipient never marked them read (pact-ler.3), oldest
-/// first.
-///
-/// Leans on [`all_messages`] resolving `read` against each message's own
-/// recipient rather than a querying agent — so this is exactly "nobody the
-/// message was addressed to has acknowledged it", not "I have not read it".
-///
-/// Why this is worth a check of its own: `pact msg sent` already shows a
-/// sender whether their message landed, but only that sender, only for their
-/// own messages, and only if they think to look. A fleet field run
-/// (megablast) ended with one message unacknowledged — an agent warning the
-/// owner of a file it did not own that a constant it had just changed would
-/// panic at runtime if `MAX_QUADS` was not updated with it. The warning was
-/// acted on, correctly, but never marked read, so `pact msg sent` reported it
-/// undelivered permanently and nothing anywhere said so. The contrast case
-/// matters too: an earlier run's three messages all carry `read-by-` labels,
-/// so the acknowledgement mechanism works and is exercised — what was missing
-/// was anything reporting when it did not happen.
-pub fn unacknowledged(cli: &BeadsCli, repo_root: &Path) -> Result<Vec<Message>> {
-    let mut messages = all_messages(cli, repo_root)?;
-    messages.retain(|m| !m.read);
-    Ok(messages)
-}
-
-/// `list --json` output -> issues. bd emits a bare array.
-///
-/// A parse failure here is frequently a backend-shape mismatch rather than a
-/// transient error, so the error path checks the installed backend's version
-/// against pact's tested range (`version_compat_warning`) and folds the hint
-/// in — "outside tested range" turns a bare serde error into an actionable one
-/// instead of leaving the reader to guess why the shape changed.
-fn parse_issues(stdout: &str, cli: &BeadsCli, repo_root: &Path) -> Result<Vec<BdIssue>> {
-    let issues: Vec<BdIssue> = serde_json::from_str(stdout).with_context(|| {
-        let mut msg = format!("parsing `{} list --json` output", cli.binary());
-        if let Ok(version) = cli.version(repo_root) {
-            if let Some(hint) = crate::beads::version_compat_warning(&version) {
-                msg.push_str(&format!(" ({} {version} is {hint})", cli.binary()));
-            }
-        }
-        msg
-    })?;
-    Ok(issues)
-}
-
-/// Issues -> message beads only, oldest first.
-fn to_messages(issues: Vec<BdIssue>, viewer: Option<&str>) -> Vec<Message> {
-    let mut messages: Vec<Message> = issues
-        .into_iter()
-        .filter(|i| i.issue_type == "message")
-        .map(|i| i.into_message(None, viewer))
-        .collect();
-    messages.sort_by(oldest_first);
-    messages
-}
-
-/// pact-rnc.20: compare parsed instants, never the raw strings. Two writers
-/// reach these lists — bd's `Z` and pact's own chrono `+00:00` — and `'+'`
-/// (0x2B) sorts before `'Z'` (0x5A), so a string compare calls an older `Z`
-/// stamp newer than a `+00:00` one. Unparsable sorts oldest (None < Some)
-/// rather than blowing up, same as `agents::parse_ts`.
+/// pact-rnc.20: compare parsed instants, never the raw strings. Two writers reached
+/// these lists in the bd era — bd's `Z` and pact's own chrono `+00:00` — and `'+'`
+/// (0x2B) sorts before `'Z'` (0x5A), so a string compare calls an older `Z` stamp
+/// newer than a `+00:00` one. Only pact writes them now, but a store can still hold
+/// lines from both eras, and unparsable must keep sorting oldest (None < Some) rather
+/// than blowing up.
 fn oldest_first(a: &Message, b: &Message) -> Ordering {
     parse_ts(&a.created_at).cmp(&parse_ts(&b.created_at))
 }
@@ -1383,17 +1020,547 @@ fn record_unread(messages: &[Message], now: DateTime<Utc>) {
 mod tests {
     use super::*;
 
-    fn bd() -> BeadsCli {
-        BeadsCli { binary: "bd" }
+    // ------------------------------------------------ the native store
+    //
+    // Every test below runs with no `bd` anywhere near it. That is not a detail of
+    // the fixtures: there is no longer any code path from a message to a
+    // subprocess, so a store test cannot accidentally be a backend test.
+
+    fn repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        tmp
     }
 
-    /// The pre-br entry point, kept for the tests that predate the split so
-    /// they still assert the same thing about the same bytes.
-    fn parse_messages(stdout: &str, viewer: Option<&str>) -> Result<Vec<Message>> {
-        Ok(to_messages(
-            parse_issues(stdout, &bd(), Path::new("/nonexistent"))?,
-            viewer,
-        ))
+    fn mail<'a>(body: &'a str) -> Draft<'a> {
+        Draft {
+            thread: None,
+            subject: None,
+            body,
+            about: &[],
+            notice: false,
+        }
+    }
+
+    #[test]
+    fn a_send_lands_in_the_recipients_inbox_and_nowhere_else() {
+        let tmp = repo();
+        let root = tmp.path();
+        let sent = send(
+            root,
+            "alpha",
+            &["bravo".into()],
+            Draft {
+                subject: Some("the contract"),
+                ..mail("MAX_QUADS moved")
+            },
+        )
+        .unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].to, "bravo");
+        assert_eq!(sent[0].from, "alpha");
+        assert!(!sent[0].read, "a message is not read by being sent");
+
+        let bravo = inbox(root, "bravo", false).unwrap();
+        assert_eq!(bravo.len(), 1);
+        assert_eq!(bravo[0].body, "MAX_QUADS moved");
+        assert_eq!(bravo[0].subject.as_deref(), Some("the contract"));
+
+        assert!(
+            inbox(root, "charlie", false).unwrap().is_empty(),
+            "an unaddressed agent has an empty inbox, not everyone else's"
+        );
+    }
+
+    #[test]
+    fn one_send_to_many_is_one_row_one_thread_and_one_entry_per_recipient() {
+        let tmp = repo();
+        let root = tmp.path();
+        let sent = send(
+            root,
+            "alpha",
+            &["bravo".into(), "charlie".into()],
+            mail("the enum grew a variant"),
+        )
+        .unwrap();
+
+        // The API fans out, so `--json` still has one entry per recipient and `to` is
+        // still a single agent name.
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].to, "bravo");
+        assert_eq!(sent[1].to, "charlie");
+        assert_eq!(
+            sent[0].thread, sent[1].thread,
+            "one send is one thread, however many recipients"
+        );
+        assert_eq!(
+            sent[0].id, sent[1].id,
+            "and one row, so both copies carry the same id"
+        );
+
+        // The STORE holds one line, not one per recipient. That is the whole reason
+        // the parent-child fan-out could go.
+        let (records, skipped) = records(root).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(skipped, 0);
+        assert_eq!(records[0].to, vec!["bravo", "charlie"]);
+
+        // And a reply from either recipient joins that same thread.
+        let reply = send(
+            root,
+            "charlie",
+            &["alpha".into()],
+            Draft {
+                thread: Some(&sent[1].id),
+                ..mail("which variant?")
+            },
+        )
+        .unwrap();
+        assert_eq!(reply[0].thread, sent[0].thread);
+
+        let thread = read_thread(root, "alpha", &sent[0].id).unwrap();
+        let bodies: Vec<&str> = thread.iter().map(|m| m.body.as_str()).collect();
+        assert!(
+            bodies.contains(&"the enum grew a variant") && bodies.contains(&"which variant?"),
+            "the thread holds both halves of the conversation: {bodies:?}"
+        );
+    }
+
+    #[test]
+    fn sending_the_same_message_twice_delivers_it_once() {
+        let tmp = repo();
+        let root = tmp.path();
+        let first = send(root, "alpha", &["bravo".into()], mail("same words")).unwrap();
+        let again = send(root, "alpha", &["bravo".into()], mail("same words")).unwrap();
+
+        assert_eq!(
+            first[0].id, again[0].id,
+            "the id is a hash of the content, so a replay computes the same one"
+        );
+        let (records, _) = records(root).unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "the duplicate line is collapsed on read, so bravo is told once"
+        );
+        assert_eq!(inbox(root, "bravo", false).unwrap().len(), 1);
+        assert_eq!(
+            records[0].at, first[0].created_at,
+            "and the surviving row keeps the FIRST delivery's timestamp"
+        );
+    }
+
+    /// The property this buys over the bd era, which could not have it: a REPLY is
+    /// idempotent too. On bd the deterministic id could only ride a root message,
+    /// because a create could not carry `--id` alongside `--parent`.
+    #[test]
+    fn a_replayed_reply_is_also_delivered_once() {
+        let tmp = repo();
+        let root = tmp.path();
+        let root_msg = send(root, "alpha", &["bravo".into()], mail("question")).unwrap();
+        let draft = || Draft {
+            thread: Some(&root_msg[0].id),
+            ..mail("answer")
+        };
+        let a = send(root, "bravo", &["alpha".into()], draft()).unwrap();
+        let b = send(root, "bravo", &["alpha".into()], draft()).unwrap();
+        assert_eq!(a[0].id, b[0].id);
+        let (records, _) = records(root).unwrap();
+        assert_eq!(records.len(), 2, "the question and one answer");
+    }
+
+    #[test]
+    fn each_message_chains_to_the_one_before_it() {
+        let tmp = repo();
+        let root = tmp.path();
+        send(root, "alpha", &["bravo".into()], mail("first")).unwrap();
+        send(root, "alpha", &["bravo".into()], mail("second")).unwrap();
+        send(root, "alpha", &["bravo".into()], mail("third")).unwrap();
+
+        let text = std::fs::read_to_string(messages_file_path(root)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+
+        let mut point = crate::events::CHAIN_GENESIS.to_string();
+        for (i, line) in lines.iter().enumerate() {
+            let mut record: Record = serde_json::from_str(line).unwrap();
+            let stored = record.chain_hash.take().expect("every line is chained");
+            let canonical = serde_json::to_string(&record).unwrap();
+            assert_eq!(
+                stored,
+                crate::events::chain_hash_of(&point, &canonical),
+                "line {} does not chain to the one before it",
+                i + 1
+            );
+            point = stored;
+        }
+    }
+
+    #[test]
+    fn a_torn_final_line_is_counted_and_skipped_without_losing_the_rest() {
+        let tmp = repo();
+        let root = tmp.path();
+        send(root, "alpha", &["bravo".into()], mail("survivor")).unwrap();
+
+        // A half-written append: the shape a write that failed on ENOSPC leaves.
+        let path = messages_file_path(root);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("{\"id\":\"pact-msg-000\",\"at\":\"2026-08-13T10:00");
+        std::fs::write(&path, text).unwrap();
+
+        let (rows, skipped) = records(root).unwrap();
+        assert_eq!(skipped, 1, "the torn line is counted, not silently dropped");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body, "survivor");
+
+        // And the next append does not glue itself onto the dangling offset.
+        send(root, "alpha", &["bravo".into()], mail("after the tear")).unwrap();
+        let (rows, skipped) = records(root).unwrap();
+        assert_eq!(skipped, 1, "still one bad line, not two");
+        assert_eq!(rows.len(), 2);
+    }
+
+    // -------------------------------------------------------- read cursors
+
+    #[test]
+    fn reading_a_thread_marks_it_for_that_reader_alone() {
+        let tmp = repo();
+        let root = tmp.path();
+        let sent = send(
+            root,
+            "alpha",
+            &["bravo".into(), "charlie".into()],
+            mail("both of you"),
+        )
+        .unwrap();
+
+        let shown = read_thread(root, "bravo", &sent[0].id).unwrap();
+        assert!(
+            shown.iter().all(|m| m.read),
+            "the reader sees it as read in the same call that recorded it"
+        );
+
+        // bravo's copy is read; charlie's is not. One row, two independent read
+        // positions — the property the per-recipient beads used to provide.
+        let bravo = inbox(root, "bravo", false).unwrap();
+        assert!(bravo[0].read);
+        let charlie = inbox(root, "charlie", false).unwrap();
+        assert!(!charlie[0].read, "charlie has not read anything");
+        assert!(
+            inbox(root, "charlie", true).unwrap().len() == 1,
+            "so it is still in charlie's unread queue"
+        );
+    }
+
+    /// The one thing local read state must still do, and the reason pact-rnc.17
+    /// moved it into bd in the first place: a sender can see that their message
+    /// landed. Within a shared checkout — which is pact's model — a cursor written by
+    /// one agent is readable by another, so `sent` can still answer honestly.
+    #[test]
+    fn a_sender_sees_that_the_recipient_read_it() {
+        let tmp = repo();
+        let root = tmp.path();
+        let posted = send(root, "alpha", &["bravo".into()], mail("please confirm")).unwrap();
+
+        let before = sent(root, "alpha").unwrap();
+        assert!(!before[0].read, "unread until somebody reads it");
+        assert!(before[0].read_by.is_empty());
+
+        read_thread(root, "bravo", &posted[0].id).unwrap();
+
+        let after = sent(root, "alpha").unwrap();
+        assert_eq!(after[0].read_by, vec!["bravo"]);
+        assert!(
+            after[0].read,
+            "`read` on a sender's own listing resolves against the recipient"
+        );
+        assert!(
+            unacknowledged(root).unwrap().is_empty(),
+            "and the message stops being reported as unacknowledged"
+        );
+    }
+
+    #[test]
+    fn re_reading_a_thread_is_idempotent_and_does_not_duplicate_a_reader() {
+        let tmp = repo();
+        let root = tmp.path();
+        let sent = send(root, "alpha", &["bravo".into()], mail("twice")).unwrap();
+        read_thread(root, "bravo", &sent[0].id).unwrap();
+        let second = read_thread(root, "bravo", &sent[0].id).unwrap();
+        assert_eq!(second[0].read_by, vec!["bravo"]);
+    }
+
+    #[test]
+    fn a_malformed_read_cursor_reads_as_having_read_nothing() {
+        let tmp = repo();
+        let root = tmp.path();
+        let sent = send(root, "alpha", &["bravo".into()], mail("hello")).unwrap();
+        read_thread(root, "bravo", &sent[0].id).unwrap();
+
+        std::fs::write(cursor_path(root, "bravo"), "{not json").unwrap();
+        let bravo = inbox(root, "bravo", false).unwrap();
+        assert!(
+            !bravo[0].read,
+            "local, regenerable state: unreadable means 'read nothing', never an error"
+        );
+    }
+
+    /// The property the MCP server depends on: looking does not deliver. An observer
+    /// that marked threads read would tell every sender their message had landed.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn peeking_a_thread_leaves_it_unread() {
+        let tmp = repo();
+        let root = tmp.path();
+        let posted = send(root, "alpha", &["bravo".into()], mail("do not ack me")).unwrap();
+
+        let peeked = peek_thread(root, Some("bravo"), &posted[0].id).unwrap();
+        assert_eq!(peeked.len(), 1);
+        assert!(!peeked[0].read);
+
+        assert!(
+            !inbox(root, "bravo", false).unwrap()[0].read,
+            "peeking must not write a read cursor"
+        );
+        assert_eq!(
+            sent(root, "alpha").unwrap()[0].read_by,
+            Vec::<String>::new(),
+            "and the sender must not be told it landed"
+        );
+    }
+
+    // ------------------------------------------------------ addressing an id
+
+    #[test]
+    fn an_id_prefix_is_enough_to_read_a_thread() {
+        let tmp = repo();
+        let root = tmp.path();
+        let sent = send(root, "alpha", &["bravo".into()], mail("prefix me")).unwrap();
+        let short = &sent[0].id[..14];
+        let shown = read_thread(root, "bravo", short).unwrap();
+        assert_eq!(shown[0].body, "prefix me");
+    }
+
+    #[test]
+    fn an_ambiguous_id_prefix_names_the_candidates_instead_of_guessing() {
+        let tmp = repo();
+        let root = tmp.path();
+        send(root, "alpha", &["bravo".into()], mail("one")).unwrap();
+        send(root, "alpha", &["bravo".into()], mail("two")).unwrap();
+
+        // Every id shares the `pact-msg-` prefix, so that alone is ambiguous.
+        let err = read_thread(root, "bravo", "pact-msg-").unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("matches 2 messages"),
+            "an ambiguous prefix must say so: {text}"
+        );
+        assert!(
+            text.contains("use more of the id"),
+            "and say what to do about it: {text}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_id_is_an_error_and_not_an_empty_thread() {
+        let tmp = repo();
+        let err = read_thread(tmp.path(), "bravo", "pact-msg-nope").unwrap_err();
+        assert!(format!("{err:#}").contains("no message matching"));
+    }
+
+    // -------------------------------------------------------- about a path
+
+    #[test]
+    fn a_message_about_a_path_is_found_by_that_path() {
+        let tmp = repo();
+        let root = tmp.path();
+        send(
+            root,
+            "alpha",
+            &["bravo".into()],
+            Draft {
+                about: &["src/ast.rs".to_string()],
+                ..mail("the visitor signature changed")
+            },
+        )
+        .unwrap();
+        send(root, "alpha", &["bravo".into()], mail("unrelated traffic")).unwrap();
+
+        let about = about_path(root, "src/ast.rs").unwrap();
+        assert_eq!(about.len(), 1);
+        assert_eq!(about[0].body, "the visitor signature changed");
+        assert!(
+            about_path(root, "src/other.rs").unwrap().is_empty(),
+            "another path's traffic is not this path's"
+        );
+    }
+
+    /// Raw paths, where bd labels needed an encoding that turned every `.` into a
+    /// `-`. A dot is in every real filename, so this is the common case, not an edge
+    /// one — and `a.b` and `a-b` used to collapse onto the same tag.
+    #[test]
+    fn two_paths_that_the_old_label_encoding_collapsed_stay_distinct() {
+        let tmp = repo();
+        let root = tmp.path();
+        for path in ["src/a.rs", "src/a-rs"] {
+            send(
+                root,
+                "alpha",
+                &["bravo".into()],
+                Draft {
+                    about: &[path.to_string()],
+                    ..mail(path)
+                },
+            )
+            .unwrap();
+        }
+        let hits = about_path(root, "src/a.rs").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].body, "src/a.rs");
+    }
+
+    // ------------------------------------------------------------- notices
+
+    #[test]
+    fn a_notice_is_classified_by_its_stored_kind() {
+        let tmp = repo();
+        let root = tmp.path();
+        send(
+            root,
+            "alpha",
+            &["bravo".into()],
+            Draft {
+                subject: Some(&format!("src/ast.rs{NOTICE_SUBJECT_MARKER}alpha")),
+                notice: true,
+                ..mail("diff follows")
+            },
+        )
+        .unwrap();
+        let bravo = inbox(root, "bravo", false).unwrap();
+        assert!(bravo[0].notice);
+        let (records, _) = records(root).unwrap();
+        assert_eq!(records[0].kind, NOTICE);
+    }
+
+    /// An agent writing prose that happens to look like a notice is correspondence,
+    /// and this is now true by construction rather than by a three-condition
+    /// heuristic over English: the kind is a field, and no CLI path sets it.
+    #[test]
+    fn prose_that_reads_like_a_notice_is_still_correspondence() {
+        let tmp = repo();
+        let root = tmp.path();
+        send(
+            root,
+            "alpha",
+            &["bravo".into()],
+            Draft {
+                subject: Some(&format!(
+                    "src/ast.rs{NOTICE_SUBJECT_MARKER}alpha, please re-read it"
+                )),
+                ..mail("src/ast.rs changed, which you are watching.")
+            },
+        )
+        .unwrap();
+        let bravo = inbox(root, "bravo", false).unwrap();
+        assert!(
+            !bravo[0].notice,
+            "a message no watch wrote must not be filed as machine noise"
+        );
+    }
+
+    /// pact-rnc.20's ordering rule, still load-bearing: a store can hold lines from
+    /// both eras, bd's `Z` stamps and pact's own `+00:00` ones, and `'+'` (0x2B)
+    /// sorts before `'Z'` (0x5A) — so a string compare calls an older `Z` stamp
+    /// newer than a `+00:00` one.
+    #[test]
+    fn sorting_compares_instants_and_not_raw_stamps() {
+        let mut messages = [authored_msg("newer-offset"), authored_msg("older-zulu")];
+        messages[0].created_at = "2026-08-13T12:00:00+00:00".to_string();
+        messages[1].created_at = "2026-08-13T09:00:00Z".to_string();
+        messages.sort_by(oldest_first);
+        assert_eq!(
+            messages[0].id, "older-zulu",
+            "the earlier instant sorts first regardless of how it spells its zone"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_stamp_sorts_oldest_rather_than_panicking() {
+        let mut messages = [authored_msg("good"), authored_msg("bad")];
+        messages[0].created_at = "2026-08-13T09:00:00Z".to_string();
+        messages[1].created_at = "not a timestamp".to_string();
+        messages.sort_by(oldest_first);
+        assert_eq!(messages[0].id, "bad");
+    }
+
+    #[test]
+    fn send_with_no_recipients_is_an_error() {
+        let tmp = repo();
+        let err = send(tmp.path(), "alpha", &[], mail("into the void")).unwrap_err();
+        assert!(format!("{err:#}").contains("no recipients"));
+    }
+
+    #[test]
+    fn a_message_id_is_stable_across_repeated_calls() {
+        let to = vec!["bravo".to_string()];
+        let a = message_id("alpha", &to, None, "subject", "body");
+        let b = message_id("alpha", &to, None, "subject", "body");
+        assert_eq!(a, b, "the id is a pure function of the send's own content");
+        assert!(a.starts_with("pact-msg-"));
+    }
+
+    #[test]
+    fn a_message_id_differs_when_any_input_differs() {
+        let to = vec!["bravo".to_string()];
+        let base = message_id("alpha", &to, None, "subject", "body");
+        let others = [
+            message_id("other", &to, None, "subject", "body"),
+            message_id("alpha", &["charlie".to_string()], None, "subject", "body"),
+            message_id("alpha", &to, Some("pact-msg-root"), "subject", "body"),
+            message_id("alpha", &to, None, "different", "body"),
+            message_id("alpha", &to, None, "subject", "different"),
+        ];
+        for other in others {
+            assert_ne!(base, other);
+        }
+    }
+
+    /// The recipient LIST is part of the id, so adding a recipient is a different
+    /// message rather than a replay of the smaller send.
+    #[test]
+    fn adding_a_recipient_makes_it_a_different_message() {
+        let one = message_id("alpha", &["bravo".to_string()], None, "s", "b");
+        let two = message_id(
+            "alpha",
+            &["bravo".to_string(), "charlie".to_string()],
+            None,
+            "s",
+            "b",
+        );
+        assert_ne!(one, two);
+    }
+
+    fn notice_msg(id: &str, path: &str, holder: &str, at: &str, read: bool) -> Message {
+        Message {
+            id: id.into(),
+            thread: id.into(),
+            from: holder.into(),
+            to: "watcher".into(),
+            subject: Some(format!("{path}{NOTICE_SUBJECT_MARKER}{holder}")),
+            body: "a diff".into(),
+            created_at: at.into(),
+            read,
+            read_by: Vec::new(),
+            notice: true,
+        }
+    }
+
+    fn authored_msg(id: &str) -> Message {
+        Message {
+            notice: false,
+            subject: Some("six duplicate test fns in src/parser.rs".into()),
+            ..notice_msg(id, "unused", "agent-05", "2026-08-11T09:30:55Z", false)
+        }
     }
 
     #[test]
@@ -1405,582 +1572,6 @@ mod tests {
         let subject = default_subject(&long);
         assert_eq!(subject.chars().count(), 60);
         assert!(subject.ends_with("..."));
-    }
-
-    /// Shape copied from real `bd list --include-infra --json` output, labels
-    /// included (bd hydrates them by default and emits `null` when there are
-    /// none).
-    const LIST_JSON: &str = r#"[
-      {"id":"pact-wisp-1","title":"hi","description":"body one",
-       "assignee":"msg-fix","created_by":"tui-dev","created_at":"2026-07-31T07:20:00Z",
-       "issue_type":"message","labels":["read-by-msg-fix","urgent"]},
-      {"id":"pact-wisp-2","title":"re: hi","description":"body two",
-       "assignee":"msg-fix","created_by":"Clement HUSSENOT-DESENONGES",
-       "created_at":"2026-07-31T07:10:00Z","issue_type":"message","parent":"pact-wisp-1",
-       "labels":null},
-      {"id":"pact-wisp-3","title":"anon","assignee":"msg-fix",
-       "created_at":"2026-07-31T07:30:00Z","issue_type":"message",
-       "labels":["read-by-someone-else"]},
-      {"id":"pact-rnc.1","title":"a real bug, not a message",
-       "created_at":"2026-07-31T07:00:00Z","issue_type":"bug","created_by":"someone"}
-    ]"#;
-
-    #[test]
-    fn parse_messages_keeps_from_and_drops_non_messages() {
-        let msgs = parse_messages(LIST_JSON, None).unwrap();
-
-        // "bug" filtered out client-side; oldest first.
-        let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, ["pact-wisp-2", "pact-wisp-1", "pact-wisp-3"]);
-
-        // from survives the round trip, verbatim -- a pact agent name for
-        // --actor sends, a git user name otherwise, "" when bd reports none.
-        let from: Vec<&str> = msgs.iter().map(|m| m.from.as_str()).collect();
-        assert_eq!(
-            from,
-            ["Clement HUSSENOT-DESENONGES", "tui-dev", ""],
-            "missing created_by must yield \"\", not a panic"
-        );
-
-        // Reply is pinned to its parent thread; roots thread on themselves.
-        assert_eq!(msgs[0].thread, "pact-wisp-1");
-        assert_eq!(msgs[1].thread, "pact-wisp-1");
-        assert_eq!(msgs[2].thread, "pact-wisp-3");
-        assert!(msgs.iter().all(|m| m.to == "msg-fix"));
-        assert_eq!(
-            msgs[2].body, "",
-            "missing description is empty, not a panic"
-        );
-    }
-
-    /// pact-rnc.17: read state is bd labels now, so a sender can see it too.
-    #[test]
-    fn read_by_comes_from_labels_and_read_follows_the_viewer() {
-        let msgs = parse_messages(LIST_JSON, None).unwrap();
-        // Only read-by-* labels land in read_by; "urgent" is not a reader.
-        assert_eq!(msgs[1].read_by, ["msg-fix"]);
-        assert_eq!(msgs[2].read_by, ["someone-else"]);
-        assert!(msgs[0].read_by.is_empty(), "labels:null is not a panic");
-
-        // No viewer (all_messages): read is resolved against the recipient.
-        let read: Vec<bool> = msgs.iter().map(|m| m.read).collect();
-        assert_eq!(read, [false, true, false]);
-
-        // Viewer = the querying agent, whoever the recipient happens to be.
-        let mine: Vec<bool> = parse_messages(LIST_JSON, Some("msg-fix"))
-            .unwrap()
-            .iter()
-            .map(|m| m.read)
-            .collect();
-        assert_eq!(mine, [false, true, false]);
-        let theirs: Vec<bool> = parse_messages(LIST_JSON, Some("someone-else"))
-            .unwrap()
-            .iter()
-            .map(|m| m.read)
-            .collect();
-        assert_eq!(theirs, [false, false, true]);
-    }
-
-    /// What `msg inbox --unread-only` and the TUI's unread badge both do.
-    #[test]
-    fn unread_only_filtering_still_works_off_labels() {
-        let mut msgs = parse_messages(LIST_JSON, Some("msg-fix")).unwrap();
-        msgs.retain(|m| !m.read);
-        let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, ["pact-wisp-2", "pact-wisp-3"]);
-        assert_eq!(msgs.len(), 2, "the unread badge counts these");
-    }
-
-    /// pact-rnc.20: String::cmp gets both of these backwards.
-    #[test]
-    fn sorting_mixes_bd_z_stamps_with_pact_offset_stamps() {
-        const MIXED: &str = r#"[
-          {"id":"pact-0720","title":"pact, 07:20Z written as +02:00","assignee":"a",
-           "created_at":"2026-07-31T09:20:00+02:00","issue_type":"message"},
-          {"id":"bd-0800","title":"bd, 08:00Z","assignee":"a",
-           "created_at":"2026-07-31T08:00:00Z","issue_type":"message"},
-          {"id":"bd-0900","title":"bd, 09:00Z","assignee":"a",
-           "created_at":"2026-07-31T09:00:00Z","issue_type":"message"},
-          {"id":"pact-0900","title":"pact, the same instant as bd-0900","assignee":"a",
-           "created_at":"2026-07-31T09:00:00+00:00","issue_type":"message"}
-        ]"#;
-        // The two bytes that mislead a string compare: '+' (0x2B) sorts before
-        // 'Z' (0x5A), so the same instant from pact looks older than from bd...
-        assert!("2026-07-31T09:00:00+00:00" < "2026-07-31T09:00:00Z");
-        // ...and a local-offset stamp's digits swamp the offset entirely.
-        assert!("2026-07-31T09:20:00+02:00" > "2026-07-31T08:00:00Z");
-
-        let ids: Vec<String> = parse_messages(MIXED, None)
-            .unwrap()
-            .into_iter()
-            .map(|m| m.id)
-            .collect();
-        assert_eq!(
-            ids,
-            ["pact-0720", "bd-0800", "bd-0900", "pact-0900"],
-            "07:20Z < 08:00Z < 09:00Z, and the 09:00 tie keeps input order; \
-             a string sort would say bd-0800, pact-0900, bd-0900, pact-0720"
-        );
-    }
-
-    /// pact-rnc.7: an outbox is a filter on `from`, newest first.
-    #[test]
-    fn sent_is_only_this_agents_sends_newest_first() {
-        // Same body as sent(), which cannot run here (it shells out to bd).
-        let mut msgs = parse_messages(LIST_JSON, None).unwrap();
-        msgs.retain(|m| m.from == "tui-dev");
-        msgs.reverse();
-        assert_eq!(
-            msgs.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            ["pact-wisp-1"],
-            "other agents' sends, and the human's, are not mine"
-        );
-
-        let mut human = parse_messages(LIST_JSON, None).unwrap();
-        human.retain(|m| m.from == "Clement HUSSENOT-DESENONGES");
-        assert_eq!(human.len(), 1);
-
-        // Newest first, unlike every other listing here.
-        let mut all = parse_messages(LIST_JSON, None).unwrap();
-        all.reverse();
-        assert_eq!(all[0].id, "pact-wisp-3");
-    }
-
-    /// pact-rnc.4: recipients 2..N are children of the first one's bead, which
-    /// is what makes them one thread `read_thread` can return whole.
-    #[test]
-    fn multi_recipient_send_parents_the_rest_on_the_root() {
-        let root = create_args(
-            "mascot-dev",
-            None,
-            "animator",
-            "Alarmed loops",
-            "body",
-            &[],
-            false,
-        );
-        assert!(
-            !root.iter().any(|a| a.starts_with("--parent=")),
-            "a new thread's root has no parent: {root:?}"
-        );
-        assert!(root.contains(&"--assignee=mascot-dev".to_string()));
-        assert!(root.contains(&"--actor=animator".to_string()));
-
-        // Second recipient, parented on the root bead the first create returned.
-        let child = create_args(
-            "tui-dev",
-            Some("pact-wisp-a2u"),
-            "animator",
-            "Alarmed loops",
-            "body",
-            &[],
-            false,
-        );
-        assert!(child.contains(&"--parent=pact-wisp-a2u".to_string()));
-        assert!(child.contains(&"--assignee=tui-dev".to_string()));
-        // Same subject and body, one thread — not N near-duplicate threads.
-        assert!(child.contains(&"--title=Alarmed loops".to_string()));
-
-        // Without this, a child inherits the parent's read-by-* labels and is
-        // born "already read" (verified against bd 1.1.0).
-        for args in [&root, &child] {
-            assert!(args.contains(&"--no-inherit-labels".to_string()));
-        }
-    }
-
-    /// pact-m7j.6.4: a retried `create` with identical arguments must produce
-    /// the identical `--id`, or the whole point of the upsert is lost.
-    #[test]
-    fn idempotency_key_is_stable_across_repeated_calls() {
-        let a = idempotency_key("animator", "mascot-dev", None, "Alarmed loops", "body");
-        let b = idempotency_key("animator", "mascot-dev", None, "Alarmed loops", "body");
-        assert_eq!(a, b);
-        assert!(a.starts_with("pact-msg-"));
-    }
-
-    /// Anything that changes what the message actually says or who it is
-    /// between must not collide — that would silently merge two distinct
-    /// messages into one bead, which is the one thing this key must not do.
-    #[test]
-    fn idempotency_key_differs_when_any_input_differs() {
-        let base = idempotency_key("animator", "mascot-dev", None, "subject", "body");
-        let variants = [
-            idempotency_key("tui-dev", "mascot-dev", None, "subject", "body"),
-            idempotency_key("animator", "docs-writer", None, "subject", "body"),
-            idempotency_key(
-                "animator",
-                "mascot-dev",
-                Some("pact-wisp-a2u"),
-                "subject",
-                "body",
-            ),
-            idempotency_key("animator", "mascot-dev", None, "other subject", "body"),
-            idempotency_key("animator", "mascot-dev", None, "subject", "other body"),
-            // Concatenation ambiguity: "sub" + "ject" must not equal "subj" + "ect".
-            idempotency_key("animator", "mascot-dev", None, "subj", "ectbody"),
-        ];
-        for v in variants {
-            assert_ne!(base, v, "distinct inputs collided: {base} == {v}");
-        }
-    }
-
-    /// `create_args` wires the key through with `--force`, and only for bd —
-    /// pact-0re: the branch that turns bd 1.2's refusal into a delivered message
-    /// has to be narrow in both directions, because "the bead is already there"
-    /// and "bd could not write" must never collapse into one answer — only the
-    /// first is safe to report as a successful send.
-    #[test]
-    fn only_our_own_planned_id_already_existing_counts_as_a_delivered_message() {
-        let id = "pact-msg-bf787ceef4d8f3d3";
-        let refusal = anyhow::anyhow!(
-            "bd [\"create\", \"--id={id}\"] failed (exit status: 1): \
-             {{\"error\": \"{id} already exists; use bd update, or bd import for \
-             upsert semantics\"}}"
-        );
-        assert!(is_duplicate_id(&refusal, id));
-
-        // Someone ELSE's id already existing is a real error: a prefix collision
-        // or a hand-run command in the same store is not proof our message landed.
-        assert!(!is_duplicate_id(&refusal, "pact-msg-0000000000000000"));
-
-        // And any other failure stays a failure, however it exits.
-        for other in [
-            "bd not found on PATH",
-            "database is locked",
-            "prefix mismatch: database uses 'proj-' but ID 'pact-msg-x' doesn't match",
-        ] {
-            assert!(
-                !is_duplicate_id(&anyhow::anyhow!("{other}"), id),
-                "must not read {other:?} as a delivered message"
-            );
-        }
-    }
-
-    /// br has no equivalent primitive (module docs) and would reject
-    /// `--no-inherit-labels`-adjacent bd-only flags outright.
-    #[test]
-    fn create_args_passes_a_deterministic_id_and_force() {
-        let bd_args = create_args(
-            "mascot-dev",
-            None,
-            "animator",
-            "subject",
-            "body",
-            &[],
-            false,
-        );
-        let expected_id = format!(
-            "--id={}",
-            idempotency_key("animator", "mascot-dev", None, "subject", "body")
-        );
-        assert!(
-            bd_args.contains(&expected_id),
-            "expected {expected_id} in {bd_args:?}"
-        );
-        assert!(bd_args.contains(&"--force".to_string()));
-    }
-
-    /// pact-m7j.4.7: `about_path` used to fetch every message bead unfiltered
-    /// and filter client-side for the one label it wanted. The label must
-    /// reach the backend's own argv — on both backends, since both support
-    /// `--label` — not just pact's post-filter.
-    #[test]
-    fn list_args_passes_the_label_filter_through_to_both_backends() {
-        let label = "about-src__foo.rs";
-        let args = list_args(None, Some(label));
-        assert!(
-            args.contains(&format!("--label={label}")),
-            "the backend must receive the label filter server-side: {args:?}"
-        );
-    }
-
-    /// `inbox` and `all_messages` call this with `label: None` and must not
-    /// start silently narrowing their listing to one label.
-    #[test]
-    fn list_args_has_no_label_filter_when_none_is_given() {
-        let args = list_args(None, None);
-        assert!(
-            !args.iter().any(|a| a.starts_with("--label=")),
-            "no label requested, none should be sent: {args:?}"
-        );
-    }
-
-    /// The bd branch needs `--include-infra` (message beads are otherwise
-    /// hidden) and the br branch needs `--type=message` (bd has no such
-    /// filter and does it client-side) — a label filter must not replace
-    /// either.
-    #[test]
-    fn list_args_keeps_the_message_filter_alongside_a_label() {
-        let args = list_args(None, Some("about-x"));
-        assert!(args.contains(&"--include-infra".to_string()), "{args:?}");
-        assert!(args.contains(&"--label=about-x".to_string()), "{args:?}");
-    }
-
-    /// `bd create` rejects `--id` together with `--parent` outright — a reply
-    /// (or recipients 2..N of a fan-out) must not carry the idempotency key,
-    /// or every reply in a thread would fail outright. `--force` is still
-    /// needed: bd auto-derives a reply's id from its parent
-    /// (`<parent-id>.1`), and once the parent carries our synthetic id, the
-    /// derived child id fails bd's prefix check too — confirmed by
-    /// reproducing the exact error against a real scratch store.
-    #[test]
-    fn create_args_omits_the_idempotency_key_but_keeps_force_when_there_is_a_parent() {
-        let reply = create_args(
-            "tui-dev",
-            Some("pact-wisp-a2u"),
-            "animator",
-            "subject",
-            "body",
-            &[],
-            false,
-        );
-        assert!(
-            !reply.iter().any(|a| a.starts_with("--id=")),
-            "a reply must not carry --id alongside --parent: {reply:?}"
-        );
-        assert!(
-            reply.contains(&"--force".to_string()),
-            "a reply still needs --force, since its auto-derived id inherits \
-             the parent's prefix mismatch: {reply:?}"
-        );
-        assert!(reply.contains(&"--parent=pact-wisp-a2u".to_string()));
-    }
-
-    /// pact-m7j.10.1: the about-<path> labels must ride the SAME `create` call
-    /// as the bead itself — one argv, one subprocess — so there is no window
-    /// between "bead exists" and "bead is tagged" for a concurrent
-    /// `about_path` read to land in. Before this fix, `send()` created the
-    /// bead here and only tagged it in a second `label add` call after the
-    /// whole recipient loop finished.
-    #[test]
-    fn create_args_folds_about_labels_into_the_same_create_call() {
-        let about = vec!["src/msg.rs".to_string(), "src/main.rs".to_string()];
-        let args = create_args(
-            "mascot-dev",
-            None,
-            "animator",
-            "subject",
-            "body",
-            &about,
-            false,
-        );
-        assert!(
-            args.contains(&"--labels=about-src__msg-rs,about-src__main-rs".to_string()),
-            "expected a single --labels flag carrying both paths: {args:?}"
-        );
-        // No separate tagging call exists any more — create_args builds one
-        // argv and that argv is everything `create()` runs.
-        assert!(!args.iter().any(|a| a == "label" || a == "add"));
-
-        // br takes the same flag as bd, unconditionally.
-        let br_args = create_args(
-            "mascot-dev",
-            None,
-            "animator",
-            "subject",
-            "body",
-            &about,
-            false,
-        );
-        assert!(
-            br_args.contains(&"--labels=about-src__msg-rs,about-src__main-rs".to_string()),
-            "{br_args:?}"
-        );
-    }
-
-    /// The common case (no `--to-owner-of`) must not grow a `--labels` flag it
-    /// has nothing to put in — an empty `--labels=` would be a label named "".
-    #[test]
-    fn create_args_omits_labels_flag_when_about_is_empty() {
-        let args = create_args(
-            "mascot-dev",
-            None,
-            "animator",
-            "subject",
-            "body",
-            &[],
-            false,
-        );
-        assert!(!args.iter().any(|a| a.starts_with("--labels=")), "{args:?}");
-    }
-
-    /// bd's `--no-inherit-labels` only suppresses labels inherited FROM THE
-    /// PARENT — it must not also eat an explicit `--labels` list handed to the
-    /// same `create` call, or a reply that is about a path would be tagged on
-    /// bd's own root message but silently lose the tag on a reply. Verified
-    /// empirically against a real bd 1.1.0 store (see [`encode_path`]'s doc
-    /// comment for the br side of this verification).
-    #[test]
-    fn no_inherit_labels_and_an_explicit_labels_list_coexist_on_bd() {
-        let reply = create_args(
-            "tui-dev",
-            Some("pact-wisp-a2u"),
-            "animator",
-            "subject",
-            "body",
-            &["src/x.rs".to_string()],
-            false,
-        );
-        assert!(reply.contains(&"--no-inherit-labels".to_string()));
-        assert!(reply.contains(&"--labels=about-src__x-rs".to_string()));
-    }
-
-    /// br rejects a label containing `.` outright ("invalid characters (only
-    /// alphanumeric, hyphen, underscore, colon allowed)", exit 4 — confirmed
-    /// against a real br 0.2.19 store). Every real file path has one, so this
-    /// must not reach br's argv unescaped.
-    #[test]
-    fn encode_path_sanitizes_characters_br_labels_reject() {
-        assert_eq!(encode_path("src/otel.rs"), "src__otel-rs");
-        assert_eq!(encode_path("a/b/c"), "a__b__c");
-        assert_eq!(encode_path("plain"), "plain");
-        // The allowed set survives untouched.
-        assert_eq!(encode_path("a-b_c:d"), "a-b_c:d");
-    }
-
-    fn issue(json: &str) -> BdIssue {
-        serde_json::from_str(json).unwrap()
-    }
-
-    /// `into_message`'s `thread` argument overrides the bead's own `parent` — so
-    /// whatever `read_thread` passes there IS the thread every row reports.
-    /// Deliberately not named after the root: the caller is what has to resolve
-    /// the root (see the `walk_to_root` tests), and a literal called
-    /// `"pact-wisp-root"` here made this assertion look like it pinned the root
-    /// when it only pinned the override, and it passed just as happily while
-    /// `read_thread` was passing the queried child id (pact-rnc.4/22).
-    #[test]
-    fn into_message_thread_argument_overrides_the_beads_parent() {
-        let m = issue(
-            r#"{"id":"pact-wisp-9","title":"deep reply","assignee":"human",
-                "created_by":"lease-fix","created_at":"2026-07-31T08:00:00Z",
-                "issue_type":"message","parent":"pact-wisp-8",
-                "labels":["read-by-human"]}"#,
-        )
-        .into_message(Some("whatever-read-thread-passes"), Some("human"));
-        assert_eq!(m.thread, "whatever-read-thread-passes");
-        assert_eq!(m.from, "lease-fix");
-        assert_eq!(m.to, "human");
-        assert!(m.read);
-        assert_eq!(m.read_by, ["human"]);
-    }
-
-    /// pact-rnc.4: the walk that makes every thread member report the same
-    /// thread id. Recipient 2 of a fan-out holds `...8g3.1`; the thread is
-    /// `...8g3`, and a reply parented anywhere else is invisible to the thread.
-    #[test]
-    fn walk_to_root_climbs_to_the_thread_root() {
-        let beads = |id: &str, parent: Option<&str>, kind: &str| {
-            issue(&format!(
-                r#"{{"id":"{id}","title":"t","assignee":"a",
-                     "created_at":"2026-07-31T08:00:00Z","issue_type":"{kind}"
-                     {}}}"#,
-                parent
-                    .map(|p| format!(r#","parent":"{p}""#))
-                    .unwrap_or_default()
-            ))
-        };
-        let chain = |id: &str| match id {
-            "root" => Some(beads("root", None, "message")),
-            "child" => Some(beads("child", Some("root"), "message")),
-            "epic" => Some(beads("epic", None, "epic")),
-            _ => None,
-        };
-
-        // Grandchild -> child -> root, which is the shape today's bug creates.
-        let grandchild = beads("grandchild", Some("child"), "message");
-        assert_eq!(walk_to_root(grandchild, chain).id, "root");
-        // A root walks nowhere.
-        assert_eq!(
-            walk_to_root(beads("root", None, "message"), chain).id,
-            "root"
-        );
-        // A parent bd cannot produce (deleted, or another repo) stops the walk
-        // where it is, rather than failing the read.
-        let orphan = beads("orphan", Some("vanished"), "message");
-        assert_eq!(walk_to_root(orphan, chain).id, "orphan");
-        // `--thread <issue-id>`: the issue is not part of the conversation.
-        let on_an_issue = beads("note", Some("epic"), "message");
-        assert_eq!(walk_to_root(on_an_issue, chain).id, "note");
-    }
-
-    /// Corrupt/hand-edited parents pointing at each other must terminate, not
-    /// hang the CLI — the only reason `MAX_THREAD_DEPTH` exists.
-    #[test]
-    fn walk_to_root_gives_up_on_a_parent_cycle() {
-        let cyclic = |id: &str| {
-            let other = if id == "a" { "b" } else { "a" };
-            Some(issue(&format!(
-                r#"{{"id":"{id}","title":"t","assignee":"x","parent":"{other}",
-                     "created_at":"2026-07-31T08:00:00Z","issue_type":"message"}}"#
-            )))
-        };
-        let start = issue(
-            r#"{"id":"a","title":"t","assignee":"x","parent":"b",
-                "created_at":"2026-07-31T08:00:00Z","issue_type":"message"}"#,
-        );
-        let landed = walk_to_root(start, cyclic);
-        assert!(landed.id == "a" || landed.id == "b", "{}", landed.id);
-    }
-
-    /// The label `mark_read` writes must be the label `into_message` reads.
-    #[test]
-    fn the_read_label_write_and_read_paths_agree() {
-        let json = format!(
-            r#"[{{"id":"m","title":"t","assignee":"msg-fix",
-                  "created_at":"2026-07-31T07:00:00Z","issue_type":"message",
-                  "labels":["{}"]}}]"#,
-            read_label("msg-fix")
-        );
-        let msgs = parse_messages(&json, Some("msg-fix")).unwrap();
-        assert!(msgs[0].read);
-        assert_eq!(msgs[0].read_by, ["msg-fix"]);
-    }
-
-    /// pact-l94: `bd list --json` is a bare array, `br list --json` an envelope.
-    /// The string below is real output, trimmed to the fields pact reads.
-    #[test]
-    fn list_parsing_reads_bds_bare_array() {
-        assert_eq!(
-            parse_issues(LIST_JSON, &bd(), Path::new("/nonexistent"))
-                .unwrap()
-                .len(),
-            4
-        );
-    }
-
-    /// pact-m7j.6.2: a parse failure caused by a backend-shape mismatch should
-    /// say so, using the tested-version-range check pact already has
-    /// (`version_compat_warning`) instead of leaving the reader with a bare
-    /// serde error. `binary` is directly settable to any program (see the
-    /// hung-child test in `beads.rs`), so a tiny script standing in for `br`
-    /// prints a known out-of-range version on `--version` without needing a
-    /// real backend on PATH.
-    #[test]
-    fn parse_failure_folds_in_the_tested_range_hint_for_an_out_of_range_backend() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let script = tmp.path().join("fake-bd");
-        std::fs::write(&script, "#!/bin/sh\necho 'bd version 9.9.9'\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // Leaked to get the `&'static str` the field requires; a test-only,
-        // one-time leak of a temp path is not a real leak.
-        let binary: &'static str =
-            Box::leak(script.to_string_lossy().into_owned().into_boxed_str());
-        let cli = BeadsCli { binary };
-
-        let err = parse_issues("not json", &cli, tmp.path())
-            .expect_err("malformed stdout must not parse");
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("outside tested range"),
-            "expected the tested-range hint in the parse error, got: {message}"
-        );
-        assert!(
-            message.contains("1.1.0") && message.contains("1.3.0"),
-            "expected the actual tested bounds, got: {message}"
-        );
     }
 
     /// pact-aw7.4: the counter that says whether the fleet adopted
@@ -2077,79 +1668,6 @@ mod tests {
         assert_eq!(age_ms("not a timestamp", now), None);
     }
 
-    /// pact-rnc.4: sending to nobody is a mistake, not a silent no-op. Bails
-    /// before bd is ever spawned, hence the deliberately bogus binary.
-    #[test]
-    fn send_with_no_recipients_is_an_error() {
-        let cli = BeadsCli {
-            binary: "pact-definitely-not-bd",
-        };
-        let err = send(
-            &cli,
-            Path::new("/nonexistent"),
-            "msg-fix",
-            &[],
-            Draft {
-                thread: None,
-                subject: None,
-                body: "body",
-                about: &[],
-                notice: false,
-            },
-        )
-        .expect_err("empty --to must not be accepted");
-        assert!(err.to_string().contains("no recipients"), "{err}");
-    }
-
-    // -------------------------------------------------- watch notices (mqw.5)
-
-    fn notice_msg(id: &str, path: &str, holder: &str, at: &str, read: bool) -> Message {
-        Message {
-            id: id.into(),
-            thread: id.into(),
-            from: holder.into(),
-            to: "watcher".into(),
-            subject: Some(format!("{path}{NOTICE_SUBJECT_MARKER}{holder}")),
-            body: "a diff".into(),
-            created_at: at.into(),
-            read,
-            read_by: Vec::new(),
-            notice: true,
-        }
-    }
-
-    fn authored_msg(id: &str) -> Message {
-        Message {
-            notice: false,
-            subject: Some("six duplicate test fns in src/parser.rs".into()),
-            ..notice_msg(id, "unused", "agent-05", "2026-08-11T09:30:55Z", false)
-        }
-    }
-
-    /// The label is what makes the distinction, not the wording of the body.
-    #[test]
-    fn a_watch_notice_is_recognised_by_its_label_not_its_text() {
-        let tagged = issue(
-            r#"{"id":"pact-msg-1","title":"src/ast.rs changed","assignee":"watcher",
-                "created_by":"agent-01","created_at":"2026-08-11T09:30:50Z",
-                "issue_type":"message","labels":["about-src__ast-rs","watch-notice"]}"#,
-        )
-        .into_message(None, Some("watcher"));
-        assert!(tagged.notice, "the watch-notice label marks a notice");
-
-        // Same wording, no label: authored. An agent writing "src/ast.rs
-        // changed — released by me" by hand must not be filtered out of its
-        // recipient's inbox.
-        let lookalike = issue(
-            r#"{"id":"pact-msg-2","title":"src/ast.rs changed — released by agent-01",
-                "assignee":"watcher","created_by":"agent-01",
-                "created_at":"2026-08-11T09:30:50Z","issue_type":"message",
-                "labels":["about-src__ast-rs"]}"#,
-        )
-        .into_message(None, Some("watcher"));
-        assert!(!lookalike.notice, "prose must not make something a notice");
-    }
-
     /// The crucible shape: nine deliveries of one path in nine seconds. One
     /// entry, count 9, and the LATEST releaser — the only one whose diff is
     /// still current.
@@ -2222,104 +1740,5 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].path, "something else entirely");
         assert_eq!(groups[0].count, 1);
-    }
-
-    /// pact-mqw.11: the tag is forward-only, and on a real store that cost the
-    /// whole point of the fix — nine agents' inboxes returned identical counts with
-    /// and without `--include-watch`, because every notice already in the store
-    /// predates the label. Recovering those leans on the fact that pact WROTE them:
-    /// their shape is a format string, not user text.
-    #[test]
-    fn a_notice_written_before_the_tag_existed_is_still_recognised() {
-        // Exactly what pact's watch notices looked like before the tag.
-        let legacy = issue(
-            r#"{"id":"pact-msg-old","title":"src/ast.rs changed — released by agent-01",
-                "description":"agent-01 released src/ast.rs, which you are watching. What changed while they held it:\n\n@@ -1 +1 @@\n",
-                "assignee":"agent-05","created_by":"agent-01",
-                "created_at":"2026-08-11T09:30:50Z","issue_type":"message",
-                "labels":["about-src__ast-rs"]}"#,
-        )
-        .into_message(None, Some("agent-05"));
-        assert!(
-            legacy.notice,
-            "an untagged message in pact's own notice shape must classify"
-        );
-    }
-
-    /// The cost of a false positive here is the one thing this feature exists to
-    /// prevent: silently filing a real warning as machine noise. So the fallback is
-    /// anchored to the FULL shape, and each of these fails a different anchor.
-    #[test]
-    fn a_human_writing_the_same_phrase_is_never_reclassified() {
-        let authored = |title: &str, body: &str| {
-            issue(&format!(
-                r#"{{"id":"pact-msg-h","title":"{title}","description":"{body}",
-                    "assignee":"agent-05","created_by":"agent-06",
-                    "created_at":"2026-08-11T09:30:55Z","issue_type":"message"}}"#
-            ))
-            .into_message(None, Some("agent-05"))
-            .notice
-        };
-
-        // Prose after the holder name: the second half is not an agent name.
-        assert!(!authored(
-            "src/ast.rs changed — released by agent-01, please re-read it",
-            "agent-01 released src/ast.rs, which you are watching."
-        ));
-        // The right subject shape, but no body anchor — one half of a format string
-        // is not the format string.
-        assert!(!authored(
-            "src/ast.rs changed — released by agent-01",
-            "heads up, I think this needs another look"
-        ));
-        // The phrase quoted mid-sentence.
-        assert!(!authored(
-            "re: your note",
-            "you said src/ast.rs changed — released by agent-01, which you are watching."
-        ));
-        // And the marker twice, which is prose rather than a subject.
-        assert!(!authored(
-            "a.rs changed — released by b.rs changed — released by c",
-            "x released y, which you are watching."
-        ));
-    }
-
-    /// The label wins, always. A tagged message must never depend on prose, so the
-    /// heuristic can only ever ADD to what the tag already knows.
-    #[test]
-    fn the_tag_classifies_on_its_own_without_help_from_the_subject() {
-        let tagged = issue(
-            r#"{"id":"pact-msg-new","title":"anything at all","description":"and any body",
-                "assignee":"agent-05","created_by":"agent-01",
-                "created_at":"2026-08-11T09:30:50Z","issue_type":"message",
-                "labels":["watch-notice"]}"#,
-        )
-        .into_message(None, Some("agent-05"));
-        assert!(tagged.notice);
-    }
-
-    /// The label has to ride the SAME create call as the about-<path> labels —
-    /// a second `label add` leaves a window in which the bead is neither
-    /// findable by path nor recognisable as a notice.
-    #[test]
-    fn create_args_folds_the_notice_label_in_with_the_about_labels() {
-        let about = vec!["src/ast.rs".to_string()];
-        let args = create_args("watcher", None, "agent-01", "s", "b", &about, true);
-        assert!(
-            args.contains(&"--labels=about-src__ast-rs,watch-notice".to_string()),
-            "{args:?}"
-        );
-        // And a notice with no path still gets the label.
-        let bare = create_args("watcher", None, "agent-01", "s", "b", &[], true);
-        assert!(
-            bare.contains(&"--labels=watch-notice".to_string()),
-            "{bare:?}"
-        );
-        // An authored message is never tagged.
-        let authored = create_args("watcher", None, "agent-01", "s", "b", &about, false);
-        assert!(
-            authored.contains(&"--labels=about-src__ast-rs".to_string()),
-            "{authored:?}"
-        );
     }
 }

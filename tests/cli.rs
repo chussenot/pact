@@ -1285,21 +1285,19 @@ fn inbox_json(repo: &Path, agent: &str) -> serde_json::Value {
     json_stdout(&out)
 }
 
-/// pact-rnc.4, the half that only a live bd can prove: one send, several
-/// recipients, ONE thread — and every surface agreeing on its id.
+/// pact-rnc.4: one send is one thread, however many recipients, and every
+/// recipient can reply into it from the id their own inbox shows them.
 ///
-/// The trap this pins: recipients 2..N get their own child bead, and `msg read`
-/// used to report *that* id as the thread. `msg inbox`'s human output prints no
-/// thread column, so `msg read` is where a recipient learns the id — and a reply
-/// parented on a child becomes a grandchild that `msg read <root>` (direct
-/// children only) never shows. The shared decision fragments again, one hop later,
-/// for exactly the agents multi-recipient send was built for.
+/// Since pact-as5.3 they also share one ID, because one send is now one STORED ROW
+/// rather than N beads — a bead has exactly one assignee, a row carries a recipient
+/// list. The parent-child fan-out that made N beads read as one conversation is gone
+/// with the constraint that forced it.
+///
+/// No `bd_repo` gate any more: messages are pact's own file, so this test runs on
+/// every machine instead of skipping wherever the issue tracker is not installed.
 #[test]
 fn every_recipient_of_a_fan_out_sees_one_thread_and_can_reply_into_it() {
-    let Some(tmp) = bd_repo("every_recipient_of_a_fan_out_sees_one_thread_and_can_reply_into_it")
-    else {
-        return;
-    };
+    let tmp = init_repo();
     assert_ok(&pact(
         tmp.path(),
         "alpha",
@@ -1322,52 +1320,35 @@ fn every_recipient_of_a_fan_out_sees_one_thread_and_can_reply_into_it() {
         .expect("bravo got a message")
         .to_string();
     assert_eq!(bravo[0]["thread"], serde_json::json!(root));
+    assert_eq!(bravo[0]["to"], serde_json::json!("bravo"), "{bravo}");
 
     let charlie = inbox_json(tmp.path(), "charlie");
     let charlie_id = charlie[0]["id"]
         .as_str()
         .expect("charlie got a message")
         .to_string();
-    assert_ne!(charlie_id, root, "recipient 2 has its own bead");
     assert_eq!(
-        charlie[0]["thread"],
-        serde_json::json!(root),
-        "inbox reports the root: {charlie}"
+        charlie_id, root,
+        "one send is one row, so both recipients see the same id"
     );
+    assert_eq!(
+        charlie[0]["to"],
+        serde_json::json!("charlie"),
+        "but each sees their own copy addressed to them: {charlie}"
+    );
+    assert_eq!(charlie[0]["thread"], serde_json::json!(root));
 
-    // The surface a recipient actually learns the thread id from must say the
-    // same thing — and reading her own copy must give her the conversation, not
-    // a one-message "thread".
+    // Reading her own copy must give charlie the conversation, and a reply into it
+    // must reach the thread rather than starting a new one.
     let read = pact(
         tmp.path(),
         "charlie",
         &["msg", "read", &charlie_id, "--json"],
     );
     assert_ok(&read);
-    let thread = json_stdout(&read);
-    assert_eq!(
-        thread.as_array().map(Vec::len),
-        Some(2),
-        "reading a non-root member must return the whole thread: {thread}"
-    );
-    for m in thread.as_array().unwrap() {
-        assert_eq!(
-            m["thread"],
-            serde_json::json!(root),
-            "two pact commands must not disagree about the thread id: {m}"
-        );
-    }
-    // Human output too, since that is what an agent reads by default.
-    let human = pact(tmp.path(), "charlie", &["msg", "read", &charlie_id]);
-    assert_ok(&human);
-    assert!(
-        stdout_of(&human).contains(&format!("thread: {root}")),
-        "{}",
-        stdout_of(&human)
-    );
+    assert_eq!(json_stdout(&read)[0]["thread"], serde_json::json!(root));
 
-    // Now follow the CLI's own output: reply with the id charlie was handed.
-    let reply = pact(
+    assert_ok(&pact(
         tmp.path(),
         "charlie",
         &[
@@ -1377,31 +1358,20 @@ fn every_recipient_of_a_fan_out_sees_one_thread_and_can_reply_into_it() {
             "alpha",
             "--thread",
             &charlie_id,
-            "--subject",
-            "re: shared decision",
-            "charlie acks",
+            "works for me",
         ],
-    );
-    assert_ok(&reply);
-    assert!(
-        stdout_of(&reply).contains(&format!("thread {root}")),
-        "a reply from any member belongs to the root thread: {}",
-        stdout_of(&reply)
-    );
-
-    let as_alpha = pact(tmp.path(), "alpha", &["msg", "read", &root, "--json"]);
-    assert_ok(&as_alpha);
-    let full = json_stdout(&as_alpha);
-    let bodies: Vec<&str> = full
+    ));
+    let thread = pact(tmp.path(), "alpha", &["msg", "read", &root, "--json"]);
+    assert_ok(&thread);
+    let bodies: Vec<String> = json_stdout(&thread)
         .as_array()
-        .unwrap()
+        .expect("array")
         .iter()
-        .map(|m| m["body"].as_str().unwrap_or_default())
+        .map(|m| m["body"].as_str().unwrap_or_default().to_string())
         .collect();
     assert!(
-        bodies.contains(&"charlie acks"),
-        "the ack must be in the thread everyone reads, not an invisible \
-         grandchild: {full}"
+        bodies.iter().any(|b| b == "friday?") && bodies.iter().any(|b| b == "works for me"),
+        "the reply joined the thread it was sent into: {bodies:?}"
     );
 }
 
@@ -1472,19 +1442,17 @@ fn reading_a_message_clears_the_readers_unread_and_shows_the_sender_it_landed() 
     );
 }
 
-/// pact-m7j.6.6: `mark_read` used to trust `label add`'s exit code with no
-/// re-read to confirm the specific label landed — unlike `lease.rs`'s
-/// `verify_own_lease`, built for the identical shape of problem ("a rename
-/// reporting success is not proof you're the one who ends up holding it").
-/// This checks the label independently of pact's own read path, by shelling
-/// out to the real `bd` binary directly instead of asking `pact msg inbox`
-/// (which would just re-exercise the same `show`/`list` code the fix itself
-/// calls).
+/// `msg read` must record the read somewhere a SEPARATE reader can confirm, not
+/// just report it back on its own stdout — that independence is the whole point,
+/// because `msg sent` telling a sender their message landed is only worth anything
+/// if the record behind it is real.
+///
+/// This used to check bd for a `read-by-<agent>` label. The record is now
+/// `.pact/read/<agent>.json`, so the independent check reads that file directly
+/// rather than asking a subprocess. Same argument, one less dependency.
 #[test]
-fn reading_a_message_lands_the_read_by_label_verified_independently_via_bd() {
-    let Some(tmp) = bd_repo("reading_a_message_lands_the_read_by_label_verified") else {
-        return;
-    };
+fn reading_a_message_records_it_where_the_sender_can_see_it() {
+    let tmp = init_repo();
     assert_ok(&pact(
         tmp.path(),
         "sender-agent",
@@ -1504,24 +1472,25 @@ fn reading_a_message_lands_the_read_by_label_verified_independently_via_bd() {
 
     assert_ok(&pact(tmp.path(), "reader-agent", &["msg", "read", &id]));
 
-    let shown = Command::new("bd")
-        .args(["show", &id, "--json"])
-        .current_dir(tmp.path())
-        .output()
-        .expect("bd show");
-    assert!(shown.status.success(), "{}", stderr_of(&shown));
-    // `bd show <id> --json` returns an array even for one id (same shape
-    // show_many's own doc comment in msg.rs describes).
-    let issues: serde_json::Value =
-        serde_json::from_slice(&shown.stdout).expect("bd show --json output");
-    let labels: Vec<&str> = issues[0]["labels"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
+    // The cursor on disk, read without going through pact at all.
+    let cursor = tmp.path().join(".pact/read/reader-agent.json");
+    let raw = std::fs::read_to_string(&cursor)
+        .unwrap_or_else(|e| panic!("no read cursor at {}: {e}", cursor.display()));
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("cursor is JSON");
     assert!(
-        labels.contains(&"read-by-reader-agent"),
-        "bd's own record must carry the read-by label, verified independently \
-         of pact's own read path: {labels:?}"
+        parsed["read"].get(&id).is_some(),
+        "the cursor must name the message that was read: {raw}"
+    );
+
+    // And the sender sees it, which is what the record exists for.
+    let outbox = pact(tmp.path(), "sender-agent", &["msg", "sent", "--json"]);
+    assert_ok(&outbox);
+    let sent = json_stdout(&outbox);
+    assert_eq!(sent[0]["read"], serde_json::json!(true), "{sent}");
+    assert_eq!(
+        sent[0]["read_by"],
+        serde_json::json!(["reader-agent"]),
+        "{sent}"
     );
 }
 
@@ -3378,122 +3347,39 @@ fn doctor_flags_a_state_dir_shared_with_an_unrelated_repository() {
     );
 }
 
-/// pact-m7j.10.7: `conflicting_stores` had exactly one call site in the whole
-/// binary — `doctor.rs`. Reproduced live: with the identical on-disk conflict
-/// the test above exercises, `pact doctor` warned correctly and, seconds
-/// later, `pact msg inbox` against the SAME repo reported "inbox empty", exit
-/// 0, and said nothing about the second store it was silently ignoring.
-/// `msg.rs`, `run_msg` and the MCP message tools had no side channel to report
-/// it. This is the plumbing fix: `run_msg` now calls the same
-/// `beads::conflict_warning` doctor.rs does, so the fact reaches stderr on
-/// every msg invocation where it is true.
+/// pact-m7j.10.7 plumbed `beads::conflict_warning` into `run_msg`, because a
+/// second, shadowed Beads store made `pact msg inbox` report "inbox empty", exit 0,
+/// and say nothing about the store it was silently ignoring.
+///
+/// **That warning is now WRONG on this command and has been removed.** `msg inbox`
+/// reads `.pact/messages.jsonl`; no Beads store, shadowed or otherwise, can affect
+/// what it returns, so repeating the fact here would be telling an agent about a
+/// dependency this command does not have. The fact itself has not stopped
+/// mattering — `pact doctor` still reports it, and this test now pins BOTH halves so
+/// the warning cannot quietly disappear from the command that should still make it.
 #[test]
-fn msg_inbox_names_a_conflicting_store_on_its_own_stderr() {
-    let Some(tmp) = bd_repo("msg_inbox_names_a_conflicting_store_on_its_own_stderr") else {
+fn a_conflicting_store_is_doctors_business_and_no_longer_msg_inboxs() {
+    let Some(tmp) = bd_repo("a_conflicting_store_is_doctors_business") else {
         return;
     };
-    // The stray br store beside the real bd one `bd_repo` just created — the
-    // forward-order half of pact-nv4's own incident, reused here rather than
-    // invented fresh so this test is provably the same conflict doctor sees.
+    // The same on-disk conflict pact-nv4 reproduced live: a stray br-era sqlite
+    // store beside the real bd one.
     std::fs::write(tmp.path().join(".beads").join("beads.db"), "").unwrap();
 
     let out = pact(tmp.path(), "someone", &["msg", "inbox"]);
     assert_ok(&out);
-    assert_eq!(
-        stdout_of(&out).trim(),
-        "inbox empty",
-        "the resolution itself is unchanged by this fix — bd is still queried"
-    );
+    assert_eq!(stdout_of(&out).trim(), "inbox empty");
     let stderr = stderr_of(&out);
     assert!(
-        stderr.contains("two stores in .beads/") && stderr.contains("beads.db"),
-        "msg inbox must name the conflict pact doctor already sees, not stay \
-         silent about it: {stderr}"
+        !stderr.contains("two stores in .beads/"),
+        "msg inbox must not warn about a store it does not read: {stderr}"
     );
-}
 
-/// pact-m7j.10.6, the reverse-order half of the same incident, reproduced
-/// exactly: `br init`, then a REAL message (`br create` with a live
-/// `--assignee`), then `bd init` in the same `.beads/`. `bd init` succeeds at
-/// exit 0 with no warning of its own and leaves its empty `embeddeddolt/` as
-/// what `BeadsCli::locate()` reads from then on — confirmed live via `bd list
-/// --json` returning `[]` while `br list --json` still shows the record.
-/// `PACT_AGENT=someone pact msg inbox`, the exact command AGENTS.md tells
-/// every agent to run first, used to answer "inbox empty" with no hint that
-/// its own recipient's real message was sitting one directory entry away.
-///
-/// Fixing the tiebreak itself (data-aware `classify_workspace`, or refusing
-/// `bd init` outright over a non-empty store) is a declined-for-now
-/// architecture question — see `beads::conflict_warning`'s doc comment. What
-/// this test proves is the mitigation: the silence is gone even though the
-/// resolution is not.
-#[test]
-fn msg_inbox_beside_a_leftover_sqlite_store_still_warns() {
-    let tmp = init_repo();
-
-    let on_path = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|d| d.join("bd").is_file()))
-        .unwrap_or(false);
-    if !on_path {
-        eprintln!(
-            "SKIP msg_inbox_beside_a_leftover_sqlite_store_still_warns: \
-             bd not found on PATH"
-        );
-        return;
-    }
-
-    // The two-store condition is built on DISK rather than by running `bd init`
-    // over the br store (pact-0re).
-    //
-    // That is how this fixture used to work, and bd 1.2 now refuses it outright:
-    // "historical SQLite workspace detected; explicit migration is required
-    // before this bd version can open or modify the workspace". br refuses the
-    // reverse order too. So neither tool will create this state any more — which
-    // is an upstream fix, and does NOT retire pact's warning: bd's own error
-    // tells the user to preserve `.beads` and migrate, so repositories that were
-    // already in this state stay in it across the upgrade, and those are exactly
-    // the ones the warning is for.
-    //
-    // `conflicting_stores` looks for a Dolt directory beside a `.db` file, both
-    // of which are plain filesystem facts, so a real `bd init` plus a planted
-    // sibling reproduces the condition precisely — and keeps bd's store real, so
-    // the "bd answers and the br message is invisible" half below still means
-    // something.
-    let br_db = tmp.path().join(".beads").join("beads.db");
-    std::fs::remove_dir_all(tmp.path().join(".beads")).ok();
-    let bd_init = Command::new("bd")
-        .arg("init")
-        .current_dir(tmp.path())
-        .output()
-        .expect("bd init");
+    let doc = pact(tmp.path(), "someone", &["doctor"]);
+    let doc_out = format!("{}{}", stdout_of(&doc), stderr_of(&doc));
     assert!(
-        bd_init.status.success(),
-        "bd init on a clean repo must succeed: {}",
-        stderr_of(&bd_init)
-    );
-    std::fs::write(&br_db, b"SQLite format 3\0").unwrap();
-    assert!(
-        tmp.path().join(".beads/embeddeddolt").is_dir() && br_db.is_file(),
-        "the fixture must present both stores, or it proves nothing"
-    );
-
-    let out = pact(tmp.path(), "someone", &["msg", "inbox"]);
-    assert_ok(&out);
-    // (a) the underlying resolution is unchanged by design: bd's freshly
-    // created, empty store is still what answers, so the real message stays
-    // invisible here — that is the declined tiebreak change, not a bug this
-    // fix introduces.
-    assert_eq!(
-        stdout_of(&out).trim(),
-        "inbox empty",
-        "bd's own store has no messages, and that tiebreak is not what this fix changes"
-    );
-    // (b) but the mitigation fires in exactly this reverse-order scenario,
-    // not only the forward one the previous test covers.
-    let stderr = stderr_of(&out);
-    assert!(
-        stderr.contains("two stores in .beads/"),
-        "must name the conflict in the br-then-bd order this bug reproduced: {stderr}"
+        doc_out.contains("two stores in .beads/") && doc_out.contains("beads.db"),
+        "doctor still owns this fact: {doc_out}"
     );
 }
 
@@ -3807,17 +3693,25 @@ fn leasing_a_path_with_no_messages_about_it_says_nothing_extra() {
     );
 }
 
-/// pact-m7j.10.3: with no Beads CLI reachable at all, the check that would
-/// have surfaced a genuine unread message must say it could not run — not
-/// print nothing, which was byte-identical to the genuinely clean case above.
+/// This test used to assert the opposite, and the inversion is the point of
+/// pact-as5.
+///
+/// `lease acquire` checks whether a message is waiting on the path being claimed.
+/// That check went through bd, so with no backend on `PATH` the best pact could do
+/// was admit it had not looked — "could not check for pending messages" — and the
+/// test pinned that admission, because looking clean when you have not checked is
+/// worse than saying so.
+///
+/// There is nothing left to admit. The check reads `.pact/messages.jsonl`, so a
+/// machine with no issue tracker installed gets the real answer: the waiting message
+/// is found and named. The warning this test was built to protect is now unreachable
+/// and gone.
 #[test]
-fn no_backend_on_path_reports_a_check_failure_not_silence() {
-    let Some(tmp) = bd_repo("no_backend_on_path_reports_a_check_failure") else {
-        return;
-    };
-    // A genuine unread message about src/x.rs, sent while bd is still
-    // reachable, so the ONLY thing missing for the acquire below is the
-    // backend to check it with.
+fn a_message_waiting_on_a_path_is_found_with_no_backend_on_path() {
+    let tmp = init_repo();
+
+    // A genuine unread message about src/x.rs, addressed to the path rather than to
+    // a name — the delivery mechanism that used to need a backend most.
     assert_ok(&pact(
         tmp.path(),
         "first-owner",
@@ -3834,38 +3728,37 @@ fn no_backend_on_path_reports_a_check_failure_not_silence() {
         &["msg", "send", "--to-owner-of", "src/x.rs", "body"],
     ));
 
-    // Acquire again with PATH pointing at an empty directory: no bd, no br.
+    // Acquire with PATH pointing at an empty directory: no bd anywhere.
     let empty_path = tmp.path().join("no-backend-here");
     std::fs::create_dir(&empty_path).unwrap();
     let mut cmd = pact_cmd(tmp.path(), &["lease", "acquire", "src/x.rs"]);
     cmd.env("PACT_AGENT", "no-backend-agent")
         .env("PATH", &empty_path);
-    let broken = cmd.output().expect("failed to run pact binary");
-    assert_ok(&broken);
-    let broken_stderr = stderr_of(&broken);
+    let out = cmd.output().expect("failed to run pact binary");
+    assert_ok(&out);
+    let stderr = stderr_of(&out);
     assert!(
-        broken_stderr.contains("could not check for pending messages"),
-        "a missing backend must say so, not look clean: {broken_stderr}"
+        stderr.contains("1 unread message(s) about src/x.rs"),
+        "the waiting message must be FOUND with no backend, not excused: {stderr}"
+    );
+    assert!(
+        !stderr.contains("could not check for pending messages"),
+        "and there is nothing left to apologise for: {stderr}"
     );
 
-    // The genuinely clean comparison: healthy backend, a path with nothing to
-    // report. Before this fix these two cases were byte-identical (both
-    // printed nothing extra); now only this one is quiet.
-    let clean = pact(
-        tmp.path(),
-        "no-backend-agent",
-        &["lease", "acquire", "quiet.rs"],
-    );
-    assert_ok(&clean);
-    let clean_stderr = stderr_of(&clean);
-    assert!(
-        !clean_stderr.contains("could not check"),
-        "a genuinely healthy, clean check must not also claim it could not check: {clean_stderr}"
-    );
-    assert_ne!(
-        broken_stderr, clean_stderr,
-        "a missing backend and a genuinely clean path must not read the same"
-    );
+    // The whole `msg` surface works there too, which is what makes exit 3
+    // unreachable from these paths.
+    for args in [
+        vec!["msg", "inbox"],
+        vec!["msg", "sent"],
+        vec!["msg", "send", "--to", "someone", "offline mail"],
+    ] {
+        let mut cmd = pact_cmd(tmp.path(), &args);
+        cmd.env("PACT_AGENT", "no-backend-agent")
+            .env("PATH", &empty_path);
+        let out = cmd.output().expect("failed to run pact binary");
+        assert_ok(&out);
+    }
 }
 
 /// A repo that has never run `bd`/`br init` at all — no `.beads/`, ever — has
@@ -4004,46 +3897,37 @@ fn prior_owner_and_to_owner_of_agree_across_cwd_relative_spellings() {
     );
 }
 
-/// pact-m7j.10.8: `encode_path`'s charset was narrowed after `br` was found
-/// to reject a `.` outright. A message tagged with the OLDER, wider encoding
-/// — the shape a live `bd` store could genuinely hold from before that fix —
-/// must still be found by `about_path`'s query, via the legacy-encoding
-/// fallback, not silently stop matching just because the current encoding
-/// changed. Bypasses pact's own `msg send` (which always tags with the
-/// CURRENT encoding) and creates the label directly via `bd`, the only way
-/// to reproduce the pre-fix on-disk shape.
+/// pact-m7j.10.1/10.8 existed because an about-tag was a bd LABEL, and bd labels
+/// could not hold a path. `/` became `__` and every byte outside
+/// `[A-Za-z0-9_:-]` became `-`, which meant `a.b` and `a-b` collapsed onto the same
+/// tag — and once the charset was narrowed, queries needed a second fallback pass in
+/// the older encoding to find anything tagged before the change.
+///
+/// A row in `.pact/messages.jsonl` stores the raw path, so the encoding, the
+/// collision and the fallback query are all gone. This is the property that replaces
+/// them: two paths the old encoding could not tell apart stay distinct end to end.
 #[test]
-fn an_about_tag_using_the_pre_charset_fix_encoding_is_still_found() {
-    let Some(tmp) = bd_repo("an_about_tag_using_the_pre_charset_fix_encoding") else {
-        return;
-    };
+fn two_paths_the_old_label_encoding_collapsed_stay_distinct() {
+    let tmp = init_repo();
+    // `--to-owner-of` is what tags a message with a path, and it needs the path to
+    // have an owner — so lease and release each one first.
+    for path in ["src/a.rs", "src/a-rs"] {
+        assert_ok(&pact(tmp.path(), "owner-a", &["lease", "acquire", path]));
+        assert_ok(&pact(tmp.path(), "owner-a", &["lease", "release", path]));
+        assert_ok(&pact(
+            tmp.path(),
+            "sender",
+            &["msg", "send", "--to-owner-of", path, path],
+        ));
+    }
 
-    // The legacy encoding for src/foo.rs: only "/" became "__", so the "."
-    // survives — exactly what pact would have written before pact-m7j.10.1
-    // narrowed the charset, and exactly what br's own label validator
-    // rejects today (this label only ever existed on a live bd store).
-    let created = Command::new("bd")
-        .args([
-            "create",
-            "--type=message",
-            "--title=heads up",
-            "--description=old encoding",
-            "--assignee=recipient",
-            "--actor=sender",
-            "--labels=about-src__foo.rs",
-            "--json",
-        ])
-        .current_dir(tmp.path())
-        .output()
-        .expect("bd create");
-    assert!(created.status.success(), "{}", stderr_of(&created));
-
-    let checked = pact(tmp.path(), "recipient", &["lease", "acquire", "src/foo.rs"]);
-    assert_ok(&checked);
+    // Leasing one of them must surface only ITS message.
+    let out = pact(tmp.path(), "next-owner", &["lease", "acquire", "src/a.rs"]);
+    assert_ok(&out);
+    let stderr = stderr_of(&out);
     assert!(
-        stderr_of(&checked).contains("unread message"),
-        "a legacy-encoded about-tag must still be found via the fallback query: {}",
-        stderr_of(&checked)
+        stderr.contains("1 unread message(s) about src/a.rs"),
+        "exactly one, for the dotted path only: {stderr}"
     );
 }
 
@@ -4387,109 +4271,18 @@ fn a_retried_send_reports_the_original_created_at_not_the_retrys() {
     );
 }
 
-/// A stand-in `bd` that fails outright when asked to create a bead for
-/// `fail_for`, and forwards to the real `bd` (resolved once, from the current
-/// PATH, before this directory is ever prepended to one) for everything else.
-/// Lets a test force a partial fan-out failure at a specific recipient
-/// against a REAL backend (pact-m7j.6.5), instead of guessing at a bd
-/// argument shape that happens to error.
-fn bd_wrapper_that_fails_for(fail_for: &str) -> TempDir {
-    let real_bd = std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-        .map(|dir| dir.join("bd"))
-        .find(|p| p.is_file())
-        .expect("real bd must be on PATH for this test");
-    let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("bd");
-    std::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\nfor a in \"$@\"; do\n  \
-             if [ \"$a\" = \"--assignee={fail_for}\" ]; then\n    \
-             echo 'synthetic failure for testing' >&2\n    exit 7\n  fi\n\
-             done\nexec {real} \"$@\"\n",
-            fail_for = fail_for,
-            real = real_bd.display(),
-        ),
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(&script).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&script, perms).unwrap();
-    dir
-}
-
-/// Like [`pact`], but with `path_prefix` searched before the rest of `PATH` —
-/// so a wrapper binary placed there shadows the real one for this call only,
-/// without touching any other test's environment.
-fn pact_with_path_prefix(repo: &Path, agent: &str, args: &[&str], path_prefix: &Path) -> Output {
-    let existing = std::env::var_os("PATH").unwrap_or_default();
-    let new_path = std::env::join_paths(
-        std::iter::once(path_prefix.to_path_buf()).chain(std::env::split_paths(&existing)),
-    )
-    .unwrap();
-    pact_cmd(repo, args)
-        .env("PACT_AGENT", agent)
-        .env("PATH", new_path)
-        .output()
-        .expect("failed to run pact binary")
-}
-
-/// pact-m7j.6.5: replaying a partially-failed multi-recipient send with
-/// `--skip` for the recipients an earlier attempt's `--json` error already
-/// named as sent must not duplicate delivery to them, and must still attempt
-/// the recipient that actually failed.
+/// pact-m7j.6.5 built `--skip` so a PARTIALLY failed multi-recipient send could be
+/// replayed without re-delivering to whoever already got it: bd needed one `create`
+/// per recipient, so recipient 3 could fail after 1 and 2 had landed, and the error
+/// carried an `already_sent` list for the retry to skip.
+///
+/// A send is one append now. It cannot partially fail, so `already_sent` has nothing
+/// to report and that JSON error shape is gone. `--skip` survives as what it always
+/// literally was — leave this recipient out — and this test pins that, plus the
+/// atomicity that made the rest unnecessary.
 #[test]
-fn a_partially_failed_send_replays_safely_with_skip() {
-    let Some(tmp) = bd_repo("a_partially_failed_send_replays_safely_with_skip") else {
-        return;
-    };
-    let wrapper = bd_wrapper_that_fails_for("agent-d");
-
-    // agent-b (recipient 1, thread root) and agent-c (recipient 2) succeed;
-    // agent-d (recipient 3) fails.
-    let failed = pact_with_path_prefix(
-        tmp.path(),
-        "sender",
-        &[
-            "msg",
-            "send",
-            "--to",
-            "agent-b",
-            "--to",
-            "agent-c",
-            "--to",
-            "agent-d",
-            "--subject",
-            "shared decision",
-            "--json",
-            "friday?",
-        ],
-        wrapper.path(),
-    );
-    assert_eq!(
-        failed.status.code(),
-        Some(1),
-        "a partial failure is still a failure: {}",
-        stderr_of(&failed)
-    );
-    // pact-m7j.5.1: this JSON object is on stdout now, not stderr — every
-    // --json failure gets its structured shape on the same stream a
-    // successful --json run uses.
-    let err = json_stdout(&failed);
-    let already_sent: Vec<&str> = err["already_sent"]
-        .as_array()
-        .unwrap_or_else(|| panic!("already_sent missing or not an array: {err}"))
-        .iter()
-        .map(|v| v.as_str().unwrap())
-        .collect();
-    assert_eq!(already_sent, ["agent-b", "agent-c"], "{err}");
-    assert_eq!(err["failed_at"], "agent-d", "{err}");
-
-    // Replay with --skip for the two recipients the failed attempt's JSON
-    // already said got it. No wrapper this time: agent-d succeeds.
+fn skip_leaves_a_recipient_out_and_a_send_is_all_or_nothing() {
+    let tmp = init_repo();
     assert_ok(&pact(
         tmp.path(),
         "sender",
@@ -4502,43 +4295,55 @@ fn a_partially_failed_send_replays_safely_with_skip() {
             "agent-c",
             "--to",
             "agent-d",
-            "--subject",
-            "shared decision",
-            "--skip",
-            "agent-b",
             "--skip",
             "agent-c",
+            "--subject",
+            "shared decision",
             "friday?",
         ],
     ));
 
-    for agent in ["agent-b", "agent-c", "agent-d"] {
-        let inbox = inbox_json(tmp.path(), agent);
-        assert_eq!(
-            inbox.as_array().map(Vec::len),
-            Some(1),
-            "{agent} must end up with exactly one bead: {inbox}"
-        );
-    }
+    assert_eq!(
+        inbox_json(tmp.path(), "agent-b").as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        inbox_json(tmp.path(), "agent-d").as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        inbox_json(tmp.path(), "agent-c").as_array().map(Vec::len),
+        Some(0),
+        "the skipped recipient got nothing"
+    );
+
+    // One row for the whole send: agent-b and agent-d share an id and a thread.
+    let b = inbox_json(tmp.path(), "agent-b");
+    let d = inbox_json(tmp.path(), "agent-d");
+    assert_eq!(b[0]["id"], d[0]["id"]);
+    assert_eq!(b[0]["thread"], d[0]["thread"]);
 }
 
-/// The other half of pact-m7j.6.5: a naive identical replay (no `--skip`) is
-/// deliberately UNCHANGED by this fix. bd's own `--id`/`--force` upsert
-/// (pact-m7j.6.4) already protects the thread ROOT — the first `--to` — from
-/// duplicating on an identical retry; that upsert key is only computed when
-/// there is no `--parent`, so recipients 2..N of a fan-out carry no such
-/// protection and still duplicate. Confirmed against real bd 1.1.2: this is
-/// the actual pre-existing behavior, not a hypothetical the fix leaves alone.
+/// The defect this test used to PIN is fixed, so it now asserts the fix.
+///
+/// The deterministic id protected root messages only, because a bd `create` could not
+/// carry `--id` alongside `--parent` — so recipients 2..N of a fan-out, and every
+/// reply, were created without one. A sender who followed `msg sent`'s own advice and
+/// re-sent an unconfirmed message duplicated delivery to exactly those recipients.
+/// This test named that asymmetry so nobody mistook the id for full protection.
+///
+/// A row in a file has no such restriction. Every recipient of every send, reply
+/// included, is covered by the same content hash, so a naive replay is a no-op
+/// throughout.
 #[test]
-fn a_naive_replay_without_skip_still_duplicates_non_root_recipients() {
-    let Some(tmp) = bd_repo("a_naive_replay_without_skip_still_duplicates_non_root_recipients")
-    else {
-        return;
+fn a_naive_replay_duplicates_nothing_for_any_recipient() {
+    let tmp = init_repo();
+    let send = |args: &[&str]| {
+        let mut all = vec!["msg", "send"];
+        all.extend_from_slice(args);
+        assert_ok(&pact(tmp.path(), "sender", &all));
     };
-    let wrapper = bd_wrapper_that_fails_for("agent-d");
-    let send_args: &[&str] = &[
-        "msg",
-        "send",
+    let fan_out = [
         "--to",
         "agent-b",
         "--to",
@@ -4549,29 +4354,42 @@ fn a_naive_replay_without_skip_still_duplicates_non_root_recipients() {
         "shared decision",
         "friday?",
     ];
+    send(&fan_out);
+    send(&fan_out); // the naive replay
 
-    let failed = pact_with_path_prefix(tmp.path(), "sender", send_args, wrapper.path());
-    assert_eq!(failed.status.code(), Some(1), "{}", stderr_of(&failed));
+    for who in ["agent-b", "agent-c", "agent-d"] {
+        assert_eq!(
+            inbox_json(tmp.path(), who).as_array().map(Vec::len),
+            Some(1),
+            "{who} must be told once, not twice"
+        );
+    }
 
-    // Naive identical replay: no --skip, no wrapper (agent-d succeeds now).
-    assert_ok(&pact(tmp.path(), "sender", send_args));
-
-    assert_eq!(
-        inbox_json(tmp.path(), "agent-b").as_array().map(Vec::len),
-        Some(1),
-        "the thread root is already protected by pact-m7j.6.4's --id upsert"
-    );
-    assert_eq!(
-        inbox_json(tmp.path(), "agent-c").as_array().map(Vec::len),
-        Some(2),
-        "recipient 2 carries no --id and duplicates on a naive replay — \
-         the gap --skip exists to let a sender avoid, left unchanged here"
-    );
-    assert_eq!(
-        inbox_json(tmp.path(), "agent-d").as_array().map(Vec::len),
-        Some(1),
-        "agent-d only ever succeeded once, on the replay"
-    );
+    // And a REPLY replays clean too, which is the half bd could not protect at all.
+    let root = inbox_json(tmp.path(), "agent-b")[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for _ in 0..2 {
+        assert_ok(&pact(
+            tmp.path(),
+            "agent-b",
+            &[
+                "msg",
+                "send",
+                "--to",
+                "sender",
+                "--thread",
+                &root,
+                "works for me",
+            ],
+        ));
+    }
+    let replies: usize = inbox_json(tmp.path(), "sender")
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or_default();
+    assert_eq!(replies, 1, "the replayed reply is one message, not two");
 }
 
 /// Deduping must not reorder a genuine fan-out: the thread root is the first

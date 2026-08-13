@@ -1885,14 +1885,11 @@ pub fn export(
     // Best-effort by design: a repo with no `.beads/` or no backend on PATH
     // is not a repo with a messaging problem, and `doctor` above already
     // reports a missing CLI on its own line.
-    let unacknowledged_messages = if repo_root.join(".beads").exists() {
-        crate::beads::BeadsCli::locate()
-            .ok()
-            .and_then(|cli| crate::msg::unacknowledged(&cli, repo_root).ok())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    // No `.beads` gate and no backend probe: messages are pact's own file now, so
+    // "this repo has no issue tracker" says nothing about whether it has
+    // unacknowledged mail. Still best-effort — an unreadable store is not a
+    // messaging finding.
+    let unacknowledged_messages = crate::msg::unacknowledged(repo_root).unwrap_or_default();
 
     let mut observations = Vec::new();
     if double_win.findings() > 0 {

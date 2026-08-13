@@ -638,8 +638,7 @@ impl Server {
             }
             "pact_msg_inbox" => {
                 let agent = required_str(args, "agent")?;
-                let cli = beads::BeadsCli::locate()?;
-                let messages = msg::inbox(&cli, &self.root, agent, flag(args, "unread_only"))?;
+                let messages = msg::inbox(&self.root, agent, flag(args, "unread_only"))?;
                 self.wrap_messages(messages)
             }
             // `peek_thread`, NOT `read_thread`: the latter writes a
@@ -647,8 +646,7 @@ impl Server {
             "pact_msg_thread" => {
                 let id = required_str(args, "id")?;
                 let viewer = args.get("agent").and_then(Value::as_str);
-                let cli = beads::BeadsCli::locate()?;
-                self.wrap_messages(msg::peek_thread(&cli, &self.root, viewer, id)?)
+                self.wrap_messages(msg::peek_thread(&self.root, viewer, id)?)
             }
             "pact_doctor" => Ok(serde_json::to_value(doctor::checks(&self.root))?),
             // Reads `.pact/events.jsonl` only, like every other tool here — and

@@ -418,18 +418,14 @@ fn main() {
         }
         Err(e) => {
             let code = output::code_for(&e);
-            // A `--json` caller gets a single parseable document on stdout
-            // for EVERY failing exit code (pact-m7j.5.1), not only a
-            // partially-failed `msg send`'s already-structured
-            // `already_sent`/`--skip` shape (pact-m7j.6.5) — which this
-            // still prefers verbatim over the generic fallback wherever it
-            // applies, rather than replacing it. Without `--json`, the
-            // human-readable text is unchanged and stays on stderr.
+            // A `--json` caller gets a single parseable document on stdout for
+            // EVERY failing exit code (pact-m7j.5.1). There used to be a second,
+            // richer shape here for a partially-failed `msg send`
+            // (`already_sent`/`--skip`, pact-m7j.6.5); a send is one append now, so
+            // it cannot partially fail and that shape has nothing left to report.
+            // Without `--json`, the human-readable text stays on stderr.
             if json {
-                match msg::json_send_failure(&e) {
-                    Some(structured) => output::line(&structured),
-                    None => output::emit_error_json(&e, code),
-                }
+                output::emit_error_json(&e, code);
             } else {
                 output::warn(&format!("error: {e:#}"));
             }
@@ -1354,8 +1350,7 @@ fn run_agents(cwd: &Path, json: bool, for_path: Option<&str>) -> Result<()> {
     // `agents::list` covers bd being present but unable to answer, folding that
     // into the same lease-only listing with a warning on stderr. So this `?` is
     // now only for unreadable lease files (pact-rnc.6).
-    let cli = beads::BeadsCli::locate().ok();
-    let found = agents::list(cli.as_ref(), &root)?;
+    let found = agents::list(&root)?;
 
     output::emit(json, &found, |found: &Vec<agents::AgentInfo>| {
         if found.is_empty() {
@@ -1459,22 +1454,12 @@ enum MessageCheck {
 /// to check IS worth surfacing (see [`MessageCheck::Failed`]) — something
 /// that was set up is now unreachable.
 fn messages_about(root: &Path, paths: &[String], agent: &str) -> Vec<MessageCheck> {
-    let shared_root = repo::RepoContext::resolve(root).shared_root;
-    if !shared_root.join(".beads").exists() {
-        return paths.iter().map(|_| MessageCheck::Clean).collect();
-    }
-    let cli = match beads::BeadsCli::locate() {
-        Ok(cli) => cli,
-        Err(e) => {
-            return vec![MessageCheck::Failed(format!(
-                "note: could not check for pending messages about {}: {e:#}",
-                paths.join(", ")
-            ))];
-        }
-    };
+    // No `.beads` gate any more: that guard existed because a repo with no Beads
+    // store could hold no messages. Messages are pact's own file now, so a repo
+    // that has never seen the issue tracker can still have mail waiting on a path.
     paths
         .iter()
-        .map(|path| check_one_path(msg::about_path(&cli, root, path), path, agent))
+        .map(|path| check_one_path(msg::about_path(root, path), path, agent))
         .collect()
 }
 
@@ -1816,16 +1801,17 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
 
 fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) -> Result<()> {
     let root = repo::find_repo_root(cwd)?;
-    // `pact doctor` already detects a second, ignored Beads store
-    // (pact-nv4), but nothing routed that fact through the commands that
-    // actually query one — an agent running `pact msg inbox` against a repo
-    // with a shadowed store saw "inbox empty" and no hint why (pact-m7j.10.7).
-    // Every invocation, not just the first: this process has no memory of a
-    // previous run, and the fact is as true on the tenth call as the first.
-    if let Some(warning) = beads::conflict_warning(&root) {
-        output::warn(&warning);
-    }
-    let cli = beads::BeadsCli::locate()?;
+    // No backend probe, and no conflicting-store warning (pact-as5.3).
+    //
+    // Both existed because `pact msg` QUERIED a Beads store: the `locate()?` made
+    // every message command exit 3 when `bd` was missing, and the warning explained
+    // an "inbox empty" that was really a second, shadowed store being read
+    // (pact-m7j.10.7). Messages live in `.pact/messages.jsonl` now, so neither fact
+    // can affect an inbox, and repeating them here would be telling an agent about a
+    // dependency this command no longer has. `pact doctor` still reports both.
+    //
+    // This is what makes exit 3 unreachable from every `msg` path — see the
+    // exit-code table in README.md.
     let agent = identity::resolve_agent(agent_flag)?;
     match action {
         MsgAction::Send {
@@ -1944,9 +1930,8 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
                 check_recipient(recipient)?;
             }
             // One registry lookup for all recipients, not one per --to.
-            warn_if_unknown(&cli, &root, &to);
+            warn_if_unknown(&root, &to);
             let sent = msg::send(
-                &cli,
                 &root,
                 &agent,
                 &to,
@@ -1985,7 +1970,7 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
             Ok(())
         }
         MsgAction::Sent => {
-            let messages = msg::sent(&cli, &root, &agent)?;
+            let messages = msg::sent(&root, &agent)?;
             output::emit(json, &messages, |messages: &Vec<msg::Message>| {
                 if messages.is_empty() {
                     format!("{agent} has sent nothing yet")
@@ -2008,7 +1993,7 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
             } else {
                 msg::WatchView::Authored
             };
-            let messages = msg::inbox(&cli, &root, &agent, unread_only)?;
+            let messages = msg::inbox(&root, &agent, unread_only)?;
             // `--json` is never coalesced: a machine can group for itself, and
             // collapsing nine deliveries into one entry would cost it their ids.
             // The flags choose which messages it sees and nothing else.
@@ -2027,7 +2012,7 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
             Ok(())
         }
         MsgAction::Read { id } => {
-            let thread = msg::read_thread(&cli, &root, &agent, &id)?;
+            let thread = msg::read_thread(&root, &agent, &id)?;
             output::emit(json, &thread, |thread: &Vec<msg::Message>| {
                 render_full(&thread.iter().collect::<Vec<_>>())
             });
@@ -2074,7 +2059,7 @@ fn run_log(cwd: &Path, json: bool, limit: usize) -> Result<()> {
         })
         .collect();
 
-    match beads::BeadsCli::locate().and_then(|cli| msg::all_messages(&cli, &root)) {
+    match msg::all_messages(&root) {
         Ok(messages) => feed.extend(messages.into_iter().map(|m| LogEvent {
             at: m.created_at,
             agent: m.from,
@@ -2179,8 +2164,8 @@ fn check_recipient(to: &str) -> Result<()> {
 /// fleet legitimately messages agents that have not acted yet, so this must
 /// never become a wall — and a lookup that only feeds a warning must never
 /// break a send, hence the swallowed error.
-fn warn_if_unknown(cli: &beads::BeadsCli, root: &Path, to: &[String]) {
-    let known = agents::list(Some(cli), root).unwrap_or_default();
+fn warn_if_unknown(root: &Path, to: &[String]) {
+    let known = agents::list(root).unwrap_or_default();
     for recipient in to {
         if let Some(warning) = unknown_recipient_warning(&known, recipient) {
             output::warn(&warning);

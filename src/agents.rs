@@ -14,7 +14,6 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::beads::BeadsCli;
 use crate::{identity, lease, msg};
 
 #[derive(Debug, Serialize)]
@@ -91,17 +90,17 @@ impl AgentInfo {
 }
 
 /// Identities seen holding leases or in message traffic, most-recent first.
-/// `cli` is None when bd is unavailable: lease-derived agents only, never an
-/// error, so `pact agents` still works without bd the way `pact lease` does.
 ///
-/// "bd unavailable" means *cannot answer*, not just *not installed*: a bd that
-/// is on PATH but has no reachable database is the common case in a fresh repo,
-/// and it used to take the whole command down with it (pact-rnc.6). The lease
-/// half is on disk and readable, so it is still reported.
+/// Both halves are pact's own files now, so there is no backend to be missing and
+/// no `cli` to pass. This used to take an `Option<&BeadsCli>` because the message
+/// half went through bd, and "bd unavailable" meant *cannot answer* rather than
+/// *not installed* — a bd on PATH with no reachable database was the common case in
+/// a fresh repo and once took the whole command down with it (pact-rnc.6). That
+/// failure mode no longer exists.
 ///
 /// Reads leases with `lease::peek`, not `lease::list`: asking who is active
 /// must not change the answer (pact-rnc.19).
-pub fn list(cli: Option<&BeadsCli>, repo_root: &Path) -> Result<Vec<AgentInfo>> {
+pub fn list(repo_root: &Path) -> Result<Vec<AgentInfo>> {
     let mut seen: BTreeMap<String, AgentInfo> = BTreeMap::new();
 
     for entry in lease::peek(repo_root, true)? {
@@ -123,18 +122,16 @@ pub fn list(cli: Option<&BeadsCli>, repo_root: &Path) -> Result<Vec<AgentInfo>> 
         Err(e) => crate::output::warn(&format!("warning: lease history unavailable: {e:#}")),
     }
 
-    if let Some(cli) = cli {
-        match msg::all_messages(cli, repo_root) {
-            Ok(messages) => {
-                for m in messages {
-                    observe(&mut seen, &m.from, &m.created_at).messages_sent += 1;
-                    observe(&mut seen, &m.to, &m.created_at).messages_received += 1;
-                }
+    match msg::all_messages(repo_root) {
+        Ok(messages) => {
+            for m in messages {
+                observe(&mut seen, &m.from, &m.created_at).messages_sent += 1;
+                observe(&mut seen, &m.to, &m.created_at).messages_received += 1;
             }
-            // Loud but not fatal: the caller asked who is working here, and the
-            // lease answer is still true.
-            Err(e) => crate::output::warn(&format!("warning: message history unavailable: {e:#}")),
         }
+        // Loud but not fatal: the caller asked who is working here, and the lease
+        // answer is still true.
+        Err(e) => crate::output::warn(&format!("warning: message history unavailable: {e:#}")),
     }
 
     let mut agents: Vec<AgentInfo> = seen.into_values().collect();
@@ -365,16 +362,16 @@ mod tests {
         assert_eq!(find(&agents, "human").messages_received, 1);
     }
 
-    /// Without bd we still answer "who is working here" from lease files alone.
+    /// Leases alone answer "who is working here", with no message traffic at all.
     #[test]
-    fn list_works_without_bd() {
+    fn list_reports_lease_holders_with_no_messages_in_the_repo() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir(root.join(".git")).unwrap();
         lease::acquire(root, "tui-dev", "src/tui.rs", 900, false, None).unwrap();
         lease::acquire(root, "msg-fix", "src/msg.rs", 900, false, None).unwrap();
 
-        let agents = list(None, root).unwrap();
+        let agents = list(root).unwrap();
         assert_eq!(agents.len(), 2);
         assert_eq!(find(&agents, "tui-dev").leases_held, 1);
         assert_eq!(find(&agents, "msg-fix").messages_sent, 0);
@@ -382,22 +379,37 @@ mod tests {
         assert!(!is_known(&agents, "tui-de"), "is_known is exact");
     }
 
-    /// pact-rnc.6: bd on PATH but unable to answer must degrade to the lease
-    /// half, not take the command down. A binary that does not exist stands in
-    /// for "no beads database" — both are `cli.run` returning Err.
+    /// pact-rnc.6 used to live here: bd on PATH but unable to answer had to degrade
+    /// to the lease half instead of taking the command down, and the test stood a
+    /// non-existent binary in for "no beads database". Both halves are pact's own
+    /// files now, so that failure mode is gone rather than handled — what is worth
+    /// asserting instead is that BOTH halves are counted, which is the property the
+    /// degradation path used to put at risk.
     #[test]
-    fn list_degrades_when_bd_cannot_answer() {
+    fn list_counts_lease_holders_and_message_traffic_together() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir(root.join(".git")).unwrap();
         lease::acquire(root, "tui-dev", "src/tui.rs", 900, false, None).unwrap();
+        msg::send(
+            root,
+            "tui-dev",
+            &["msg-fix".to_string()],
+            msg::Draft {
+                thread: None,
+                subject: None,
+                body: "the pane moved",
+                about: &[],
+                notice: false,
+            },
+        )
+        .unwrap();
 
-        let broken = BeadsCli {
-            binary: "pact-definitely-not-bd",
-        };
-        let agents = list(Some(&broken), root).expect("a broken bd must not fail the listing");
-        assert_eq!(agents.len(), 1);
+        let agents = list(root).expect("listing must not fail");
+        assert_eq!(agents.len(), 2, "the sender and the recipient");
         assert_eq!(find(&agents, "tui-dev").leases_held, 1);
+        assert_eq!(find(&agents, "tui-dev").messages_sent, 1);
+        assert_eq!(find(&agents, "msg-fix").messages_received, 1);
     }
 
     /// pact-rnc.5: one typo'd send used to register the typo forever, so every

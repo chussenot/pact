@@ -54,24 +54,6 @@ fn have_git() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// Is a Beads CLI reachable?
-///
-/// Needed because exit 3 has two causes and only one of them is about topology.
-/// `BeadsCli::locate()` runs before the bare-repo check, so with no backend at all
-/// `msg send` refuses with "no Beads CLI found on PATH" — also exit 3, also
-/// correct, and not the message the topology assertion is looking for.
-///
-/// This mattered: the assertion below passed locally for four days and failed on
-/// every CI push in that window, because ci.yml installs no Beads CLI and a
-/// developer machine has one. An assertion that can only be reached in one
-/// environment has to say so.
-fn have_beads() -> bool {
-    Command::new("bd")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
 /// A real repository with one commit, plus a linked worktree on its own branch.
 /// Returns (tempdir, main worktree, linked worktree).
 fn repo_with_worktree(branch: &str, wt_name: &str) -> (TempDir, PathBuf, PathBuf) {
@@ -584,7 +566,7 @@ fn release_after_a_scope_change_names_the_other_candidate_directory() {
 /// (f) Bare repository plus worktrees: leases anchor inside the common gitdir,
 /// and messaging refuses instead of creating a store somewhere nobody will find.
 #[test]
-fn a_worktree_of_a_bare_repo_anchors_state_and_refuses_messaging() {
+fn a_worktree_of_a_bare_repo_anchors_state_and_can_message() {
     if !have_git() {
         eprintln!("SKIP: no git on PATH");
         return;
@@ -637,42 +619,36 @@ fn a_worktree_of_a_bare_repo_anchors_state_and_refuses_messaging() {
     assert!(doc.contains("common-gitdir"), "{doc}");
     assert!(doc.contains("BARE"), "{doc}");
 
-    // Messaging refuses with exit 3 either way, and that much is asserted
-    // unconditionally: a bare worktree cannot message, and neither can a machine
-    // with no backend. `--to` a name that does not exist is fine — the refusal
-    // comes before any recipient resolution.
+    // Messaging WORKS here now, and that is the change worth pinning.
+    //
+    // This used to assert exit 3 unconditionally: a bare worktree could not message,
+    // because `bd` needs a working tree and `locate()` ran before anything else. So
+    // the topology that most needs coordination — several worktrees off one bare
+    // clone — was the one topology where agents could not talk to each other.
+    // `.pact/messages.jsonl` lives under the resolved shared root, which for a bare
+    // repo is the common gitdir, so a send is just an append there.
     let sent = pact(&wt, "agent-a", &["msg", "send", "--to", "agent-b", "hello"]);
     assert_eq!(
         sent.status.code(),
-        Some(3),
-        "bare topology must refuse messaging with exit 3; stderr: {}",
+        Some(0),
+        "a bare worktree can message now; stderr: {}",
         stderr(&sent)
     );
-    let why = stderr(&sent);
-    if have_beads() {
-        // Only reachable with a backend installed: `locate()` runs first, so
-        // without one the "no Beads CLI on PATH" refusal wins — a truer answer to
-        // a more fundamental problem, and the reason this branch is conditional
-        // rather than the assertion being weakened for everyone.
-        assert!(why.contains("BARE"), "must explain the topology: {why}");
-        assert!(
-            why.contains("Leases and the event log work") || why.contains("messaging does not"),
-            "must say what still works: {why}"
-        );
-    } else {
-        // Since 0.8.0 there is one backend, so this names it rather than saying
-        // "no Beads CLI found" — a reader who has to go install something is
-        // better served by the binary's name than by a category.
-        assert!(
-            why.contains("bd") && why.contains("not found on PATH"),
-            "with no backend, exit 3 should name the CLI to install: {why}"
-        );
-    }
-    // Nothing was created in the worktree as a side effect of refusing.
+    // Anchored beside the leases, in the common gitdir, not in the worktree.
     assert!(
-        !wt.join(".beads").exists(),
-        "refusing must not leave a Beads store behind"
+        bare.join("pact/messages.jsonl").is_file(),
+        "expected the store at {}",
+        bare.join("pact/messages.jsonl").display()
     );
+    assert!(
+        !wt.join(".pact").exists(),
+        "still no worktree-local fallback"
+    );
+
+    // And it is readable from the worktree that sent it.
+    let inbox = pact(&wt, "agent-b", &["msg", "inbox"]);
+    assert!(inbox.status.success(), "{}", stderr(&inbox));
+    assert!(stdout(&inbox).contains("hello"), "{}", stdout(&inbox));
 }
 
 /// (g) A `.git` file pact cannot follow: local fallback, a doctor warning, and no
