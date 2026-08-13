@@ -88,6 +88,10 @@ jobs:
             /tmp/audit.txt
             /tmp/audit.json
             .pact/events.jsonl
+            # The communication half of the same run: audit's own summary reports on
+            # messages, so uploading the log without the store gives a reader half
+            # the evidence the report is about.
+            .pact/messages.jsonl
           if-no-files-found: warn
           retention-days: 90
 

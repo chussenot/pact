@@ -29,22 +29,36 @@ One orchestrator, agents in waves, one git worktree per agent per wave.
 3. **Agents commit in their own worktree**, so `git blame` attributes work to the
    agent that did it.
 4. **The orchestrator merges each worktree at wave end**, one merge commit per
-   worktree per wave, then checkpoints `.pact/events.jsonl` and
-   `.beads/interactions.jsonl` in a `chore:` commit for the wave.
+   worktree per wave, then checkpoints `.pact/events.jsonl`,
+   `.pact/messages.jsonl` and `.beads/interactions.jsonl` in a `chore:` commit for
+   the wave.
 5. **The orchestrator acts under its own `PACT_AGENT` and `BEADS_ACTOR`**, so its
    merges and checkpoints are not attributed to any worker.
 
-Two files, two reasons, and both need committing. `.pact/events.jsonl` is pact's
-own coordination history and the only thing it cannot derive.
+Three files, three reasons, and all of them need committing.
+
+`.pact/events.jsonl` is pact's own coordination history — who held what, and the
+only thing it cannot derive.
+
+`.pact/messages.jsonl` is what agents said to each other. It is committed for the
+same reason the event log is, and a wave that forgets it produces a history that
+can be asked who held a path but never who was warned about it. Both files are
+append-only, so `pact init` gives both `merge=union` in `.gitattributes` — without
+that, this very pattern conflicts on every wave, in the file agents use to warn
+each other.
+
 `.beads/interactions.jsonl` is bd's audit sidecar — and since 0.9.0 it is also the
 **only** thing pact reads from bd, so a wave that forgets it leaves
 [`--check claim-lease-divergence`](audit.md#--check-claim-lease-divergence) with
-nothing to check against. It is off by default in bd; turn it on with
-`audit.enabled: true` in `.beads/config.yaml` before the first wave, not after.
+nothing to check against. It is off by default; turn it on with `bd config set
+audit.enabled true` before the first wave, not after — bd records from that point
+and not retroactively, so enabling it afterwards buys the next run, never this one.
 
-**Messages are not in that list, deliberately.** `.pact/messages.jsonl` and
-`.pact/read/` stay local: mail is ephemeral, and a read position belongs to the
-machine that read it. What survives a wave is the event log and the commits.
+**The read cursors are the one thing that stays local.** `.pact/read/<agent>.json`
+is per-machine by nature, and committing it would have every clone inherit its
+peers' read state. Sharing *who said what* while keeping *who has read it* local is
+the line, and it is where `.pact/leases/` and `.pact/waits/` sit too: live runtime
+state nobody else should be resolving merges against.
 
 ### What it buys
 

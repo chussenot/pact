@@ -148,11 +148,11 @@ every other command promises; in human mode it prints the path it wrote. See
 | 0 | success |
 | 1 | generic error — and `pact audit --check …` found something (a finding is a result, not a fault) |
 | 2 | lease conflict — held by another agent, or you don't hold the one you're releasing, or `init` found one on a file it rewrites |
-| 3 | Beads backend unavailable — **reserved since 0.9.0: no `pact msg`, `lease`, `watch`, `log` or `audit` path can raise it** |
+| 3 | **RETIRED in 0.9.0.** Formerly "Beads backend unavailable". No command raises it — never reuse it for a new meaning, because wrappers in the field still branch on it |
 | 4 | not in a git repository |
 | 5 | usage error — unknown subcommand, bad or missing flag value |
 
-**3 is the one code that got quieter rather than clearer.** Until 0.9.0 every
+**3 is retired, not repurposed.** Until 0.9.0 every
 `pact msg` command located and ran a Beads CLI first, so exit 3 was the routine
 answer to no `bd` on `PATH`, a `br`-only workspace
 ([no longer supported](install.md#br-beads-rust-is-no-longer-supported)), or a
@@ -161,11 +161,15 @@ call killed for running past `PACT_BEADS_TIMEOUT_SECS`. Messages now live in
 `lease acquire`'s check for mail about a path all work with **no `bd` installed at
 all** ([messaging.md](messaging.md#why-this-is-not-in-the-issue-tracker-any-more)).
 
-The two commands that still look for `bd` do not raise it either: `pact doctor`
-reports it as a check and `pact whoami` as one of the problems it always exits 0
-despite. So a wrapper that branches on 3 will not see it — and it stays reserved
-rather than being recycled for something else, because a 0.8.x caller still tests
-for it and a re-used code is how a wrapper silently starts doing the wrong thing.
+The commands that still look for `bd` do not raise it either: `pact doctor` reports
+it as a check, `pact whoami` as one of the problems it always exits 0 despite, and
+`pact ui` as a line in its status pane. The single site that can produce it,
+`BeadsCli::locate`, has no caller left that propagates it — asserted by a test that
+drives the whole command surface with `bd` hidden from `PATH` and requires that
+nothing exits 3.
+
+It stays retired rather than recycled because a 0.8.x caller still tests for it, and
+a re-used code is how such a wrapper silently starts doing the wrong thing.
 
 **5 exists so that 2 means only one thing.** clap emits 2 for any usage error,
 which collided with "lease held by another agent" — and a wrapper branching on 2

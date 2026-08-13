@@ -83,17 +83,21 @@ They lived in bd — a message bead per recipient, read state as a
 is the second move for one fact; [messaging.md](messaging.md#this-narrows-pact-rnc17-and-says-so-rather-than-inheriting-it-quietly)
 states what the round trip costs instead of pretending it was free.
 
-Neither is committed. A message is ephemeral by design — the store is capped, so
-mail past the cap is dropped exactly as event-log lines are — and a read position
-is per-machine by nature. `events.jsonl` remains the one exception, for the reason
-its own section below gives.
+**The store is committed; the cursors are not.** `.pact/messages.jsonl` joins
+`.pact/events.jsonl` as history: it is what agents said to each other, and no more
+derivable than who held what. It is still capped, so mail past the cap is dropped
+exactly as event-log lines are — committed does not mean permanent. The read
+cursors stay local because a read position is per-machine, and committing one would
+have every clone inherit its peers' read state. Sharing *who said what* while
+keeping *who has read it* local is the whole line.
 
-`pact init` writes two lines — deny everything under `.pact/`, then re-include
-the one file that is history:
+`pact init` writes a deny for everything under `.pact/`, then re-includes the two
+files that are history:
 
 ```
 .pact/*
 !.pact/events.jsonl
+!.pact/messages.jsonl
 ```
 
 **Deny by default, and that ordering is the design.** The obvious alternative is
@@ -155,9 +159,16 @@ and every merge stops. `pact init` therefore also writes
 
 ```
 .pact/events.jsonl merge=union
+.pact/messages.jsonl merge=union
 ```
 
-to `.gitattributes`, which tells git to keep **both** sides. That is the correct
+to `.gitattributes`, which tells git to keep **both** sides. Both files, from one
+list in the code, because they were maintained separately once and drifted: 0.9.0
+made the message store committed without a merge rule, which would have made the
+[per-worktree fleet pattern](fleet-patterns.md) conflict on every wave in the file
+agents use to warn each other. A repository that already had the rule for the event
+log gets the second one on the next `pact init` — the check is per path, not "has
+pact been here". That is the correct
 resolution for a log whose entries are independent and whose ordering between
 unrelated agents carries no meaning. Verified rather than assumed: two branches
 each appending a different event merge with no conflict, and both events survive.
@@ -633,7 +644,7 @@ humans, its exit codes are documented behavior, not incidental:
 | 0 | success |
 | 1 | generic error |
 | 2 | lease held by another agent (or you don't hold the lease you're releasing) |
-| 3 | Beads backend unavailable — **no longer reachable from any `pact msg` path** (see below) |
+| 3 | **RETIRED in 0.9.0.** Formerly "Beads backend unavailable". No command raises it — never reuse it for a new meaning, because wrappers in the field still branch on it (see below) |
 | 4 | not in a git repository |
 | 5 | usage error — unknown subcommand, bad or missing flag value |
 

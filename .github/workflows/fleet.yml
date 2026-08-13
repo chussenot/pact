@@ -127,6 +127,7 @@ jobs:
             ${{ env.RUN_DIR }}/conflicts.txt
             ${{ env.RUN_DIR }}/worker-summary.txt
             ${{ env.RUN_DIR }}/repo/.pact/events.jsonl
+            ${{ env.RUN_DIR }}/repo/.pact/messages.jsonl
           if-no-files-found: warn
           retention-days: 14
 

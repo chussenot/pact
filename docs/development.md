@@ -100,9 +100,9 @@ test "$(cargo tree --edges normal,build,dev)" \
 State lives under `.pact/` at the repo root (found by walking up to `.git`):
 `.pact/leases/*.lock`, `.pact/events.jsonl` (the bounded lease-event log behind
 `pact log`), `.pact/messages.jsonl` and `.pact/read/<agent>.json`. `pact init`
-writes `.pact/*` plus `!.pact/events.jsonl`, so everything under there is ignored
-except the one file that is history — and anything else an agent invents is covered
-without a new rule.
+writes `.pact/*` plus `!.pact/events.jsonl` and `!.pact/messages.jsonl`, so
+everything under there is ignored except the two files that are history — and
+anything else an agent invents is covered without a new rule.
 
 ## Beyond the gates: the fleet soak
 
