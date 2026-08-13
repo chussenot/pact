@@ -1191,21 +1191,6 @@ fn bd_repo(test: &str) -> Option<TempDir> {
     beads_repo(test, "bd")
 }
 
-/// The br twin of [`bd_repo`] (pact-l94). `BeadsCli::locate()` picks the
-/// backend that can actually read the workspace, so a `br init` repo is the
-/// only thing that selects the br code paths at all — without one they are
-/// unreachable from the CLI and every br-specific divergence in `msg.rs` is
-/// covered by unit tests alone.
-///
-/// It needs no separate body: `br init` takes the same argv shape and, though
-/// it commits nothing (unlike `bd init`), the git identity is harmless. What
-/// it must NOT be handed is `--db <path>` — br ignores it and initialises in
-/// the cwd regardless, which is how a stray beads store landed in this repo
-/// once. The cwd *is* the tempdir here, so that hazard cannot fire.
-fn br_repo(test: &str) -> Option<TempDir> {
-    beads_repo(test, "br")
-}
-
 fn beads_repo(test: &str, tool: &str) -> Option<TempDir> {
     let on_path = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join(tool).is_file()))
@@ -2251,165 +2236,6 @@ fn init_skips_the_later_of_two_instruction_targets_aliased_to_each_other() {
 }
 
 // ------------------------------------------- msg over the br backend (pact-l94)
-
-/// pact-l94, requested by br-dev in thread pact-wisp-0ma. The plain round trip
-/// on br, which is a sharper guard than it looks: br rejects
-/// `--no-inherit-labels` with `error: unexpected argument`, so a regression in
-/// the create argv is a hard failure on EVERY send rather than a subtle one.
-/// Read state rides along because `read-by-<agent>` labels are the one part of
-/// the messaging model that needed no br-specific code — and "needed no change"
-/// is exactly the claim that rots without a test.
-#[test]
-fn br_backed_msg_round_trip_carries_read_state_the_way_bd_does() {
-    let Some(tmp) = br_repo("br_backed_msg_round_trip_carries_read_state_the_way_bd_does") else {
-        return;
-    };
-    assert_ok(&pact(
-        tmp.path(),
-        "sender-agent",
-        &[
-            "msg",
-            "send",
-            "--to",
-            "reader-agent",
-            "--subject",
-            "ack me",
-            "please ack",
-        ],
-    ));
-
-    let inbox = inbox_json(tmp.path(), "reader-agent");
-    assert_eq!(inbox.as_array().map(Vec::len), Some(1), "{inbox}");
-    assert_eq!(inbox[0]["from"], serde_json::json!("sender-agent"));
-    assert_eq!(inbox[0]["to"], serde_json::json!("reader-agent"));
-    assert_eq!(inbox[0]["read"], serde_json::json!(false));
-    assert_eq!(inbox[0]["body"], serde_json::json!("please ack"));
-    let id = inbox[0]["id"].as_str().unwrap().to_string();
-
-    let before = pact(tmp.path(), "sender-agent", &["msg", "sent"]);
-    assert_ok(&before);
-    assert!(
-        stdout_of(&before).contains("1 not read yet"),
-        "{}",
-        stdout_of(&before)
-    );
-
-    assert_ok(&pact(tmp.path(), "reader-agent", &["msg", "read", &id]));
-
-    let after = pact(
-        tmp.path(),
-        "reader-agent",
-        &["msg", "inbox", "--unread-only", "--json"],
-    );
-    assert_ok(&after);
-    assert_eq!(
-        json_stdout(&after).as_array().map(Vec::len),
-        Some(0),
-        "reading must clear the reader's unread on br too: {}",
-        stdout_of(&after)
-    );
-    let confirmed = pact(tmp.path(), "sender-agent", &["msg", "sent"]);
-    assert_ok(&confirmed);
-    assert!(
-        stdout_of(&confirmed).contains("0 not read yet"),
-        "the read must be visible to the sender: {}",
-        stdout_of(&confirmed)
-    );
-}
-
-/// The br twin of `every_recipient_of_a_fan_out_sees_one_thread_and_can_reply_into_it`,
-/// and the one br-dev asked not to skip.
-///
-/// bd answers "which messages are in this thread" with `list --parent <id>`.
-/// br has no such filter and its `list --json` omits `parent` entirely, so on br
-/// the answer is reconstructed from the ROOT's `parent-child` dependents out of
-/// `show --json`. A naive port passes every unit test and still reports each
-/// reply as its own one-message thread — the shared decision fragmenting exactly
-/// as pact-rnc.4 described, one backend later. Only a live br proves the walk.
-#[test]
-fn br_backed_fan_out_shares_one_thread_and_a_reply_reaches_the_root() {
-    let Some(tmp) = br_repo("br_backed_fan_out_shares_one_thread_and_a_reply_reaches_the_root")
-    else {
-        return;
-    };
-    assert_ok(&pact(
-        tmp.path(),
-        "alpha",
-        &[
-            "msg",
-            "send",
-            "--to",
-            "bravo",
-            "--to",
-            "charlie",
-            "--subject",
-            "fan out",
-            "friday?",
-        ],
-    ));
-
-    let bravo = inbox_json(tmp.path(), "bravo");
-    let root = bravo[0]["id"].as_str().expect("bravo got it").to_string();
-    assert_eq!(bravo[0]["thread"], serde_json::json!(root));
-
-    let charlie = inbox_json(tmp.path(), "charlie");
-    let charlie_id = charlie[0]["id"]
-        .as_str()
-        .expect("charlie got it")
-        .to_string();
-    assert_ne!(charlie_id, root, "recipient 2 has its own bead");
-    assert_eq!(
-        charlie[0]["thread"],
-        serde_json::json!(root),
-        "both recipients must report the same thread: {charlie}"
-    );
-
-    // Reading a non-root member gives the whole conversation, not a stub.
-    let read = pact(
-        tmp.path(),
-        "charlie",
-        &["msg", "read", &charlie_id, "--json"],
-    );
-    assert_ok(&read);
-    assert_eq!(
-        json_stdout(&read).as_array().map(Vec::len),
-        Some(2),
-        "{}",
-        stdout_of(&read)
-    );
-
-    assert_ok(&pact(
-        tmp.path(),
-        "charlie",
-        &[
-            "msg",
-            "send",
-            "--to",
-            "alpha",
-            "--thread",
-            &charlie_id,
-            "--subject",
-            "re: fan out",
-            "charlie acks",
-        ],
-    ));
-
-    let as_alpha = pact(tmp.path(), "alpha", &["msg", "read", &root, "--json"]);
-    assert_ok(&as_alpha);
-    let full = json_stdout(&as_alpha);
-    assert_eq!(
-        full.as_array().map(Vec::len),
-        Some(3),
-        "a reply parented on a child must still land in the root thread: {full}"
-    );
-    let bodies: Vec<&str> = full
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["body"].as_str().unwrap_or_default())
-        .collect();
-    assert!(bodies.contains(&"charlie acks"), "{full}");
-}
 
 // ------------------------------------------------ --json shapes (pact-er0)
 
@@ -3513,33 +3339,15 @@ fn msg_inbox_names_a_conflicting_store_on_its_own_stderr() {
 /// this test proves is the mitigation: the silence is gone even though the
 /// resolution is not.
 #[test]
-fn msg_inbox_after_bd_init_over_a_live_br_store_still_warns() {
-    let Some(tmp) = br_repo("msg_inbox_after_bd_init_over_a_live_br_store_still_warns_br_half")
-    else {
-        return;
-    };
-
-    let create = Command::new("br")
-        .args([
-            "create",
-            "--type=message",
-            "--title=hello",
-            "--description=a real message, about to be shadowed",
-            "--assignee=someone",
-            "--actor=sender",
-            "--json",
-        ])
-        .current_dir(tmp.path())
-        .output()
-        .expect("br create");
-    assert!(create.status.success(), "br create: {}", stderr_of(&create));
+fn msg_inbox_beside_a_leftover_sqlite_store_still_warns() {
+    let tmp = init_repo();
 
     let on_path = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join("bd").is_file()))
         .unwrap_or(false);
     if !on_path {
         eprintln!(
-            "SKIP msg_inbox_after_bd_init_over_a_live_br_store_still_warns: \
+            "SKIP msg_inbox_beside_a_leftover_sqlite_store_still_warns: \
              bd not found on PATH"
         );
         return;
@@ -3827,63 +3635,6 @@ fn a_message_about_a_path_is_delivered_to_whoever_leases_it_next() {
     assert!(
         stderr.contains("second-agent"),
         "and name who sent it: {stderr}"
-    );
-}
-
-/// br twin of the test above (pact-m7j.10.1). Doubles as the end-to-end proof
-/// for `encode_path`'s charset fix: `src/otel.rs` contains a `.`, which a real
-/// br 0.2.19 store rejects outright in a label ("invalid characters", exit 4)
-/// — before that fix AND before 10.1's atomic `--labels` (which turns a
-/// rejected label from a swallowed warning into a hard `msg send` failure),
-/// this exact scenario either silently failed to tag the bead or failed to
-/// send at all. If it did, `third-agent`'s acquire below would see nothing.
-#[test]
-fn a_message_about_a_path_is_delivered_to_whoever_leases_it_next_on_br() {
-    let Some(tmp) = br_repo("a_message_about_a_path_is_delivered_on_br") else {
-        return;
-    };
-    assert_ok(&pact(
-        tmp.path(),
-        "first-owner",
-        &["lease", "acquire", "src/otel.rs"],
-    ));
-    assert_ok(&pact(
-        tmp.path(),
-        "first-owner",
-        &["lease", "release", "--all"],
-    ));
-
-    let sent = pact(
-        tmp.path(),
-        "second-agent",
-        &[
-            "msg",
-            "send",
-            "--to-owner-of",
-            "src/otel.rs",
-            "--subject",
-            "BLOCKER: flush",
-            "spans never sent",
-        ],
-    );
-    assert_ok(&sent);
-    assert!(
-        !stderr_of(&sent).contains("could not tag"),
-        "the label must land in the same create call, not a separate one that \
-         can fail: {}",
-        stderr_of(&sent)
-    );
-
-    let out = pact(
-        tmp.path(),
-        "third-agent",
-        &["lease", "acquire", "src/otel.rs"],
-    );
-    assert_ok(&out);
-    let stderr = stderr_of(&out);
-    assert!(
-        stderr.contains("unread message") && stderr.contains("BLOCKER: flush"),
-        "the message must follow the file to its next holder on br too: {stderr}"
     );
 }
 

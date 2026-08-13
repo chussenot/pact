@@ -66,12 +66,10 @@ fn have_git() -> bool {
 /// developer machine has one. An assertion that can only be reached in one
 /// environment has to say so.
 fn have_beads() -> bool {
-    ["bd", "br"].iter().any(|b| {
-        Command::new(b)
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success())
-    })
+    Command::new("bd")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 /// A real repository with one commit, plus a linked worktree on its own branch.
@@ -662,9 +660,12 @@ fn a_worktree_of_a_bare_repo_anchors_state_and_refuses_messaging() {
             "must say what still works: {why}"
         );
     } else {
+        // Since 0.8.0 there is one backend, so this names it rather than saying
+        // "no Beads CLI found" — a reader who has to go install something is
+        // better served by the binary's name than by a category.
         assert!(
-            why.contains("no Beads CLI"),
-            "with no backend, exit 3 should be about the missing CLI: {why}"
+            why.contains("bd") && why.contains("not found on PATH"),
+            "with no backend, exit 3 should name the CLI to install: {why}"
         );
     }
     // Nothing was created in the worktree as a side effect of refusing.

@@ -343,8 +343,7 @@ pub fn checks(root: &Path) -> DoctorReport {
         .map(|e| e.agent)
         .collect();
     checks.push(match beads::interaction_actors(root) {
-        // Absence is read as "not applicable" — whether `br` writes this
-        // same file is unconfirmed, so a `br`-only repo where it does not
+        // Absence is read as "not applicable" — a repo whose backend does not
         // exist must not be told its attribution is broken.
         None => DoctorCheck {
             name: "Beads actor attribution",
@@ -368,7 +367,7 @@ pub fn checks(root: &Path) -> DoctorReport {
                 detail: if suspicious {
                     format!(
                         "{} pact agent identities acted, but none of the {} Beads actor(s) \
-                         recorded in .beads/interactions.jsonl match any of them — direct `bd`/`br` \
+                         recorded in .beads/interactions.jsonl match any of them — direct `bd` \
                          commands are not attributed to the agent that ran them. Run `pact whoami` \
                          and export the `BEADS_ACTOR` line it prints.",
                         pact_agents.len(),

@@ -45,14 +45,14 @@ run = [
   "cargo test",
   "cargo test --features $PACT_ALL_FEATURES",
   """
-  # Exclude exactly the directories bd/br live in, rather than pattern-matching
+  # Exclude exactly the directory bd lives in, rather than pattern-matching
   # the PATH: on a machine without them this is a no-op, which is correct.
   p="$PATH"
-  for b in bd br; do
+  for b in bd; do
     d="$(command -v "$b" 2>/dev/null)" || continue
     p="$(printf '%s' "$p" | tr ':' '\n' | grep -vxF "$(dirname "$d")" | paste -sd: -)"
   done
-  echo "no-backend leg: bd=$(PATH="$p" command -v bd || echo absent) br=$(PATH="$p" command -v br || echo absent)"
+  echo "no-backend leg: bd=$(PATH="$p" command -v bd || echo absent)"
   PATH="$p" cargo test --features $PACT_ALL_FEATURES
   """,
 ]

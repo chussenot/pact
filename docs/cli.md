@@ -145,11 +145,11 @@ every other command promises; in human mode it prints the path it wrote. See
 | 0 | success |
 | 1 | generic error — and `pact audit --check …` found something (a finding is a result, not a fault) |
 | 2 | lease conflict — held by another agent, or you don't hold the one you're releasing, or `init` found one on a file it rewrites |
-| 3 | Beads backend unavailable — no `bd`/`br` on `PATH`, or one killed for running past `PACT_BEADS_TIMEOUT_SECS` |
+| 3 | Beads backend unavailable — no `bd` on `PATH`, a `br`-only workspace ([no longer supported](install.md#br-beads-rust-is-no-longer-supported)), or a call killed for running past `PACT_BEADS_TIMEOUT_SECS` |
 | 4 | not in a git repository |
 | 5 | usage error — unknown subcommand, bad or missing flag value |
 
-**3 covers both ways the backend can be absent.** A `bd` or `br` that never
+**3 covers every way the backend can be unusable.** A `bd` that never
 exits — wedged on a credential prompt, a backend write lock, an internal bug —
 used to hang the pact command that called it, and everything built on it,
 forever. That wait is now bounded: past `PACT_BEADS_TIMEOUT_SECS` (default 30

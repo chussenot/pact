@@ -3,7 +3,7 @@
 //! dependency. `git` on `PATH` is already a hard requirement (pact only ever
 //! runs inside a git repository) and pact's established pattern is to shell
 //! out to a CLI it depends on rather than link its library — see `beads.rs`
-//! for the same choice about `bd`/`br`.
+//! for the same choice about `bd`.
 //!
 //! Used by `audit::Check::CommitCorrelation` (pact-1l8.1) to ask whether real
 //! commits landed inside the lease windows `.pact/events.jsonl` records.

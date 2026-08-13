@@ -212,48 +212,61 @@ config.
 
 ## The Beads CLI
 
-Requires a **Beads CLI** on `PATH` for the `msg` subcommands; `init`, `lease`,
-`whoami`, `agents`, `log` and `doctor` (partially — the lease half plus a
-warning) work without one. Either implementation will do:
+Requires **[`bd`](https://github.com/gastownhall/beads)** on `PATH` for the `msg`
+subcommands; `init`, `lease`, `whoami`, `agents`, `watch`, `log` and `doctor`
+(partially — everything but the backend half) work without one.
 
-| Backend | What it is | What its `.beads/` looks like |
-|---|---|---|
-| [`bd`](https://github.com/gastownhall/beads) | Go, embedded Dolt | `.beads/embeddeddolt/` |
-| [`br`](https://github.com/Dicklesworthstone/beads_rust) | Rust, SQLite | `.beads/<name>.db` |
+`bd` is Go with an embedded Dolt database, and its store is `.beads/embeddeddolt/`.
+pact walks up from the working directory for the first `.beads/` and uses the
+backend that made it, so a linked worktree finds the same store as the main
+checkout rather than a fresh empty one.
 
-**The store on disk picks the backend, not a preference.** The two don't share
-data, so pact walks up for the first `.beads/`, reads which tool made it, and
-uses that one. Only a repo with no Beads workspace yet gets a preference (`br`,
-then `bd`), and if both stores are present — what one stray `br init` inside a
-`bd` repo leaves behind — `bd` wins, because that is where the data is. The
-alternative, always preferring `br`, would open an empty SQLite database in
-every existing `bd` repo and cheerfully report an empty inbox.
-
-`pact doctor` has always warned about that second store. Every `pact msg`
-invocation now prints the same warning on stderr, and the two MCP message tools
-carry it as a `store_conflict` key. Which store gets queried is deliberately
-unchanged — the point is that an agent seeing `inbox empty` in a repo with a
-shadowed store had no hint why, and nobody runs `doctor` about an inbox that
-merely looks quiet.
-
-Exit code `3` means the Beads backend is unavailable. Usually that is no usable
-CLI on `PATH`, and the message names *which* one to install and why the other
-one you already have isn't a substitute; it is also what you get when a
-`bd`/`br` had to be killed for not exiting
+Exit code `3` means the Beads backend is unavailable — usually no `bd` on `PATH`,
+and it is also what you get when a `bd` call had to be killed for not exiting
 (see [cli.md](cli.md#exit-codes)).
 
-Tested ranges are per backend — `bd` `1.1.0 <= v < 1.2.0`, `br`
-`0.2.0 <= v < 0.3.0` — and outside them everything still runs while `pact
-doctor` adds a warning, since a Beads CLI that changed its output is the
+The tested range is `1.1.0 <= v < 1.3.0`. Outside it everything still runs while
+`pact doctor` adds a warning, since a Beads CLI that changed its output is the
 likeliest cause of a puzzling `msg` failure:
 
 ```
-✓ Beads CLI: bd (bd version 1.1.2 (20e493e56))
-✓ Beads CLI: br (br 0.2.19)
+✓ Beads CLI: bd (bd version 1.2.1 (634cbbc4b)), attributes writes to the acting agent (--actor)
 ```
 
-`br` is younger and its CLI still moves; the differences pact has to absorb are
-listed in [docs/messaging.md](messaging.md#two-backends-two-argv).
+That warning has earned its place. bd 1.2 dropped `create --id --force`'s upsert,
+which is what pact's [idempotent send](messaging.md#what-survives-a-retry-means-depends-on-your-bd-version)
+was built on, and it also stopped opening legacy SQLite workspaces at all.
+
+### `br` (beads-rust) is no longer supported
+
+pact used to accept either backend. **`pact 0.7.9` was the last release that
+supported [`br`](https://github.com/Dicklesworthstone/beads_rust).**
+
+If you point a newer pact at a `br` workspace it refuses with exit `3` and says
+so, rather than reporting a missing CLI — `br` will still be installed and
+working, and the thing that went away is pact's support:
+
+```
+this repo's .beads/ is a br (beads-rust, SQLite) workspace, and pact no longer
+supports br — pact 0.7.9 was the last release that did.
+
+Either migrate the store to bd (https://github.com/gastownhall/beads), or pin
+pact 0.7.9 if you need br. pact has not touched your .beads/ and will not.
+```
+
+**Why it went.** The two CLIs run the same model but not the same argv, so pact
+carried a branch for every divergence: `--include-infra`, `--no-inherit-labels`,
+the `list --json` envelope, replies as dependency edges. That was affordable. What
+was not is that the two backends never offered the same *guarantees* — `br` has no
+`--id`/`--force` equivalent, so a replayed `msg send` on `br` duplicated the
+message, and pact's documented advice to re-send when you cannot confirm a send
+was actively unsafe there. Two backends meant two contracts, one of them weaker,
+described in every doc that touched messaging.
+
+A stray `.beads/<name>.db` left beside a `bd` store is now simply ignored, and
+`pact doctor` plus every `pact msg` call still name it — a second store nobody
+reads is worth a warning, because an agent seeing `inbox empty` in a repo with a
+shadowed store had no hint why.
 
 ## Which binary am I running?
 

@@ -1,18 +1,18 @@
-//! Subprocess adapter over the Beads CLI. Two backends are supported: `bd`
-//! (Go, embedded Dolt) and `br` (beads-rust, SQLite).
+//! Subprocess adapter over the Beads CLI (`bd`: Go, embedded Dolt).
 //! Never reads/writes the Beads database or JSONL directly; always shells out.
 //!
-//! The two backends do NOT share a store, and that is the whole reason
-//! [`BeadsCli::locate`] is more than `which("br").or(which("bd"))`. `bd init`
-//! lays down `.beads/embeddeddolt/`; `br init` lays down `.beads/<name>.db`
-//! (SQLite) plus an `issues.jsonl`. Pointed at the other one's workspace
-//! neither errors — br quietly initialises a *second*, empty store beside bd's
-//! (observed: running `br init` once in this repo added `.beads/beads.db` and
-//! an empty `.beads/issues.jsonl` next to the live Dolt data). A tool that
-//! reports "inbox empty" because it opened the wrong database is worse than one
-//! that is missing, so the store on disk decides the backend and only a repo
-//! with no Beads workspace yet gets to express a preference.
-
+//! [`BeadsCli::locate`] is more than `which("bd")`, because the store on disk —
+//! not the working directory, and not a preference — decides what pact may talk
+//! to. `bd init` lays down `.beads/embeddeddolt/`. A tool that reports "inbox
+//! empty" because it opened the wrong database is worse than one that is missing,
+//! so the workspace is classified first and the candidate list is one binary long.
+//!
+//! pact supported a second backend, `br` (beads-rust, SQLite), through 0.7.9.
+//! The two never shared a store, and — more importantly — never shared the same
+//! guarantees: `br` had no `--id`/`--force` equivalent, so a replayed `msg send`
+//! duplicated the message there while the protocol told agents to re-send when
+//! they could not confirm one. A `br` workspace is still *detected*, so it can be
+//! refused with an accurate message rather than a misleading "CLI not found".
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -30,10 +30,6 @@ const TESTED_BD_MIN: (u64, u64, u64) = (1, 1, 0);
 /// workspace at all. Both are handled, and the handling is version-agnostic —
 /// 1.1's upsert still takes the success path — so the floor stays at 1.1.0.
 const TESTED_BD_MAX_EXCLUSIVE: (u64, u64, u64) = (1, 3, 0);
-/// br's surface was mapped against 0.2.19; it is pre-1.0 and its CLI moves, so
-/// the tested window is the 0.2.x line rather than anything wider.
-const TESTED_BR_MIN: (u64, u64, u64) = (0, 2, 0);
-const TESTED_BR_MAX_EXCLUSIVE: (u64, u64, u64) = (0, 3, 0);
 
 /// Default ceiling on how long [`BeadsCli::run`] waits for the child before
 /// treating it as hung, overridable via `PACT_BEADS_TIMEOUT_SECS` — the same
@@ -94,6 +90,10 @@ fn beads_root(repo_root: &Path) -> Result<PathBuf> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Workspace {
     Bd,
+    /// A br (beads-rust, SQLite) store. **Detected but no longer supported** —
+    /// see [`missing_backend_message`]. It stays a distinct state precisely
+    /// because `br` will still be on the user's PATH, so collapsing it into
+    /// `None` would answer "no Beads CLI found" while the CLI sits right there.
     Br,
     /// No `.beads/` above the cwd at all — nothing to be compatible with yet.
     None,
@@ -127,14 +127,6 @@ impl BeadsCli {
 
     pub fn binary(&self) -> &'static str {
         self.binary
-    }
-
-    /// True when the backend is br. The two CLIs are close enough to share this
-    /// adapter but not close enough to share argv: br has no `--include-infra`
-    /// and no `--no-inherit-labels`, wraps `list --json` in an envelope, and
-    /// exposes children as dependency edges. `msg.rs` branches on this.
-    pub fn is_br(&self) -> bool {
-        self.binary == "br"
     }
 
     /// `bd --version` output, trimmed, for `pact doctor`.
@@ -402,25 +394,29 @@ fn failure_reason(stdout: &str, stderr: &str) -> String {
 fn candidates(workspace: Workspace) -> &'static [&'static str] {
     match workspace {
         Workspace::Bd => &["bd"],
-        Workspace::Br => &["br"],
-        // Greenfield: nothing to break, so prefer br (pact-l94).
-        Workspace::None => &["br", "bd"],
+        // Nothing can serve a br workspace any more, so `locate` falls straight
+        // through to the refusal rather than offering a binary that would read
+        // the wrong store.
+        Workspace::Br => &[],
+        Workspace::None => &["bd"],
     }
 }
 
 fn missing_backend_message(workspace: Workspace) -> String {
     match workspace {
-        Workspace::Bd => "bd (beads) not found on PATH — this repo's .beads/ is a bd \
-             (Dolt) workspace, which br cannot read; install bd: \
+        Workspace::Bd | Workspace::None => "bd (beads) not found on PATH — install it: \
              https://github.com/gastownhall/beads"
             .to_string(),
-        Workspace::Br => "br (beads-rust) not found on PATH — this repo's .beads/ is a br \
-             (SQLite) workspace, which bd cannot read; install br: \
-             https://github.com/Dicklesworthstone/beads_rust"
-            .to_string(),
-        Workspace::None => "no Beads CLI found on PATH — install br \
-             (https://github.com/Dicklesworthstone/beads_rust) or bd \
-             (https://github.com/gastownhall/beads)"
+        // Not "no Beads CLI found": `br` is almost certainly installed and
+        // working, and this repository's data really is in its store. Saying the
+        // CLI is missing would send the reader off to install something they
+        // already have. What changed is pact, so pact says so, names the last
+        // version that worked, and gives both ways out.
+        Workspace::Br => "this repo's .beads/ is a br (beads-rust, SQLite) workspace, and \
+             pact no longer supports br — pact 0.7.9 was the last release that did.\n\
+             \n\
+             Either migrate the store to bd (https://github.com/gastownhall/beads), or pin \
+             pact 0.7.9 if you need br. pact has not touched your .beads/ and will not."
             .to_string(),
     }
 }
@@ -650,15 +646,7 @@ fn sqlite_db(beads_dir: &Path) -> Option<PathBuf> {
 
 /// Warning text for versions outside pact's tested range for that backend.
 pub fn version_compat_warning(version_output: &str) -> Option<String> {
-    // Dispatch on the version string rather than on a new argument: `doctor.rs`
-    // calls this with `cli.version(root)` and belongs to another agent. bd's
-    // output ("bd version 1.1.2 (…)") never starts with "br", so the bd branch
-    // is byte-identical to what shipped.
-    let (min, max) = if version_output.trim_start().starts_with("br") {
-        (TESTED_BR_MIN, TESTED_BR_MAX_EXCLUSIVE)
-    } else {
-        (TESTED_BD_MIN, TESTED_BD_MAX_EXCLUSIVE)
-    };
+    let (min, max) = (TESTED_BD_MIN, TESTED_BD_MAX_EXCLUSIVE);
     let parsed = parse_triplet(version_output)?;
     if parsed >= min && parsed < max {
         None
@@ -805,18 +793,13 @@ mod tests {
         assert_eq!(version_compat_warning("beads unknown"), None);
     }
 
-    /// `br --version` prints "br 0.2.19", which is outside bd's window and
-    /// would have been reported as untested forever if the range were fixed.
+    /// One backend, one window — and it is read off the version string rather
+    /// than assumed, so a binary that reports something unexpected still gets
+    /// judged against the range pact actually tested.
     #[test]
-    fn the_tested_range_follows_the_backend_that_printed_the_version() {
-        assert_eq!(version_compat_warning("br 0.2.19"), None);
-        assert!(version_compat_warning("br 0.3.0")
-            .unwrap()
-            .contains("0.2.0 <= version < 0.3.0"));
-        // Real strings from both binaries on this machine, verbatim.
+    fn every_version_is_judged_against_bds_window() {
+        // A real string from the binary on this machine, verbatim.
         assert_eq!(version_compat_warning("bd version 1.1.2 (20e493e56)"), None);
-        // A bd version must still be judged against bd's window: "br" only
-        // matches at the start, so nothing here silently widens it.
         assert!(version_compat_warning("bd version 0.2.19")
             .unwrap()
             .contains("1.1.0 <= version < 1.3.0"));
@@ -881,16 +864,32 @@ mod tests {
     /// An existing store is a constraint, not a preference: falling back to the
     /// other backend would open an empty database and report an empty repo.
     #[test]
-    fn an_existing_store_pins_the_backend_and_greenfield_prefers_br() {
+    fn a_br_workspace_is_refused_with_a_message_that_names_the_last_version() {
         assert_eq!(candidates(Workspace::Bd), ["bd"]);
-        assert_eq!(candidates(Workspace::Br), ["br"]);
-        assert_eq!(candidates(Workspace::None), ["br", "bd"]);
-        // Exit 3's text has to name the binary to install and say why the other
-        // one on PATH is not a substitute, or the fix is a guess.
-        let bd = missing_backend_message(Workspace::Bd);
-        assert!(bd.starts_with("bd (beads) not found") && bd.contains("br cannot read"));
+        assert_eq!(candidates(Workspace::None), ["bd"]);
+        // Nothing can serve it, so `locate` reaches the refusal instead of
+        // handing back a binary that would read the wrong store.
+        assert!(candidates(Workspace::Br).is_empty());
+
+        // The refusal must NOT claim the CLI is missing: `br` is almost certainly
+        // installed and working, and sending the reader off to install what they
+        // already have is the one wrong answer available here.
         let br = missing_backend_message(Workspace::Br);
-        assert!(br.starts_with("br (beads-rust) not found") && br.contains("bd cannot read"));
+        assert!(
+            !br.contains("not found on PATH"),
+            "br is on their PATH; the missing thing is pact's support: {br}"
+        );
+        assert!(
+            br.contains("no longer supports br") && br.contains("0.7.9"),
+            "must say what changed and name the last version that worked: {br}"
+        );
+        assert!(
+            br.contains("migrate") && br.contains("pin"),
+            "must give both ways out: {br}"
+        );
+
+        let bd = missing_backend_message(Workspace::Bd);
+        assert!(bd.starts_with("bd (beads) not found"), "{bd}");
     }
 
     #[test]

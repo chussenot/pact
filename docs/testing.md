@@ -82,7 +82,7 @@ and says where the evidence belongs.
 
 **Message round-trip.** Every exit-2 encounter produced a message that reached
 somebody's inbox — asked through `pact msg inbox` rather than the backend,
-because bd hides message beads without `--include-infra` and br has no such flag,
+because bd hides message beads without `--include-infra`,
 argv differences pact already encapsulates.
 
 One class of miss is accepted, and pretending otherwise made the assertion

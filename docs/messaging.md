@@ -63,8 +63,7 @@ bd create --type=message --title=<subject> --description=<body> \
 
 Every `bd create` pact runs passes `--no-inherit-labels`. Without it a child
 inherits its parent's labels, so a reply to a message you had already read would
-be born carrying your own `read-by-` label and arrive pre-read. (br doesn't have
-the flag and doesn't need it — see [Two backends, two argv](#two-backends-two-argv).)
+be born carrying your own `read-by-` label and arrive pre-read.
 Every `bd create` also passes `--force`, which sounds alarming and isn't: its
 only effect is to accept an id that doesn't start with this project's bd prefix,
 which pact's message ids deliberately don't — see
@@ -132,9 +131,8 @@ a version number:
 | Backend | Mechanism | Precedence it documents |
 |---|---|---|
 | `bd` 1.1.2 | `--actor <string>` | `--actor` > `$BEADS_ACTOR` > `git user.name` > `$USER` |
-| `br` 0.2.19 | `--actor <ACTOR>` | also has a richer per-agent scheme: `BR_AGENT_NAME`, `BR_HARNESS`, `BR_MODEL` |
 
-pact uses the flag on both rather than br's env-var scheme, because one mechanism
+pact uses the flag rather than any env-var scheme, because one mechanism
 that works everywhere beats two that have to be kept in step. `pact doctor`'s
 **Beads CLI** line says which of the two it found, in either direction — the
 question gets asked when a trail already looks wrong, and an absent line answers
@@ -173,57 +171,27 @@ canary asserts the part that is observable: a message sent as `canary-a` must co
 back with `created_by: canary-a` while the scratch repo's git user is deliberately
 something else.
 
-## Two backends, two argv
+## The backend, and the one that went away
 
-pact speaks to either Beads CLI: `bd` (Go, embedded Dolt) or `br` (beads-rust,
-SQLite). Which one it uses is decided by the store on disk, not by preference —
-see [install.md](install.md). The messaging *model* is identical on
-both: message-typed beads, `--parent` threads, `read-by-<agent>` labels. The
-argv is not, and the differences are the whole of `pact-l94`. Each was found by
-running `br` 0.2.19, not inferred from bd's documentation.
+pact speaks to **`bd`** (Go, embedded Dolt). The messaging model is beads:
+message-typed beads, `--parent` threads, `read-by-<agent>` labels. See
+[install.md](install.md#the-beads-cli) for how the store is located.
 
-| What pact needs | `bd` | `br` |
-|---|---|---|
-| list message beads | `list --include-infra --json` | `list --json --type=message` |
-| don't inherit read labels | `--no-inherit-labels` | flag rejected, and unnecessary |
-| shape of `list --json` | a bare array | `{"issues": […], "total": …}` |
-| a message's replies | `list --parent=<id> --include-infra --json` | `dep list <root> --direction up --json` |
-| survive a retried send | `--id=<content hash>` + `--force` on a thread root | no primitive at all — retries still duplicate |
-
-Two of those are worth more than a table row:
-
-- **`--no-inherit-labels` isn't missing on br, it's moot.** br rejects the flag
-  outright (`error: unexpected argument`), and the obvious response — emulate it
-  — would be wasted work: a br child is born with no labels at all, so the bug
-  the flag prevents (a reply arriving pre-read) cannot happen there. pact omits
-  it on br and keeps it on bd.
-- **`br list` omits `parent` and has no `--parent` filter**, which is the one
-  divergence that could have shipped as a quietly half-broken inbox: every reply
-  would report itself as its own thread root, and `msg read` would find no
-  replies. `br show --json` does carry `parent`, so a thread's root is found the
-  same way it is on bd. Its replies are a separate, fresh `dep list <root>
-  --direction up --json` query every time — not `show`'s own `dependents`
-  field, which is a snapshot from whenever the root was fetched and stayed
-  wrong about a reply created after that fetch until something re-fetched the
-  root (`pact-m7j.6.1`). So on br every listing is one query for the ids
-  (`dep list`) plus one `show` to hydrate the records — two subprocesses, but
-  always current. The alternative, deriving parents from br's `<id>.<n>` id
-  shape, would be pact guessing at another tool's id format.
-
-The retry row is the newest divergence, and the only one where br is left
-materially worse off rather than merely different — it gets
-[its own section](#a-retried-send-lands-on-the-same-bead).
-
-`--type` is the one place br is *ahead*: the filter bd lacks, so on br the
-message-bead filter happens in the backend rather than in pact.
-
-`pact doctor` names the backend it picked, so a puzzling `msg` result starts
-with a one-line answer to "which database am I even looking at":
+`pact doctor` names the backend and version it picked, so a puzzling `msg` result
+starts with a one-line answer to "which database am I even looking at":
 
 ```
-✓ Beads CLI: br (br 0.2.19)
-✓ Beads CLI: bd (bd version 1.1.2 (20e493e56))
+✓ Beads CLI: bd (bd version 1.2.1 (634cbbc4b)), attributes writes to the acting agent (--actor)
 ```
+
+pact used to accept `br` (beads-rust, SQLite) as well, and **0.7.9 was the last
+release that did** — see
+[why it went](install.md#br-beads-rust-is-no-longer-supported). The short version
+belongs here because it is a messaging story: the two CLIs shared the model but
+not the argv, which was affordable, and did not share the *guarantees*, which was
+not. `br` had no `--id`/`--force` equivalent, so a replayed `msg send` duplicated
+the message there — while this page told senders to re-send when they could not
+confirm a send. One page, two contracts, one of them unsafe.
 
 ## One send is one thread, however many recipients
 
@@ -316,12 +284,8 @@ A replay is not a reset. The `read-by-` labels a recipient already added survive
 it, so re-sending something that has already been read does not make it unread,
 and `pact msg sent` goes on saying the recipient has seen it.
 
-Three limits, all of them permanent rather than pending:
+Two limits, both permanent rather than pending:
 
-- **`bd` only.** `br` has no equivalent primitive on `create` — no `--id`, no
-  `--dedupe`, and its one lever (`--slug`) still appends a uniquifying hash on
-  every call. A `br` retry duplicates exactly as it always did, and nothing on
-  pact's side can emulate the missing flag.
 - **Thread roots only, even on bd.** `bd create` refuses `--id` and `--parent`
   together outright (`cannot specify both --id and --parent flags`), because it
   derives a reply's id from its parent — `<root>.1`, `.2`. So a reply carries no
@@ -395,7 +359,7 @@ just this one — see [cli.md](cli.md#exit-codes)):
 {
   "already_sent": ["alice", "bob"],
   "failed_at": "carol",
-  "reason": "br [...] failed (exit status: 1): ..."
+  "reason": "bd [...] failed (exit status: 1): ..."
 }
 ```
 
@@ -672,7 +636,7 @@ Three things the warning deliberately does not treat as "known":
   reads pact's output but never runs commands as `human`, so "never acted" is
   normal there.
 - **A name that fails pact's own identity grammar**, even one with real message
-  traffic. `from`/`to` come back from bd/br, not from this command's own check,
+  traffic. `from`/`to` come back from bd, not from this command's own check,
   so a name planted straight into the shared store by something other than pact
   can still show up there — `pact agents` marks it `[INVALID]` rather than
   listing it as an agent, since no `pact` process could ever have sent under it.
@@ -733,7 +697,7 @@ pact msg sent
 pact msg read <id>
 ```
 
-All four require a Beads CLI — `bd` or `br` — on `PATH` (exit code 3 if
+All four require `bd` on `PATH` (exit code 3 if
 neither is, naming which one this repo's store needs) and a resolved
 agent identity — `--agent <name>` or `PACT_AGENT` (see the
 [README](../README.md) for identity resolution rules).
@@ -796,20 +760,23 @@ Two supporting changes:
 
 ### The tag goes on at create time
 
-The `about-<path>` label is passed to `bd`/`br create` in the same call that
+The `about-<path>` label is passed to `bd create` in the same call that
 makes the bead, not added by a `label add` afterwards. A second call is a second
 thing that can fail or be raced, and the window it opened was one where the
 message existed and was findable by name but not by path — exactly the state
 this mechanism exists to close.
 
 The label is `about-` plus the path with `/` as `__` and **every byte outside
-`[A-Za-z0-9_:-]` replaced by `-`**. That narrowing is not cosmetic: br 0.2.19
-rejects a `.` in a label outright, so before it, every tag on a real file path
-— anything with an extension — failed on br and the message was delivered
-untagged, with only a swallowed warning to show for it. bd accepts the wider
-set, so the narrow encoding is a subset that works on both rather than a second
-scheme to keep in sync. It is one-way: nothing decodes a label back to a path,
-it only re-encodes the path being queried and compares.
+`[A-Za-z0-9_:-]` replaced by `-`**. It is one-way: nothing decodes a label back
+to a path, it only re-encodes the path being queried and compares.
+
+That charset is narrower than bd needs, and it is **inherited rather than
+chosen** — `br` rejected a `.` in a label outright, so before the narrowing every
+tag on a real file path (anything with an extension) failed there and the message
+was delivered untagged with only a swallowed warning to show for it. `br` is
+[gone now](install.md#br-beads-rust-is-no-longer-supported), but the encoding
+stays: every label already written to a live store uses it, and widening it would
+strand them exactly the way the narrowing itself did.
 
 Narrowing it changed what a query for the same path produces — a message
 tagged on a live `bd` store before the narrowing landed used the wider
@@ -820,9 +787,7 @@ query comes back empty — zero extra cost for the common case (most paths
 have no punctuation the narrowing touches, so the two encodings are
 identical and only one query ever runs), and one extra query only for a
 path that genuinely might still be carrying an old-style tag
-(pact-m7j.10.8). `br` never needed this: the punctuation this fallback
-covers was already rejected outright there, so nothing was ever tagged with
-it on `br` to begin with.
+(pact-m7j.10.8).
 
 ### When that check can't run, it says so
 
@@ -838,7 +803,7 @@ same way. They don't:
 | `.beads/` exists, check could not run | `note: could not check for pending messages about <path>: <why>` |
 
 The first row took two goes to get right. The check ran unconditionally at
-first, so a repository that had never run `bd`/`br init` — the lease-only
+first, so a repository that had never run `bd init` — the lease-only
 population, who never opted into messaging at all — got "could not check for
 pending messages" on every single acquire, forever, for a lookup that could not
 have found anything. Silence is correct there: nothing was ever set up. Once

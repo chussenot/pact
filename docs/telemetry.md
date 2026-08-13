@@ -102,7 +102,7 @@ graph TD
 | `usage-error` / `help` | `pact.exit_code` **only** — see below |
 | `pact.lease.acquire` | `pact.path`, `pact.lease.ttl_secs`, `pact.lease.stolen` |
 | `pact.lease.release` | `pact.path` |
-| `pact.beads.exec` | `process.executable.name` (`bd`/`br`), `pact.beads.argv_shape`, `pact.beads.subcommand`, `pact.beads.version`, `process.exit.code` |
+| `pact.beads.exec` | `process.executable.name` (`bd`), `pact.beads.argv_shape`, `pact.beads.subcommand`, `pact.beads.version`, `process.exit.code` |
 | `pact.init.write` | `pact.instruction_files` (a count) |
 | `pact.init.commit` | — |
 

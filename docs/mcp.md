@@ -156,7 +156,7 @@ one regardless of era.
 
 `pact_msg_inbox` and `pact_msg_thread` add one further key when it applies:
 `store_conflict`, carrying the same sentence `pact doctor` and `pact msg` print
-when `.beads/` holds both a bd and a br store. Simply absent when there is
+when `.beads/` holds a leftover SQLite store beside bd's. Simply absent when there is
 nothing to say. These two are the tools that shell out to Beads, and a model
 reading `structuredContent` has no stderr on which to notice a warning — an
 empty inbox caused by a shadowed store would otherwise look exactly like a quiet
@@ -308,7 +308,7 @@ alongside `structuredContent.message`, so a script-driven client can branch on
 it without regexing the sentence below — which carries no compatibility
 guarantee of its own:
 
-- **exit 3** — the Beads backend is unavailable: no `bd`/`br` on `PATH`, or one
+- **exit 3** — the Beads backend is unavailable: no `bd` on `PATH`, or one
   killed for running past `PACT_BEADS_TIMEOUT_SECS`. Only the two message tools
   need Beads at all; leases, doctor and the event log are plain files and keep
   working — which is now true *during* a hung call as well, not only after it.

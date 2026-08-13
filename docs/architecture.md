@@ -33,7 +33,7 @@ flowchart TB
     P -->|writes| I["GEMINI.md, .cursorrules, …
     (pointers, if already present)"]
     P -->|shells out to| BD["Beads CLI
-    (bd or br)"]
+    (bd)"]
     BD -->|reads/writes| DB[(Beads database)]
 
     W -.->|"a release delivers the diff<br/>to each subscriber"| BD
@@ -391,7 +391,7 @@ the `bd` it will shell out to. Three properties are deliberate:
   fails. So `whoami` runs a listing — the query those commands actually run —
   and reports the failure as a problem. The probe is deliberately the plainest
   form both backends answer (`list --json`, no filters): a probe carrying a
-  bd-only flag failed on br and announced that messaging was broken while
+  bd-only flag failed on the other backend and announced that messaging was broken while
   `pact msg` worked perfectly, which is a diagnostic lying about the one thing
   you ran it to diagnose.
 - **It creates nothing**, including `.pact/` — a read-only question shouldn't
@@ -411,7 +411,7 @@ That derivation is also why `pact agents` distinguishes an identity that has
 than confirming it as an agent.
 
 The derivation cuts the other way too: `from`/`to` on a message come back from
-bd/br, not from pact's own `--to` check, so a name that violates pact's
+bd, not from pact's own `--to` check, so a name that violates pact's
 identity grammar (`[a-z0-9][a-z0-9-]{1,31}`) can still show up in that traffic
 — planted by a human running `bd create`, another tool, or an older pact build
 with a looser check. `pact agents` flags such a name `[INVALID]` rather than
@@ -478,24 +478,38 @@ agents`, `pact doctor` and `pact ui`'s refresh timer all pruned lock files as a
 side effect, and asking twice gave two answers. Collecting is now confined to
 `lease ls` and `acquire` — see [docs/leases.md](leases.md).
 
-## Choosing a Beads backend: the store decides, not a preference
+## Locating the Beads store: the store decides, not the cwd
 
-`src/beads.rs` is the only place pact shells out to Beads, and it supports two
-CLIs: `bd` (Go, embedded Dolt) and `br` (beads-rust, SQLite). They do **not**
-share a store, which is why selecting one is not `which("br").or(which("bd"))`.
-pact walks up for the first `.beads/` and reads what made it — `embeddeddolt/`
-means bd, a `*.db` file means br — and tries only that backend. Nothing to read
-yet is the only case with a genuine preference (br, then bd).
+`src/beads.rs` is the only place pact shells out to Beads. It walks up for the
+first `.beads/` and reads what made it, rather than trusting the working directory
+— in a linked worktree there is usually no `.beads/` to walk up to, so cwd-based
+detection would find nothing and fall through to a *preference*, opening an empty
+database for a repository whose data is elsewhere. A tool that says "no messages"
+because it opened the wrong store is worse than one that is missing.
 
-An existing store is a constraint, not a taste. On a machine with both installed,
-an unconditional "prefer br" would open an empty SQLite database in every bd repo
-and report an empty inbox — and a tool that says "no messages" because it opened
-the wrong database is worse than one that is missing. So a store pins the
-backend, the candidate list is one binary long, and a missing binary is an honest
-exit 3 whose message names which one to install and why the other one already on
-your `PATH` is not a substitute. When both stores are present — which is what one
-stray `br init` inside a bd repo leaves behind — bd wins, because that is where
-the data is.
+So the candidate list is one binary long, and a backend pact cannot serve is an
+honest exit 3 whose message says what to do about it.
+
+### One backend, since 0.7.9
+
+pact used to support two CLIs — `bd` (Go, embedded Dolt) and `br` (beads-rust,
+SQLite) — behind one adapter. They never shared a store, so selection could not be
+`which(…).or(which(…))`, and they never shared argv either: `--include-infra`,
+`--no-inherit-labels`, the `list --json` envelope and replies-as-dependency-edges
+each needed a branch.
+
+**The branches were affordable; the divergent guarantees were not.** `br` had no
+`--id`/`--force` equivalent, so a replayed `msg send` duplicated the message —
+while the protocol pact writes tells agents to re-send when they cannot confirm a
+send. That made one documented behaviour safe on one backend and unsafe on the
+other, and every page touching messaging had to carry the distinction.
+
+`0.7.9` was the last release that supported `br`. A `br` workspace is now detected
+and refused with a message naming that version and both ways forward, which is
+deliberately *not* the "no Beads CLI found" text — `br` is still on the user's
+PATH, and telling them to install what they already have would be the one useless
+answer available. A stray `*.db` beside a bd store is ignored and reported, since a
+second store nobody reads is worth a warning.
 
 ### `.beads/interactions.jsonl` is committed, and is not the passive export
 

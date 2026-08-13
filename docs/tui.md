@@ -97,7 +97,7 @@ claim is always an explicit, visible action, never silent. See
 
 Your inbox — the same query `pact msg inbox` runs, which depends on the backend:
 `bd list --assignee=<agent> --include-infra` on a bd workspace,
-`br list --type=message --assignee=<agent>` on a br one. Unread messages are
+Unread messages are
 marked `*`. `Enter` opens the full
 thread — root message plus replies — in a detail pane and marks it read;
 `Esc` goes back to the list.
@@ -141,7 +141,7 @@ here that the CLI does not emit, fails CI:
 | `otel export` | built in? configured? actually exporting? warns (`!`) when the answer to the last one is no |
 | `one Beads store` | warns (`!`) when `.beads/` holds two backends' stores |
 | `Beads CLI` | which binary, which version, warning outside the tested range |
-| `Beads actor attribution` | warns (`!`) when multiple pact agent identities never appear as any Beads actor — direct `bd`/`br` commands bypassing pact's `--actor` |
+| `Beads actor attribution` | warns (`!`) when multiple pact agent identities never appear as any Beads actor — direct `bd` commands bypassing pact's `--actor` |
 | `stale leases` | how many, without collecting them |
 | `corrupt leases` | lock files pact cannot read, which only a human can clear |
 | `orphaned staging files` | `staging-*`/`tmp-*` debris left by a write that crashed mid-rename |

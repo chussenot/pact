@@ -28,36 +28,6 @@
 //! every create here passes it. Without it a reply to a message you had
 //! already read would be born carrying your own `read-by-` label.
 //!
-//! # br (beads-rust)
-//!
-//! br 0.2.19 runs the same model but not the same argv, so the four places
-//! below branch on [`BeadsCli::is_br`]. Every claim here was checked by running
-//! the binary against a scratch workspace (pact-l94), not read off bd's docs:
-//!
-//! - `br create --type=message --title= --description= --assignee= --parent=
-//!   --actor= --json` all work unchanged, and return the same single JSON
-//!   object bd does.
-//! - `--no-inherit-labels` does not exist (`error: unexpected argument`) and is
-//!   not needed: a br child is born with no labels at all, so the bug that flag
-//!   exists to prevent cannot happen. It is therefore omitted, not faked.
-//! - `--include-infra` does not exist either, and is equally unnecessary: plain
-//!   `br list` already returns `issue_type: "message"` beads. br *does* have the
-//!   `--type` filter bd lacks, so the filtering happens server-side there and
-//!   client-side for bd.
-//! - `br list --json` returns an envelope, `{"issues":[…],"total":…}`, where bd
-//!   returns a bare array — hence [`parse_issues`] accepts either.
-//! - `br list --json` omits `parent`, and `br list` has no `--parent` filter, so
-//!   neither the thread column nor `read_thread`'s reply fetch can come from it.
-//!   `br show <id>… --json` *does* carry `parent`, so a thread's root is found
-//!   the same way bd finds it. Its replies are NOT read from that same `show`
-//!   response's `dependents` field, though — that field is a snapshot from
-//!   whenever the root was fetched, and a reply created after the fetch stayed
-//!   invisible until something re-fetched the root (pact-m7j.6.1). `br dep list
-//!   <root> --direction up --json` answers the same question as its own fresh
-//!   query, so it is asked every time — one extra subprocess (`dep list` for
-//!   the ids, `show` for the records) in exchange for the same data bd gives,
-//!   from the backend itself rather than from guessing at br's `<id>.<n>` id
-//!   shape.
 
 use std::cmp::Ordering;
 use std::path::Path;
@@ -252,35 +222,6 @@ struct BdIssue {
     /// rather than a `#[serde(default)] Vec` (which would fail on null).
     #[serde(default)]
     labels: Option<Vec<String>>,
-}
-
-/// One edge from br's `dep list --direction up --json` — the beads that point
-/// *at* the queried one. Field names differ from `show`'s own embedded
-/// `dependents` (`id`/`dependency_type`): `dep list` calls the same two things
-/// `issue_id`/`type` (confirmed against a real `br dep list`, pact-m7j.6.1).
-/// bd never emits these.
-#[derive(Debug, Deserialize)]
-struct DepListItem {
-    issue_id: String,
-    #[serde(default, rename = "type")]
-    dependency_type: String,
-}
-
-/// `list --json` output. bd returns a bare array, br wraps it in an envelope;
-/// untagged means neither backend needs a parser of its own.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum ListPayload {
-    Bare(Vec<BdIssue>),
-    Envelope { issues: Vec<BdIssue> },
-}
-
-impl ListPayload {
-    fn into_issues(self) -> Vec<BdIssue> {
-        match self {
-            ListPayload::Bare(v) | ListPayload::Envelope { issues: v } => v,
-        }
-    }
 }
 
 impl BdIssue {
@@ -664,7 +605,6 @@ fn idempotency_key(agent: &str, to: &str, parent: Option<&str>, title: &str, bod
 /// — confirmed against a real bd store with both flags on the same call.
 #[allow(clippy::too_many_arguments)]
 fn create_args(
-    is_br: bool,
     to: &str,
     parent: Option<&str>,
     agent: &str,
@@ -678,37 +618,34 @@ fn create_args(
         "--type=message".to_string(),
         "--json".to_string(),
     ];
-    if !is_br {
-        // A child must not inherit the parent's read-by-* labels, or a reply
-        // would be born already "read" by whoever read the message above it.
-        // br rejects the flag outright and does not inherit labels anyway.
-        args.push("--no-inherit-labels".to_string());
-        // `--force` bypasses bd's project-prefix guard (confirmed against
-        // `bd create --help` and a real scratch run). Needed unconditionally,
-        // not just alongside `--id`: bd auto-derives a REPLY's id from its
-        // parent (`<parent-id>.1`, `.2`, ...), and once the root carries our
-        // synthetic `pact-msg-` id, every child's auto-derived id fails the
-        // same prefix check even though the reply itself never passes `--id`
-        // — confirmed by reproducing the exact "prefix mismatch" error on a
-        // plain `--parent=pact-msg-...` create with no `--id` at all.
-        args.push("--force".to_string());
-        // Idempotency key: root messages only. `bd create` rejects `--id`
-        // together with `--parent` outright ("cannot specify both --id and
-        // --parent flags", confirmed against a real scratch run) — bd derives
-        // a child's id from its parent, and an explicit id conflicts with
-        // that. So a reply, or recipients 2..N of a fan-out, are unprotected
-        // by this key; only the first create in a `send()` call (thread root,
-        // no parent yet) gets one. Narrower than every create being safe to
-        // retry, but it is the shape the reported incident actually was — a
-        // single long send, not a reply — and reparenting after an id-only
-        // create would double the subprocess calls on the common path
-        // (every reply) to protect the uncommon one.
-        if parent.is_none() {
-            args.push(format!(
-                "--id={}",
-                idempotency_key(agent, to, parent, title, body)
-            ));
-        }
+    // A child must not inherit the parent's read-by-* labels, or a reply
+    // would be born already "read" by whoever read the message above it.
+    args.push("--no-inherit-labels".to_string());
+    // `--force` overrides bd's project-prefix guard (confirmed against
+    // `bd create --help` and a real scratch run). Needed unconditionally,
+    // not just alongside `--id`: bd auto-derives a REPLY's id from its
+    // parent (`<parent-id>.1`, `.2`, ...), and once the root carries our
+    // synthetic `pact-msg-` id, every child's auto-derived id fails the
+    // same prefix check even though the reply itself never passes `--id`
+    // — confirmed by reproducing the exact "prefix mismatch" error on a
+    // plain `--parent=pact-msg-...` create with no `--id` at all.
+    args.push("--force".to_string());
+    // Idempotency key: root messages only. `bd create` rejects `--id`
+    // together with `--parent` outright ("cannot specify both --id and
+    // --parent flags", confirmed against a real scratch run) — bd derives
+    // a child's id from its parent, and an explicit id conflicts with
+    // that. So a reply, or recipients 2..N of a fan-out, are unprotected
+    // by this key; only the first create in a `send()` call (thread root,
+    // no parent yet) gets one. Narrower than every create being safe to
+    // retry, but it is the shape the reported incident actually was — a
+    // single long send, not a reply — and reparenting after an id-only
+    // create would double the subprocess calls on the common path
+    // (every reply) to protect the uncommon one.
+    if parent.is_none() {
+        args.push(format!(
+            "--id={}",
+            idempotency_key(agent, to, parent, title, body)
+        ));
     }
     args.extend([
         format!("--title={title}"),
@@ -754,7 +691,7 @@ fn create(
     about: &[String],
     notice: bool,
 ) -> Result<BdIssue> {
-    let args = create_args(cli.is_br(), to, parent, agent, title, body, about, notice);
+    let args = create_args(to, parent, agent, title, body, about, notice);
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
     // Read back out of the argv rather than re-deriving it: this is the id the
     // call actually carried, so the retry path below cannot drift from
@@ -927,12 +864,8 @@ pub fn split_notices(messages: &[Message]) -> (Vec<&Message>, Vec<NoticeGroup>) 
 /// The exact argv [`list_issues`] hands to the backend, factored out so the
 /// filters it decides to send are unit-testable without a real subprocess
 /// (pact-m7j.4.7) — the same reasoning [`create_args`] is split out for.
-fn list_args(is_br: bool, assignee: Option<&str>, label: Option<&str>) -> Vec<String> {
-    let mut args: Vec<String> = if is_br {
-        vec!["list".into(), "--json".into(), "--type=message".into()]
-    } else {
-        vec!["list".into(), "--include-infra".into(), "--json".into()]
-    };
+fn list_args(assignee: Option<&str>, label: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = vec!["list".into(), "--include-infra".into(), "--json".into()];
     if let Some(a) = assignee {
         args.push(format!("--assignee={a}"));
     }
@@ -943,48 +876,26 @@ fn list_args(is_br: bool, assignee: Option<&str>, label: Option<&str>) -> Vec<St
 }
 
 /// Every message bead the backend will admit to, optionally narrowed to one
-/// assignee and/or one label. The one place the two backends' listing argv
-/// differ.
+/// assignee and/or one label.
 ///
-/// `label` is passed straight through as `--label=`, not applied after the
-/// fact (pact-m7j.4.7): `about_path` used to fetch every message bead here and
-/// filter client-side for the one label it wanted, paying for every OTHER
-/// path's traffic too. Both bd 1.1.2 and br 0.2.19 support `-l/--label` as an
-/// exact-match filter (`bd list --help`: "Filter by labels (AND: must have
-/// ALL)"; `br list --help`: "Filter by label (AND logic..)"), so bounding the
-/// query there bounds the response, and — on br — bounds the id set the `show`
-/// fan-out below walks.
-///
-/// br's `list --json` omits `parent` even when `--label` narrows the result to
-/// one bead — checked directly: a labelled reply's `list --json` entry still
-/// carries no `parent`, only `dependency_count`. So the id-then-show fan-out
-/// below still runs on br regardless of `label`; skipping it would silently
-/// drop thread linkage for exactly the messages this filter exists to find.
-/// (This corrects an assumption in the original bead that a label-filtered
-/// `br list --json` already returns full record data — it does not, for
-/// `parent` specifically.) `sent` and the TUI still call this with
-/// `label: None`, unaffected.
+/// `label` is passed straight through as `--label=`, not applied after the fact
+/// (pact-m7j.4.7): `about_path` used to fetch every message bead here and filter
+/// client-side for the one label it wanted, paying for every OTHER path's traffic
+/// too. bd supports `-l/--label` as an exact-match filter (`bd list --help`:
+/// "Filter by labels (AND: must have ALL)"), so bounding the query there bounds
+/// the response.
 fn list_issues(
     cli: &BeadsCli,
     repo_root: &Path,
     assignee: Option<&str>,
     label: Option<&str>,
 ) -> Result<Vec<BdIssue>> {
-    let args = list_args(cli.is_br(), assignee, label);
+    let args = list_args(assignee, label);
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    let issues = parse_issues(&cli.run(repo_root, &borrowed)?, cli, repo_root)?;
-    if !cli.is_br() {
-        return Ok(issues);
-    }
-    let ids: Vec<&str> = issues.iter().map(|i| i.id.as_str()).collect();
-    if ids.is_empty() {
-        // `br show` with no ids is an error, and an empty inbox is not one.
-        return Ok(Vec::new());
-    }
-    show_many(cli, repo_root, &ids)
+    parse_issues(&cli.run(repo_root, &borrowed)?, cli, repo_root)
 }
 
-/// `show <id>… --json`, which returns an array on both backends.
+/// `show <id>… --json`, which returns an array even for a single id.
 fn show_many(cli: &BeadsCli, repo_root: &Path, ids: &[&str]) -> Result<Vec<BdIssue>> {
     let mut args = vec!["show"];
     args.extend_from_slice(ids);
@@ -1159,45 +1070,17 @@ pub fn read_thread(
 
 /// The direct replies to `root`, unfiltered by type.
 ///
-/// bd answers this with a fresh `list --parent=<id>` every time. br has no such
-/// filter; this used to read `show --json`'s own `dependents` field instead —
-/// but that field is a snapshot from whenever `root` was fetched, so a reply
-/// created after that fetch stayed invisible until something re-fetched the
-/// root (pact-m7j.6.1). `br dep list <root> --direction up --json` is br's own
-/// fresh query for exactly this edge, so it is asked here every time, the same
-/// way the bd branch already asks `list --parent=` every time.
+/// A fresh `list --parent=<id>` every time rather than `show --json`'s own
+/// `dependents` field, which is a snapshot from whenever `root` was fetched — so
+/// a reply created after that fetch stayed invisible until something re-fetched
+/// the root (pact-m7j.6.1).
 fn replies_of(cli: &BeadsCli, repo_root: &Path, root: &BdIssue) -> Result<Vec<BdIssue>> {
-    if !cli.is_br() {
-        let parent_arg = format!("--parent={}", root.id);
-        let out = cli.run(
-            repo_root,
-            &["list", "--include-infra", "--json", &parent_arg],
-        )?;
-        return parse_issues(&out, cli, repo_root);
-    }
+    let parent_arg = format!("--parent={}", root.id);
     let out = cli.run(
         repo_root,
-        &["dep", "list", &root.id, "--direction", "up", "--json"],
+        &["list", "--include-infra", "--json", &parent_arg],
     )?;
-    let children = parse_child_ids(&out, cli)?;
-    if children.is_empty() {
-        return Ok(Vec::new());
-    }
-    let ids: Vec<&str> = children.iter().map(String::as_str).collect();
-    show_many(cli, repo_root, &ids)
-}
-
-/// `dep list --direction up --json` -> the ids of `parent-child` edges only, in
-/// the order br listed them. Any other edge type (`blocks`, `related`) is a
-/// real dependency, not a reply, and must not be dragged into a conversation.
-fn parse_child_ids(stdout: &str, cli: &BeadsCli) -> Result<Vec<String>> {
-    let items: Vec<DepListItem> = serde_json::from_str(stdout)
-        .with_context(|| format!("parsing `{} dep list --json` output", cli.binary()))?;
-    Ok(items
-        .into_iter()
-        .filter(|d| d.dependency_type == "parent-child")
-        .map(|d| d.issue_id)
-        .collect())
+    parse_issues(&out, cli, repo_root)
 }
 
 /// The one place the `read-by-` label is spelled for writing; `into_message`
@@ -1327,7 +1210,7 @@ pub fn unacknowledged(cli: &BeadsCli, repo_root: &Path) -> Result<Vec<Message>> 
     Ok(messages)
 }
 
-/// `list --json` output -> issues. bd emits a bare array, br an envelope.
+/// `list --json` output -> issues. bd emits a bare array.
 ///
 /// A parse failure here is frequently a backend-shape mismatch rather than a
 /// transient error, so the error path checks the installed backend's version
@@ -1335,7 +1218,7 @@ pub fn unacknowledged(cli: &BeadsCli, repo_root: &Path) -> Result<Vec<Message>> 
 /// in — "outside tested range" turns a bare serde error into an actionable one
 /// instead of leaving the reader to guess why the shape changed.
 fn parse_issues(stdout: &str, cli: &BeadsCli, repo_root: &Path) -> Result<Vec<BdIssue>> {
-    let payload: ListPayload = serde_json::from_str(stdout).with_context(|| {
+    let issues: Vec<BdIssue> = serde_json::from_str(stdout).with_context(|| {
         let mut msg = format!("parsing `{} list --json` output", cli.binary());
         if let Ok(version) = cli.version(repo_root) {
             if let Some(hint) = crate::beads::version_compat_warning(&version) {
@@ -1344,7 +1227,7 @@ fn parse_issues(stdout: &str, cli: &BeadsCli, repo_root: &Path) -> Result<Vec<Bd
         }
         msg
     })?;
-    Ok(payload.into_issues())
+    Ok(issues)
 }
 
 /// Issues -> message beads only, oldest first.
@@ -1504,10 +1387,6 @@ mod tests {
         BeadsCli { binary: "bd" }
     }
 
-    fn br() -> BeadsCli {
-        BeadsCli { binary: "br" }
-    }
-
     /// The pre-br entry point, kept for the tests that predate the split so
     /// they still assert the same thing about the same bytes.
     fn parse_messages(stdout: &str, viewer: Option<&str>) -> Result<Vec<Message>> {
@@ -1515,121 +1394,6 @@ mod tests {
             parse_issues(stdout, &bd(), Path::new("/nonexistent"))?,
             viewer,
         ))
-    }
-
-    /// A real `br`-initialised repo, for the one test (pact-m7j.6.1) that needs
-    /// actual replies fetched over a live subprocess rather than a JSON
-    /// fixture — `replies_of` and `thread_root` are private, so `tests/cli.rs`
-    /// (which only sees the compiled binary) cannot reach them directly.
-    /// Mirrors `tests/cli.rs`'s `beads_repo`: skip with a reason on stderr
-    /// rather than failing the whole file when `br` is not on PATH.
-    fn br_test_workspace(test: &str) -> Option<tempfile::TempDir> {
-        let on_path = std::env::var_os("PATH")
-            .map(|p| std::env::split_paths(&p).any(|d| d.join("br").is_file()))
-            .unwrap_or(false);
-        if !on_path {
-            eprintln!("SKIP {test}: br not found on PATH");
-            return None;
-        }
-        let tmp = tempfile::tempdir().unwrap();
-        let setup: [&[&str]; 4] = [
-            &["git", "init", "-q", "."],
-            &["git", "config", "user.email", "tests@pact.invalid"],
-            &["git", "config", "user.name", "pact tests"],
-            &["br", "init"],
-        ];
-        for cmd in setup {
-            match std::process::Command::new(cmd[0])
-                .args(&cmd[1..])
-                .current_dir(tmp.path())
-                .output()
-            {
-                Ok(o) if o.status.success() => {}
-                _ => {
-                    eprintln!("SKIP {test}: `{}` failed", cmd.join(" "));
-                    return None;
-                }
-            }
-        }
-        Some(tmp)
-    }
-
-    /// pact-m7j.6.1: `replies_of`'s br branch used to answer from `root`'s own
-    /// `dependents` field — a snapshot from whenever `root` was fetched — so a
-    /// reply created after that fetch stayed invisible to any caller still
-    /// holding the old `root` value. `gather_thread` itself never reuses a
-    /// `root` across two `replies_of` calls (it re-fetches at the top of every
-    /// call, which is why this cannot be reproduced by calling `msg read`
-    /// twice from the shell — confirmed against real `br` 0.2.19), but nothing
-    /// stopped a caller that fetches `root` once from asking twice, and that is
-    /// exactly the shape this test drives directly against the two private
-    /// functions involved.
-    ///
-    /// Causality: with the old code (`child_ids(root)` reading `root.dependents`)
-    /// the second call below returns 1, matching what existed when `root` was
-    /// fetched; with the fix (a fresh `dep list` every call) it returns 2.
-    #[test]
-    fn br_replies_are_queried_fresh_not_read_from_a_stale_root_snapshot() {
-        let Some(tmp) =
-            br_test_workspace("br_replies_are_queried_fresh_not_read_from_a_stale_root_snapshot")
-        else {
-            return;
-        };
-        let cli = br();
-        let root = create(
-            &cli,
-            tmp.path(),
-            "alpha",
-            "bravo",
-            None,
-            "root",
-            "root body",
-            &[],
-            false,
-        )
-        .expect("create root");
-        create(
-            &cli,
-            tmp.path(),
-            "bravo",
-            "alpha",
-            Some(&root.id),
-            "root",
-            "reply one",
-            &[],
-            false,
-        )
-        .expect("create reply1");
-
-        // Fetched BEFORE reply2 exists — this is the "earlier show call"
-        // snapshot the bug held onto.
-        let stale_root = thread_root(&cli, tmp.path(), &root.id).expect("thread_root");
-        assert_eq!(
-            replies_of(&cli, tmp.path(), &stale_root).unwrap().len(),
-            1,
-            "only reply1 exists so far"
-        );
-
-        create(
-            &cli,
-            tmp.path(),
-            "bravo",
-            "alpha",
-            Some(&root.id),
-            "root",
-            "reply two",
-            &[],
-            false,
-        )
-        .expect("create reply2");
-
-        // Same `stale_root` value, reused rather than re-fetched.
-        let replies = replies_of(&cli, tmp.path(), &stale_root).expect("replies_of");
-        assert_eq!(
-            replies.len(),
-            2,
-            "a reply created after root was fetched must still show up: {replies:?}"
-        );
     }
 
     #[test]
@@ -1787,7 +1551,6 @@ mod tests {
     #[test]
     fn multi_recipient_send_parents_the_rest_on_the_root() {
         let root = create_args(
-            false,
             "mascot-dev",
             None,
             "animator",
@@ -1805,7 +1568,6 @@ mod tests {
 
         // Second recipient, parented on the root bead the first create returned.
         let child = create_args(
-            false,
             "tui-dev",
             Some("pact-wisp-a2u"),
             "animator",
@@ -1897,9 +1659,8 @@ mod tests {
     /// br has no equivalent primitive (module docs) and would reject
     /// `--no-inherit-labels`-adjacent bd-only flags outright.
     #[test]
-    fn create_args_passes_a_deterministic_id_and_force_on_bd_only() {
+    fn create_args_passes_a_deterministic_id_and_force() {
         let bd_args = create_args(
-            false,
             "mascot-dev",
             None,
             "animator",
@@ -1917,23 +1678,6 @@ mod tests {
             "expected {expected_id} in {bd_args:?}"
         );
         assert!(bd_args.contains(&"--force".to_string()));
-
-        let br_args = create_args(
-            true,
-            "mascot-dev",
-            None,
-            "animator",
-            "subject",
-            "body",
-            &[],
-            false,
-        );
-        assert!(
-            !br_args
-                .iter()
-                .any(|a| a.starts_with("--id=") || a == "--force"),
-            "br has no --id/--force primitive: {br_args:?}"
-        );
     }
 
     /// pact-m7j.4.7: `about_path` used to fetch every message bead unfiltered
@@ -1943,26 +1687,22 @@ mod tests {
     #[test]
     fn list_args_passes_the_label_filter_through_to_both_backends() {
         let label = "about-src__foo.rs";
-        for is_br in [false, true] {
-            let args = list_args(is_br, None, Some(label));
-            assert!(
-                args.contains(&format!("--label={label}")),
-                "backend (is_br={is_br}) must receive the label filter server-side: {args:?}"
-            );
-        }
+        let args = list_args(None, Some(label));
+        assert!(
+            args.contains(&format!("--label={label}")),
+            "the backend must receive the label filter server-side: {args:?}"
+        );
     }
 
     /// `inbox` and `all_messages` call this with `label: None` and must not
     /// start silently narrowing their listing to one label.
     #[test]
     fn list_args_has_no_label_filter_when_none_is_given() {
-        for is_br in [false, true] {
-            let args = list_args(is_br, None, None);
-            assert!(
-                !args.iter().any(|a| a.starts_with("--label=")),
-                "no label requested, none should be sent: {args:?}"
-            );
-        }
+        let args = list_args(None, None);
+        assert!(
+            !args.iter().any(|a| a.starts_with("--label=")),
+            "no label requested, none should be sent: {args:?}"
+        );
     }
 
     /// The bd branch needs `--include-infra` (message beads are otherwise
@@ -1970,18 +1710,10 @@ mod tests {
     /// filter and does it client-side) — a label filter must not replace
     /// either.
     #[test]
-    fn list_args_keeps_the_backend_specific_message_filter_alongside_a_label() {
-        let bd_args = list_args(false, None, Some("about-x"));
-        assert!(
-            bd_args.contains(&"--include-infra".to_string()),
-            "{bd_args:?}"
-        );
-
-        let br_args = list_args(true, None, Some("about-x"));
-        assert!(
-            br_args.contains(&"--type=message".to_string()),
-            "{br_args:?}"
-        );
+    fn list_args_keeps_the_message_filter_alongside_a_label() {
+        let args = list_args(None, Some("about-x"));
+        assert!(args.contains(&"--include-infra".to_string()), "{args:?}");
+        assert!(args.contains(&"--label=about-x".to_string()), "{args:?}");
     }
 
     /// `bd create` rejects `--id` together with `--parent` outright — a reply
@@ -1994,7 +1726,6 @@ mod tests {
     #[test]
     fn create_args_omits_the_idempotency_key_but_keeps_force_when_there_is_a_parent() {
         let reply = create_args(
-            false,
             "tui-dev",
             Some("pact-wisp-a2u"),
             "animator",
@@ -2025,7 +1756,6 @@ mod tests {
     fn create_args_folds_about_labels_into_the_same_create_call() {
         let about = vec!["src/msg.rs".to_string(), "src/main.rs".to_string()];
         let args = create_args(
-            false,
             "mascot-dev",
             None,
             "animator",
@@ -2044,7 +1774,6 @@ mod tests {
 
         // br takes the same flag as bd, unconditionally.
         let br_args = create_args(
-            true,
             "mascot-dev",
             None,
             "animator",
@@ -2064,7 +1793,6 @@ mod tests {
     #[test]
     fn create_args_omits_labels_flag_when_about_is_empty() {
         let args = create_args(
-            false,
             "mascot-dev",
             None,
             "animator",
@@ -2085,7 +1813,6 @@ mod tests {
     #[test]
     fn no_inherit_labels_and_an_explicit_labels_list_coexist_on_bd() {
         let reply = create_args(
-            false,
             "tui-dev",
             Some("pact-wisp-a2u"),
             "animator",
@@ -2210,83 +1937,10 @@ mod tests {
         assert_eq!(msgs[0].read_by, ["msg-fix"]);
     }
 
-    /// pact-l94: br rejects `--no-inherit-labels` outright —
-    /// `error: unexpected argument '--no-inherit-labels' found`, exit non-zero —
-    /// so passing it would break every single send on that backend. Everything
-    /// else in the create line is identical, verified against br 0.2.19.
-    #[test]
-    fn br_creates_the_same_bead_without_bds_label_inheritance_flag() {
-        let brs = create_args(
-            true,
-            "docs-writer",
-            Some("brlab-udp"),
-            "br-dev",
-            "subj",
-            "b",
-            &[],
-            false,
-        );
-        assert!(
-            !brs.contains(&"--no-inherit-labels".to_string()),
-            "br errors on this flag: {brs:?}"
-        );
-        // Dropping it is safe rather than a silent loss of the guarantee: a br
-        // child is born with no labels, so it cannot arrive pre-"read".
-        for expected in [
-            "create",
-            "--type=message",
-            "--json",
-            "--title=subj",
-            "--description=b",
-            "--assignee=docs-writer",
-            "--actor=br-dev",
-            "--parent=brlab-udp",
-        ] {
-            assert!(brs.contains(&expected.to_string()), "missing {expected}");
-        }
-
-        // bd keeps the flag, plus its own `--id`/`--force` idempotency pair
-        // (pact-m7j.6.4 — br has no equivalent primitive to give the same
-        // one), and every OTHER argument is byte-identical, so the shipped
-        // backend cannot regress on the way past.
-        let bds = create_args(
-            false,
-            "docs-writer",
-            Some("brlab-udp"),
-            "br-dev",
-            "subj",
-            "b",
-            &[],
-            false,
-        );
-        let without: Vec<&String> = bds
-            .iter()
-            .filter(|a| *a != "--no-inherit-labels" && *a != "--force" && !a.starts_with("--id="))
-            .collect();
-        assert_eq!(without, brs.iter().collect::<Vec<_>>());
-    }
-
     /// pact-l94: `bd list --json` is a bare array, `br list --json` an envelope.
-    /// Both strings below are real output, trimmed to the fields pact reads.
+    /// The string below is real output, trimmed to the fields pact reads.
     #[test]
-    fn list_parsing_accepts_bds_bare_array_and_brs_envelope() {
-        const BR_LIST: &str = r#"{"issues":[
-          {"id":"brlab-udp","title":"hello","description":"body","status":"open",
-           "issue_type":"message","assignee":"br-dev","created_by":"sender",
-           "created_at":"2026-08-02T07:23:58.797517176Z",
-           "labels":["read-by-br-dev"],"dependency_count":0,"dependent_count":0}
-        ],"total":1,"limit":0,"offset":0,"has_more":false}"#;
-
-        let from_br = to_messages(
-            parse_issues(BR_LIST, &br(), Path::new("/nonexistent")).unwrap(),
-            Some("br-dev"),
-        );
-        assert_eq!(from_br.len(), 1);
-        assert_eq!(from_br[0].from, "sender");
-        assert_eq!(from_br[0].to, "br-dev");
-        assert!(from_br[0].read, "read-by- labels work the same on br");
-
-        // The bd array still parses through the same function, unchanged.
+    fn list_parsing_reads_bds_bare_array() {
         assert_eq!(
             parse_issues(LIST_JSON, &bd(), Path::new("/nonexistent"))
                 .unwrap()
@@ -2307,8 +1961,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
-        let script = tmp.path().join("fake-br");
-        std::fs::write(&script, "#!/bin/sh\necho 'br 0.4.0'\n").unwrap();
+        let script = tmp.path().join("fake-bd");
+        std::fs::write(&script, "#!/bin/sh\necho 'bd version 9.9.9'\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         // Leaked to get the `&'static str` the field requires; a test-only,
         // one-time leak of a temp path is not a real leak.
@@ -2324,33 +1978,9 @@ mod tests {
             "expected the tested-range hint in the parse error, got: {message}"
         );
         assert!(
-            message.contains("0.2.0") && message.contains("0.3.0"),
-            "expected br's actual tested bounds, got: {message}"
+            message.contains("1.1.0") && message.contains("1.3.0"),
+            "expected the actual tested bounds, got: {message}"
         );
-    }
-
-    /// pact-l94/pact-m7j.6.1: br has no `list --parent`, so replies come from
-    /// a fresh `dep list <root> --direction up --json` query — not from
-    /// `show`'s own `dependents` snapshot (see `replies_of`'s doc comment for
-    /// why). JSON copied from a real `br dep list --direction up --json`.
-    #[test]
-    fn br_dep_list_parses_parent_child_edges_and_ignores_the_rest() {
-        const DEP_LIST_JSON: &str = r#"[
-          {"issue_id":"brlab-udp.2","depends_on_id":"brlab-udp","type":"parent-child",
-           "title":"r2","status":"open","priority":2},
-          {"issue_id":"brlab-udp.1","depends_on_id":"brlab-udp","type":"parent-child",
-           "title":"reply","status":"open","priority":2},
-          {"issue_id":"brlab-zzz","depends_on_id":"brlab-udp","type":"blocks",
-           "title":"a real blocker","status":"open","priority":2}
-        ]"#;
-        assert_eq!(
-            parse_child_ids(DEP_LIST_JSON, &br()).unwrap(),
-            ["brlab-udp.2", "brlab-udp.1"],
-            "the blocks edge must not be dragged into the conversation"
-        );
-
-        // No replies at all: an empty array, not a parse failure.
-        assert!(parse_child_ids("[]", &br()).unwrap().is_empty());
     }
 
     /// pact-aw7.4: the counter that says whether the fleet adopted
@@ -2674,19 +2304,19 @@ mod tests {
     #[test]
     fn create_args_folds_the_notice_label_in_with_the_about_labels() {
         let about = vec!["src/ast.rs".to_string()];
-        let args = create_args(false, "watcher", None, "agent-01", "s", "b", &about, true);
+        let args = create_args("watcher", None, "agent-01", "s", "b", &about, true);
         assert!(
             args.contains(&"--labels=about-src__ast-rs,watch-notice".to_string()),
             "{args:?}"
         );
         // And a notice with no path still gets the label.
-        let bare = create_args(false, "watcher", None, "agent-01", "s", "b", &[], true);
+        let bare = create_args("watcher", None, "agent-01", "s", "b", &[], true);
         assert!(
             bare.contains(&"--labels=watch-notice".to_string()),
             "{bare:?}"
         );
         // An authored message is never tagged.
-        let authored = create_args(false, "watcher", None, "agent-01", "s", "b", &about, false);
+        let authored = create_args("watcher", None, "agent-01", "s", "b", &about, false);
         assert!(
             authored.contains(&"--labels=about-src__ast-rs".to_string()),
             "{authored:?}"

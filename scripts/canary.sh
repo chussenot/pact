@@ -207,10 +207,9 @@ printf '  acquire, list and release round-tripped\n'
 # bead history is attributed to one human and the audit trail cannot answer the
 # only question it exists for: who did this.
 #
-# Both backends take the same flag, and pact passes it — `bd` 1.1.2 documents
-# precedence `--actor` > `$BEADS_ACTOR` > `git user.name` > `$USER`, and `br`
-# 0.2.19 accepts `--actor` too. This asserts the end-to-end result rather than the
-# flag: the canary's git user is deliberately NOT an agent name, so a match on
+# pact passes `--actor`, whose documented precedence is `--actor` >
+# `$BEADS_ACTOR` > `git user.name` > `$USER`. This asserts the end-to-end result
+# rather than the flag: the canary's git user is deliberately NOT an agent name, so a match on
 # `canary-a` can only come from attribution working.
 step "backend attributes writes to the agent, not the git user"
 GIT_USER="$(git config user.name)"
@@ -221,8 +220,8 @@ if ! bd show "$MSG_ID" --json >"$ACTOR_JSON" 2>&1; then
 	cat "$ACTOR_JSON" >&2
 	fail "could not read $MSG_ID back from the backend"
 fi
-# bd returns a bare object from `show`; br has returned an array. Accept either
-# rather than branching on the backend.
+# `show` has returned both a bare object and a single-element array across bd
+# versions, so accept either rather than pinning one shape.
 RECORDED="$(jq -r 'if type == "array" then .[0] else . end | .created_by // ""' "$ACTOR_JSON")"
 printf '  git user.name: %s\n  created_by:    %s\n' "$GIT_USER" "$RECORDED"
 [ "$RECORDED" = "canary-a" ] ||

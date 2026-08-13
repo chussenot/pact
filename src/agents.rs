@@ -30,7 +30,7 @@ pub struct AgentInfo {
     pub messages_received: usize,
     /// Does `name` pass `identity::validate`? `check_recipient` only enforces
     /// the grammar on the literal `--to` argument at send time — a `from`/`to`
-    /// string read back from bd/br is never re-checked, so anything with write
+    /// string read back from bd is never re-checked, so anything with write
     /// access to the shared store (a human running `bd create`, another tool,
     /// a looser pact build) can plant a name no real `pact` process could ever
     /// hold (pact-m7j.6.3). `false` here is what lets `is_known`/`suggest` and
@@ -229,7 +229,7 @@ fn observe<'a>(
     // recipient; "" is not an identity.
     let key = if name.is_empty() { "(unknown)" } else { name };
     // Checked once, at the single point every source (lease files, event log,
-    // bd/br message traffic) funnels into the roster — the same grammar
+    // bd message traffic) funnels into the roster — the same grammar
     // `check_recipient` enforces on `--to` at send time, applied here on read
     // (pact-m7j.6.3). "(unknown)" itself never matches it, which is fine: it
     // is a placeholder, not a claimed identity, and was never going to be
@@ -426,7 +426,7 @@ mod tests {
     }
 
     /// pact-m7j.6.3: `observe` is the one point where `from`/`to` strings read
-    /// back from bd/br enter the roster, and until now nothing there matched
+    /// back from bd enter the roster, and until now nothing there matched
     /// `check_recipient`'s grammar check on the literal `--to` at send time.
     /// A name planted straight into the shared store — by a human running `bd
     /// create`, another tool, or a looser pact build — used to fold in and

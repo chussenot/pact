@@ -41,7 +41,7 @@ flowchart LR
     B[Agent B] -->|"lease · msg · watch"| P
     P --> G["AGENTS.md<br/>the protocol agents read"]
     P --> F[".pact/<br/>leases · watches · event log"]
-    P --> D["Beads CLI<br/>bd or br"]
+    P --> D["Beads CLI (bd)<br/>messages, as issues"]
     D --> M[["messages, as issues"]]
     P -.->|"on lease release,<br/>the diff goes to watchers"| D
 ```
