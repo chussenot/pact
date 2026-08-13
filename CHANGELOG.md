@@ -10,6 +10,20 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.9.1 - 2026-08-13
+#### Bug Fixes
+- **(init)** give the message store a union merge driver too - (14e9074) - Clement HUSSENOT-DESENONGES
+- **(tui)** count the warnings in the Doctor panel title, like the CLI does - (4050d32) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- name the message store in every checkpoint statement, and retire exit 3 - (4cfd431) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(pact)** coordination record for the checkpoint audit - (28fe435) - Clement HUSSENOT-DESENONGES
+- **(pact)** the last three lease events - (cf2e295) - Clement HUSSENOT-DESENONGES
+#### Tests
+- **(cli)** pin exit 3 as unreachable across the whole command surface - (5ef17cb) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.9.0 - 2026-08-13
 #### Bug Fixes
 - **(msg)** commit the message store, as the design says - (4000384) - Clement HUSSENOT-DESENONGES
