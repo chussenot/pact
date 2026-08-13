@@ -9,9 +9,9 @@
 # Added by cargo
 /target
 
-# pact runtime state. NOT .pact/events.jsonl — that is the append-only
-# history behind `pact log`, and it is meant to be committed
-# (see docs/architecture.md).
+# pact runtime state. NOT .pact/events.jsonl or .pact/messages.jsonl — those are
+# the append-only history behind `pact log` and `pact msg`, and both are meant to
+# be committed (see docs/architecture.md). Read cursors are not: see below.
 .pact/leases/
 .pact/waits/
 # One file per agent, id -> when they read it. Local because a read position is
@@ -24,7 +24,7 @@
 tmp/*
 
 # Everything pact or an agent writes under .pact/ is local runtime state,
-# EXCEPT the append-only event log, which is history and belongs in git.
+# EXCEPT the two append-only logs below, which are history and belong in git.
 .pact/*
 !.pact/events.jsonl
 !.pact/messages.jsonl

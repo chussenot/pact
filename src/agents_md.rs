@@ -603,10 +603,23 @@ const RUNTIME_IGNORE_SENTINEL: &str = ".pact/*";
 const RUNTIME_IGNORE_COMMENT_1: &str =
     "# Everything pact or an agent writes under .pact/ is local runtime state,";
 const RUNTIME_IGNORE_COMMENT_2: &str =
-    "# EXCEPT the append-only event log, which is history and belongs in git.";
+    "# EXCEPT the two append-only logs below, which are history and belong in git.";
 
-/// `.pact/events.jsonl`: the one file under `.pact/` that belongs in git.
+/// `.pact/events.jsonl`: the lease-event log, and the first file under `.pact/`
+/// that belonged in git.
 pub const EVENTS_LOG_PATH: &str = ".pact/events.jsonl";
+
+/// `.pact/messages.jsonl`: the message store, committed since 0.9.0.
+pub const MESSAGES_STORE_PATH: &str = ".pact/messages.jsonl";
+
+/// Every append-only file pact commits, and therefore every path that needs a
+/// union merge driver.
+///
+/// A list rather than a constant, because there are two of them now and a second
+/// hand-maintained copy of "which files does pact commit" is how one of them gets
+/// forgotten — which is exactly what happened when the message store became
+/// committed without a matching merge rule.
+pub const COMMITTED_APPEND_ONLY: &[&str] = &[EVENTS_LOG_PATH, MESSAGES_STORE_PATH];
 
 /// `merge=union` for the event log, so that committing an append-only file does
 /// not mean a conflict on every merge.
@@ -628,13 +641,29 @@ pub fn ensure_gitattributes(repo_root: &Path) -> Result<()> {
     write_atomic_cas(&path, repo_root, gitattributes_content)
 }
 
+/// Does `existing` already say something about `path`?
+///
+/// Per PATH, not per file: the old check returned early if `.pact/events.jsonl`
+/// appeared anywhere, which meant every repository initialised before 0.9.0 —
+/// i.e. every existing one — would never receive the rule for the message store,
+/// no matter how many times `pact init` was re-run. The bug only shows up on
+/// upgrade, which is the case a sentinel check is least likely to be tested
+/// against.
+fn mentions_path(existing: &str, path: &str) -> bool {
+    existing
+        .lines()
+        .any(|l| l.split_whitespace().next() == Some(path))
+}
+
 /// Pure computation half of [`ensure_gitattributes`] — see
 /// [`gitignore_content`]'s doc comment for why this is split out.
 fn gitattributes_content(existing: &str) -> String {
-    if existing
-        .lines()
-        .any(|l| l.split_whitespace().next() == Some(EVENTS_LOG_PATH))
-    {
+    let missing: Vec<&str> = COMMITTED_APPEND_ONLY
+        .iter()
+        .copied()
+        .filter(|p| !mentions_path(existing, p))
+        .collect();
+    if missing.is_empty() {
         return existing.to_string();
     }
 
@@ -642,9 +671,9 @@ fn gitattributes_content(existing: &str) -> String {
     if !out.is_empty() {
         out.push(String::new());
     }
-    out.push("# pact: the event log is append-only, so a merge keeps BOTH sides".to_string());
+    out.push("# pact: these logs are append-only, so a merge keeps BOTH sides".to_string());
     out.push("# rather than stopping for a human who has nothing to decide.".to_string());
-    out.push(format!("{EVENTS_LOG_PATH} merge=union"));
+    out.extend(missing.iter().map(|p| format!("{p} merge=union")));
 
     let mut content = out.join("\n");
     content.push('\n');
@@ -897,6 +926,72 @@ pub fn nearest_preceding_marker(content: &str, line: usize) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The two lists that decide a file's fate must agree: anything pact COMMITS
+    /// needs a `!` negation in the ignore rules and a union merge driver. They were
+    /// maintained by hand and drifted exactly once — the message store became
+    /// committed with no merge rule, so the per-worktree fleet pattern
+    /// docs/fleet-patterns.md recommends would have conflicted on every wave.
+    #[test]
+    fn every_committed_file_is_both_un_ignored_and_union_merged() {
+        for path in COMMITTED_APPEND_ONLY {
+            assert!(
+                RUNTIME_IGNORE_RULES.contains(&format!("!{path}").as_str()),
+                "{path} is committed but has no `!` negation in RUNTIME_IGNORE_RULES, \
+                 so `pact init` would write a .gitignore that hides it"
+            );
+            let attrs = gitattributes_content("");
+            assert!(
+                attrs.lines().any(|l| l == format!("{path} merge=union")),
+                "{path} is committed and append-only but gets no union merge driver, \
+                 so two branches appending to it conflict on every merge:\n{attrs}"
+            );
+        }
+    }
+
+    /// The upgrade path, which a sentinel check gets wrong by construction: a
+    /// repository whose .gitattributes already names the event log must still
+    /// receive the rule for the message store.
+    #[test]
+    fn gitattributes_adds_a_missing_path_to_a_file_that_already_has_the_other() {
+        let existing = format!("{EVENTS_LOG_PATH} merge=union\n");
+        let out = gitattributes_content(&existing);
+        assert!(
+            out.lines()
+                .any(|l| l == format!("{MESSAGES_STORE_PATH} merge=union")),
+            "an existing events.jsonl rule suppressed the messages.jsonl one:\n{out}"
+        );
+        // And it must not duplicate the one that was already there.
+        let events = out
+            .lines()
+            .filter(|l| l.split_whitespace().next() == Some(EVENTS_LOG_PATH))
+            .count();
+        assert_eq!(events, 1, "duplicated the existing rule:\n{out}");
+
+        // Idempotent once both are present.
+        assert_eq!(gitattributes_content(&out), out);
+    }
+
+    /// A hand-chosen merge driver stays the user's call, per path.
+    #[test]
+    fn gitattributes_leaves_a_deliberate_merge_driver_alone() {
+        let existing = format!("{MESSAGES_STORE_PATH} merge=ours\n");
+        let out = gitattributes_content(&existing);
+        assert!(
+            out.lines()
+                .any(|l| l == format!("{MESSAGES_STORE_PATH} merge=ours")),
+            "overrode a deliberate choice:\n{out}"
+        );
+        assert!(
+            !out.lines()
+                .any(|l| l == format!("{MESSAGES_STORE_PATH} merge=union")),
+            "added a second, contradicting rule:\n{out}"
+        );
+        // The path it says nothing about still gets its rule.
+        assert!(out
+            .lines()
+            .any(|l| l == format!("{EVENTS_LOG_PATH} merge=union")));
+    }
+
     use super::*;
 
     /// Deterministic proof of the compare-and-swap fix — no thread, no sleep,
@@ -1251,7 +1346,31 @@ mod tests {
 
         ensure_gitattributes(tmp.path()).unwrap();
 
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        // The deliberate choice for THAT path survives, which is what this test is
+        // about. It used to assert the whole file came back byte-identical, which
+        // quietly encoded the sentinel bug rather than the intent: "leave this path
+        // alone" and "add nothing at all" are different promises, and only the first
+        // is one pact should keep. A repo carrying a hand-picked driver for the event
+        // log still needs a rule for the message store.
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after
+                .lines()
+                .any(|l| l == format!("{EVENTS_LOG_PATH} merge=ours")),
+            "{after}"
+        );
+        assert!(
+            !after
+                .lines()
+                .any(|l| l == format!("{EVENTS_LOG_PATH} merge=union")),
+            "added a rule contradicting the one already there:\n{after}"
+        );
+        assert!(
+            after
+                .lines()
+                .any(|l| l == format!("{MESSAGES_STORE_PATH} merge=union")),
+            "the message store was left without a merge rule:\n{after}"
+        );
     }
 
     /// An agent only knows the commands this block tells it about.

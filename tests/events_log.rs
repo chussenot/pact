@@ -89,7 +89,7 @@ fn ignored(repo: &Path, rel: &str) -> bool {
 /// "events.jsonl is tracked" says nothing on its own about whether a lock file
 /// slipped in beside it.
 #[test]
-fn init_makes_the_event_log_committable_and_leaves_runtime_state_ignored() {
+fn init_commits_the_two_append_only_logs_and_leaves_runtime_state_ignored() {
     if !have_git() {
         eprintln!("SKIP: no git on PATH");
         return;
@@ -119,6 +119,42 @@ fn init_makes_the_event_log_committable_and_leaves_runtime_state_ignored() {
         "a lock file is NOT ignored — runtime state would get committed"
     );
 
+    // All THREE fates, because 0.9.0 made the message store committed and a fleet
+    // orchestrator follows the .gitignore, not the design note. `read/` is the line
+    // that matters most: a read position is per-machine, so committing it would have
+    // every clone inherit its peers' inboxes.
+    assert!(
+        pact(root, "agent-a", &["msg", "send", "--to", "agent-b", "hi"])
+            .status
+            .success()
+    );
+    assert!(
+        root.join(".pact/messages.jsonl").is_file(),
+        "no message store to test"
+    );
+    assert!(
+        !ignored(root, ".pact/messages.jsonl"),
+        "the message store is ignored — the fleet's communication record dies at the \
+         next clone"
+    );
+    assert!(pact(root, "agent-b", &["msg", "inbox"]).status.success());
+    assert!(
+        ignored(root, ".pact/read/agent-b.json"),
+        "a read cursor is NOT ignored — every clone would inherit peers' read state"
+    );
+
+    // Committed AND append-only means it needs a union merge driver, or the
+    // per-worktree fleet pattern conflicts on every wave.
+    let attrs = std::fs::read_to_string(root.join(".gitattributes")).unwrap_or_default();
+    for path in [".pact/events.jsonl", ".pact/messages.jsonl"] {
+        assert!(
+            attrs
+                .lines()
+                .any(|l| l.split_whitespace().next() == Some(path) && l.contains("merge=union")),
+            "{path} is committed but has no union merge rule:\n{attrs}"
+        );
+    }
+
     // And it really does get committed, which is the property that matters.
     git_ok(root, &["add", "-A"]);
     git_ok(root, &["commit", "--quiet", "-m", "with pact history"]);
@@ -126,12 +162,22 @@ fn init_makes_the_event_log_committable_and_leaves_runtime_state_ignored() {
         tracked(root, ".pact/events.jsonl"),
         "the event log did not survive a commit"
     );
+    assert!(
+        tracked(root, ".pact/messages.jsonl"),
+        "the message store did not survive a commit"
+    );
+    // Exactly TWO since 0.9.0, and the list is asserted whole rather than by
+    // membership: a new file quietly becoming committable is the thing to catch,
+    // because `.pact/` is where evidence logs and once a live SIGNOZ_API_KEY have
+    // been written by agents.
     let committed =
         String::from_utf8_lossy(&git(root, &["ls-files", "--", ".pact/"]).stdout).into_owned();
+    let mut listed: Vec<&str> = committed.lines().collect();
+    listed.sort_unstable();
     assert_eq!(
-        committed.trim(),
-        ".pact/events.jsonl",
-        "exactly one file under .pact/ belongs in git, got: {committed:?}"
+        listed,
+        [".pact/events.jsonl", ".pact/messages.jsonl"],
+        "exactly these belong in git, got: {committed:?}"
     );
 
     // A clone is the whole point: history has to travel.
@@ -189,6 +235,23 @@ fn re_init_narrows_an_older_pacts_broad_ignore_rule() {
     assert!(
         ignored(root, ".pact/leases/f.rs.lock"),
         "narrowing must not un-ignore the runtime state"
+    );
+    // The upgrade path a sentinel check gets wrong: a repo initialised before 0.9.0
+    // has an ignore rule that predates the message store entirely, and re-running
+    // init is the only thing that will ever fix it.
+    assert!(
+        pact(root, "agent-a", &["msg", "send", "--to", "peer", "hi"])
+            .status
+            .success()
+    );
+    assert!(
+        !ignored(root, ".pact/messages.jsonl"),
+        "re-running init did not un-ignore the message store:\n{}",
+        std::fs::read_to_string(root.join(".gitignore")).unwrap()
+    );
+    assert!(
+        ignored(root, ".pact/read/agent-a.json"),
+        "narrowing must not un-ignore read cursors"
     );
     let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
     for kept in ["/target", "*.tmp"] {
@@ -257,6 +320,77 @@ fn two_branches_appending_events_merge_without_conflict() {
     for needle in ["a.rs", "b.rs", "base.rs"] {
         assert!(log.contains(needle), "merge lost {needle}:\n{log}");
     }
+}
+
+/// The same proof for the MESSAGE store, which is the half that was missing.
+///
+/// 0.9.0 made `.pact/messages.jsonl` committed but wrote no merge rule for it, so
+/// the per-worktree fleet pattern docs/fleet-patterns.md recommends — one worktree
+/// per agent, merged at wave end — would have hit a conflict on every wave, in the
+/// file agents use to warn each other. This is the regression test for that.
+#[test]
+fn two_branches_sending_messages_merge_without_conflict() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+    let tmp = repo();
+    let root = tmp.path();
+    assert!(pact(root, "agent-a", &["init", "--no-commit"])
+        .status
+        .success());
+    assert!(
+        pact(root, "agent-a", &["msg", "send", "--to", "human", "base"])
+            .status
+            .success()
+    );
+    git_ok(root, &["add", "-A"]);
+    git_ok(root, &["commit", "--quiet", "-m", "base"]);
+
+    git_ok(root, &["checkout", "--quiet", "-b", "branch-a"]);
+    assert!(
+        pact(root, "agent-a", &["msg", "send", "--to", "human", "from a"])
+            .status
+            .success()
+    );
+    git_ok(root, &["commit", "--quiet", "-am", "a sends"]);
+
+    git_ok(root, &["checkout", "--quiet", "main"]);
+    git_ok(root, &["checkout", "--quiet", "-b", "branch-b"]);
+    assert!(
+        pact(root, "agent-b", &["msg", "send", "--to", "human", "from b"])
+            .status
+            .success()
+    );
+    git_ok(root, &["commit", "--quiet", "-am", "b sends"]);
+
+    let merge = git(root, &["merge", "--no-edit", "branch-a"]);
+    assert!(
+        merge.status.success(),
+        "the message store must merge cleanly with merge=union; git said:\n{}\n{}",
+        stdout_of(&merge),
+        String::from_utf8_lossy(&merge.stderr)
+    );
+
+    // Neither agent's mail is lost, which is the whole reason to keep both sides.
+    let store = std::fs::read_to_string(root.join(".pact/messages.jsonl")).unwrap();
+    for needle in ["base", "from a", "from b"] {
+        assert!(store.contains(needle), "merge lost {needle:?}:\n{store}");
+    }
+    // And the merged store is still readable BY PACT, not merely by grep — a union
+    // merge that interleaved two half-lines would satisfy the check above.
+    let inbox = pact(root, "human", &["msg", "inbox", "--json"]);
+    assert!(
+        inbox.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inbox.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&stdout_of(&inbox)).expect("inbox JSON");
+    assert_eq!(
+        parsed.as_array().map(Vec::len),
+        Some(3),
+        "pact must read all three messages back after the merge: {parsed}"
+    );
 }
 
 /// doctor has to say so when the log is ignored, and warn rather than fail:

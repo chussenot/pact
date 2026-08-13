@@ -1,3 +1,4 @@
-# pact: the event log is append-only, so a merge keeps BOTH sides
+# pact: these logs are append-only, so a merge keeps BOTH sides
 # rather than stopping for a human who has nothing to decide.
 .pact/events.jsonl merge=union
+.pact/messages.jsonl merge=union
