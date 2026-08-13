@@ -18,12 +18,16 @@
 //!
 //! ## Scope, which is narrow on purpose
 //!
-//! Audit never opens `.beads/`, a Dolt directory, a SQLite file or a JSONL
-//! export, because "pact never touches the Beads store directly, only the
-//! CLI" is an invariant the whole messaging design rests on, and an analytics
-//! command is exactly where it would be convenient to break it. Beads-side
-//! questions live in `scripts/beads-retro.sh`, which is best-effort,
-//! jq-based, and says so in its header.
+//! Audit never opens a Beads *database* — no Dolt directory, no SQLite file —
+//! because "pact never touches the Beads store directly" is an invariant the
+//! whole messaging design rests on, and an analytics command is exactly where
+//! it would be convenient to break it. The one `.beads/` artifact it reads is
+//! the committed, append-only `interactions.jsonl` export
+//! ([`crate::beads::interaction_assignees`], pact-as5.6), read-only and
+//! parse-tolerant — the same shape of file as `.pact/events.jsonl` on pact's
+//! own side, and the reason audit needs no subprocess. Richer Beads-side
+//! questions live in `scripts/beads-retro.sh`, which is best-effort, jq-based,
+//! and says so in its header.
 //!
 //! `.pact/events.jsonl` is not the *only* thing audit reads, though — as of
 //! `Check::CommitCorrelation` (pact-1l8.1) it also shells out to `git log`
@@ -129,8 +133,10 @@ pub enum Check {
     /// hashes `acquired` and `released` already carry.
     MergeDivergence,
     /// pact-mqw.4: did a hold's note name a bead that belongs to somebody else?
-    /// The one check that asks the Beads store a question rather than reading only
-    /// `.pact/` — see [`ClaimDivergence`] for the caveat that comes with it.
+    /// The one check that reads outside `.pact/` for a Beads-side fact — the
+    /// committed `.beads/interactions.jsonl`, never the store, and never a
+    /// subprocess. See [`ClaimDivergence`] for the caveat that comes with it, and
+    /// [`claim_divergences`] for the sensitivity it trades away.
     ClaimLeaseDivergence,
     /// pact-1gv.3: which agents busy-retried a lease instead of backing off. The
     /// only check about what the FLEET wasted rather than what pact got wrong.
@@ -312,11 +318,15 @@ fn merge_divergences(events: &[(usize, Event)]) -> (Vec<MergeDivergence>, usize)
 /// One hold whose note named a bead assigned to a different agent.
 ///
 /// **The caveat, stated first because it bounds the claim.** `assignee` is the
-/// assignee *now*, not at acquire time — the log records the note, not the bead's
-/// state when it was written. So a hold that legitimately handed its bead on
-/// afterwards shows up here too. This answers "whose bead did this hold's note
-/// name, and who owns that bead today", which is the retrospective question; the
-/// live question is answered at acquire time, where the assignee really is current.
+/// LAST assignee `.beads/interactions.jsonl` recorded, not the assignee at acquire
+/// time — the log records the note, not the bead's state when it was written. So a
+/// hold that legitimately handed its bead on afterwards shows up here too. This
+/// answers "whose bead did this hold's note name, and who was it last assigned
+/// to", which is the retrospective question; the live question is answered at
+/// acquire time, where the assignee really is current.
+///
+/// The second caveat is [`claim_divergences`]': beads never *re*assigned have no
+/// row in the export and cannot appear here at all.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClaimDivergence {
     pub path: String,
@@ -327,31 +337,34 @@ pub struct ClaimDivergence {
     pub line: usize,
 }
 
-/// Cross-check each hold's note against the Beads store.
+/// Cross-check each hold's note against the assignees recorded in
+/// `.beads/interactions.jsonl`.
 ///
 /// Widens audit's usual "`.pact/` and nothing else" scope for the second time, the
 /// same way [`Check::CommitCorrelation`] widened it for git — and under the same
 /// rule: the invariant that section protects is "never touch the Beads DB
-/// directly, only its CLI", which this obeys. `pact audit --export` already asks
-/// bd a question for `unacknowledged_messages`.
+/// directly", which this obeys. Since pact-as5.6 it spawns no subprocess at all:
+/// [`crate::beads::interaction_assignees`] reads the committed, git-tracked
+/// export, so this check runs with no `bd` on `PATH`.
 ///
-/// One lookup per DISTINCT bead, not per hold: a wave of twenty holds naming one
-/// bead is one subprocess.
+/// **It is deliberately less sensitive than the `bd show` version it replaced.**
+/// The export records CHANGES, so a bead assigned at creation and never
+/// reassigned has no assignee row and resolves to nothing — it finds fewer
+/// divergences than a live query would, never more. See
+/// [`crate::beads::interaction_assignees`] and `docs/audit.md`.
 fn claim_divergences(
     repo_root: &std::path::Path,
     events: &[(usize, Event)],
     report: &mut CheckReport,
 ) {
-    let cli = match crate::beads::BeadsCli::locate() {
-        Ok(cli) => cli,
-        Err(e) => {
-            report.claim_unavailable = Some(format!("{e:#}"));
-            return;
-        }
-    };
-    // bead id -> assignee, resolved once. `None` means asked and unassigned (or
-    // unknown), which is not worth asking twice either.
-    let mut resolved: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let assignees = crate::beads::interaction_assignees(repo_root);
+    if assignees.is_empty() {
+        // Absent, empty, unparseable, or no assignee change ever recorded: all
+        // one answer, "nothing to check against", and all of them PASS.
+        report.claim_unavailable =
+            Some("no assignee history in .beads/interactions.jsonl".to_string());
+        return;
+    }
     // Walked over the OPENING EVENTS rather than over reconstructed `Hold`s,
     // because the note lives on the event's `detail` and a Hold does not carry it.
     // Same set either way — every hold has exactly one open — with no need to widen
@@ -368,19 +381,17 @@ fn claim_divergences(
             report.holds_naming_no_bead += 1;
             continue;
         };
-        let assignee = resolved
-            .entry(bead.to_string())
-            .or_insert_with(|| crate::beads::assignee_of(&cli, repo_root, bead))
-            .clone();
-        let Some(assignee) = assignee else { continue };
-        if assignee == e.agent {
+        let Some(assignee) = assignees.get(bead) else {
+            continue;
+        };
+        if assignee == &e.agent {
             continue;
         }
         report.claim_divergences.push(ClaimDivergence {
             path: path.to_string(),
             agent: e.agent.clone(),
             bead: bead.to_string(),
-            assignee,
+            assignee: assignee.clone(),
             acquired_at: e.at.clone(),
             line: *line,
         });
@@ -1008,10 +1019,11 @@ pub struct CheckReport {
     pub divergence_unhashed: usize,
     /// `Check::ClaimLeaseDivergence` only.
     pub claim_divergences: Vec<ClaimDivergence>,
-    /// `Check::ClaimLeaseDivergence` only: `Some(reason)` when the Beads store
-    /// could not be asked at all. `claim_divergences` is then always empty, which
+    /// `Check::ClaimLeaseDivergence` only: `Some(reason)` when there was no Beads
+    /// data to check against at all. `claim_divergences` is then always empty, which
     /// must read as "this check could not run", never as "nothing found" — the same
-    /// contract `git_unavailable` has.
+    /// contract `git_unavailable` has. It is never an error and never a non-zero
+    /// exit: a repository with no `.beads/interactions.jsonl` passes.
     pub claim_unavailable: Option<String>,
     /// `Check::ClaimLeaseDivergence` only: holds whose note named no bead, so there
     /// was nothing to cross-check. Scope, not a finding.
@@ -2780,8 +2792,7 @@ pub fn render_check(r: &CheckReport) -> String {
     if r.check == "claim-lease-divergence" {
         if let Some(reason) = &r.claim_unavailable {
             out.push(format!(
-                "  the Beads store could not be asked ({reason}) — claim-lease-divergence could \
-                 not run"
+                "  no beads data ({reason}) — claim-lease-divergence could not run"
             ));
             return out.join("\n");
         }
@@ -3133,7 +3144,7 @@ pub fn render_check(r: &CheckReport) -> String {
     for c in &r.claim_divergences {
         out.push(String::new());
         out.push(format!(
-            "CLAIM/LEASE DIVERGENCE on {}: held by {} for {}, which bd assigns to {} (line {}, \
+            "CLAIM/LEASE DIVERGENCE on {}: held by {} for {}, last assigned to {} (line {}, \
              acquired {})",
             c.path, c.agent, c.bead, c.assignee, c.line, c.acquired_at
         ));
@@ -3566,6 +3577,142 @@ mod tests {
             "{}",
             render_summary(&s)
         );
+    }
+
+    /// An acquire whose note names a bead, which is the only thing
+    /// claim-lease-divergence reads off the event.
+    fn ev_note(at: &str, agent: &str, path: &str, note: &str) -> String {
+        format!(
+            r#"{{"at":"{at}","agent":"{agent}","kind":"acquired","path":"{path}","detail":"{note}"}}"#
+        )
+    }
+
+    /// Plant a Beads interactions export beside an existing log (pact-as5.6). Raw
+    /// lines, so a fixture can plant junk — parse-tolerance is this reader's whole
+    /// contract.
+    fn with_interactions(tmp: &tempfile::TempDir, lines: &[&str]) {
+        let beads = tmp.path().join(".beads");
+        std::fs::create_dir_all(&beads).unwrap();
+        std::fs::write(beads.join("interactions.jsonl"), lines.join("\n")).unwrap();
+    }
+
+    fn assignee_row(at: &str, issue: &str, new_value: &str) -> String {
+        format!(
+            r#"{{"id":"int-1","kind":"field_change","created_at":"{at}","actor":"someone","issue_id":"{issue}","extra":{{"field":"assignee","new_value":"{new_value}","old_value":""}}}}"#
+        )
+    }
+
+    /// pact-as5.6: the assignee is reconstructed by replaying `field=assignee` rows
+    /// from the committed export, with no `bd` subprocess anywhere. Three things at
+    /// once, because they are one replay: the last row wins, a `field=status` row is
+    /// ignored, and a final empty `new_value` means unassigned (so no divergence).
+    #[test]
+    fn claim_divergence_reads_the_assignee_out_of_interactions_jsonl() {
+        let tmp = with_log(&[
+            &ev_note(
+                "2026-08-11T09:00:00Z",
+                "agent-b",
+                "src/printer.rs",
+                "pact-abc: rewriting the printer",
+            ),
+            &ev_note(
+                "2026-08-11T09:05:00Z",
+                "agent-b",
+                "src/token.rs",
+                "pact-xyz: nobody owns this one",
+            ),
+        ]);
+        with_interactions(
+            &tmp,
+            &[
+                // Ignored: not an assignee change.
+                r#"{"id":"int-0","kind":"field_change","created_at":"2026-08-11T08:00:00Z","actor":"someone","issue_id":"pact-abc","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}"#,
+                // Reassigned: the LAST row wins, so agent-a owns pact-abc.
+                &assignee_row("2026-08-11T08:01:00Z", "pact-abc", "agent-b"),
+                &assignee_row("2026-08-11T08:02:00Z", "pact-abc", "agent-a"),
+                // Unassigned at the end: resolves to nothing, so no divergence.
+                &assignee_row("2026-08-11T08:03:00Z", "pact-xyz", "agent-a"),
+                &assignee_row("2026-08-11T08:04:00Z", "pact-xyz", ""),
+            ],
+        );
+        let r = run_check(tmp.path(), Check::ClaimLeaseDivergence, None, false).unwrap();
+        assert_eq!(r.claim_unavailable, None);
+        assert_eq!(r.findings(), 1, "{:?}", r.claim_divergences);
+        let c = &r.claim_divergences[0];
+        assert_eq!(c.path, "src/printer.rs");
+        assert_eq!(c.agent, "agent-b");
+        assert_eq!(c.bead, "pact-abc");
+        assert_eq!(c.assignee, "agent-a");
+        assert!(
+            render_check(&r).contains("CLAIM/LEASE DIVERGENCE on src/printer.rs"),
+            "{}",
+            render_check(&r)
+        );
+    }
+
+    /// One malformed line is skipped, not fatal — the rest of the export still
+    /// answers. An export is appended to live and can be cut mid-write, the same
+    /// hazard `.pact/events.jsonl` has.
+    #[test]
+    fn a_malformed_interactions_line_is_skipped_and_the_rest_still_resolves() {
+        let tmp = with_log(&[&ev_note(
+            "2026-08-11T09:00:00Z",
+            "agent-b",
+            "src/printer.rs",
+            "pact-abc: rewriting the printer",
+        )]);
+        with_interactions(
+            &tmp,
+            &[
+                "{not json at all",
+                &assignee_row("2026-08-11T08:02:00Z", "pact-abc", "agent-a"),
+                r#"{"kind":"field_change","created_at":"2026-08-11T08:03:00Z""#, // truncated
+            ],
+        );
+        let r = run_check(tmp.path(), Check::ClaimLeaseDivergence, None, false).unwrap();
+        assert_eq!(r.claim_unavailable, None);
+        assert_eq!(r.findings(), 1, "{:?}", r.claim_divergences);
+        assert_eq!(r.claim_divergences[0].assignee, "agent-a");
+    }
+
+    /// A wholly unparseable export is "no beads data" and PASSES. Never an error,
+    /// never a finding — the same contract `git_unavailable` has, because a check
+    /// that cannot run must not read as a clean one.
+    #[test]
+    fn a_wholly_malformed_interactions_file_reports_no_beads_data_and_passes() {
+        let tmp = with_log(&[&ev_note(
+            "2026-08-11T09:00:00Z",
+            "agent-b",
+            "src/printer.rs",
+            "pact-abc: rewriting the printer",
+        )]);
+        with_interactions(&tmp, &["garbage", "", "still not json"]);
+        let r = run_check(tmp.path(), Check::ClaimLeaseDivergence, None, false).unwrap();
+        assert!(r.claim_divergences.is_empty());
+        assert_eq!(r.findings(), 0);
+        let reason = r.claim_unavailable.as_deref().unwrap_or_default();
+        assert!(reason.contains(".beads/interactions.jsonl"), "{reason}");
+        assert!(
+            render_check(&r).contains("no beads data"),
+            "{}",
+            render_check(&r)
+        );
+    }
+
+    /// No `.beads/` at all — the common case for a repo that never adopted bd, and
+    /// the one that proves the check needs no backend.
+    #[test]
+    fn an_absent_interactions_file_reports_no_beads_data_and_passes() {
+        let tmp = with_log(&[&ev_note(
+            "2026-08-11T09:00:00Z",
+            "agent-b",
+            "src/printer.rs",
+            "pact-abc: rewriting the printer",
+        )]);
+        let r = run_check(tmp.path(), Check::ClaimLeaseDivergence, None, false).unwrap();
+        assert!(r.claim_divergences.is_empty());
+        assert_eq!(r.findings(), 0);
+        assert!(r.claim_unavailable.is_some());
     }
 
     /// Plant watch records beside an existing log, so a fixture can say what an agent

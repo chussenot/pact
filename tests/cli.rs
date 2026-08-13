@@ -2881,6 +2881,15 @@ fn acquiring_for_a_bead_somebody_else_owns_warns_and_still_succeeds() {
     };
     let repo = tmp.path();
 
+    // pact-as5.6: the OFFLINE half of this test reads `.beads/interactions.jsonl`,
+    // and bd only writes that sidecar when `audit.enabled` is set — it is off by
+    // default, which is a real limit of the offline check and is why this line has
+    // to exist. The live half below needs nothing but bd itself.
+    let config = repo.join(".beads/config.yaml");
+    let mut yaml = std::fs::read_to_string(&config).expect("bd wrote a config");
+    yaml.push_str("\naudit:\n  enabled: true\n");
+    std::fs::write(&config, yaml).unwrap();
+
     // A real bead, assigned to somebody who is not the acquirer.
     let created = std::process::Command::new("bd")
         .args([
@@ -3026,6 +3035,86 @@ fn acquiring_for_a_bead_somebody_else_owns_warns_and_still_succeeds() {
         !stderr_of(&blind).contains("assigned to"),
         "and must not warn: {}",
         stderr_of(&blind)
+    );
+}
+
+/// pact-as5.6: `pact audit` spawns no `bd` at all. Every check — including
+/// claim-lease-divergence, the only one that reads a Beads-side fact — runs to
+/// completion with `PATH` pointing at an empty directory, and the divergence is
+/// still found, because the assignee comes from the committed
+/// `.beads/interactions.jsonl` rather than from `bd show`.
+///
+/// This is the acceptance criterion for demoting bd to a read-only tracker: an
+/// offline analysis command that needs a subprocess is an analysis command that
+/// stops working on any machine where the tracker is not installed.
+#[test]
+fn audit_runs_every_check_and_finds_a_divergence_with_no_bd_on_path() {
+    let tmp = init_repo();
+    let empty_path = tmp.path().join("no-backend-here");
+    std::fs::create_dir(&empty_path).unwrap();
+
+    // A hold whose note names a bead, taken with no backend reachable.
+    let mut cmd = pact_cmd(
+        tmp.path(),
+        &["lease", "acquire", "c.rs", "--note", "pact-abc: wiring"],
+    );
+    cmd.env("PACT_AGENT", "agent-06").env("PATH", &empty_path);
+    assert_ok(&cmd.output().expect("failed to run pact binary"));
+
+    // The export bd would have written, with the bead assigned to someone else.
+    // Two rows for the same bead: the later one wins.
+    std::fs::create_dir_all(tmp.path().join(".beads")).unwrap();
+    std::fs::write(
+        tmp.path().join(".beads/interactions.jsonl"),
+        "not json, and skipped\n\
+         {\"kind\":\"field_change\",\"created_at\":\"2026-08-11T08:00:00Z\",\"actor\":\"x\",\"issue_id\":\"pact-abc\",\"extra\":{\"field\":\"assignee\",\"new_value\":\"agent-06\",\"old_value\":\"\"}}\n\
+         {\"kind\":\"field_change\",\"created_at\":\"2026-08-11T08:01:00Z\",\"actor\":\"x\",\"issue_id\":\"pact-abc\",\"extra\":{\"field\":\"assignee\",\"new_value\":\"agent-07\",\"old_value\":\"agent-06\"}}\n",
+    )
+    .unwrap();
+
+    let mut cmd = pact_cmd(
+        tmp.path(),
+        &["audit", "--check", "claim-lease-divergence", "--json"],
+    );
+    cmd.env("PACT_AGENT", "auditor").env("PATH", &empty_path);
+    let audit = cmd.output().expect("failed to run pact binary");
+    assert_eq!(
+        audit.status.code(),
+        Some(1),
+        "a divergence is a finding, backend or no backend\nstdout: {}\nstderr: {}",
+        stdout_of(&audit),
+        stderr_of(&audit)
+    );
+    let found = json_stdout(&audit);
+    assert_eq!(
+        found["claim_unavailable"],
+        serde_json::Value::Null,
+        "{found}"
+    );
+    let rows = found["claim_divergences"].as_array().expect("array");
+    assert!(
+        rows.iter()
+            .any(|r| r["path"] == "c.rs" && r["assignee"] == "agent-07"),
+        "{found}"
+    );
+
+    // And every OTHER check runs to completion too — `--export` is all of them
+    // plus doctor in one command.
+    let out_file = tmp.path().join("report.json");
+    let mut cmd = pact_cmd(
+        tmp.path(),
+        &["audit", "--export", out_file.to_str().unwrap()],
+    );
+    cmd.env("PACT_AGENT", "auditor").env("PATH", &empty_path);
+    let full = cmd.output().expect("failed to run pact binary");
+    assert_ok(&full);
+    let all: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_file).expect("report written")).unwrap();
+    assert!(
+        all["claim_lease_divergence"]["claim_divergences"]
+            .as_array()
+            .is_some_and(|r| !r.is_empty()),
+        "{all}"
     );
 }
 

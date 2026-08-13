@@ -634,6 +634,69 @@ pub fn interaction_actors(repo_root: &Path) -> Option<Vec<String>> {
     Some(actors)
 }
 
+/// Current assignee per bead, reconstructed by replaying `.beads/interactions.jsonl`
+/// (pact-as5.6) — the offline answer to what [`assignee_of`] asks a subprocess.
+///
+/// Read under exactly the same licence as [`interaction_actors`], for the same
+/// reasons: one already-committed append-only audit log, read-only, best-effort,
+/// never the Beads DB. Absent, empty or wholly unparseable file, or one with no
+/// assignee rows at all, all give an empty map — the caller reports "no beads
+/// data" and passes. A single malformed line is skipped, never fatal.
+///
+/// Rows are replayed in `created_at` order and the last `new_value` wins; an empty
+/// `new_value` means unassigned, which drops the bead from the map rather than
+/// recording `""`.
+///
+/// **The honest limits, all three, because a check that quietly got weaker is worse
+/// than one that says so.** This is strictly LESS sensitive than asking `bd show`:
+/// it finds fewer divergences, never more, and never a false one.
+///
+/// 1. The export records CHANGES. A bead assigned at creation and never reassigned
+///    has no `field=assignee` row and cannot be resolved at all. Measured in this
+///    repo: 5 of 264 rows are assignee changes, 257 are status.
+/// 2. **The sidecar is opt-in.** bd writes `interactions.jsonl` only when
+///    `audit.enabled: true` is set in `.beads/config.yaml`, and it is off by
+///    default — verified against bd 1.2 by running `bd update --assignee` with and
+///    without it. So in a default bd repository the file never appears and every
+///    caller reports "no beads data" forever.
+/// 3. Even enabled, it is a committed export and lags the live store, so an
+///    assignment made in the current session may not be visible yet.
+///
+/// Those are the price of needing no subprocess. The live cross-check at
+/// `lease acquire` time still asks [`assignee_of`], where the answer is current.
+pub fn interaction_assignees(repo_root: &Path) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(contents) = std::fs::read_to_string(repo_root.join(".beads/interactions.jsonl")) else {
+        return out;
+    };
+    let mut rows: Vec<(String, String, String)> = contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|v| v["extra"]["field"].as_str() == Some("assignee"))
+        .filter_map(|v| {
+            Some((
+                v["created_at"].as_str().unwrap_or_default().to_string(),
+                v["issue_id"].as_str()?.to_string(),
+                v["extra"]["new_value"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            ))
+        })
+        .collect();
+    // The export is append-ordered already; sorting costs one line and survives a
+    // merge of two branches' logs, which append-order does not.
+    rows.sort();
+    for (_, issue, who) in rows {
+        if who.trim().is_empty() {
+            out.remove(&issue);
+        } else {
+            out.insert(issue, who);
+        }
+    }
+    out
+}
+
 fn sqlite_db(beads_dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(beads_dir)
         .ok()?
