@@ -10,6 +10,14 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.8.0 - 2026-08-13
+#### Features
+- **(beads)** drop br support; 0.7.9 was the last release that had it - (4212cfa) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- Add events - (6935d5c) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.7.9 - 2026-08-13
 #### Bug Fixes
 - **(msg)** keep a retried send idempotent on bd 1.2, which stopped upserting - (2cf3462) - Clement HUSSENOT-DESENONGES
