@@ -1,0 +1,84 @@
+# The lease hot path, against a documented budget (pact-fib).
+#
+# NOT on pull requests, deliberately. A wall-clock assertion on a shared runner
+# measures the runner's neighbours as much as the code: the same commit swings
+# wide enough between runs that a per-PR gate would either be too loose to catch
+# anything or too tight to stay green, and a check people learn to re-run is
+# worse than no check. Nightly plus workflow_dispatch means a regression is found
+# within a day and can be reproduced on demand.
+#
+# It is also NOT a required check, for the same reason `canary.yml` is not: this
+# asserts a property of the machine as much as of the code, and a gate that can
+# block a merge because a runner was busy gets disabled the first time it does.
+name: Bench
+on:
+  schedule:
+    # 04:30 UTC, off the hour to avoid the top-of-hour runner crush.
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+    inputs:
+      budget_ms:
+        description: "Budget in ms for the acquire+release median"
+        required: false
+        default: "50"
+
+permissions:
+  contents: read
+
+jobs:
+  budget:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch tip — pins the ACTION, not the toolchain
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # The runner pact is measured on, recorded in the log so a number in
+      # docs/performance.md can be compared against the hardware that produced it
+      # rather than against a different machine's.
+      - name: Record the hardware
+        run: |
+          set -euo pipefail
+          echo "runner: ${{ runner.os }} ${{ runner.arch }}"
+          nproc || true
+          grep -m1 'model name' /proc/cpuinfo || true
+          free -h | head -2 || true
+          df -h . | tail -1 || true
+          echo "fs: $(stat -f -c %T . 2>/dev/null || echo unknown)"
+
+      - name: Assert the lease budget
+        env:
+          # A short measurement window: this job asserts an order of magnitude,
+          # not a percentage, so precision beyond this buys nothing and the
+          # default 5s/bench would spend most of the job on benches the budget
+          # does not read.
+          BENCH_ARGS: "--warm-up-time 1 --measurement-time 3"
+        run: scripts/bench-budget.sh "${{ github.event.inputs.budget_ms || '50' }}"
+
+      # The full suite, after the assertion, so a failure above is reported
+      # against the one benchmark that gates rather than lost in the rest — and
+      # so the other numbers are still captured on a green run.
+      - name: Full suite, for the record
+        if: always()
+        env:
+          BENCH_ARGS: "--warm-up-time 1 --measurement-time 3"
+        run: |
+          set -euo pipefail
+          p="$PATH"
+          if d="$(command -v bd 2>/dev/null)"; then
+            p="$(printf '%s' "$p" | tr ':' '\n' | grep -vxF "$(dirname "$d")" | paste -sd: -)"
+          fi
+          # shellcheck disable=SC2086
+          PATH="$p" cargo bench --bench lease -- $BENCH_ARGS 2>&1 | tee bench-full.txt
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: bench-results
+          path: |
+            bench-full.txt
+            target/criterion/**/new/estimates.json
+          retention-days: 30

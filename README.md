@@ -223,6 +223,7 @@ The full evidence, and the design decisions each run forced, is in the studies:
 | [fleet-patterns.md](docs/fleet-patterns.md) | how to run a fleet: the orchestrated-wave topology, and the two rules that make its record trustworthy |
 | [testing.md](docs/testing.md) | the fleet soak and the fault injector: how to run each, and what they cannot prove |
 | [development.md](docs/development.md) | build, test, the CI gates and why each exists, the upstream canary |
+| [performance.md](docs/performance.md) | what the lease hot path costs, measured — and where the time actually goes |
 | [mascot-animations.md](docs/mascot-animations.md) | the mascot in `pact ui`: gestures, triggers, frame data |
 
 Those pages answer *what* and *how*. For *what happened when this was used for

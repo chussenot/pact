@@ -57,6 +57,13 @@ run = [
   """,
 ]
 
+[tasks.bench]
+description = "Measure the lease hot path (criterion, dev-only, no bd on PATH)"
+# Not part of `check`: it takes minutes and asserts a property of the machine as
+# much as of the code. `scripts/bench-budget.sh` is the assertion; this is the
+# whole suite for reading. See docs/performance.md.
+run = "scripts/bench-budget.sh"
+
 [tasks.fmt]
 description = "Format the code"
 run = "cargo fmt"

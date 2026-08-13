@@ -43,3 +43,16 @@ thiserror = "2.0.19"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Benchmarks only, and dev-only by construction: nothing in `[dependencies]`
+# changes, so the shipped binary is byte-identical with or without this. Default
+# features are OFF to keep the dev tree small — the html/plotters reporting is
+# what drags the bulk of criterion's transitive graph in, and the budget check in
+# CI reads `estimates.json`, which the base crate writes regardless.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# `harness = false` because criterion supplies its own main(). See
+# benches/lease.rs's header for why the bench reaches pact's modules via
+# `#[path]` includes instead of a new `[lib]` target.
+[[bench]]
+name = "lease"
+harness = false
