@@ -54,6 +54,7 @@ pact watch rm <path>
 pact watch ls
 
 # ─── humans run these, around a run ──────────────────────────────────────────
+pact plan lint <manifest>
 pact init [--print] [--no-commit] [--force]
 pact doctor
 pact audit [--check <double-win|stale-holds|chain-integrity|commit-correlation|merge-divergence|claim-lease-divergence|retry-storm|silent-contention|topology>] [--expect <worktrees|main|any>] [--since <rfc3339|duration>] [--include-annotated] [--compare <path>] [--export <path>]

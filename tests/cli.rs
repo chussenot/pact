@@ -2485,6 +2485,151 @@ fn json_shapes_of_every_msg_command() {
 
 // -------------------------------------------------------------- exit codes
 
+/// `pact plan lint` end to end: the megablast rule is an error and sets the exit
+/// code, a clean plan is quiet, and neither needs a backend.
+#[test]
+fn plan_lint_fails_on_intra_wave_overlap_and_passes_a_clean_plan() {
+    let tmp = init_repo();
+    let repo = tmp.path();
+
+    let bad = repo.join("bad.jsonl");
+    std::fs::write(
+        &bad,
+        "{\"id\":\"writer\",\"wave\":1,\"files\":[\"src/shared.rs\"]}\n\
+         {\"id\":\"tester\",\"wave\":1,\"files\":[\"src/shared.rs\"]}\n",
+    )
+    .unwrap();
+    let out = pact(repo, "planner", &["plan", "lint", bad.to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "overlap must set the exit code\nstdout: {}\nstderr: {}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let text = stdout_of(&out);
+    assert!(text.contains("src/shared.rs"), "{text}");
+    assert!(text.contains("writer") && text.contains("tester"), "{text}");
+
+    // The same two entries in different waves is ordinary sequencing.
+    let good = repo.join("good.jsonl");
+    std::fs::write(
+        &good,
+        "{\"id\":\"writer\",\"wave\":1,\"files\":[\"src/shared.rs\"]}\n\
+         {\"id\":\"tester\",\"wave\":2,\"files\":[\"src/shared.rs\"],\"depends_on\":[\"writer\"]}\n",
+    )
+    .unwrap();
+    let out = pact(repo, "planner", &["plan", "lint", good.to_str().unwrap()]);
+    assert_ok(&out);
+    assert!(
+        stdout_of(&out).contains("plan is clean"),
+        "{}",
+        stdout_of(&out)
+    );
+
+    // A JSON array is accepted too, and --json carries the findings.
+    let arr = repo.join("plan.json");
+    std::fs::write(
+        &arr,
+        "[{\"id\":\"a\",\"wave\":1,\"files\":[\"x.rs\"]},\
+          {\"id\":\"b\",\"wave\":1,\"files\":[\"x.rs\"]}]",
+    )
+    .unwrap();
+    let out = pact(
+        repo,
+        "planner",
+        &["plan", "lint", arr.to_str().unwrap(), "--json"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let report = json_stdout(&out);
+    assert_eq!(report["entries"], 2, "{report}");
+    assert!(
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .any(|f| f["kind"] == "intra-wave-overlap" && f["error"] == true),
+        "{report}"
+    );
+
+    // A malformed line is an error naming the line, not a skipped line.
+    let torn = repo.join("torn.jsonl");
+    std::fs::write(&torn, "{\"id\":\"a\",\"files\":[]}\nnot json\n").unwrap();
+    let out = pact(repo, "planner", &["plan", "lint", torn.to_str().unwrap()]);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(stderr_of(&out).contains("line 2"), "{}", stderr_of(&out));
+}
+
+/// The reporting the quern run asked for: zero refusals said out loud, a mutex
+/// labelled as one, and a short-TTL expiry distinguished from a release.
+///
+/// Seeded as a LOG rather than driven through `lease`, because a lease is only
+/// expired past `ttl + GRACE_SECS` (30s of clock-skew tolerance) and a test must not
+/// sleep half a minute to watch it. `audit` is a log reader, so a log is the honest
+/// fixture — and it lets the quern shape be reproduced exactly: a mutex taken with a
+/// 20-second TTL and let lapse, which is the blessed fire-and-forget idiom.
+#[test]
+fn audit_reports_no_contention_a_mutex_and_a_short_ttl_expiry_distinctly() {
+    let tmp = init_repo();
+    let pact_dir = tmp.path().join(".pact");
+    std::fs::create_dir_all(&pact_dir).unwrap();
+    std::fs::write(
+        pact_dir.join("events.jsonl"),
+        concat!(
+            // An ordinary hold, released properly.
+            r#"{"at":"2026-08-13T17:00:00+00:00","agent":"agent-a","kind":"acquired","path":"src/a.rs","ttl_secs":2700}"#,
+            "\n",
+            r#"{"at":"2026-08-13T17:05:00+00:00","agent":"agent-a","kind":"released","path":"src/a.rs"}"#,
+            "\n",
+            // The quern idiom: a directory mutex on the reserved namespace, taken with
+            // a short TTL to serialize a bd write, and let lapse rather than released.
+            r#"{"at":"2026-08-13T17:10:00+00:00","agent":"agent-b","kind":"acquired","path":".pact/internal/beads-writes","ttl_secs":20}"#,
+            "\n",
+            r#"{"at":"2026-08-13T17:10:20+00:00","agent":"agent-b","kind":"expired","path":".pact/internal/beads-writes","ttl_secs":20}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let out = pact(tmp.path(), "auditor", &["audit"]);
+    assert_ok(&out);
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("no contention: 0 refusals"),
+        "zero refusals is a result, not an empty section:\n{text}"
+    );
+    assert!(
+        text.contains("PREVENTED, not resolved"),
+        "and it must be attributed:\n{text}"
+    );
+    assert!(
+        text.contains("[mutex, not a file]"),
+        "a reserved-namespace lease is not file contention:\n{text}"
+    );
+    assert!(
+        text.contains("ended by expiry rather than release"),
+        "expiry must be distinguished from release:\n{text}"
+    );
+    assert!(
+        text.contains("not holds anyone abandoned"),
+        "a short TTL must not be scolded:\n{text}"
+    );
+
+    let report = json_stdout(&pact(tmp.path(), "auditor", &["audit", "--json"]));
+    let contended = report["top_contended"].as_array().expect("array");
+    assert!(
+        contended
+            .iter()
+            .any(|c| c["path"] == ".pact/internal/beads-writes" && c["mutex"] == true),
+        "{report}"
+    );
+    // And the mutex sorts BELOW the file, whatever its hold count.
+    let last = contended.last().expect("at least one");
+    assert_eq!(last["path"], ".pact/internal/beads-writes", "{report}");
+    assert_eq!(report["hold_secs"]["ended_by_expiry"], 1, "{report}");
+    assert_eq!(report["hold_secs"]["expiry_short_ttl"], 1, "{report}");
+}
+
 /// Exit 3 is RETIRED, and this is what "retired" has to mean: no command raises
 /// it, not merely no `msg` command.
 ///

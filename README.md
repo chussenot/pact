@@ -220,6 +220,7 @@ The full evidence, and the design decisions each run forced, is in the studies:
 |---|---|
 | [install.md](docs/install.md) | `mise use -g github:chussenot/pact@latest`, downloading a release or building from source, and what pact does and does not need installed |
 | [cli.md](docs/cli.md) | every command, flag, exit code and `--json` shape |
+| [plan.md](docs/plan.md) | the wave-plan manifest, and why contention is a planning problem rather than a lease one |
 | [onboarding.md](docs/onboarding.md) | what `pact init` writes, to which files, and how to check it |
 | [leases.md](docs/leases.md) | the lease lifecycle: TTL, grace period, steal vs. expiry, path identity |
 | [messaging.md](docs/messaging.md) | the message store, threading, read state, addressing a path, and the 0.9.0 cutover |

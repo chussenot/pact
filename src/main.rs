@@ -14,6 +14,7 @@ mod mcp;
 mod msg;
 mod otel;
 mod output;
+mod plan;
 mod repo;
 #[cfg(feature = "ui")]
 mod tui;
@@ -115,6 +116,11 @@ enum Command {
     Completion {
         /// bash, zsh, fish, elvish or powershell.
         shell: clap_complete::Shell,
+    },
+    /// Check a wave plan before you spawn a fleet.
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
     },
     /// Check that pact, AGENTS.md, and the Beads CLI are all in a healthy state.
     Doctor,
@@ -256,6 +262,22 @@ enum LeaseAction {
         /// Include expired leases in the listing.
         #[arg(long)]
         all: bool,
+    },
+}
+
+/// `pact plan <action>`.
+#[derive(Subcommand)]
+enum PlanAction {
+    /// Lint a plan manifest: intra-wave file overlap, cycles, orphans, hot files.
+    ///
+    /// The manifest is a JSON array or one JSON object per line, of
+    /// `{id, wave, files[], depends_on[]}`. pact does NOT read the Beads store to
+    /// build it — the orchestrator exports it, which is what keeps bd off every pact
+    /// command's path. docs/plan.md has the schema and a `bd list --json` pipeline
+    /// that produces one.
+    Lint {
+        /// Path to the manifest.
+        manifest: String,
     },
 }
 
@@ -474,6 +496,9 @@ fn subcommand_name(command: &Command) -> &'static str {
             MsgAction::Read { .. } => "msg read",
         },
         Command::Log { .. } => "log",
+        Command::Plan { action } => match action {
+            PlanAction::Lint { .. } => "plan lint",
+        },
         Command::Doctor => "doctor",
         // The shell is a closed enum clap already validated, so it cannot
         // carry user text into a span name.
@@ -550,6 +575,9 @@ fn run(cli: Cli) -> Result<i32> {
         // `doctor` reports failure as an exit code rather than an error,
         // because its report *is* the output; everything else succeeds or
         // raises, and `Ok(())` means exit 0.
+        Command::Plan { action } => match action {
+            PlanAction::Lint { manifest } => run_plan_lint(&cwd, cli.json, &manifest),
+        },
         Command::Doctor => run_doctor(&cwd, cli.json),
         Command::Init {
             print,
@@ -2027,6 +2055,21 @@ fn run_log(cwd: &Path, json: bool, limit: usize) -> Result<()> {
 
     output::emit(json, &feed, |feed: &Vec<LogEvent>| render_log(feed));
     Ok(())
+}
+
+/// `pact plan lint <manifest>` — the contention-prevention step, as a check.
+///
+/// Returns the exit code rather than exiting, same shape as [`run_doctor`]: errors
+/// are 1, warnings alone are 0. Deliberately NOT a new exit code — the table just
+/// retired 3, and "errors found" is already what 1 means for `pact audit`.
+fn run_plan_lint(cwd: &Path, json: bool, manifest: &str) -> Result<i32> {
+    // A repo root only so that paths normalize exactly as `lease acquire` would:
+    // one file must be one path however the manifest spelled it, or this check and
+    // the lease it protects disagree about what they are discussing.
+    let root = repo::find_repo_root(cwd)?;
+    let report = plan::run(&root, Path::new(manifest))?;
+    output::emit(json, &report, plan::render);
+    Ok(i32::from(report.errors() > 0))
 }
 
 fn run_doctor(cwd: &Path, json: bool) -> Result<i32> {
