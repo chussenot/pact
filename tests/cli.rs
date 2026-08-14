@@ -2313,6 +2313,8 @@ fn json_shapes_of_every_command_that_needs_no_beads_backend() {
     // of the same element — already pinned by
     // `acquire_single_path_json_stays_an_object`, repeated here so the two
     // shapes sit next to each other in the contract.
+    // No `invoked_from` here, and that is the point: it is recorded only in a repository
+    // that HAS linked worktrees (finding 5a), so a plain checkout's payload is unchanged.
     const LEASE: &[&str] = &["path", "agent", "acquired_at", "ttl_secs", "note"];
     let one = run(&["lease", "acquire", "a.rs", "--json"]);
     assert_object_keys("lease acquire <one>", &one, &["lease", "stolen"]);

@@ -410,6 +410,7 @@ fn seed_event() -> events::Event {
         displaced: None,
         chain_hash: None,
         invoked_from: None,
+        collected_from: None,
         scope: None,
         pact_version: None,
         content_hash: None,

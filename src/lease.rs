@@ -107,6 +107,18 @@ pub struct LeaseInfo {
     pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<String>,
+    /// Where the HOLDER was standing when they acquired — `main`, a linked worktree's
+    /// name, or `outside`, exactly as `Event::invoked_from` records it.
+    ///
+    /// On the lock file because the expiry is written by a DIFFERENT process, often
+    /// minutes later and often somewhere else, and by then the holder is gone. Without
+    /// this the `expired` row inherited the sweeper's location and said something false
+    /// about the holder (pact-83r.3 / finding 5).
+    ///
+    /// Absent — not null — so lock files stay byte-identical to what pact wrote before
+    /// this existed, and an old lock still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoked_from: Option<String>,
     /// The git blob id of this path's content when the lease was taken
     /// (pact-8qu), or absent when the file did not exist yet.
     ///
@@ -148,12 +160,27 @@ pub struct LeaseInfo {
 /// holder may be sitting in the MAIN worktree while the loser is in a linked
 /// one, and a conflict message that can only name the loser's worktree explains
 /// nothing.
-fn worktree_stamp(repo_root: &Path) -> (Option<String>, Option<String>) {
+/// The three facts a lock records about WHERE its holder was: branch, worktree name, and
+/// the invocation point `Event::invoked_from` uses.
+///
+/// All three are gated on the same condition and decided here, so they cannot disagree
+/// about whether this repository has worktrees at all.
+///
+/// **Absent in a repo with no linked worktrees, deliberately.** Lock files stay
+/// byte-identical to what pact wrote before it understood worktrees, which two worktree
+/// tests assert directly. Nothing is lost by omitting `invoked_from` there: the finding it
+/// exists for (pact-83r.3 / finding 5a) is that an expiry inherits the SWEEPER's location
+/// rather than the holder's, and in a single checkout those are necessarily the same place.
+fn worktree_stamp(repo_root: &Path) -> (Option<String>, Option<String>, Option<String>) {
     let ctx = crate::repo::RepoContext::resolve(repo_root);
     if !ctx.has_worktrees {
-        return (None, None);
+        return (None, None, None);
     }
-    (ctx.branch(), ctx.worktree_name.clone())
+    (
+        ctx.branch(),
+        ctx.worktree_name.clone(),
+        Some(crate::repo::invoked_from(&ctx)),
+    )
 }
 
 /// "held by agent-a", plus where they are holding it from when that is knowable.
@@ -1047,6 +1074,11 @@ fn verify_own_lease(lock_path: &Path, agent: &str) -> Result<()> {
 /// happens to be compiled with. Without it, raising the default silently
 /// reclassifies history: the 900s-era holds in this repo top out at 36m, so under
 /// a 45m default every one of them would quietly stop being a finding.
+// Eight positional arguments, and a struct would be worse here: this has eleven callers
+// and every one of them passes a different combination, so a builder or an args struct
+// would move the same noise to eleven call sites and add a type with no other purpose.
+// Same reasoning `msg::create` recorded before it was deleted.
+#[allow(clippy::too_many_arguments)]
 fn log_event(
     repo_root: &Path,
     agent: &str,
@@ -1061,6 +1093,12 @@ fn log_event(
     // apart could legitimately differ, and a diff computed against a baseline
     // the log does not agree with would be unexplainable afterwards.
     content_hash: Option<String>,
+    // The HOLDER's invocation context, for a row somebody else is writing on their
+    // behalf. Only `collect_expired` passes it: an expiry is a fact about the holder's
+    // lease, and `events::append` would otherwise stamp whoever swept the lock. `None`
+    // everywhere else means "stamp my own", which is right for every event an agent
+    // writes about itself (pact-83r.3 / finding 5).
+    holder_invoked_from: Option<String>,
 ) {
     events::append(
         repo_root,
@@ -1083,8 +1121,10 @@ fn log_event(
             // Event::chain_hash (pact-m7j.2.5).
             chain_hash: None,
             // Likewise stamped by append(), which is the only place that can
-            // measure them; see Event::invoked_from (pact-ler.1).
-            invoked_from: None,
+            // measure them; see Event::invoked_from (pact-ler.1) — unless the caller
+            // knows better, which only the expiry sweeper does.
+            invoked_from: holder_invoked_from,
+            collected_from: None,
             scope: None,
             pact_version: None,
             content_hash,
@@ -1358,7 +1398,7 @@ fn acquire_inner(
     // pact-m7j.4.4/4.5: the clock-corrected "now", not raw `Utc::now()` — see
     // `effective_now`'s doc comment.
     let now = effective_now(repo_root);
-    let (branch, worktree) = worktree_stamp(repo_root);
+    let (branch, worktree, invoked_from) = worktree_stamp(repo_root);
     // Hashed BEFORE the claim lands, so it describes the content the holder is
     // taking responsibility for rather than whatever a racing writer left
     // after. Best-effort: `hash_objects` yields nothing for a path that does
@@ -1379,6 +1419,11 @@ fn acquire_inner(
         note,
         branch,
         worktree,
+        // Recorded HERE, at acquire, because the expiry that may eventually close this
+        // lease is written by a different process in a different place after the holder
+        // has gone (pact-83r.3 / finding 5a). Absent in a repo with no worktrees — see
+        // `worktree_stamp`.
+        invoked_from,
         content_hash,
         extra: BTreeMap::new(),
     };
@@ -1453,6 +1498,7 @@ fn acquire_inner(
                 new_lease.note.clone(),
                 new_lease.ttl_secs,
                 new_lease.content_hash.clone(),
+                None,
             );
             count_transition("acquired");
             Ok(AcquireOutcome {
@@ -1493,6 +1539,7 @@ fn acquire_inner(
                         )),
                         new_lease.ttl_secs,
                         new_lease.content_hash.clone(),
+                        None,
                     );
                     count_transition("stolen");
                     return Ok(AcquireOutcome {
@@ -1544,6 +1591,7 @@ fn acquire_inner(
                     // The DEAD holder's ttl: this row closes their window.
                     existing.ttl_secs,
                     None,
+                    None,
                 );
                 // Reported as `stolen` by AcquireOutcome, so logged as "stolen"
                 // too — but the detail says *why*, because taking over a dead
@@ -1560,6 +1608,7 @@ fn acquire_inner(
                     // The NEW holder's ttl: this row opens their window.
                     new_lease.ttl_secs,
                     new_lease.content_hash.clone(),
+                    None,
                 );
                 count_transition("expired");
                 record_hold(&existing, "expired");
@@ -1600,6 +1649,7 @@ fn acquire_inner(
                     new_lease.note.clone(),
                     new_lease.ttl_secs,
                     None,
+                    None,
                 );
                 count_transition("renewed");
                 Ok(AcquireOutcome {
@@ -1628,6 +1678,7 @@ fn acquire_inner(
                     )),
                     new_lease.ttl_secs,
                     new_lease.content_hash.clone(),
+                    None,
                 );
                 // Closes the displaced holder's window, as the "expired" row does
                 // one branch up and for the identical reason: without it the
@@ -1668,7 +1719,8 @@ fn acquire_inner(
                     // The DISPLACED holder's ttl: this row closes their window.
                     existing.ttl_secs,
                     None,
-                );
+                None,
+            );
                 count_transition("displaced");
                 count_transition("stolen");
                 record_hold(&existing, "stolen");
@@ -1735,6 +1787,7 @@ fn acquire_inner(
                         chain_hash: None,
                         // Likewise stamped by append().
                         invoked_from: None,
+                        collected_from: None,
                         scope: None,
                         pact_version: None,
                         content_hash: None,
@@ -1897,6 +1950,7 @@ fn acquire_many_fs(
                             // restored hold by the promise that is actually
                             // live again.
                             before.ttl_secs,
+                            None,
                             None,
                         );
                     }
@@ -2063,6 +2117,7 @@ fn release_relative(
                     // Likewise stamped by append(); see Event::invoked_from
                     // (pact-ler.1).
                     invoked_from: None,
+                    collected_from: None,
                     scope: None,
                     pact_version: None,
                     content_hash: None,
@@ -2140,6 +2195,7 @@ fn release_relative(
                     // Likewise stamped by append(); see Event::invoked_from
                     // (pact-ler.1).
                     invoked_from: None,
+                    collected_from: None,
                     scope: None,
                     pact_version: None,
                     // Same as the plain-release branch: what the displaced
@@ -2181,6 +2237,7 @@ fn release_relative(
                 // release must never fail because git could not be asked.
                 crate::git_history::hash_objects(repo_root, std::slice::from_ref(&relative))
                     .remove(&relative),
+                None,
             );
             count_transition("released");
         }
@@ -2253,6 +2310,10 @@ fn collect_expired(repo_root: &Path, lock_path: &Path, lease: &LeaseInfo) {
             )),
             lease.ttl_secs,
             None,
+            // The holder's own recorded context, so this row says something true about
+            // the lease it closes. `None` on a lock written before pact recorded it,
+            // which correctly falls back to the sweeper's rather than inventing one.
+            lease.invoked_from.clone(),
         );
     }
 }
@@ -2390,7 +2451,7 @@ fn renew_fs(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
     // Re-stamped rather than carried over: a long task can outlive a `git
     // switch`, and a lease claiming a branch the worktree left is a lie that
     // survives every renew.
-    let (branch, worktree) = worktree_stamp(repo_root);
+    let (branch, worktree, _) = worktree_stamp(repo_root);
     let renewed = LeaseInfo {
         acquired_at: effective_now(repo_root).to_rfc3339(),
         branch,
@@ -2406,6 +2467,7 @@ fn renew_fs(repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo> {
         &relative,
         renewed.note.clone(),
         renewed.ttl_secs,
+        None,
         None,
     );
     count_transition("renewed");
@@ -2693,6 +2755,7 @@ mod tests {
                 note: None,
                 branch: None,
                 worktree: None,
+                invoked_from: None,
                 content_hash: None,
                 extra: BTreeMap::new(),
             },
@@ -2766,6 +2829,7 @@ mod tests {
                 displaced: None,
                 chain_hash: None,
                 invoked_from: None,
+                collected_from: None,
                 scope: None,
                 pact_version: None,
                 content_hash: None,
@@ -2829,6 +2893,7 @@ mod tests {
                 displaced: None,
                 chain_hash: None,
                 invoked_from: None,
+                collected_from: None,
                 scope: None,
                 pact_version: None,
                 content_hash: None,
@@ -2927,6 +2992,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            invoked_from: None,
             content_hash: None,
             extra: BTreeMap::new(),
         };
@@ -2969,6 +3035,7 @@ mod tests {
                 note: None,
                 branch: None,
                 worktree: None,
+                invoked_from: None,
                 content_hash: None,
                 extra: BTreeMap::new(),
             };
@@ -3031,6 +3098,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            invoked_from: None,
             content_hash: None,
             extra: BTreeMap::new(),
         };
@@ -3404,6 +3472,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            invoked_from: None,
             content_hash: None,
             extra: BTreeMap::new(),
         };
@@ -3672,6 +3741,51 @@ mod tests {
     }
 
     // ---- pact-rnc.24: release_all reports only real releases -------------
+
+    /// FINDING 5a, the data bug: an `expired` row must describe the HOLDER's lease, not the
+    /// process that swept the lock.
+    ///
+    /// Measured in the quern run, 2 of 3 expiries carried a worktree attribution that was
+    /// not the holder's, because the row is written by whoever happens to run `lease ls`
+    /// later — often in the main checkout, minutes after the holder is gone. No later fix
+    /// repairs a log already on disk, which is why this outranked the check it was
+    /// breaking.
+    #[test]
+    fn an_expiry_carries_the_holders_context_and_names_the_sweeper_separately() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim(root, "agent-a", "f.rs");
+
+        // This fixture has no linked worktrees, so the lock records no invocation context
+        // at all — see `worktree_stamp` for why that is deliberate. What is under test is
+        // what `collect_expired` does with a context when there IS one, so the lapsed lock
+        // carries a sentinel the sweeper could not possibly produce.
+        let lock = read_lease(&lock_file_path(root, "f.rs").unwrap()).unwrap();
+        assert_eq!(
+            lock.invoked_from, None,
+            "a repo with no worktrees keeps pre-worktree lock files byte-identical"
+        );
+        let mut lapsed = lock.clone();
+        lapsed.invoked_from = Some("wt-holder".to_string());
+        collect_expired(root, &lock_file_path(root, "f.rs").unwrap(), &lapsed);
+
+        let expired = crate::events::recent(root, 100)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == "expired")
+            .expect("an expiry was logged");
+        assert_eq!(
+            expired.invoked_from.as_deref(),
+            Some("wt-holder"),
+            "the expiry must carry the HOLDER's context, not the sweeper's"
+        );
+        assert!(
+            expired.collected_from.is_some()
+                && expired.collected_from.as_deref() != Some("wt-holder"),
+            "the sweeper must be recorded separately, where topology ignores it: {:?}",
+            expired.collected_from
+        );
+    }
 
     #[test]
     fn release_all_omits_expired_leases_but_still_sweeps_them() {
@@ -4186,6 +4300,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            invoked_from: None,
             content_hash: None,
             extra: BTreeMap::new(),
         };
@@ -4355,6 +4470,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            invoked_from: None,
             content_hash: None,
             extra: BTreeMap::new(),
         };
@@ -4387,6 +4503,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            invoked_from: None,
             content_hash: None,
             extra: BTreeMap::new(),
         };
@@ -4434,6 +4551,7 @@ mod tests {
             note: None,
             branch: None,
             worktree: None,
+            invoked_from: None,
             content_hash: None,
             extra: BTreeMap::new(),
         };

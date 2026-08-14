@@ -102,7 +102,9 @@ const TOP_N: usize = 10;
 pub const ANNOTATION_KIND: &str = "annotation";
 
 /// Which named check to run. Absent means the summary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy` since `Topology` carries `Expect`, which carries its exception list.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Check {
     DoubleWin,
     StaleHolds,
@@ -148,10 +150,24 @@ pub enum Check {
 }
 
 /// What `--expect` declares a run's topology should have been.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy`, because `Worktrees` carries its declared exceptions. They belong
+/// here rather than as a separate parameter for the same reason the expectation itself
+/// does: a declaration with no way to state its exceptions is one nobody can satisfy.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expect {
-    /// Every stamped event was invoked from a linked worktree.
-    Worktrees,
+    /// Every stamped event was invoked from a linked worktree, EXCEPT events by these
+    /// agents from the main checkout.
+    ///
+    /// The exception list exists because the check could not pass for any real fleet
+    /// (pact-83r.3 / finding 5b). In the topology pact documents, somebody must sit in
+    /// the main checkout — it is where the coordination logs are committed from — so an
+    /// orchestrator necessarily acts from `main`, and run 5 failed this check with 19
+    /// offending events, not one of which was an agent working in the wrong place.
+    ///
+    /// Naming identities rather than a count: "one agent may work from main" would pass
+    /// a run where the wrong one did.
+    Worktrees { allow_main: Vec<String> },
     /// Every stamped event was invoked from the main checkout.
     Main,
     /// Nothing to fail — report the distribution and exit 0.
@@ -159,9 +175,14 @@ pub enum Expect {
 }
 
 impl Expect {
-    pub fn parse(s: &str) -> Result<Self> {
+    /// `allow_main` names the identities permitted to act from the main checkout, and is
+    /// only meaningful for `worktrees` — the other two either have nothing to except or
+    /// expect main already.
+    pub fn parse(s: &str, allow_main: &[String]) -> Result<Self> {
         match s {
-            "worktrees" => Ok(Expect::Worktrees),
+            "worktrees" => Ok(Expect::Worktrees {
+                allow_main: allow_main.to_vec(),
+            }),
             "main" => Ok(Expect::Main),
             "any" => Ok(Expect::Any),
             other => Err(anyhow::anyhow!(
@@ -170,11 +191,19 @@ impl Expect {
         }
     }
 
-    fn label(self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
-            Expect::Worktrees => "worktrees",
+            Expect::Worktrees { .. } => "worktrees",
             Expect::Main => "main",
             Expect::Any => "any",
+        }
+    }
+
+    /// The identities this expectation excuses from the main checkout.
+    fn allowed_from_main(&self) -> &[String] {
+        match self {
+            Expect::Worktrees { allow_main } => allow_main,
+            _ => &[],
         }
     }
 
@@ -187,14 +216,14 @@ impl Expect {
     /// cutoff nobody derived from data is exactly the failure docs/audit.md
     /// records under the dangling-hash example. All-or-nothing is explainable
     /// in one sentence and cannot drift.
-    fn satisfied_by(self, invoked_from: &str) -> bool {
+    fn satisfied_by(&self, invoked_from: &str) -> bool {
         match self {
             Expect::Any => true,
             Expect::Main => invoked_from == "main",
             // "outside" is not a worktree: it means pact ran somewhere that is
             // not under this repository at all, which is the one value that
             // says the lease/edit binding cannot be assumed.
-            Expect::Worktrees => invoked_from != "main" && invoked_from != "outside",
+            Expect::Worktrees { .. } => invoked_from != "main" && invoked_from != "outside",
         }
     }
 }
@@ -203,7 +232,7 @@ impl Check {
     /// `expect` is only meaningful for `topology`; every other check ignores
     /// it, and clap requires `--check` alongside it so it cannot be passed
     /// alone.
-    pub fn parse(s: &str, expect: Option<&str>) -> Result<Self> {
+    pub fn parse(s: &str, expect: Option<&str>, allow_main: &[String]) -> Result<Self> {
         match s {
             "double-win" => Ok(Check::DoubleWin),
             "stale-holds" => Ok(Check::StaleHolds),
@@ -214,7 +243,7 @@ impl Check {
             "retry-storm" => Ok(Check::RetryStorm),
             "silent-contention" => Ok(Check::SilentContention),
             "topology" => Ok(Check::Topology(match expect {
-                Some(e) => Expect::parse(e)?,
+                Some(e) => Expect::parse(e, allow_main)?,
                 // Defaulting to `any` rather than erroring: `--check topology`
                 // alone is a legitimate "show me the distribution", and the
                 // summary says the same thing without a flag.
@@ -1159,6 +1188,12 @@ pub struct CheckReport {
     /// repository the moment this shipped. Same discipline as
     /// `chain_untracked`.
     pub topology_unstamped: usize,
+    /// Events excused by `--allow-main` (pact-83r.3 / finding 5b).
+    ///
+    /// Counted and reported rather than silently dropped: an exception nobody can see the
+    /// size of is an exception that stops being read as one.
+    #[serde(default)]
+    pub topology_allowed_from_main: usize,
 }
 
 impl CheckReport {
@@ -1858,6 +1893,7 @@ pub fn run_check(
         topology_mismatches: Vec::new(),
         expected_topology: None,
         topology_unstamped: 0,
+        topology_allowed_from_main: 0,
         merge_divergences: Vec::new(),
         divergence_unhashed: 0,
         claim_divergences: Vec::new(),
@@ -1926,11 +1962,18 @@ pub fn run_check(
         Check::ClaimLeaseDivergence => claim_divergences(repo_root, &events, &mut report),
         Check::RetryStorm => retry_storms(&events, &mut report),
         Check::SilentContention => silent_contentions(repo_root, &events, &holds, &mut report),
-        Check::Topology(expect) => {
+        Check::Topology(ref expect) => {
             report.expected_topology = Some(expect.label());
+            let allowed = expect.allowed_from_main();
             let mut by_point: BTreeMap<String, usize> = BTreeMap::new();
             for (_, e) in &events {
                 match e.invoked_from.as_deref() {
+                    // A declared main-checkout identity is excused, and only from `main`
+                    // — naming an agent does not license it to act from anywhere else
+                    // (pact-83r.3 / finding 5b).
+                    Some("main") if allowed.contains(&e.agent) => {
+                        report.topology_allowed_from_main += 1;
+                    }
                     Some(from) => *by_point.entry(from.to_string()).or_insert(0) += 1,
                     None => report.topology_unstamped += 1,
                 }
@@ -2999,6 +3042,16 @@ pub fn render_check(r: &CheckReport) -> String {
             r.expected_topology.unwrap_or("any"),
             r.topology_unstamped
         ));
+        // In the header for the same reason the line above is: an exception has to be
+        // visible on a PASS, or a reader cannot tell "the fleet ran where it was asked"
+        // from "the exception list was wide enough to cover where it did not"
+        // (pact-83r.3 / finding 5b).
+        if r.topology_allowed_from_main > 0 {
+            out.push(format!(
+                "  {} event(s) excused from the main checkout by --allow-main",
+                r.topology_allowed_from_main
+            ));
+        }
     }
 
     if r.check == "chain-integrity" {
@@ -4971,6 +5024,7 @@ mod tests {
             displaced: None,
             chain_hash: None,
             invoked_from: None,
+            collected_from: None,
             scope: None,
             pact_version: None,
             content_hash: None,
@@ -5138,8 +5192,15 @@ mod tests {
         ]);
         // A mixed run satisfies neither expectation — deliberately, because
         // any "mostly" rule needs a cutoff nobody derived from data.
-        let worktrees =
-            run_check(tmp.path(), Check::Topology(Expect::Worktrees), None, false).unwrap();
+        let worktrees = run_check(
+            tmp.path(),
+            Check::Topology(Expect::Worktrees {
+                allow_main: Vec::new(),
+            }),
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(worktrees.findings(), 1);
         assert_eq!(worktrees.topology_mismatches[0].invoked_from, "main");
 
@@ -5169,7 +5230,15 @@ mod tests {
             "a.rs",
             "outside",
         )]);
-        let r = run_check(tmp.path(), Check::Topology(Expect::Worktrees), None, false).unwrap();
+        let r = run_check(
+            tmp.path(),
+            Check::Topology(Expect::Worktrees {
+                allow_main: Vec::new(),
+            }),
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(r.findings(), 1, "{:?}", r.topology_mismatches);
     }
 
@@ -5183,12 +5252,19 @@ mod tests {
             &ev("2026-08-01T10:00:00Z", "a", "acquired", "a.rs"),
             &ev("2026-08-01T10:01:00Z", "a", "released", "a.rs"),
         ]);
-        for expect in [Expect::Worktrees, Expect::Main, Expect::Any] {
+        for expect in [
+            Expect::Worktrees {
+                allow_main: Vec::new(),
+            },
+            Expect::Main,
+            Expect::Any,
+        ] {
+            let label = format!("{expect:?}");
             let r = run_check(tmp.path(), Check::Topology(expect), None, false).unwrap();
             assert_eq!(
                 r.findings(),
                 0,
-                "{expect:?} must not fail on a pre-stamping log"
+                "{label} must not fail on a pre-stamping log"
             );
             assert_eq!(r.topology_unstamped, 2);
         }
@@ -5196,16 +5272,16 @@ mod tests {
 
     #[test]
     fn expect_and_check_names_are_validated() {
-        assert!(Check::parse("topology", Some("worktrees")).is_ok());
+        assert!(Check::parse("topology", Some("worktrees"), &[]).is_ok());
         assert!(
-            Check::parse("topology", None).is_ok(),
+            Check::parse("topology", None, &[]).is_ok(),
             "bare topology means `any`"
         );
-        let bad = Check::parse("topology", Some("mostly"))
+        let bad = Check::parse("topology", Some("mostly"), &[])
             .unwrap_err()
             .to_string();
         assert!(bad.contains("worktrees, main or any"), "{bad}");
-        let unknown = Check::parse("nope", None).unwrap_err().to_string();
+        let unknown = Check::parse("nope", None, &[]).unwrap_err().to_string();
         assert!(
             unknown.contains("topology"),
             "the list must name it: {unknown}"
@@ -5520,6 +5596,70 @@ mod tests {
             .output()
             .unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// FINDING 5b: `--expect worktrees` could not pass for any real fleet, because in the
+    /// topology pact documents somebody must sit in the main checkout — it is where the
+    /// coordination logs are committed from. Run 5 failed with 19 offending events, not one
+    /// of which was an agent working in the wrong place.
+    #[test]
+    fn allow_main_excuses_a_declared_orchestrator_and_nobody_else() {
+        let tmp = with_log(&[
+            &ev_from(
+                "2026-08-01T10:00:00Z",
+                "agent-a",
+                "acquired",
+                "a.rs",
+                "wt-a",
+            ),
+            &ev_from(
+                "2026-08-01T10:01:00Z",
+                "orchestrator",
+                "acquired",
+                "b.rs",
+                "main",
+            ),
+        ]);
+
+        // Without the exception, the orchestrator's own protocol-following lease fails it.
+        let bare = Check::parse("topology", Some("worktrees"), &[]).unwrap();
+        let r = run_check(tmp.path(), bare, None, false).unwrap();
+        assert_eq!(r.findings(), 1, "{:?}", r.topology_mismatches);
+
+        // With it, the run passes and the exception is COUNTED — an exception nobody can
+        // see the size of stops being read as one.
+        let allowed =
+            Check::parse("topology", Some("worktrees"), &["orchestrator".to_string()]).unwrap();
+        let r = run_check(tmp.path(), allowed, None, false).unwrap();
+        assert_eq!(r.findings(), 0, "{:?}", r.topology_mismatches);
+        assert_eq!(r.topology_allowed_from_main, 1);
+        assert!(render_check(&r).contains("excused from the main checkout"));
+    }
+
+    /// Naming an identity excuses it from `main` ONLY. It is not a licence to act from
+    /// anywhere, and it does not excuse anyone else.
+    #[test]
+    fn allow_main_does_not_excuse_another_agent_or_another_location() {
+        let tmp = with_log(&[
+            &ev_from("2026-08-01T10:00:00Z", "stray", "acquired", "a.rs", "main"),
+            &ev_from(
+                "2026-08-01T10:01:00Z",
+                "orchestrator",
+                "acquired",
+                "b.rs",
+                "outside",
+            ),
+        ]);
+        let check =
+            Check::parse("topology", Some("worktrees"), &["orchestrator".to_string()]).unwrap();
+        let r = run_check(tmp.path(), check, None, false).unwrap();
+        assert_eq!(
+            r.findings(),
+            2,
+            "an unlisted agent from main and a listed one from outside both fail: {:?}",
+            r.topology_mismatches
+        );
+        assert_eq!(r.topology_allowed_from_main, 0);
     }
 
     /// pact-b73.6, the exact answer: with a head on both boundaries the hold brackets a

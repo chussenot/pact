@@ -154,6 +154,24 @@ pub struct Event {
     /// `ttl_secs` and `chain_hash` already do for theirs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invoked_from: Option<String>,
+    /// The process that COLLECTED a lapsed lock, when that is not the holder.
+    ///
+    /// Only ever set on `expired`, and it exists because [`Self::invoked_from`] used to
+    /// carry this by accident. An expiry is a fact about the HOLDER's lease, but the row
+    /// is written by whichever process happened to sweep the lock — often `pact lease ls`
+    /// running in the main checkout minutes later. So an agent that let a lease lapse from
+    /// its worktree got an `expired` row stamped `invoked_from=main`, which is simply
+    /// false, and `--check topology --expect worktrees` counted it as an agent working in
+    /// the wrong place.
+    ///
+    /// Measured in the quern run: 2 of 3 expiries carried a worktree attribution that was
+    /// not the holder's, and no later fix can repair a log already on disk. That is why
+    /// this data fix outranked the check it was breaking (pact-83r.3 / finding 5).
+    ///
+    /// `--check topology` ignores this field deliberately: the sweeper's location says
+    /// nothing about whether the fleet ran where it was asked to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collected_from: Option<String>,
     /// The coordination scope actually in force — `"shared"` or `"local"`.
     /// See [`crate::repo::effective_scope`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -687,7 +705,21 @@ pub fn verify_chain(numbered: &[(usize, Event)]) -> (Vec<ChainMismatch>, usize, 
 /// does not exist in pact, which never rewrites history.
 fn stamp_context(repo_root: &Path, ev: &mut Event) {
     let ctx = crate::repo::RepoContext::resolve(repo_root);
-    ev.invoked_from = Some(crate::repo::invoked_from(&ctx));
+    // A caller that already knows whose context belongs on this row WINS. Only
+    // `collect_expired` does: it holds the lapsed lease and therefore the holder's own
+    // recorded context, and an expiry is a fact about the holder rather than about
+    // whoever swept the lock. Everything else leaves this None and gets the truth about
+    // its own invocation, as before.
+    let sweeping = crate::repo::invoked_from(&ctx);
+    match ev.invoked_from.take() {
+        Some(holder) => {
+            if holder != sweeping {
+                ev.collected_from = Some(sweeping);
+            }
+            ev.invoked_from = Some(holder);
+        }
+        None => ev.invoked_from = Some(sweeping),
+    }
     ev.scope = Some(crate::repo::effective_scope().to_string());
     ev.pact_version = Some(env!("CARGO_PKG_VERSION").to_string());
     // The protocol the agents in this run were actually reading — the block in
@@ -1117,6 +1149,7 @@ mod tests {
             // same as every event this test module writes before append().
             chain_hash: None,
             invoked_from: None,
+            collected_from: None,
             scope: None,
             pact_version: None,
             content_hash: None,

@@ -57,7 +57,7 @@ pact watch ls
 pact plan lint <manifest>
 pact init [--print] [--no-commit] [--force]
 pact doctor
-pact audit [--check <double-win|stale-holds|chain-integrity|commit-correlation|merge-divergence|claim-lease-divergence|retry-storm|silent-contention|topology>] [--expect <worktrees|main|any>] [--since <rfc3339|duration>] [--include-annotated] [--compare <path>] [--export <path>]
+pact audit [--check <double-win|stale-holds|chain-integrity|commit-correlation|merge-divergence|claim-lease-divergence|retry-storm|silent-contention|topology>] [--expect <worktrees|main|any>] [--since <rfc3339|duration>] [--include-annotated] [--compare <path>] [--export <path>] [--allow-main <agent>...]
 pact ui
 pact completion <bash|zsh|fish|elvish|powershell>
 pact mcp serve

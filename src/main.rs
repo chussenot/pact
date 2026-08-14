@@ -166,6 +166,16 @@ enum Command {
         /// proportion threshold, deliberately (see docs/audit.md).
         #[arg(long, requires = "check")]
         expect: Option<String>,
+        /// An identity allowed to act from the main checkout under
+        /// `--expect worktrees`; repeat for several.
+        ///
+        /// In the worktree topology pact documents somebody must sit in the main
+        /// checkout — it is where the coordination logs are committed from — so an
+        /// orchestrator necessarily acts from `main`. Without this the check could not
+        /// pass for any real fleet: one field run failed it with 19 offending events,
+        /// not one of which was an agent working in the wrong place.
+        #[arg(long, value_name = "AGENT", requires = "expect")]
+        allow_main: Vec<String>,
         /// Compare this repository against a previously written `--export`
         /// report and print what moved.
         ///
@@ -610,6 +620,7 @@ fn run(cli: Cli) -> Result<i32> {
             since,
             include_annotated,
             expect,
+            allow_main,
             compare,
             export,
         } => run_audit(
@@ -620,6 +631,7 @@ fn run(cli: Cli) -> Result<i32> {
                 since,
                 include_annotated,
                 expect,
+                allow_main,
                 compare,
                 export,
             },
@@ -693,6 +705,7 @@ fn run_watch(cwd: &Path, agent_flag: Option<&str>, json: bool, action: WatchActi
                     displaced: None,
                     chain_hash: None,
                     invoked_from: None,
+                    collected_from: None,
                     scope: None,
                     pact_version: None,
                     content_hash: None,
@@ -750,6 +763,7 @@ fn run_watch(cwd: &Path, agent_flag: Option<&str>, json: bool, action: WatchActi
                         displaced: None,
                         chain_hash: None,
                         invoked_from: None,
+                        collected_from: None,
                         scope: None,
                         pact_version: None,
                         content_hash: None,
@@ -827,6 +841,7 @@ struct AuditArgs {
     since: Option<String>,
     include_annotated: bool,
     expect: Option<String>,
+    allow_main: Vec<String>,
     compare: Option<PathBuf>,
     export: Option<PathBuf>,
 }
@@ -837,6 +852,7 @@ fn run_audit(cwd: &Path, json: bool, args: AuditArgs) -> Result<i32> {
         since,
         include_annotated,
         expect,
+        allow_main,
         compare,
         export,
     } = args;
@@ -880,7 +896,7 @@ fn run_audit(cwd: &Path, json: bool, args: AuditArgs) -> Result<i32> {
             Ok(0)
         }
         Some(name) => {
-            let check = audit::Check::parse(&name, expect.as_deref())?;
+            let check = audit::Check::parse(&name, expect.as_deref(), &allow_main)?;
             let report = audit::run_check(&root, check, since, include_annotated)?;
             output::emit(json, &report, audit::render_check);
             // The whole point of a named check: a machine can branch on it.
@@ -2694,6 +2710,8 @@ mod tests {
                 note: Some("wiring the CLI".to_string()),
                 branch: None,
                 worktree: None,
+                invoked_from: None,
+
                 content_hash: None,
                 extra: Default::default(),
             },

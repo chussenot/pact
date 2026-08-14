@@ -589,6 +589,46 @@ many events it could not speak for. Every log written before pact 0.7.0 is
 entirely in that state; failing them would have failed every repository on the
 day this shipped.
 
+### `--allow-main <agent>` — the declared main-checkout participant
+
+Repeatable. Excuses the named identity from `main`, and only from `main`.
+
+This exists because `--expect worktrees` could not pass for any real fleet. In the
+topology pact documents somebody *must* sit in the main checkout — it is the only
+place the coordination logs can be committed from, which is why the protocol block
+now says so explicitly — so an orchestrator necessarily acts from `main`. One field
+run failed the check with **19 offending events, not one of which was an agent
+working in the wrong place**.
+
+```bash
+pact audit --check topology --expect worktrees --allow-main orchestrator
+```
+
+The count of excused events is printed **even when the check passes**, in the same
+header that says how many events carry no context at all. Without that, a reader
+cannot tell "the fleet ran where it was asked" from "the exception list was wide
+enough to cover where it did not".
+
+It names identities rather than a number, because "one agent may work from main"
+would pass a run where the wrong one did.
+
+### An expiry describes the holder, not the sweeper
+
+An `expired` row is written by whichever process happens to collect the lapsed
+lock — often `pact lease ls` in the main checkout, minutes after the holder has
+gone. Until 0.9.5 the row inherited *that* process's invocation context, so an
+agent that let a lease lapse from its worktree got an expiry stamped `main`, and
+this check counted it as an agent working in the wrong place.
+
+Measured in one field run: **2 of 3 expiries carried a worktree attribution that
+was not the holder's.** No later fix repairs a log already written, which is why
+the data was corrected before the check that it broke.
+
+The holder's context is now recorded on the lock at acquire time and copied onto
+the expiry. The sweeping process is recorded separately, as `collected_from`, which
+this check deliberately ignores: where somebody swept a lock says nothing about
+whether the fleet ran where it was asked to.
+
 ## `--compare`
 
 ```bash

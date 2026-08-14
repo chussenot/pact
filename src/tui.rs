@@ -1130,6 +1130,7 @@ mod tests {
                 note: None,
                 branch: None,
                 worktree: None,
+                invoked_from: None,
                 content_hash: None,
                 extra: Default::default(),
             },
