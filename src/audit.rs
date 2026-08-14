@@ -726,6 +726,40 @@ pub struct Contended {
     pub path: String,
     pub holds: usize,
     pub distinct_agents: usize,
+    /// This lease stands for something other than a file — see [`is_mutex`].
+    ///
+    /// Reported rather than filtered. A mutex hold is still coordination and still
+    /// evidence; what it must not do is sit in a "most contended paths" table above
+    /// real source files, which is what `.beads` did in the quern run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mutex: bool,
+}
+
+/// The reserved namespace for a lease that stands for something other than a file.
+///
+/// Agents invented this pattern before pact had a word for it: in the quern run three
+/// holds were taken on `.beads` — a directory, not a file — to serialize their own bd
+/// writes. It worked, and it was the only non-file path leased in 57 acquires.
+/// docs/fleet-patterns.md now blesses it and gives it a home.
+pub const MUTEX_PREFIX: &str = ".pact/internal/";
+
+/// Is this lease a mutex rather than a claim on a file?
+///
+/// **Deliberately does not touch the filesystem.** `audit` reads a log that may
+/// describe a repository state that no longer exists, so a `std::fs` check would
+/// reclassify a since-deleted file as a mutex and make the same log produce
+/// different reports on different days. Two markers, both carried in the log itself:
+///
+/// - the reserved [`MUTEX_PREFIX`], which is self-describing;
+/// - a trailing slash, which is how an agent spells "this is a directory" and how
+///   `pact watch` already records a prefix subscription.
+///
+/// A bare directory name like `.beads` has neither, so quern's own log cannot be
+/// reclassified after the fact — new runs using the prefix get clean statistics, and
+/// a legacy bare-directory lease keeps appearing as an ordinary path. Said out loud in
+/// docs/fleet-patterns.md rather than left as a surprise.
+pub fn is_mutex(path: &str) -> bool {
+    path.starts_with(MUTEX_PREFIX) || path.ends_with('/')
 }
 
 /// `Check::CommitCorrelation`: a closed hold with no commit landing anywhere
@@ -847,7 +881,33 @@ pub struct HoldStats {
     pub median_secs: i64,
     pub p90_secs: i64,
     pub max_secs: i64,
+    /// Holds that ended by lapsing rather than by `lease release`.
+    ///
+    /// NOT a fault count. Measured on the quern run, 2 of 3 expiries were deliberate
+    /// short-lived mutexes — `ttl=20` to file nine beads, `ttl=120` for a `bd close` —
+    /// let go by lapsing on purpose. A 20-second lease that expired did exactly what
+    /// its holder asked. Reported because the alternative is a reader inferring it
+    /// from `by_kind`, and separated from short TTLs below so the number can be read
+    /// without accusing anyone.
+    #[serde(default)]
+    pub ended_by_expiry: usize,
+    /// Of [`Self::ended_by_expiry`], the ones whose own recorded TTL was under
+    /// [`SHORT_TTL_SECS`] — a lock taken to serialize a quick write, not a lease
+    /// somebody abandoned. Judged against the TTL the event RECORDED, never against
+    /// the current default, for the same reason `stale-holds` does: the default has
+    /// changed, and re-judging old history by today's number rewrites verdicts.
+    #[serde(default)]
+    pub expiry_short_ttl: usize,
 }
+
+/// Below this, a lapsed lease reads as a deliberate short-lived lock rather than an
+/// abandoned hold.
+///
+/// Five minutes, against a 45-minute default. The observed idiom sat far below it
+/// (20s, 120s, 180s) and real work sat far above (the same run's median hold was
+/// 4m34s with a 2700s TTL), so the boundary is not close to anything it has to
+/// separate.
+pub const SHORT_TTL_SECS: i64 = 300;
 
 #[derive(Debug, Serialize)]
 pub struct Summary {
@@ -1547,11 +1607,17 @@ pub fn summary(
             path: p.to_string(),
             holds: n,
             distinct_agents: set.len(),
+            mutex: is_mutex(p),
         })
         .collect();
+    // Mutexes sort BELOW every file, whatever their hold count. They are reported —
+    // see `Contended::mutex` — but a lock that stands for "the bd store" is not
+    // competing for a source file's attention, and in the quern run `.beads` sat
+    // second in this table, above every real file it outranked on hold count alone.
     top_contended.sort_by(|a, b| {
-        b.distinct_agents
-            .cmp(&a.distinct_agents)
+        a.mutex
+            .cmp(&b.mutex)
+            .then(b.distinct_agents.cmp(&a.distinct_agents))
             .then(b.holds.cmp(&a.holds))
             .then(a.path.cmp(&b.path))
     });
@@ -1559,8 +1625,19 @@ pub fn summary(
 
     let mut durations: Vec<i64> = holds.iter().filter_map(|h| h.held_secs).collect();
     durations.sort_unstable();
+    let expired: Vec<&Hold> = holds
+        .iter()
+        .filter(|h| h.closed_by.as_deref() == Some("expired"))
+        .collect();
+    let ended_by_expiry = expired.len();
+    let expiry_short_ttl = expired
+        .iter()
+        .filter(|h| (h.ttl_secs as i64) < SHORT_TTL_SECS)
+        .count();
     let hold_secs = (!durations.is_empty()).then(|| HoldStats {
         completed: durations.len(),
+        ended_by_expiry,
+        expiry_short_ttl,
         median_secs: percentile(&durations, 0.5),
         p90_secs: percentile(&durations, 0.9),
         max_secs: *durations.last().unwrap_or(&0),
@@ -2701,6 +2778,64 @@ pub fn render_summary(s: &Summary) -> String {
             secs(h.p90_secs),
             secs(h.max_secs)
         ));
+        // Said out loud, because "completed" silently excludes it. `open_holds` has
+        // been computed since this summary existed and was never rendered, so a run
+        // that ended holding something reported hold statistics with a hole in them
+        // and nothing pointing at the hole — the failure `excluded_by_annotation` and
+        // `orphaned_closes` are both here to prevent.
+        //
+        // Deliberately NOT phrased as a leak. An offline tool cannot tell "the run
+        // ended badly" from "the run is still going", and the author of this line
+        // made exactly that mistake reading a live fleet's log: a hold three minutes
+        // into a 45-minute TTL is an agent working. State the fact, name the TTL, let
+        // the reader judge.
+        if s.open_holds > 0 {
+            out.push(format!(
+                "  {} hold(s) still open at the end of the log, so NOT in the numbers \
+                 above — a fleet still running looks like this too; `pact lease ls` \
+                 says whether they are live",
+                s.open_holds
+            ));
+        }
+        if h.ended_by_expiry > 0 {
+            let short = match h.expiry_short_ttl {
+                0 => String::new(),
+                n if n == h.ended_by_expiry => format!(
+                    " — every one under {}, so these are locks taken to serialize a \
+                     quick write, not holds anyone abandoned",
+                    secs(SHORT_TTL_SECS)
+                ),
+                n => format!(
+                    " — {n} of them under {}, which is a lock taken to serialize a \
+                     quick write rather than a hold anyone abandoned",
+                    secs(SHORT_TTL_SECS)
+                ),
+            };
+            out.push(format!(
+                "  {} ended by expiry rather than release{short}",
+                h.ended_by_expiry
+            ));
+        }
+    }
+
+    // Zero refusals is a RESULT, and the summary could not say so: every contention
+    // section simply rendered empty, which reads as "nothing was measured" rather
+    // than "nothing happened". Across five field runs the only real contention ever
+    // observed was one that had been deliberately engineered, and that finding had
+    // nowhere to appear.
+    if s.contention.refusals == 0 && s.contention.claims > 0 {
+        out.push(String::new());
+        out.push(format!(
+            "no contention: 0 refusals across {} claim(s) by {} agent(s)",
+            s.contention.claims,
+            s.agents.len()
+        ));
+        out.push(
+            "  contention was PREVENTED, not resolved — a plan whose waves do not put \
+             two agents on one path never reaches the lease. `pact plan lint` checks \
+             that before you spawn."
+                .to_string(),
+        );
     }
 
     if !s.top_contended.is_empty() {
@@ -2708,8 +2843,15 @@ pub fn render_summary(s: &Summary) -> String {
         out.push("most contended paths".to_string());
         for c in &s.top_contended {
             out.push(format!(
-                "  {:<44} {} hold(s) by {} agent(s)",
-                c.path, c.holds, c.distinct_agents
+                "  {:<44} {} hold(s) by {} agent(s){}",
+                c.path,
+                c.holds,
+                c.distinct_agents,
+                if c.mutex {
+                    "   [mutex, not a file]"
+                } else {
+                    ""
+                }
             ));
         }
     }

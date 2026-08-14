@@ -104,6 +104,47 @@ but the lease/edit binding then rests on convention rather than record.
 [`--check topology --expect worktrees`](audit.md#--check-topology---expect-worktreesmainany)
 turns it into a gate.
 
+## Reserved keys: leasing something that is not a file
+
+Agents invented this before pact had a word for it. In the quern run, three holds were
+taken on `.beads` — a directory, not a file — to serialize the agents' own `bd` writes
+so two of them would not mutate the store at once. It worked. It was the only non-file
+path leased in 57 acquires, and nobody had told them to do it.
+
+A lease is keyed on a path, so it has always been able to stand for something other
+than a file. The convention now has a home:
+
+```bash
+pact lease acquire .pact/internal/beads-writes --ttl 120 \
+  --note "bd close for wave 2"
+```
+
+**`.pact/internal/<purpose>` is the reserved namespace.** Anything under it is a
+mutex, not a claim on a file, and `pact audit` labels it as one — see below. A
+trailing slash works too (`shared-fixtures/`), which is how an agent already spells
+"this whole directory" for `pact watch`.
+
+**Short TTLs are correct here, and are not a smell.** The observed idiom was 20 to 180
+seconds — long enough for a `bd close`, short enough that a crashed holder blocks
+nobody. Letting such a lease lapse instead of releasing it is a legitimate
+fire-and-forget: `pact audit` reports expiry-ended holds separately and says so when
+their TTL was short, precisely so this pattern does not read as three abandoned
+leases.
+
+Why it matters for the record: before this, a mutex hold sat in audit's **most
+contended paths** table competing with real source files, and in the quern run `.beads`
+ranked second there — above every file it outranked on hold count alone. Mutexes now
+sort below files and carry a `[mutex, not a file]` label. They are still reported and
+still counted per agent; they are simply not pretending to be file contention.
+
+One honest limit: audit classifies from the path recorded in the log and deliberately
+never touches the filesystem, because a log describes a repository state that may no
+longer exist and a `stat` would let the same log produce different reports on
+different days. A bare directory name like `.beads` carries no marker, so **quern's
+own log cannot be reclassified after the fact**. New runs using the reserved prefix
+get clean statistics; a legacy bare-directory lease keeps appearing as an ordinary
+path.
+
 ## Which channel carries what
 
 Two mechanisms overlap, and picking wrongly is the most common source of noise in
