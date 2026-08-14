@@ -10,6 +10,16 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.9.3 - 2026-08-14
+#### Bug Fixes
+- **(plan)** a file listed twice in one entry is not contention - (b1cd9b7) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- **(plan)** specify the manifest as a contract, not an example - (e7b7075) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(pact)** coordination record - (0747dfe) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.9.2 - 2026-08-14
 #### Documentation
 - **(architecture)** the union merge driver cannot fire in pact's own topology - (9dc77bf) - Clement HUSSENOT-DESENONGES
