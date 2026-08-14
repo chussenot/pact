@@ -173,6 +173,36 @@ resolution for a log whose entries are independent and whose ordering between
 unrelated agents carries no meaning. Verified rather than assumed: two branches
 each appending a different event merge with no conflict, and both events survive.
 
+**And in pact's own topology, that driver can never fire.** Worth stating, because the
+opposite was predicted and measured for.
+
+Both logs live at the **shared root**. Agents working in linked worktrees all resolve
+to the same physical file and append to it directly; a worktree branch never modifies
+its own checked-out copy of them. So there are no two versions for a merge to
+reconcile. Measured on the quern run (37 agents, one worktree each, 38 merge commits):
+
+```
+$ git log --merges -- .pact/events.jsonl
+$                                          # empty — no merge ever touched it
+```
+
+That is the structural form of the argument, and it is stronger than the statistical
+one that goes with it (0 out-of-order adjacencies across 235 consecutive event pairs).
+The driver had no *opportunity* to fire, so chain verification never meets a merged
+interleave in-charter, and the question of what `--check chain-integrity` would make of
+one does not arise.
+
+The driver stays. It is insurance for the case the charter excludes rather than
+forbids — two clones on two machines both appending, then pulling — and one line of
+`.gitattributes` is cheap against a merge conflict in the file agents use to warn each
+other.
+
+One cosmetic consequence of the upgrade path, so nobody files it as a bug: a repository
+that got the `events.jsonl` rule from an older pact and the `messages.jsonl` rule from
+a newer one carries **two** comment blocks. `pact init` adds rules per path and
+deliberately does not rewrite comments a user may have edited, so the untidiness is the
+honest result of not touching your file.
+
 The cost is the same small one bd's log has — it changes whenever coordination
 happens, so it needs committing. The protocol block `pact init` writes tells
 agents to fold it into the commit whose work produced the events; a missed one is
