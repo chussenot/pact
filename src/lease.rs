@@ -1928,7 +1928,34 @@ pub fn release(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result
 }
 
 fn release_fs(repo_root: &Path, agent: &str, path: &str, force: bool) -> Result<ReleaseOutcome> {
-    let relative = normalize_path(repo_root, path);
+    release_relative(repo_root, agent, &normalize_path(repo_root, path), force)
+}
+
+/// [`release_fs`] for a path that is ALREADY repo-relative.
+///
+/// The split exists because `normalize_path` resolves a relative path against the
+/// process CWD, so re-normalizing a path that came out of the lease store mangles it
+/// from any directory but the repo root — `a.rs` read from `.pact/leases/` becomes
+/// `sub/a.rs` when the agent happens to be standing in `sub/`, which is a lock that
+/// does not exist.
+///
+/// That was finding 2 of the fleet's field audit, and the worst bug pact has shipped:
+/// `release --all` reported "held no leases" while `lease ls` showed the leases in the
+/// same second, so agents ended their turn believing they had released everything and
+/// left live locks behind for 45 minutes of TTL. One agent had to `--steal` from a peer
+/// that had already finished — the single case the protocol reserves for "when you know
+/// a peer is gone". It also silently corrupted every contention metric: a leaked lease
+/// later stolen reads as contention that never happened.
+///
+/// Same class of defect as `msg::send` re-normalizing an `about` path `run_msg` had
+/// already canonicalized. One normalization, at the boundary, and never again.
+fn release_relative(
+    repo_root: &Path,
+    agent: &str,
+    relative: &str,
+    force: bool,
+) -> Result<ReleaseOutcome> {
+    let relative = relative.to_string();
     let lock_path = lock_file_path(repo_root, &relative)?;
     // The clock-corrected now, same as acquire's — see `effective_now`.
     let now = effective_now(repo_root);
@@ -2270,11 +2297,16 @@ fn release_all_fs(repo_root: &Path, agent: &str) -> Result<Vec<String>> {
     // `ReleaseOutcome` distinguishes the cases (pact-mqw.7).
     let mut held: Vec<String> = held
         .into_iter()
-        .filter_map(|path| match release_fs(repo_root, agent, &path, false) {
-            Ok(o) if o.removed_a_lock() => Some(Ok(path)),
-            Ok(_) => None,
-            Err(e) => Some(Err(e)),
-        })
+        // `release_relative`, NOT `release_fs`: these paths came out of the lease
+        // store and are already repo-relative. See that function for what
+        // re-normalizing them cost in the field (finding 2).
+        .filter_map(
+            |path| match release_relative(repo_root, agent, &path, false) {
+                Ok(o) if o.removed_a_lock() => Some(Ok(path)),
+                Ok(_) => None,
+                Err(e) => Some(Err(e)),
+            },
+        )
         .collect::<Result<Vec<String>>>()?;
     held.sort();
     // Swept, not reported — and deliberately not via `release`, which would

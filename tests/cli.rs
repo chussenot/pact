@@ -587,8 +587,11 @@ fn release_all_releases_yours_and_leaves_another_agents_alone() {
 
     let human = pact(tmp.path(), "agent-a", &["lease", "release", "--all"]);
     assert_ok(&human);
+    // Wording changed with finding 2: an empty result now names the store it searched,
+    // because "held no leases" was a confident negative agents acted on by exiting while
+    // their leases were still live. The PROPERTY asserted is unchanged.
     assert!(
-        stdout_of(&human).contains("held no leases"),
+        stdout_of(&human).contains("holds no leases"),
         "second --all should be honest about holding nothing: {}",
         stdout_of(&human)
     );
@@ -639,8 +642,10 @@ fn release_all_of_only_expired_leases_says_it_held_none() {
     let out = pact(tmp.path(), "agent-a", &["lease", "release", "--all"]);
 
     assert_ok(&out);
+    // Same wording change as above (finding 2); still asserts that a sweep of only
+    // EXPIRED leases reports nothing released, which is the point of this test.
     assert!(
-        stdout_of(&out).contains("agent-a held no leases"),
+        stdout_of(&out).contains("agent-a holds no leases"),
         "stdout: {}",
         stdout_of(&out)
     );
@@ -2628,6 +2633,92 @@ fn audit_reports_no_contention_a_mutex_and_a_short_ttl_expiry_distinctly() {
     assert_eq!(last["path"], ".pact/internal/beads-writes", "{report}");
     assert_eq!(report["hold_secs"]["ended_by_expiry"], 1, "{report}");
     assert_eq!(report["hold_secs"]["expiry_short_ttl"], 1, "{report}");
+}
+
+/// FINDING 2, the worst bug pact has shipped: `lease release --all` was cwd-scoped when
+/// the identity is the scope.
+///
+/// The mechanism was a double normalization. `release_all` reads paths out of the lease
+/// store, where they are already repo-relative, and passed each one back through
+/// `normalize_path`, which resolves a relative path against the process CWD. From `sub/`,
+/// the stored path `a.rs` became `sub/a.rs` — a lock that does not exist — so nothing was
+/// released and pact printed "held no leases".
+///
+/// In the field: an agent ran `release --all`, was told it held nothing, and exited. A peer
+/// later found its lease still live with 1721 seconds remaining and had to `--steal` from an
+/// agent that had already finished. It also corrupted every contention metric, because a
+/// leaked lease later stolen reads as contention that never happened.
+///
+/// Every directory below must release the same set, and each one fails against the old
+/// implementation.
+#[test]
+fn release_all_is_identity_scoped_not_cwd_scoped() {
+    let tmp = init_repo();
+    let repo = tmp.path();
+    std::fs::create_dir_all(repo.join("crate/src")).unwrap();
+    std::fs::write(repo.join("a.rs"), "x\n").unwrap();
+    std::fs::write(repo.join("crate/src/b.rs"), "y\n").unwrap();
+
+    for from in ["", "crate", "crate/src"] {
+        // Acquired from the ROOT every time, released from `from` — the shape the field
+        // hit, where an agent acquires early and tidies up from wherever it ended up.
+        let acquired = pact(
+            repo,
+            "agent-a",
+            &["lease", "acquire", "a.rs", "crate/src/b.rs"],
+        );
+        assert_ok(&acquired);
+
+        let cwd = if from.is_empty() {
+            repo.to_path_buf()
+        } else {
+            repo.join(from)
+        };
+        let mut cmd = pact_cmd(&cwd, &["lease", "release", "--all"]);
+        cmd.env("PACT_AGENT", "agent-a");
+        let out = cmd.output().expect("failed to run pact binary");
+        assert_ok(&out);
+        let text = stdout_of(&out);
+        assert!(
+            text.contains("released 2 lease(s)"),
+            "release --all from {:?} released nothing:\n{text}",
+            if from.is_empty() { "<root>" } else { from }
+        );
+        for path in ["a.rs", "crate/src/b.rs"] {
+            assert!(
+                text.contains(path),
+                "from {from:?}, missing {path}:\n{text}"
+            );
+        }
+
+        let ls = pact(repo, "agent-a", &["lease", "ls", "--json"]);
+        assert_eq!(
+            json_stdout(&ls).as_array().map(Vec::len),
+            Some(0),
+            "leases survived release --all run from {from:?}"
+        );
+    }
+}
+
+/// The other half of finding 2: a confident negative must say where it looked.
+///
+/// "held no leases" is what an agent stakes its exit on, and it printed that while
+/// `lease ls` showed the leases in the same second.
+#[test]
+fn release_all_with_nothing_held_names_the_store_it_searched() {
+    let tmp = init_repo();
+    let out = pact(tmp.path(), "agent-a", &["lease", "release", "--all"]);
+    assert_ok(&out);
+    let text = stdout_of(&out);
+    assert!(text.contains("holds no leases"), "{text}");
+    assert!(
+        text.contains(".pact"),
+        "an empty result must name the store searched:\n{text}"
+    );
+    assert!(
+        text.contains("not just this directory"),
+        "and say the search was not directory-scoped:\n{text}"
+    );
 }
 
 /// Exit 3 is RETIRED, and this is what "retired" has to mean: no command raises

@@ -1673,9 +1673,20 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
             let agent = identity::resolve_agent(agent_flag)?;
             if all {
                 let released = lease::release_all(&root, &agent)?;
+                // The scope, resolved once, so an empty result can say WHERE it looked
+                // (finding 2). "held no leases" is a confident negative that an agent
+                // acts on by exiting — it printed that while `lease ls` showed the
+                // leases in the same second, and 45 minutes of TTL followed. A negative
+                // an agent stakes its exit on has to name the store it searched.
+                let scope = repo::RepoContext::resolve(&root);
                 output::emit(json, &released, |paths: &Vec<String>| {
                     if paths.is_empty() {
-                        format!("{agent} held no leases")
+                        format!(
+                            "{agent} holds no leases in {} \n\
+                             (searched every lease in this store, not just this \
+                             directory — `pact lease ls` lists what is there)",
+                            scope.state_dir.display()
+                        )
                     } else {
                         format!(
                             "released {} lease(s):\n{}",

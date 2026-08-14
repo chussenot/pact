@@ -651,6 +651,74 @@ fn a_worktree_of_a_bare_repo_anchors_state_and_can_message() {
     assert!(stdout(&inbox).contains("hello"), "{}", stdout(&inbox));
 }
 
+/// FINDING 2 in the topology it was found in: a worktree fleet, releasing from a crate
+/// subdirectory inside the worktree.
+///
+/// This is the exact field shape — `parser-expr` acquired in its worktree, ran
+/// `release --all` from where it was working, was told it held nothing, and exited leaving
+/// a live lease a peer later had to `--steal`.
+#[test]
+fn release_all_from_a_subdirectory_inside_a_worktree_releases_everything() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let main = base.join("main");
+    std::fs::create_dir(&main).unwrap();
+    git_ok(&main, &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::create_dir_all(main.join("crate/src")).unwrap();
+    std::fs::write(main.join("crate/src/b.rs"), "y\n").unwrap();
+    std::fs::write(main.join("a.rs"), "x\n").unwrap();
+    git_ok(&main, &["add", "."]);
+    git_ok(&main, &["commit", "--quiet", "-m", "initial"]);
+    assert!(pact(&main, "agent-a", &["init", "--no-commit"])
+        .status
+        .success());
+
+    let wt = base.join("wt-a");
+    git_ok(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            wt.to_str().unwrap(),
+            "-b",
+            "feat/a",
+        ],
+    );
+
+    // Acquired from the worktree ROOT, released from a subdirectory of the same worktree.
+    let acquired = pact(
+        &wt,
+        "agent-a",
+        &["lease", "acquire", "a.rs", "crate/src/b.rs"],
+    );
+    assert!(acquired.status.success(), "{}", stderr(&acquired));
+
+    let released = pact(
+        &wt.join("crate/src"),
+        "agent-a",
+        &["lease", "release", "--all"],
+    );
+    assert!(released.status.success(), "{}", stderr(&released));
+    let text = stdout(&released);
+    assert!(
+        text.contains("released 2 lease(s)"),
+        "release --all from a worktree subdirectory released nothing:\n{text}"
+    );
+
+    // And the shared store agrees, read from the MAIN checkout.
+    let ls = pact(&main, "agent-a", &["lease", "ls"]);
+    assert!(
+        stdout(&ls).contains("no active leases"),
+        "leases survived, seen from main:\n{}",
+        stdout(&ls)
+    );
+}
+
 /// (g) A `.git` file pact cannot follow: local fallback, a doctor warning, and no
 /// panic. A broken worktree pointer is a reason to coordinate less, never a
 /// reason for `lease acquire` to abort in the middle of a fleet.
