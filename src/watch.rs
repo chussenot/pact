@@ -265,7 +265,10 @@ fn append(repo_root: &Path, record: WatchRecord) -> Result<()> {
 /// argument back.
 pub fn add(repo_root: &Path, agent: &str, raw_path: &str) -> Result<(String, bool)> {
     let prefix = is_prefix_request(repo_root, raw_path);
-    let path = crate::lease::normalize_path(repo_root, raw_path);
+    // Same validation as a claim (pact-83r.4 / findings 3 and 11). A watch is where a bad
+    // path hurts MOST: the failure mode is silence, and silence is indistinguishable from
+    // "nothing has changed yet" — the exact state a watcher is waiting in.
+    let path = crate::lease::resolve_claimable(repo_root, raw_path)?;
     append(
         repo_root,
         WatchRecord {

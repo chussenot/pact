@@ -609,6 +609,55 @@ fn case_insensitive_fs() -> bool {
 /// `repo_root` the same way (`repo::find_repo_root(&cwd)`, once, in `main`),
 /// so `cwd_in_repo` above is satisfied by construction everywhere this is
 /// called — including from other modules.
+/// Why a whitespace path almost always means an unsplit shell variable.
+///
+/// Its own constant so the sentence lives once and no continuation can smuggle source
+/// indentation into it — which the first cut of this message did.
+const HINT_WHITESPACE: &str = "If you meant several paths, pass them as separate arguments: \
+`pact lease acquire a.rs b.rs` takes two leases, while `pact lease acquire \"a.rs b.rs\"` \
+asks for one file whose name contains a space. An unquoted shell variable holding a list \
+arrives as ONE argument, because zsh does not word-split it.";
+
+/// Normalize a path a caller is about to CLAIM or WATCH, refusing the shapes that cannot
+/// be what they meant.
+///
+/// Two field findings, one function (pact-83r.4 / findings 3 and 11).
+///
+/// **Whitespace is refused outright.** From zsh an unquoted variable is not word-split, so
+/// `pact lease acquire $FILES` arrives as ONE argument and pact took a single lease on the
+/// literal string `a.rs b.rs`. Three agents independently concluded "pact caps multi-path
+/// acquires at ~15 paths" — it does not, 40 paths take 0.560s — because past about five
+/// the joined string exceeds `NAME_MAX` and the failure surfaces as a raw `os error 36`.
+/// No source file in a normal repository has whitespace in its name, so refusing costs
+/// nothing and turns the confusing failure into the true one.
+///
+/// **A path that does not exist is a WARNING, not a refusal**, because watching a
+/// not-yet-created file is legitimate and so is leasing one you are about to add. What was
+/// missing is any signal at all: six such calls in one run, every one exit 0. The
+/// orchestrator lost a lease this way — from the repo root they ran
+/// `pact lease acquire src/vm/mod.rs` when the file was at `treadle/src/vm/mod.rs`, pact
+/// echoed the path back, and the lease protected nothing while saying it did.
+///
+/// So the warning prints the RESOLVED path, never the argument as typed. Echoing the input
+/// is exactly what made the mistake convincing.
+pub(crate) fn resolve_claimable(repo_root: &Path, raw: &str) -> Result<String> {
+    if raw.chars().any(char::is_whitespace) {
+        anyhow::bail!(
+            "path {raw:?} contains whitespace, so it is not a file pact can claim.\n\
+             {HINT_WHITESPACE}"
+        );
+    }
+    let relative = normalize_path(repo_root, raw);
+    if !repo_root.join(&relative).exists() {
+        crate::output::warn(&format!(
+            "note: {relative} does not exist in the working tree (asked for {raw:?}, \
+             resolved from the current directory). Fine for a file you are about to \
+             create; if you meant an existing one, this claim protects nothing."
+        ));
+    }
+    Ok(relative)
+}
+
 pub(crate) fn normalize_path(repo_root: &Path, path: &str) -> String {
     let p = Path::new(path);
     // A relative path is resolved against the CWD — but only when the CWD is
@@ -1353,7 +1402,11 @@ fn acquire_fs(
     steal: bool,
     note: Option<String>,
 ) -> Result<AcquireOutcome> {
-    let relative = normalize_path(repo_root, path);
+    // Validated HERE and nowhere else: `acquire_many_fs` reaches every path through
+    // `acquire`, which lands here, so this runs exactly once per path in both the
+    // single- and multi-path cases. `acquire_inner` normalizes again for its own use and
+    // must not re-warn.
+    let relative = resolve_claimable(repo_root, path)?;
     let mut sp = otel::span("pact.lease.acquire");
     sp.set("pact.path", relative.clone());
     sp.set("pact.lease.ttl_secs", ttl_secs);

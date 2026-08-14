@@ -13,6 +13,32 @@ nothing stops you from `git push --force` over a coworker's branch. The point
 isn't to make that impossible; it's to make coordinating cheap enough that
 agents actually do it.
 
+## What pact refuses, and what it only warns about
+
+**A path containing whitespace is refused.** No source file in a normal repository has one,
+and the shape that produces it is specific: an unquoted shell variable holding a list
+arrives as ONE argument, because zsh does not word-split it. pact used to accept the whole
+string as a single lease. Three agents in one field run each concluded "pact caps multi-path
+acquires at about 15 paths" from that — it does not, 40 paths take 0.560s — and past roughly
+five the joined name exceeds `NAME_MAX` and surfaces as a raw `os error 36`.
+
+```bash
+pact lease acquire a.rs b.rs        # two leases
+pact lease acquire "a.rs b.rs"      # refused: one filename with a space in it
+```
+
+**A path that does not exist only warns**, and the warning prints the RESOLVED path.
+Leasing a file you are about to create is legitimate, and so is watching one. What was
+missing was any signal at all — six such calls in one run, every one exit 0.
+
+Paths resolve against the current directory, which is ordinary Unix behaviour and is exactly
+how it bites: from the repository root, `pact lease acquire src/vm/mod.rs` on a project whose
+file is at `treadle/src/vm/mod.rs` resolves to a path that does not exist. pact answered
+`acquired lease on src/vm/mod.rs`, the caller believed it, and the lease protected nothing.
+`--check commit-correlation` flagged both resulting commits afterwards. The warning names the
+resolved path rather than echoing the argument back, because echoing the input is what made
+that convincing.
+
 ## The shape of a lease
 
 A lease is one JSON file: `.pact/leases/<encoded-path>.lock`, containing

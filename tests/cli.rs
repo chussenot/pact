@@ -2723,6 +2723,127 @@ fn release_all_with_nothing_held_names_the_store_it_searched() {
     );
 }
 
+/// FINDINGS 3 and 11: a lease or watch path that cannot be what the caller meant.
+///
+/// The space-joined case is the zsh one — an unquoted variable holding a list arrives as
+/// ONE argument, and pact took a single lease on the literal string. Three agents
+/// independently concluded pact caps multi-path acquires at ~15 paths; it does not, and past
+/// about five the joined name exceeds NAME_MAX and fails with a raw `os error 36`.
+///
+/// The nonexistent case is the one that caught the orchestrator: from the repo root they ran
+/// `pact lease acquire src/vm/mod.rs` when the file was at `treadle/src/vm/mod.rs`, pact
+/// echoed the path back, and the lease protected nothing while saying it did.
+#[test]
+fn a_lease_path_with_whitespace_is_refused_and_a_missing_one_warns() {
+    let tmp = init_repo();
+    let repo = tmp.path();
+    std::fs::create_dir_all(repo.join("crate/src")).unwrap();
+    std::fs::write(repo.join("crate/src/real.rs"), "x\n").unwrap();
+
+    // Refused, and the message explains the shell behaviour that produces it.
+    let joined = pact(
+        repo,
+        "agent-a",
+        &["lease", "acquire", "crate/src/a.rs crate/src/b.rs"],
+    );
+    assert_ne!(joined.status.code(), Some(0), "whitespace must be refused");
+    let err = stderr_of(&joined);
+    assert!(err.contains("whitespace"), "{err}");
+    assert!(
+        err.contains("separate arguments"),
+        "must name the fix, since three agents diagnosed an arity limit instead:\n{err}"
+    );
+    let ls = pact(repo, "agent-a", &["lease", "ls", "--json"]);
+    assert_eq!(
+        json_stdout(&ls).as_array().map(Vec::len),
+        Some(0),
+        "a refused path must not leave a lease behind"
+    );
+
+    // Accepted with a warning that prints the RESOLVED path — echoing the input back is
+    // what made the orchestrator's typo convincing.
+    let ghost = pact(
+        repo,
+        "agent-a",
+        &["lease", "acquire", "crate/crate/src/real.rs"],
+    );
+    assert_ok(&ghost);
+    let warn = stderr_of(&ghost);
+    assert!(
+        warn.contains("crate/crate/src/real.rs") && warn.contains("does not exist"),
+        "a claim on a path that is not there must say so:\n{warn}"
+    );
+    assert!(
+        warn.contains("protects nothing"),
+        "and say what it costs:\n{warn}"
+    );
+
+    // A real path says nothing at all.
+    let real = pact(repo, "agent-b", &["lease", "acquire", "crate/src/real.rs"]);
+    assert_ok(&real);
+    assert!(
+        !stderr_of(&real).contains("does not exist"),
+        "an existing path must not warn: {}",
+        stderr_of(&real)
+    );
+}
+
+/// A watch is where a bad path hurts most: the failure mode is silence, which is
+/// indistinguishable from "nothing has changed yet" — the state a watcher waits in.
+/// Watching a not-yet-created file is legitimate, so this warns rather than refusing.
+#[test]
+fn a_watch_on_a_path_that_does_not_exist_warns_but_still_registers() {
+    let tmp = init_repo();
+    let out = pact(tmp.path(), "agent-a", &["watch", "add", "src/not/yet.rs"]);
+    assert_ok(&out);
+    assert!(
+        stderr_of(&out).contains("does not exist"),
+        "{}",
+        stderr_of(&out)
+    );
+    // Registered anyway — the legitimate case must still work.
+    let ls = pact(tmp.path(), "agent-a", &["watch", "ls"]);
+    assert!(
+        stdout_of(&ls).contains("src/not/yet.rs"),
+        "{}",
+        stdout_of(&ls)
+    );
+
+    // And whitespace is refused here too.
+    let bad = pact(tmp.path(), "agent-a", &["watch", "add", "a.rs b.rs"]);
+    assert_ne!(bad.status.code(), Some(0));
+    assert!(
+        stderr_of(&bad).contains("whitespace"),
+        "{}",
+        stderr_of(&bad)
+    );
+}
+
+/// The third part of finding 3, which turned out to need no code: pact does NOT truncate a
+/// path in `lease ls`. `table()` pads to the widest cell and Rust's `{:<n}` never cuts, so
+/// the "rendered truncated" the field report describes was the TERMINAL wrapping a long
+/// line. Asserted so a future column-width change cannot quietly introduce the truncation
+/// that made three agents misdiagnose an arity limit.
+#[test]
+fn lease_ls_never_truncates_a_path_into_looking_valid() {
+    let tmp = init_repo();
+    let repo = tmp.path();
+    let long = "src/an_extremely_long_directory_name/and_a_long_file_name_as_well.rs";
+    std::fs::create_dir_all(repo.join("src/an_extremely_long_directory_name")).unwrap();
+    std::fs::write(repo.join(long), "x\n").unwrap();
+    assert_ok(&pact(repo, "agent-a", &["lease", "acquire", long]));
+
+    let mut cmd = pact_cmd(repo, &["lease", "ls"]);
+    cmd.env("PACT_AGENT", "agent-a").env("COLUMNS", "40");
+    let out = cmd.output().expect("failed to run pact binary");
+    assert_ok(&out);
+    assert!(
+        stdout_of(&out).contains(long),
+        "the whole path must be present even in a narrow terminal:\n{}",
+        stdout_of(&out)
+    );
+}
+
 /// Exit 3 is RETIRED, and this is what "retired" has to mean: no command raises
 /// it, not merely no `msg` command.
 ///
