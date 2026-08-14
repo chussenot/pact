@@ -127,17 +127,46 @@ pub fn parse(text: &str) -> Result<Vec<Entry>> {
 pub fn lint(repo_root: &Path, entries: &[Entry]) -> Report {
     let mut findings = Vec::new();
 
+    // Normalize, then DEDUPE within the entry. Without the dedupe, one entry listing
+    // the same file twice — a copy-paste in a hand-written manifest, or two spellings
+    // of one path that normalization collapses — was reported as
+    // "x.rs is claimed by 2 entries (a, a)": a false error, naming one entry twice,
+    // that would block a run for nothing. An entry cannot contend with itself.
+    //
+    // Order-preserving, because the first spelling is the one the author wrote and any
+    // message quoting the path should quote that.
+    let mut dupes: Vec<Finding> = Vec::new();
     let normalized: Vec<(&Entry, Vec<String>)> = entries
         .iter()
         .map(|e| {
-            let files = e
-                .files
-                .iter()
-                .map(|f| crate::lease::normalize_path(repo_root, f))
-                .collect();
+            let mut seen = BTreeSet::new();
+            let mut files = Vec::new();
+            let mut repeated = BTreeSet::new();
+            for f in &e.files {
+                let norm = crate::lease::normalize_path(repo_root, f);
+                if seen.insert(norm.clone()) {
+                    files.push(norm);
+                } else {
+                    repeated.insert(norm);
+                }
+            }
+            // Reported, not swallowed: a repeat is usually a copy-paste, and once it
+            // stops being an error nothing else would ever mention it.
+            for path in repeated {
+                dupes.push(Finding {
+                    kind: "duplicate-file-in-entry".into(),
+                    error: false,
+                    detail: format!(
+                        "{} lists {path} more than once — counted once; an entry cannot \
+                         contend with itself",
+                        e.id
+                    ),
+                });
+            }
             (e, files)
         })
         .collect();
+    findings.extend(dupes);
 
     // Duplicate ids first: every check below keys on id, so a duplicate would make
     // the rest of the report ambiguous rather than wrong.
@@ -348,6 +377,15 @@ pub fn render(r: &Report) -> String {
         if r.entries == 1 { "y" } else { "ies" },
         r.waves
     ));
+    if r.entries == 0 {
+        out.push(String::new());
+        out.push(
+            "the manifest is empty — nothing to check. If that is a surprise, the export \
+             that produced it found no entries."
+                .into(),
+        );
+        return out.join("\n");
+    }
     if r.findings.is_empty() {
         out.push(String::new());
         out.push("plan is clean: no two entries in one wave touch the same file".into());
@@ -506,6 +544,74 @@ mod tests {
             "normalization must make these one path: {:?}",
             r.findings
         );
+    }
+
+    /// A false error that would have blocked a run: one entry listing a path twice
+    /// was reported as "claimed by 2 entries (a, a)". An entry cannot contend with
+    /// itself.
+    #[test]
+    fn a_file_listed_twice_in_one_entry_is_not_contention() {
+        let tmp = root();
+        let entries = [entry("a", Some(1), &["x.rs", "x.rs"], &[])];
+        let r = lint(tmp.path(), &entries);
+        assert_eq!(r.errors(), 0, "{:?}", r.findings);
+        assert!(
+            kinds(&r).contains(&"duplicate-file-in-entry"),
+            "counted once, but still worth mentioning: {:?}",
+            r.findings
+        );
+    }
+
+    /// Two SPELLINGS of one path inside one entry collapse the same way, since
+    /// normalization runs before the dedupe.
+    #[test]
+    fn two_spellings_of_one_path_in_one_entry_collapse_quietly() {
+        let tmp = root();
+        let entries = [entry("a", Some(1), &["x.rs", "./x.rs"], &[])];
+        let r = lint(tmp.path(), &entries);
+        assert_eq!(r.errors(), 0, "{:?}", r.findings);
+    }
+
+    /// And the dedupe must not hide REAL contention between two entries.
+    #[test]
+    fn deduping_within_an_entry_still_catches_overlap_between_entries() {
+        let tmp = root();
+        let entries = [
+            entry("a", Some(1), &["x.rs", "x.rs"], &[]),
+            entry("b", Some(1), &["x.rs"], &[]),
+        ];
+        let r = lint(tmp.path(), &entries);
+        let overlap: Vec<&Finding> = r
+            .findings
+            .iter()
+            .filter(|f| f.kind == "intra-wave-overlap")
+            .collect();
+        assert_eq!(overlap.len(), 1, "{:?}", r.findings);
+        assert!(
+            overlap[0].detail.contains("(a, b)"),
+            "{}",
+            overlap[0].detail
+        );
+    }
+
+    #[test]
+    fn an_empty_manifest_says_so_rather_than_calling_itself_clean() {
+        let tmp = root();
+        let r = lint(tmp.path(), &[]);
+        let text = render(&r);
+        assert!(text.contains("empty"), "{text}");
+        assert!(!text.contains("plan is clean"), "{text}");
+    }
+
+    /// Unknown fields are IGNORED, so an orchestrator can carry its own metadata in
+    /// the same file without pact having to know about it.
+    #[test]
+    fn unknown_fields_are_ignored_rather_than_rejected() {
+        let parsed =
+            parse(r#"{"id":"a","wave":1,"files":["x.rs"],"owner":"nobody","slug":"whatever"}"#)
+                .expect("unknown fields must not be an error");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "a");
     }
 
     #[test]
