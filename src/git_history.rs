@@ -116,6 +116,50 @@ pub fn commits_since(repo_root: &Path, since: Option<DateTime<Utc>>) -> Result<V
 /// Paths that do not exist are simply absent from the result: a lease on a
 /// file you are about to create is a documented workflow, and `git
 /// hash-object` errors on the whole invocation if any argument is missing.
+/// Which paths were touched by the commits in `from..to`, or `None` if that range
+/// cannot be resolved here.
+///
+/// `None` is the important half of the return type and is NOT an error: a recorded
+/// hash can legitimately stop resolving. A worktree branch gets deleted and its
+/// objects garbage-collected, a branch is force-pushed, a fleet's run is analysed in a
+/// shallow clone. The caller falls back to the timestamp window in every one of those
+/// cases, so this reports "cannot answer" rather than failing the check.
+///
+/// Exclusive of `from` and inclusive of `to`, which is git's own `A..B` and exactly the
+/// right shape for a hold: HEAD at acquire time is the commit the agent STARTED from,
+/// so it is somebody else's work, and HEAD at release time is the agent's last.
+pub fn commits_in_range(repo_root: &Path, from: &str, to: &str) -> Option<Vec<String>> {
+    // Same hash means no commits, and asking git would be a wasted spawn on the
+    // commonest case — a hold that landed nothing.
+    if from == to {
+        return Some(Vec::new());
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "log",
+            "--name-only",
+            "--pretty=format:",
+            &format!("{from}..{to}"),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        // Either hash is unknown here: an unresolvable range, not an empty one.
+        return None;
+    }
+    let mut paths: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    Some(paths)
+}
+
 pub fn hash_objects(repo_root: &Path, paths: &[String]) -> BTreeMap<String, String> {
     let existing: Vec<&String> = paths
         .iter()

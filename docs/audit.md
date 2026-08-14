@@ -180,6 +180,28 @@ whether real git history backs up what that log claims, by shelling out to
 shell out to `git` for other checks. It reports three things, only two of
 which are findings:
 
+**How a hold is matched to commits: the range first, the clock only if it must.**
+
+When the opening and closing events both recorded a `head` (pact stamps it on
+`acquired`/`stolen`/`released`/`force-released`), the hold brackets an exact commit
+set — `git log <open-head>..<close-head>` — so "what did this agent land under this
+lease" is a lookup rather than an inference. That matters on a busy fleet: a timestamp
+window credits your hold with any commit that happened to land in the same minutes,
+including a peer's.
+
+The window remains, and always will. Every log written before pact stamped `head` has
+none, and a recorded hash stops resolving after a worktree branch is deleted and
+garbage-collected, after a force-push, or when the run is analysed in a shallow clone.
+Each of those falls back to the timestamp window, and the report **says which route it
+took** — `correlated_by_head` and `correlated_by_time` in `--json`, and a line in the
+text output. A check that got quietly less precise would be worse than one that stayed
+imprecise.
+
+Measured on the quern run (37 agents, one worktree each), the first fleet whose log
+carries the field: **154 holds correlated by range, 3 by window.** Each agent records
+its own worktree's HEAD, which is what makes the range per-agent and therefore worth
+having — 111 distinct heads across the run, and 59 of 62 agents saw more than one.
+
 - **A hold with no commit anywhere in its own window** — informational only,
   never a finding. A read-only lease (research, review, a task that turned up
   nothing to change) closes exactly like this, and flagging every one would

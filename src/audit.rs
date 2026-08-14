@@ -676,6 +676,22 @@ pub struct TopologyMismatch {
     pub events: usize,
 }
 
+/// A hold that has been opened and not yet closed, while `reconstruct` walks the log.
+///
+/// A named struct rather than the tuple this was, because pact-b73.6 needed to carry a
+/// sixth field (`head`) and a six-tuple destructured at four sites is a positional
+/// mistake waiting to happen.
+#[derive(Debug)]
+struct OpenWindow {
+    line: usize,
+    at: String,
+    renewals: usize,
+    ttl: u64,
+    ttl_assumed: bool,
+    /// Short HEAD recorded on the opening event, when it recorded one.
+    head: Option<String>,
+}
+
 /// One completed or still-open hold of one path by one agent.
 #[derive(Debug, Clone, Serialize)]
 pub struct Hold {
@@ -699,6 +715,19 @@ pub struct Hold {
     /// [`LEGACY_DEFAULT_TTL_SECS`] was assumed. Surfaced so a reader can tell a
     /// measured threshold from an inferred one.
     pub ttl_assumed: bool,
+    /// Short HEAD at the moment the hold opened, if the event recorded one.
+    ///
+    /// With both heads present, a hold brackets an EXACT commit range — `git log
+    /// open..close` — so "what did this agent land under this lease" stops being an
+    /// inference from timestamps. Absent on every log written before pact stamped it,
+    /// which is why `commit-correlation` keeps its timestamp path (pact-b73.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_head: Option<String>,
+    /// Short HEAD at the moment the hold closed. `None` on an open hold, and on an
+    /// `expired` close — the holder was gone, so HEAD then belongs to whoever swept
+    /// the lock rather than to the work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_head: Option<String>,
 }
 
 /// Two agents holding one path at the same time.
@@ -1051,6 +1080,20 @@ pub struct CheckReport {
     /// three commit-based fields below are then always empty, which must
     /// read as "this check could not run", never as "nothing found".
     pub git_unavailable: Option<String>,
+    /// `Check::CommitCorrelation` only: holds correlated by their recorded HEAD range
+    /// rather than by timestamp (pact-b73.6).
+    ///
+    /// Reported so the two paths are never confused. A range answers exactly what a
+    /// hold landed; a timestamp window infers it, and on a busy fleet a commit by
+    /// somebody else can fall inside your window. Both numbers are printed whenever
+    /// either is non-zero, because "this check got more precise for 133 of 153 holds"
+    /// is the kind of change a reader must be able to see rather than deduce.
+    #[serde(default)]
+    pub correlated_by_head: usize,
+    /// Holds that fell back to the timestamp window: no head recorded (every log
+    /// written before pact stamped it), or a recorded hash that no longer resolves.
+    #[serde(default)]
+    pub correlated_by_time: usize,
     /// `Check::CommitCorrelation` only. See `UncommittedHold`'s doc comment
     /// for why this is informational and excluded from `findings()`.
     pub holds_with_no_commit: Vec<UncommittedHold>,
@@ -1206,32 +1249,37 @@ fn closes(kind: &str) -> bool {
 /// includes counting a close that found no window as orphaned.
 #[allow(clippy::too_many_arguments)]
 fn close_window(
-    open: &mut BTreeMap<String, (usize, String, usize, u64, bool)>,
+    open: &mut BTreeMap<String, OpenWindow>,
     holds: &mut Vec<Hold>,
     path: &str,
     agent: &str,
     line: usize,
     at: &str,
     closed_by: &str,
+    // HEAD on the CLOSING event, so a takeover site can pass the closer's rather
+    // than the displaced holder's.
+    closing_head: Option<&str>,
 ) -> bool {
-    let Some((oline, oat, renewals, ttl, ttl_assumed)) = open.remove(agent) else {
+    let Some(w) = open.remove(agent) else {
         return false;
     };
-    let held = parse_at(&oat)
+    let held = parse_at(&w.at)
         .zip(parse_at(at))
         .map(|(a, b)| (b - a).num_seconds());
     holds.push(Hold {
         path: path.to_string(),
         agent: agent.to_string(),
-        opened_line: oline,
-        opened_at: oat,
+        opened_line: w.line,
+        opened_at: w.at,
         closed_line: Some(line),
         closed_at: Some(at.to_string()),
         closed_by: Some(closed_by.to_string()),
-        renewals,
+        renewals: w.renewals,
         held_secs: held,
-        ttl_secs: ttl,
-        ttl_assumed,
+        ttl_secs: w.ttl,
+        ttl_assumed: w.ttl_assumed,
+        open_head: w.head,
+        close_head: closing_head.map(str::to_string),
     });
     true
 }
@@ -1270,17 +1318,17 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>, usize) 
         });
 
         // agent -> (opened_line, opened_at, renewals, ttl_secs, ttl_assumed)
-        let mut open: BTreeMap<String, (usize, String, usize, u64, bool)> = BTreeMap::new();
+        let mut open: BTreeMap<String, OpenWindow> = BTreeMap::new();
 
         for (line, e) in rows {
             if opens(&e.kind) {
                 let others: Vec<HoldingAgent> = open
                     .iter()
                     .filter(|(a, _)| *a != &e.agent)
-                    .map(|(a, (l, at, ..))| HoldingAgent {
+                    .map(|(a, w)| HoldingAgent {
                         agent: a.clone(),
-                        since: at.clone(),
-                        since_line: *l,
+                        since: w.at.clone(),
+                        since_line: w.line,
                     })
                     .collect();
                 if !others.is_empty() {
@@ -1295,13 +1343,14 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>, usize) 
                 }
                 // A re-entrant acquire by the same agent refreshes rather than
                 // opening a second window, so the original open time is kept.
-                open.entry(e.agent.clone()).or_insert((
+                open.entry(e.agent.clone()).or_insert(OpenWindow {
                     line,
-                    e.at.clone(),
-                    0,
-                    e.ttl_secs.unwrap_or(LEGACY_DEFAULT_TTL_SECS),
-                    e.ttl_secs.is_none(),
-                ));
+                    at: e.at.clone(),
+                    renewals: 0,
+                    ttl: e.ttl_secs.unwrap_or(LEGACY_DEFAULT_TTL_SECS),
+                    ttl_assumed: e.ttl_secs.is_none(),
+                    head: e.head.clone(),
+                });
                 // pact-mqw.1: a takeover ENDS the displaced holder's claim, and
                 // until now nothing said so. A routine reclaim gets an `expired`
                 // row to close it, but a `--steal` over a live lease had none —
@@ -1322,7 +1371,16 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>, usize) 
                     let victims: Vec<String> =
                         open.keys().filter(|a| *a != &e.agent).cloned().collect();
                     for victim in victims {
-                        close_window(&mut open, &mut holds, path, &victim, line, &e.at, "stolen");
+                        close_window(
+                            &mut open,
+                            &mut holds,
+                            path,
+                            &victim,
+                            line,
+                            &e.at,
+                            "stolen",
+                            e.head.as_deref(),
+                        );
                     }
                 }
             } else if e.kind == "displaced" {
@@ -1342,15 +1400,16 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>, usize) 
                     line,
                     &e.at,
                     "displaced",
+                    e.head.as_deref(),
                 );
             } else if e.kind == "renewed" {
                 if let Some(slot) = open.get_mut(&e.agent) {
-                    slot.2 += 1;
+                    slot.renewals += 1;
                     // A renew can change the TTL, so the window adopts the newest
                     // one it was actually granted.
                     if let Some(ttl) = e.ttl_secs {
-                        slot.3 = ttl;
-                        slot.4 = false;
+                        slot.ttl = ttl;
+                        slot.ttl_assumed = false;
                     }
                 }
             } else if e.kind == "restored" {
@@ -1361,10 +1420,10 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>, usize) 
                 // force is whatever this event carries (the pre-batch one),
                 // not the higher one the undone refresh briefly granted.
                 if let Some(slot) = open.get_mut(&e.agent) {
-                    slot.2 = slot.2.saturating_sub(1);
+                    slot.renewals = slot.renewals.saturating_sub(1);
                     if let Some(ttl) = e.ttl_secs {
-                        slot.3 = ttl;
-                        slot.4 = false;
+                        slot.ttl = ttl;
+                        slot.ttl_assumed = false;
                     }
                 }
             } else if closes(&e.kind) {
@@ -1379,22 +1438,24 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>, usize) 
                 // and on a force-release with no surviving holder name, so
                 // this falls back to `e.agent` exactly as before there.
                 let holder = e.displaced.as_deref().unwrap_or(e.agent.as_str());
-                if let Some((oline, oat, renewals, ttl, ttl_assumed)) = open.remove(holder) {
-                    let held = parse_at(&oat)
+                if let Some(w) = open.remove(holder) {
+                    let held = parse_at(&w.at)
                         .zip(parse_at(&e.at))
                         .map(|(a, b)| (b - a).num_seconds());
                     holds.push(Hold {
                         path: path.to_string(),
                         agent: holder.to_string(),
-                        opened_line: oline,
-                        opened_at: oat,
+                        opened_line: w.line,
+                        opened_at: w.at,
                         closed_line: Some(line),
                         closed_at: Some(e.at.clone()),
                         closed_by: Some(e.kind.clone()),
-                        renewals,
+                        renewals: w.renewals,
                         held_secs: held,
-                        ttl_secs: ttl,
-                        ttl_assumed,
+                        ttl_secs: w.ttl,
+                        ttl_assumed: w.ttl_assumed,
+                        open_head: w.head,
+                        close_head: e.head.clone(),
                     });
                 } else {
                     // A close with nothing open to close: never guessed at
@@ -1406,19 +1467,21 @@ fn reconstruct(events: &[(usize, Event)]) -> (Vec<Hold>, Vec<DoubleWin>, usize) 
 
         // Whatever is still open at the end of the log: a live lease, or an agent
         // that exited without releasing. Reported with no close, never guessed at.
-        for (agent, (oline, oat, renewals, ttl, ttl_assumed)) in open {
+        for (agent, w) in open {
             holds.push(Hold {
                 path: path.to_string(),
                 agent,
-                opened_line: oline,
-                opened_at: oat,
+                opened_line: w.line,
+                opened_at: w.at,
                 closed_line: None,
                 closed_at: None,
                 closed_by: None,
-                renewals,
+                renewals: w.renewals,
                 held_secs: None,
-                ttl_secs: ttl,
-                ttl_assumed,
+                ttl_secs: w.ttl,
+                ttl_assumed: w.ttl_assumed,
+                open_head: w.head,
+                close_head: None,
             });
         }
     }
@@ -1784,6 +1847,8 @@ pub fn run_check(
         chain_untracked: 0,
         ttl_secs: None,
         git_unavailable: None,
+        correlated_by_head: 0,
+        correlated_by_time: 0,
         holds_with_no_commit: Vec::new(),
         concurrent_writes: Vec::new(),
         uncovered_commits: Vec::new(),
@@ -2465,9 +2530,33 @@ fn correlate_commits(
         ) else {
             continue;
         };
-        let has_commit = by_path
-            .get(h.path.as_str())
-            .is_some_and(|v| v.iter().any(|c| c.at >= open && c.at <= close));
+        // THE EXACT ANSWER, when the log carries it (pact-b73.6). With a head on both
+        // boundaries the hold brackets a real commit range, so "did this lease land
+        // anything on this path" is a lookup rather than an inference from wall-clock
+        // time. Only `git log open..close` can distinguish the agent's own commits
+        // from a peer's that merely landed inside the same minutes.
+        //
+        // The fallback is not optional and never will be: every log written before
+        // pact stamped `head` has none, and a recorded hash can stop resolving when a
+        // worktree branch is deleted and gc'd, force-pushed, or read in a shallow
+        // clone. `commits_in_range` returns `None` for all of those, and the counters
+        // above make the choice visible instead of quietly reporting fewer findings.
+        let ranged = match (h.open_head.as_deref(), h.close_head.as_deref()) {
+            (Some(from), Some(to)) => crate::git_history::commits_in_range(repo_root, from, to),
+            _ => None,
+        };
+        let has_commit = match &ranged {
+            Some(paths) => {
+                report.correlated_by_head += 1;
+                paths.contains(&h.path)
+            }
+            None => {
+                report.correlated_by_time += 1;
+                by_path
+                    .get(h.path.as_str())
+                    .is_some_and(|v| v.iter().any(|c| c.at >= open && c.at <= close))
+            }
+        };
         if !has_commit {
             report.holds_with_no_commit.push(UncommittedHold {
                 path: h.path.clone(),
@@ -3335,6 +3424,29 @@ pub fn render_check(r: &CheckReport) -> String {
              duplicated definitions, or a peer's change silently reverted — see docs/leases.md.",
             r.merge_divergences.len()
         ));
+    }
+    // How the answer was reached, whenever this check ran at all. A reader must be able
+    // to see that a hold was correlated EXACTLY rather than inferred from wall-clock
+    // time — and to see when the log is too old to allow it (pact-b73.6).
+    if r.correlated_by_head + r.correlated_by_time > 0 {
+        out.push(String::new());
+        out.push(match (r.correlated_by_head, r.correlated_by_time) {
+            (n, 0) => format!(
+                "{n} hold(s) correlated by their recorded HEAD range — an exact commit set \
+                 per hold, not a timestamp window"
+            ),
+            (0, n) => format!(
+                "{n} hold(s) correlated by TIMESTAMP WINDOW: no usable HEAD range. Logs \
+                 written before pact stamped `head` have none, and a recorded hash stops \
+                 resolving after a branch is deleted, force-pushed or read in a shallow \
+                 clone. A window can attribute a peer's commit to your hold."
+            ),
+            (h, t) => format!(
+                "{h} hold(s) correlated by their recorded HEAD range (exact), {t} by \
+                 timestamp window (inferred — no head recorded, or the hash no longer \
+                 resolves)"
+            ),
+        });
     }
     if !r.holds_with_no_commit.is_empty() {
         out.push(String::new());
@@ -5390,6 +5502,216 @@ mod tests {
         assert_eq!((r.commits_attributed, r.commits_unattributed), (2, 1));
         assert_eq!(r.cross_held_commits.len(), 1, "{:?}", r.cross_held_commits);
         assert_eq!(r.cross_held_commits[0].committer_agent, "rogue");
+    }
+
+    /// An event carrying `head` on both boundaries, for the range path.
+    fn ev_head(at: &str, agent: &str, kind: &str, path: &str, head: &str) -> String {
+        format!(
+            r#"{{"at":"{at}","agent":"{agent}","kind":"{kind}","path":"{path}","head":"{head}"}}"#
+        )
+    }
+
+    /// Short HEAD right now, so a fixture can record a hash git will actually resolve.
+    fn head_of(repo: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// pact-b73.6, the exact answer: with a head on both boundaries the hold brackets a
+    /// real commit range, so the correlation is a lookup rather than an inference from
+    /// wall-clock time.
+    ///
+    /// The timestamps here are deliberately WRONG — the commit's clock puts it far
+    /// outside the hold's window — so a pass can only come from the range being used.
+    /// That is the whole point: on a busy fleet the window is what misattributes.
+    #[test]
+    fn a_hold_is_correlated_by_its_recorded_head_range_not_by_time() {
+        let tmp = with_git_log(&[]);
+        git_commit(tmp.path(), "seed.rs", "2026-08-01T09:00:00+00:00");
+        let before = head_of(tmp.path());
+        git_commit(tmp.path(), "a.rs", "2026-08-01T23:59:00+00:00");
+        let after = head_of(tmp.path());
+
+        let log = tmp.path().join(".pact/events.jsonl");
+        std::fs::write(
+            &log,
+            format!(
+                "{}\n{}\n",
+                ev_head(
+                    "2026-08-01T10:00:00Z",
+                    "agent-a",
+                    "acquired",
+                    "a.rs",
+                    &before
+                ),
+                ev_head(
+                    "2026-08-01T10:02:00Z",
+                    "agent-a",
+                    "released",
+                    "a.rs",
+                    &after
+                ),
+            ),
+        )
+        .unwrap();
+
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert_eq!(r.correlated_by_head, 1, "the range must be used");
+        assert_eq!(r.correlated_by_time, 0);
+        assert!(
+            r.holds_with_no_commit.is_empty(),
+            "the commit is inside the RANGE even though it is outside the window: {:?}",
+            r.holds_with_no_commit
+        );
+    }
+
+    /// And the range must be able to say NO: a hold whose range contains commits, none
+    /// of them touching the held path, still reports the hold as uncommitted.
+    #[test]
+    fn a_head_range_that_touches_other_paths_does_not_credit_the_held_one() {
+        let tmp = with_git_log(&[]);
+        git_commit(tmp.path(), "seed.rs", "2026-08-01T09:00:00+00:00");
+        let before = head_of(tmp.path());
+        git_commit(tmp.path(), "elsewhere.rs", "2026-08-01T10:01:00+00:00");
+        let after = head_of(tmp.path());
+
+        std::fs::write(
+            tmp.path().join(".pact/events.jsonl"),
+            format!(
+                "{}\n{}\n",
+                ev_head(
+                    "2026-08-01T10:00:00Z",
+                    "agent-a",
+                    "acquired",
+                    "a.rs",
+                    &before
+                ),
+                ev_head(
+                    "2026-08-01T10:02:00Z",
+                    "agent-a",
+                    "released",
+                    "a.rs",
+                    &after
+                ),
+            ),
+        )
+        .unwrap();
+
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert_eq!(r.correlated_by_head, 1);
+        assert_eq!(r.holds_with_no_commit.len(), 1, "a.rs was never committed");
+    }
+
+    /// The fallback that is not optional: every log written before pact stamped `head`
+    /// has none, and the check must degrade to the timestamp window and SAY it did
+    /// rather than silently reporting fewer findings.
+    #[test]
+    fn a_hold_with_no_recorded_head_falls_back_to_the_timestamp_window_and_says_so() {
+        let tmp = with_git_log(&[
+            &ev("2026-08-01T10:00:00Z", "agent-a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:02:00Z", "agent-a", "released", "a.rs"),
+        ]);
+        git_commit(tmp.path(), "a.rs", "2026-08-01T10:01:00+00:00");
+
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert_eq!(r.correlated_by_head, 0);
+        assert_eq!(r.correlated_by_time, 1);
+        assert!(r.holds_with_no_commit.is_empty(), "the window still works");
+        let text = render_check(&r);
+        assert!(
+            text.contains("TIMESTAMP WINDOW"),
+            "the reader must be told which path was taken:\n{text}"
+        );
+    }
+
+    /// A recorded hash that no longer resolves — a deleted and gc'd worktree branch, a
+    /// force-push, a shallow clone — must degrade to the window rather than report
+    /// nothing. Reporting nothing would read as "this hold landed no commit", which is
+    /// a false finding rather than a missing one.
+    #[test]
+    fn a_head_that_no_longer_resolves_degrades_to_the_window_rather_than_reporting_nothing() {
+        let tmp = with_git_log(&[
+            &ev_head(
+                "2026-08-01T10:00:00Z",
+                "agent-a",
+                "acquired",
+                "a.rs",
+                "dead1ee",
+            ),
+            &ev_head(
+                "2026-08-01T10:02:00Z",
+                "agent-a",
+                "released",
+                "a.rs",
+                "dead2ee",
+            ),
+        ]);
+        git_commit(tmp.path(), "a.rs", "2026-08-01T10:01:00+00:00");
+
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert_eq!(
+            r.correlated_by_head, 0,
+            "an unresolvable range is not a usable one"
+        );
+        assert_eq!(r.correlated_by_time, 1);
+        assert!(
+            r.holds_with_no_commit.is_empty(),
+            "the fallback found the commit the range could not: {:?}",
+            r.holds_with_no_commit
+        );
+    }
+
+    /// Both eras in one log, which is what an upgrading repository actually looks like.
+    #[test]
+    fn a_mixed_log_correlates_each_hold_by_whatever_it_recorded() {
+        let tmp = with_git_log(&[]);
+        git_commit(tmp.path(), "seed.rs", "2026-08-01T09:00:00+00:00");
+        let before = head_of(tmp.path());
+        git_commit(tmp.path(), "new.rs", "2026-08-01T10:01:00+00:00");
+        let after = head_of(tmp.path());
+        git_commit(tmp.path(), "old.rs", "2026-08-01T11:01:00+00:00");
+
+        std::fs::write(
+            tmp.path().join(".pact/events.jsonl"),
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                ev_head(
+                    "2026-08-01T10:00:00Z",
+                    "agent-a",
+                    "acquired",
+                    "new.rs",
+                    &before
+                ),
+                ev_head(
+                    "2026-08-01T10:02:00Z",
+                    "agent-a",
+                    "released",
+                    "new.rs",
+                    &after
+                ),
+                ev("2026-08-01T11:00:00Z", "agent-b", "acquired", "old.rs"),
+                ev("2026-08-01T11:02:00Z", "agent-b", "released", "old.rs"),
+            ),
+        )
+        .unwrap();
+
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert_eq!((r.correlated_by_head, r.correlated_by_time), (1, 1));
+        assert!(
+            r.holds_with_no_commit.is_empty(),
+            "each hold found its commit by its own route: {:?}",
+            r.holds_with_no_commit
+        );
+        let text = render_check(&r);
+        assert!(
+            text.contains("1 hold(s) correlated by their recorded HEAD range"),
+            "{text}"
+        );
     }
 
     #[test]
