@@ -10,6 +10,19 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.9.2 - 2026-08-14
+#### Documentation
+- **(architecture)** the union merge driver cannot fire in pact's own topology - (9dc77bf) - Clement HUSSENOT-DESENONGES
+- **(plan)** quern's zero-refusal window closed, so stop citing it as zero - (6018d55) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(audit)** say when contention was prevented, and stop counting mutexes as files - (879a5d6) - Clement HUSSENOT-DESENONGES
+- **(plan)** lint a wave plan before spawning, because contention is a planning problem - (00bab28) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(pact)** coordination record - (2053f63) - Clement HUSSENOT-DESENONGES
+- **(pact)** coordination record for the quern follow-up - (1184aa6) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.9.1 - 2026-08-13
 #### Bug Fixes
 - **(init)** give the message store a union merge driver too - (14e9074) - Clement HUSSENOT-DESENONGES
