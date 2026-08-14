@@ -10,6 +10,14 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.9.4 - 2026-08-14
+#### Features
+- **(audit)** correlate a hold to commits by its recorded HEAD range - (40d3dfe) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(pact)** coordination record - (da3b7c4) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.9.3 - 2026-08-14
 #### Bug Fixes
 - **(plan)** a file listed twice in one entry is not contention - (b1cd9b7) - Clement HUSSENOT-DESENONGES
