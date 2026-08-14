@@ -15,11 +15,16 @@ A lease resolves a collision *after* two agents have already been sent at one fi
 A plan that never sends them there costs nothing to arrange and cannot be contended.
 
 The evidence is unusually one-sided. quern (37 agents) was built to contend — deep
-coupling, three declared hot files, one shared spec — and produced **zero refusals**.
-Across five runs (arkanoid, megablast, crucible, grimcast, quern) the only real
+coupling, three declared hot files, one shared spec — and ran its first 249 events
+with **zero refusals**, reaching **1 refusal in 64 claims** as the run wound down.
+Across five runs (arkanoid, megablast, crucible, grimcast, quern) the only sustained
 contention ever measured was the crucible's, and that was engineered on purpose to
 see what refusal storms look like. Full numbers in
 [studies/field-runs.md](studies/field-runs.md).
+
+The point is not that refusals never happen — one did, and the lease handled it
+exactly as designed. It is that their rate is set by the plan, not by the arbitration:
+a fleet of 37 agents on a deliberately coupled codebase produced one.
 
 So the contention work happens at planning time. Until now it happened entirely in an
 orchestrator's head, with nothing to check it. That is what this lints.

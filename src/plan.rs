@@ -5,9 +5,13 @@
 //! Five field runs (arkanoid, megablast, crucible, grimcast, quern) point the same
 //! way: contention is decided at PLANNING time, not at acquire time. quern was
 //! deliberately built to contend — 37 agents, deep coupling, three declared hot
-//! files — and produced **zero refusals**. Across all five runs the only real
-//! contention ever observed was the crucible's, and that one was engineered on
-//! purpose.
+//! files — and produced **1 refusal in 64 claims**, its first only as the run wound
+//! down. Across all five runs the only sustained contention ever observed was the
+//! crucible's, and that one was engineered on purpose.
+//!
+//! One refusal is not zero, and the lease handled it correctly. The claim is about
+//! the RATE: 37 agents on a deliberately coupled codebase produced one, and that
+//! number is set by the plan rather than by the arbitration.
 //!
 //! A lease resolves a collision after two agents have already been sent at one file.
 //! A plan that never puts them there costs nothing to arrange and cannot be
