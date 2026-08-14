@@ -7,8 +7,6 @@ mod events;
 mod git_history;
 mod identity;
 mod lease;
-#[cfg(feature = "ui")]
-mod mascot;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod msg;
