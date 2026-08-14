@@ -198,16 +198,21 @@ this protocol whenever you touch shared files or hand off work to others.
 - **Orient with `pact log`**: one chronological feed of who leased what and
   who said what. Read it when you join, and when you need to know whether a
   peer is still moving.
-- **Commit `.pact/events.jsonl` AND `.pact/messages.jsonl` when you commit your
-  work.** They are the two things pact stores that it cannot derive from anything
-  else: who held what, and what agents said to each other. `.pact/leases/`,
-  `.pact/waits/` and `.pact/read/` stay local — live runtime state and per-machine
-  read positions, and committing those would have you fighting over peers'
-  in-flight claims and inboxes. Fold both into the commit whose work produced
-  them; a missed one is self-healing on the next commit. Left uncommitted, every
-  clone of this repo starts with no coordination history at all, and nobody can ask
-  afterwards who held what, who was warned about it, or whether two agents ever
-  held one path at once.
+- **The coordination logs are committed from the MAIN checkout, not from your
+  worktree.** `.pact/events.jsonl` and `.pact/messages.jsonl` are the two things pact
+  stores that it cannot derive from anything else — who held what, and what agents
+  said to each other — so they do belong in git. But under the default shared scope
+  every worktree resolves state to the main checkout, so from a worktree your copy of
+  those files is a stale tracked snapshot and `git add` finds nothing to stage.
+  **If you are working in a worktree, do not try to commit them.** Whoever owns the
+  main checkout — usually the orchestrator — commits them for the whole fleet, and a
+  missed one is self-healing on the next commit.
+  This sentence used to say "commit both when you commit your work", and 35 agents in
+  one run each spent time discovering that it is impossible to follow from where they
+  were standing; nine reported it independently and unprompted.
+  `.pact/leases/`, `.pact/waits/` and `.pact/read/` stay local everywhere — live
+  runtime state and per-machine read positions, and committing those would have you
+  fighting over peers' in-flight claims and inboxes.
 - **Sign your commits with your agent name**: `git commit --trailer
   Pact-Agent=$PACT_AGENT`. Every agent in a fleet commits under the same git
   identity, so `git log` cannot say which of you made a change — and without
@@ -527,6 +532,7 @@ pub fn ensure_gitignore(repo_root: &Path) -> Result<()> {
 fn gitignore_content(existing: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let (mut narrowed, mut already) = (false, false);
+    let mut sentinel_at: Option<usize> = None;
 
     for line in existing.lines() {
         let bare = line.trim().trim_end_matches('/');
@@ -543,18 +549,48 @@ fn gitignore_content(existing: &str) -> String {
         }
         if line.trim() == RUNTIME_IGNORE_SENTINEL {
             already = true;
+            sentinel_at = Some(out.len());
         }
         out.push(line.to_string());
     }
 
+    // Which committed files this file already re-includes. Checked PER PATH, because
+    // the sentinel only proves the DENY rule is present — it says nothing about the
+    // negations beside it, and an older pact wrote a deny with just one.
+    //
+    // This is the "attribute-but-ignored" bug from finding 1, and it was ours: the
+    // gitattributes half was made per-path when the message store became committed, and
+    // this half was left keyed on the sentinel. So a repo initialised before 0.9 got the
+    // `merge=union` attribute for messages.jsonl and never got the negation — a file
+    // simultaneously gitignored and carrying a merge driver, which is exactly the state
+    // the field audit found.
+    let missing: Vec<&str> = COMMITTED_APPEND_ONLY
+        .iter()
+        .copied()
+        .filter(|path| {
+            let negation = format!("!{path}");
+            !out.iter().any(|l| l.trim() == negation)
+        })
+        .collect();
+
     if narrowed {
-        // Fall through and write.
-    } else if already {
+        // Fall through and write: narrowing already emits the complete rule set.
+    } else if already && missing.is_empty() {
         // Byte-for-byte what was already there — write_atomic_cas still
         // renames it, same as splice_block does on an already-current
         // AGENTS.md, rather than adding a second "is a write actually
         // needed" branch here to skip it.
         return existing.to_string();
+    } else if already {
+        // Insert the missing negations directly AFTER the deny rule rather than at the
+        // end of the file. gitignore is last-match-wins, so a negation must follow the
+        // rule it overrides — and appending at the end would put it after any unrelated
+        // rule the user added below, where a later `.pact/**` of their own would silently
+        // win.
+        let at = sentinel_at.map_or(out.len(), |i| i + 1);
+        for (offset, path) in missing.iter().enumerate() {
+            out.insert(at + offset, format!("!{path}"));
+        }
     } else {
         if !out.is_empty() {
             out.push(String::new());
@@ -945,7 +981,58 @@ mod tests {
                 "{path} is committed and append-only but gets no union merge driver, \
                  so two branches appending to it conflict on every merge:\n{attrs}"
             );
+            // AND on the upgrade path, which is where this guard was blind: it only ever
+            // asked about a fresh file, so the asymmetry between the per-path
+            // gitattributes half and the sentinel-keyed gitignore half survived it
+            // (finding 1). Every committed path must be un-ignored on a repo that
+            // already carries the deny rule with only SOME of the negations.
+            let stale = format!(".pact/*\n!{}\n", COMMITTED_APPEND_ONLY[0]);
+            let upgraded = gitignore_content(&stale);
+            assert!(
+                upgraded.lines().any(|l| l.trim() == format!("!{path}")),
+                "{path} stays ignored when re-initialising a repo that predates it:\n{upgraded}"
+            );
         }
+    }
+
+    /// THE UPGRADE PATH FOR THE IGNORE RULES, which is where the drift guard below was
+    /// blind (pact-83r.2 / finding 1).
+    ///
+    /// A repo initialised before 0.9 has `.pact/*` plus a single `!.pact/events.jsonl`.
+    /// The sentinel `.pact/*` is present, so the old code returned the file UNCHANGED and
+    /// the message store never got its negation — while the gitattributes half, made
+    /// per-path at the same time, happily added `messages.jsonl merge=union`. The result
+    /// is a file simultaneously gitignored and carrying a merge driver, which is the state
+    /// the field audit found in a real repository.
+    #[test]
+    fn re_init_adds_a_missing_negation_to_a_pre_0_9_ignore_rule() {
+        let existing = "/target\n.pact/*\n!.pact/events.jsonl\ntmp/\n";
+        let out = gitignore_content(existing);
+        for path in COMMITTED_APPEND_ONLY {
+            assert!(
+                out.lines().any(|l| l.trim() == format!("!{path}")),
+                "{path} was left ignored by a re-init:\n{out}"
+            );
+        }
+        // The negation must come AFTER the deny rule it overrides — gitignore is
+        // last-match-wins, so order is not cosmetic here.
+        let deny = out
+            .lines()
+            .position(|l| l.trim() == RUNTIME_IGNORE_SENTINEL)
+            .expect("deny rule kept");
+        for path in COMMITTED_APPEND_ONLY {
+            let at = out
+                .lines()
+                .position(|l| l.trim() == format!("!{path}"))
+                .expect("negation present");
+            assert!(at > deny, "!{path} precedes the rule it overrides:\n{out}");
+        }
+        // Unrelated rules survive untouched.
+        for kept in ["/target", "tmp/"] {
+            assert!(out.lines().any(|l| l == kept), "lost {kept}:\n{out}");
+        }
+        // Idempotent once complete.
+        assert_eq!(gitignore_content(&out), out);
     }
 
     /// The upgrade path, which a sentinel check gets wrong by construction: a
@@ -1292,10 +1379,25 @@ mod tests {
     /// Already-narrow rules are a no-op, so `init` does not append a second copy.
     #[test]
     fn ensure_gitignore_leaves_narrow_rules_alone() {
-        let original = "target/\n.pact/*\n!.pact/events.jsonl\n";
+        // A COMPLETE rule set, which is what "already narrow" has to mean since 0.9.0.
+        // This test used to start from `.pact/*` plus only `!.pact/events.jsonl` and
+        // assert the file came back byte-identical — which is precisely the expectation
+        // that let the message store stay ignored forever on any repo that had been
+        // through `pact init` before it existed (finding 1). A file missing one of the
+        // two negations is not narrow, it is incomplete, and re-running init is the only
+        // thing that will ever fix it.
+        let original = format!(
+            "target/\n{}\n{}\n",
+            RUNTIME_IGNORE_SENTINEL,
+            COMMITTED_APPEND_ONLY
+                .iter()
+                .map(|p| format!("!{p}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(".gitignore");
-        std::fs::write(&path, original).unwrap();
+        std::fs::write(&path, &original).unwrap();
 
         ensure_gitignore(tmp.path()).unwrap();
 

@@ -128,6 +128,7 @@ here that the CLI does not emit, fails CI:
 | `coordination scope` | `PACT_WORKTREE_SCOPE` in effect; warns (`!`) when `local` is isolating leases from sibling worktrees |
 | `state placement` | which rule put the state directory where it is |
 | `event log survives a clone` | is `.pact/events.jsonl` tracked; warns (`!`) when it is ignored, because the history dies at the next clone |
+| `message store survives a clone` | the same question for `.pact/messages.jsonl`, which became committed in 0.9.0 and had no check — so a repo could sit gitignored while carrying a `merge=union` attribute with nothing reporting it |
 | `state dir writable` | can pact actually write there — the shared directory of a linked worktree may not be yours |
 | `state dir isolation` | only meaningful under `PACT_STATE_DIR`; warns (`!`) when leases there look like they came from a different repository |
 | `worktree schema marker` | only meaningful with linked worktrees; warns (`!`) when the shared `.pact/` has never been touched by a worktree-aware pact, so an older binary elsewhere on PATH may still be treating it as private state |

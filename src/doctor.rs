@@ -91,45 +91,22 @@ pub fn checks(root: &Path) -> DoctorReport {
     // just the verdict: an ignored event log is not broken, it is a repository
     // that will lose its coordination history at the next clone — and the reader
     // needs to know that is a choice they can reverse with `pact init`.
-    let events_reach = repo::reach(root, agents_md::EVENTS_LOG_PATH);
-    let (events_ok, events_warn, events_detail) = match events_reach {
-        repo::Reach::Tracked => (
-            true,
-            false,
-            format!("{} is tracked — history survives a clone", agents_md::EVENTS_LOG_PATH),
-        ),
-        repo::Reach::Untracked => (
-            true,
-            false,
-            format!(
-                "{} is not ignored and not yet committed — commit it and the history travels",
-                agents_md::EVENTS_LOG_PATH
-            ),
-        ),
-        repo::Reach::Ignored { ref source } => (
-            true,
-            true,
-            format!(
-                "{} is ignored by {source}, so every clone of this repo starts with NO coordination \
-                 history — nothing can be asked afterwards about who held what, or whether two \
-                 agents ever held one path at once. Leases and waits are runtime state and SHOULD \
-                 stay ignored; the event log is the one thing under .pact/ that pact cannot derive. \
-                 Re-run `pact init` to narrow the rule.",
-                agents_md::EVENTS_LOG_PATH
-            ),
-        ),
-        repo::Reach::Unknown => (
-            true,
-            false,
-            "cannot ask git whether the event log is tracked".to_string(),
-        ),
-    };
-    checks.push(DoctorCheck {
-        name: "event log survives a clone",
-        ok: events_ok,
-        warn: events_warn,
-        detail: events_detail,
-    });
+    checks.push(clone_reach_check(
+        root,
+        agents_md::EVENTS_LOG_PATH,
+        "event log survives a clone",
+        "who held what",
+    ));
+    // Symmetric, and the guard finding 1 identified as missing. The message store became
+    // committed in 0.9.0 and got no clone check, so the one state a repo should never be
+    // in — gitignored while carrying a `merge=union` attribute — had nothing watching for
+    // it. The field audit found a repo in exactly that state.
+    checks.push(clone_reach_check(
+        root,
+        agents_md::MESSAGES_STORE_PATH,
+        "message store survives a clone",
+        "what agents said to each other",
+    ));
 
     let agents_md_current = agents_md::is_current(root).unwrap_or(false);
     checks.push(DoctorCheck {
@@ -946,6 +923,56 @@ fn export(checks: &[DoctorCheck]) {
             status_code(c),
             &otel::attrs!["pact.doctor.check" => c.name],
         );
+    }
+}
+
+/// Whether one committed append-only log will reach a clone.
+///
+/// One function for both logs (pact-83r.2 / finding 1). They ask the same question about
+/// different files, and the events version existed alone while the message store — added
+/// in 0.9.0 — had no equivalent. That asymmetry is what let a repo sit gitignored AND
+/// carrying a `merge=union` attribute with nothing reporting it.
+///
+/// Never FAILS, only warns: an ignored log is not a broken repository, only one that will
+/// lose this history at the next clone, and the reader can reverse it with `pact init`.
+fn clone_reach_check(
+    root: &Path,
+    path: &'static str,
+    name: &'static str,
+    what: &str,
+) -> DoctorCheck {
+    let (ok, warn, detail) = match repo::reach(root, path) {
+        repo::Reach::Tracked => (
+            true,
+            false,
+            format!("{path} is tracked — {what} survives a clone"),
+        ),
+        repo::Reach::Untracked => (
+            true,
+            false,
+            format!("{path} is not ignored and not yet committed — commit it and it travels"),
+        ),
+        repo::Reach::Ignored { ref source } => (
+            true,
+            true,
+            format!(
+                "{path} is ignored by {source}, so every clone of this repo starts with NO \
+                 record of {what}. Leases, waits and read cursors are runtime state and SHOULD \
+                 stay ignored; this file is one of the two pact cannot derive. Re-run \
+                 `pact init` to narrow the rule."
+            ),
+        ),
+        repo::Reach::Unknown => (
+            true,
+            false,
+            format!("cannot ask git whether {path} is tracked"),
+        ),
+    };
+    DoctorCheck {
+        name,
+        ok,
+        warn,
+        detail,
     }
 }
 
