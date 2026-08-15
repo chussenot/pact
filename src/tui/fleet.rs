@@ -417,7 +417,7 @@ fn columns(area: Rect, roster_rows: usize) -> (Option<Rect>, Rect) {
 /// a title line plus one row per blocked agent, never taking so much that the
 /// table it sits under loses its header and its first two rows. `None` when
 /// there is genuinely no room, so a very short terminal still shows the leases.
-fn rows(right: Rect, blocked: usize) -> (Rect, Option<Rect>) {
+fn stack(right: Rect, blocked: usize) -> (Rect, Option<Rect>) {
     let wanted = 1 + blocked.clamp(1, MAX_BLOCKED_ROWS) as u16;
     let height = wanted.min(right.height.saturating_sub(4));
     if height < 2 {
@@ -453,20 +453,23 @@ fn blocks_for(app: &App) -> Vec<&Blocked> {
 // ------------------------------------------------------------------- drawing
 
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
-    let blocked = blocks_for(app);
     let (roster, right) = columns(area, roster_len(app));
-    let (work, waiting) = rows(right, blocked.len());
+    let (work, waiting) = stack(right, blocks_for(app).len());
 
+    // The waiting-on panel first, and only it reads `app` immutably: both
+    // tables render through their REAL `TableState`, because a state cloned per
+    // frame never keeps its scroll offset — and `row_at` hit-tests against that
+    // offset, so a click on a scrolled table would land on the wrong row.
+    if let Some(waiting) = waiting {
+        render_waiting(frame, waiting, app);
+    }
     if let Some(roster) = roster {
         render_roster(frame, roster, app);
-    }
-    if let Some(waiting) = waiting {
-        render_waiting(frame, waiting, app, &blocked);
     }
     render_work(frame, work, app);
 }
 
-fn render_roster(frame: &mut Frame, area: Rect, app: &App) {
+fn render_roster(frame: &mut Frame, area: Rect, app: &mut App) {
     // The rule lives in the column that `columns` excluded from the rows, so
     // hit-testing and drawing agree on where the agents actually are.
     let rule = Rect {
@@ -481,7 +484,7 @@ fn render_roster(frame: &mut Frame, area: Rect, app: &App) {
         .style(Style::default().add_modifier(Modifier::BOLD));
 
     let now = Utc::now();
-    let mut rows: Vec<Row> = app
+    let mut rows: Vec<Row<'static>> = app
         .data
         .roster()
         .iter()
@@ -549,12 +552,11 @@ fn render_roster(frame: &mut Frame, area: Rect, app: &App) {
         .row_highlight_style(selection_style(focused))
         .highlight_symbol(if focused { "> " } else { "  " });
 
-    frame.render_stateful_widget(table, area, &mut app.fleet.roster.clone());
+    frame.render_stateful_widget(table, area, &mut app.fleet.roster);
 }
 
-fn render_work(frame: &mut Frame, area: Rect, app: &App) {
-    let rows_data = work_rows(app);
-    if rows_data.is_empty() {
+fn render_work(frame: &mut Frame, area: Rect, app: &mut App) {
+    if work_rows(app).is_empty() {
         let message = match app.fleet.agent.as_deref() {
             Some(agent) => format!("{agent} holds nothing right now"),
             None => "no active leases — press r to refresh".to_string(),
@@ -577,7 +579,7 @@ fn render_work(frame: &mut Frame, area: Rect, app: &App) {
     // The lease table's rows start past the whole roster in the shared index
     // space `row_at` returns, so hover has to be read in the same coordinates.
     let offset = roster_len(app);
-    let rows: Vec<Row> = rows_data
+    let rows: Vec<Row<'static>> = work_rows(app)
         .iter()
         .enumerate()
         .map(|(i, entry)| lease_row(app, i, offset, entry, focused))
@@ -599,14 +601,15 @@ fn render_work(frame: &mut Frame, area: Rect, app: &App) {
         .row_highlight_style(selection_style(focused))
         .highlight_symbol(if focused { "> " } else { "  " });
 
-    frame.render_stateful_widget(table, area, &mut app.fleet.table.clone());
+    frame.render_stateful_widget(table, area, &mut app.fleet.table);
 }
 
 /// The contention graph — the highest-value thing the event log carries and no
 /// surface showed. `refused` names the holder and the holder's own remaining
 /// lease; the watch registry says whether the blocked agent then subscribed;
 /// `pact audit --check retry-storm` says whether it polled instead.
-fn render_waiting(frame: &mut Frame, area: Rect, app: &App, blocked: &[&Blocked]) {
+fn render_waiting(frame: &mut Frame, area: Rect, app: &App) {
+    let blocked = blocks_for(app);
     let who = match app.fleet.agent.as_deref() {
         Some(agent) => format!("waiting on {agent}"),
         None => "waiting on the fleet".to_string(),
@@ -698,13 +701,13 @@ fn blocked_line<'a>(app: &App, b: &'a Blocked) -> Line<'a> {
     Line::from(spans)
 }
 
-fn lease_row<'a>(
+fn lease_row(
     app: &App,
     index: usize,
     offset: usize,
-    entry: &'a LeaseEntry,
+    entry: &LeaseEntry,
     focused: bool,
-) -> Row<'a> {
+) -> Row<'static> {
     let agent_style = if is_mine(app, entry) {
         Style::default().fg(Color::Green)
     } else {
@@ -721,12 +724,15 @@ fn lease_row<'a>(
         _ => Style::default().fg(Color::Green),
     };
 
+    // Owned cells, not borrows of the lease: the table is handed to
+    // `render_stateful_widget` alongside `&mut app.fleet.table`, and a row still
+    // borrowing `app.fleet.leases` would keep that mutable borrow out of reach.
     let row = Row::new(vec![
-        Cell::from(entry.lease.path.as_str()),
-        Cell::from(entry.lease.agent.as_str()).style(agent_style),
+        Cell::from(entry.lease.path.clone()),
+        Cell::from(entry.lease.agent.clone()).style(agent_style),
         Cell::from(lease::human_secs(entry.age_secs)),
         Cell::from(entry.state_label()).style(state_style),
-        Cell::from(entry.lease.note.as_deref().unwrap_or("")),
+        Cell::from(entry.lease.note.clone().unwrap_or_default()),
     ]);
 
     hovered(app, row, index, offset, app.fleet.table.selected(), focused)
@@ -741,14 +747,14 @@ fn lease_row<'a>(
 /// Without it the two panes read the same `hovered_row` as their own row number
 /// and both light up, which is the same class of drift `tab_rects` exists to
 /// prevent.
-fn hovered<'a>(
+fn hovered(
     app: &App,
-    row: Row<'a>,
+    row: Row<'static>,
     index: usize,
     offset: usize,
     selected: Option<usize>,
     focused: bool,
-) -> Row<'a> {
+) -> Row<'static> {
     let hovered = app.hovered_row.and_then(|row| row.checked_sub(offset));
     if focused && widgets::is_hovered_not_selected(hovered, selected, index) {
         row.style(widgets::hover_style())
@@ -1078,6 +1084,35 @@ mod tests {
         assert_eq!(row_at(&app, work.x + 2, work.y + 9), None);
     }
 
+    /// The tables render through their real `TableState`, so a scrolled table's
+    /// offset survives the frame — and `row_at`, which hit-tests against that
+    /// offset, keeps agreeing with what is on screen. A state cloned per frame
+    /// pinned the offset at 0 and put every click on a scrolled table one
+    /// screenful of rows away from the one under the cursor.
+    #[test]
+    fn a_scrolled_table_still_maps_a_click_to_the_row_under_the_cursor() {
+        let tmp = fixture();
+        let leases: Vec<LeaseEntry> = (0..20)
+            .map(|i| entry("quern", &format!("src/f{i:02}.rs"), 60))
+            .collect();
+        let mut app = app(tmp.path(), Some("operator"), leases);
+
+        app.fleet.focus = Focus::Work;
+        for _ in 0..19 {
+            move_selection(&mut app, 1);
+        }
+        drawn(&mut app, 120, 14);
+
+        let offset = app.fleet.table.offset();
+        assert!(offset > 0, "20 leases in 7 rows should have scrolled");
+        let (_, work) = columns(app.content_area, roster_len(&app));
+        assert_eq!(
+            row_at(&app, work.x + 2, work.y + 1),
+            Some(roster_len(&app) + offset),
+            "the top visible row is the scrolled-to one, not row 0"
+        );
+    }
+
     /// The operator is not a fleet member: with no PACT_AGENT there is no
     /// "mine" to colour and no inbox to count, and the screen still works.
     #[test]
@@ -1152,12 +1187,12 @@ mod tests {
     #[test]
     fn the_waiting_panel_never_squeezes_the_table_out() {
         let right = Rect::new(0, 3, 80, 16);
-        let (work, waiting) = rows(right, 40);
+        let (work, waiting) = stack(right, 40);
         assert!(work.height >= 4, "table kept {} lines", work.height);
         assert!(waiting.unwrap().height <= 1 + MAX_BLOCKED_ROWS as u16);
 
         // A terminal with no room at all still shows the leases.
-        let (work, waiting) = rows(Rect::new(0, 3, 80, 5), 3);
+        let (work, waiting) = stack(Rect::new(0, 3, 80, 5), 3);
         assert_eq!(work.height, 5);
         assert!(waiting.is_none());
     }
