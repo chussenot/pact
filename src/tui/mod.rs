@@ -47,7 +47,6 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 
-use crate::beads::BeadsCli;
 use nav::{Nav, Screen, View};
 
 /// How often the current view refreshes itself when the user isn't pressing
@@ -151,11 +150,6 @@ struct App {
     /// Views project from here rather than re-reading a file each.
     data: data::Store,
 
-    /// `Err` if `bd` wasn't found at startup — checked once, not re-probed on
-    /// every refresh. Messages shows this error inline instead of failing the
-    /// whole UI to launch (Fleet stays fully usable).
-    bd: std::result::Result<BeadsCli, String>,
-
     // One per screen, each owned by its own module.
     fleet: fleet::State,
     messages: messages::State,
@@ -185,13 +179,11 @@ struct App {
 
 impl App {
     fn new(repo_root: PathBuf, agent: Option<String>) -> Self {
-        let bd = BeadsCli::locate().map_err(|e| format!("{e:#}"));
         let mut app = App {
             repo_root,
             agent,
             nav: Nav::default(),
             data: data::Store::default(),
-            bd,
             fleet: fleet::State::default(),
             activity: activity::State::default(),
             messages: messages::State::default(),
@@ -552,7 +544,6 @@ mod tests {
             agent: agent.map(str::to_string),
             nav: Nav::default(),
             data: data::Store::default(),
-            bd: Err("bd (beads) not found on PATH".to_string()),
             fleet: fleet::State::default(),
             activity: activity::State::default(),
             messages: messages::State::default(),
@@ -999,7 +990,6 @@ mod tests {
         let mut app = app_with(Some("agent-a"), vec![]);
         app.repo_root = root.to_path_buf();
         app.nav.set_root(View::Messages);
-        app.bd = Ok(BeadsCli { binary: "bd" });
         app.refresh_current_view();
         app.messages.list.select(Some(0));
 

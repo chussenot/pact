@@ -651,7 +651,6 @@ fn move_selection(app: &mut App, delta: isize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::beads::BeadsCli;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;
@@ -674,7 +673,6 @@ mod tests {
             agent: Some("operator".to_string()),
             nav: super::super::nav::Nav::default(),
             data: super::super::data::Store::default(),
-            bd: Err("bd (beads) not found on PATH".to_string()),
             fleet: super::super::fleet::State::default(),
             activity: super::super::activity::State::default(),
             messages: super::super::messages::State::default(),
@@ -896,7 +894,6 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_at(dir.path().to_path_buf());
-        app.bd = Ok(BeadsCli { binary: "bd" });
 
         // Nothing has run yet, so the first tick from any screen runs them:
         // an operator who never opens Health still sees a failing check.
