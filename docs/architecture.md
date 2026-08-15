@@ -729,8 +729,8 @@ every polite heads-up look like a failure.
   clock-skew grace period, steal vs. expiry, and the path-encoding caveat.
 - [docs/messaging.md](messaging.md) — how a message is stored, what a read cursor
   can and cannot tell a sender, and what upgrading from the bd era costs.
-- [docs/tui.md](tui.md) — `pact ui`'s tabs and keybindings, and the `ui` Cargo
-  feature it lives behind.
+- [docs/tui.md](tui.md) — `pact ui`'s four screens, the drill-in stack and its
+  keybindings, and the `ui` Cargo feature it lives behind.
 - [docs/telemetry.md](telemetry.md) — the optional `otel` feature: exactly what
   is exported, what is deliberately not, and what happens when the collector is
   missing or wedged.
