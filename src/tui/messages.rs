@@ -506,14 +506,22 @@ mod tests {
 
         let tmp = repo();
         for i in 0..40 {
-            send(tmp.path(), "agent-a", "agent-b", &format!("subject {i:02}"), false);
+            send(
+                tmp.path(),
+                "agent-a",
+                "agent-b",
+                &format!("subject {i:02}"),
+                false,
+            );
         }
         let mut app = app_at(tmp.path(), None);
 
         // Past the bottom of the pane, so the widget must scroll to show it.
         app.messages.list.select(Some(35));
         let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
-        terminal.draw(|frame| super::super::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| super::super::draw(frame, &mut app))
+            .unwrap();
 
         let offset = app.messages.list.offset();
         assert!(
@@ -527,7 +535,10 @@ mod tests {
         let y = app.messages.list_area.y;
         let x = app.messages.list_area.x;
         let hit = row_at(&app, x, y).expect("a row under the cursor");
-        assert_eq!(hit, offset, "click resolved {hit}, cursor was over {offset}");
+        assert_eq!(
+            hit, offset,
+            "click resolved {hit}, cursor was over {offset}"
+        );
     }
 
     /// The headline defect: the operator is not a fleet member, and with no
