@@ -45,6 +45,7 @@ pact lease acquire <path>... [--ttl <duration>] [--steal] [--note <text>]
 pact lease renew <path>
 pact lease release <path>... [--force]
 pact lease release --all
+pact merge <branch> [--verify <command>] [--ttl <duration>]
 pact msg send (--to <agent>... | --to-owner-of <path>...) [--thread <id>] [--subject <text>] [--skip <agent>...] (<body> | --body-file <path|->)
 pact msg inbox [--unread-only] [--full] [--include-watch | --watch-only]
 pact msg sent

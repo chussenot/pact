@@ -9,6 +9,7 @@ mod identity;
 mod lease;
 #[cfg(feature = "mcp")]
 mod mcp;
+mod merge;
 mod msg;
 mod otel;
 mod output;
@@ -94,6 +95,33 @@ enum Command {
     Lease {
         #[command(subcommand)]
         action: LeaseAction,
+    },
+    /// Merge a branch under the merge mutex, prove it, and release.
+    ///
+    /// The self-merge sequence a fleet with no orchestrator has to run by hand,
+    /// as one auditable command: take the reserved key, merge with `--no-ff`,
+    /// sign the merge commit with `Pact-Agent` (which `git merge` cannot do on
+    /// its own), run `--verify`, and release. A failing verification reverts the
+    /// merge and DELIBERATELY keeps the mutex, so no peer merges onto a branch
+    /// that has just failed its own oracle. See docs/fleet-patterns.md.
+    Merge {
+        /// The branch to merge into the current one.
+        branch: String,
+        /// Command that proves the merge, run from the repository root after it
+        /// lands — typically the test suite. Omitted means nothing proved it,
+        /// which is reported rather than assumed to pass.
+        #[arg(long)]
+        verify: Option<String>,
+        /// How long to hold the merge mutex.
+        ///
+        /// Deliberately shorter than the 45-minute default for a file lease. A
+        /// merge hold is bounded by a test run, not by a task: measured across
+        /// eight self-merges the median was 37s and the longest 64s. Half an
+        /// hour is already two orders of magnitude of headroom, and a shorter
+        /// TTL means a fleet blocked behind a crashed merger recovers in
+        /// minutes rather than three quarters of an hour.
+        #[arg(long, default_value = "30m")]
+        ttl: String,
     },
     /// Threaded messages between agents, via the Beads CLI.
     Msg {
@@ -505,6 +533,7 @@ fn subcommand_name(command: &Command) -> &'static str {
             LeaseAction::Release { .. } => "lease release",
             LeaseAction::Ls { .. } => "lease ls",
         },
+        Command::Merge { .. } => "merge",
         Command::Msg { action } => match action {
             MsgAction::Send { .. } => "msg send",
             MsgAction::Inbox { .. } => "msg inbox",
@@ -613,6 +642,19 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Lease { action } => {
             run_lease(&cwd, cli.agent.as_deref(), cli.json, action).map(|()| 0)
         }
+        Command::Merge {
+            branch,
+            verify,
+            ttl,
+        } => run_merge(
+            &cwd,
+            cli.agent.as_deref(),
+            cli.json,
+            &branch,
+            verify.as_deref(),
+            &ttl,
+        )
+        .map(|()| 0),
         Command::Msg { action } => {
             run_msg(&cwd, cli.agent.as_deref(), cli.json, action).map(|()| 0)
         }
@@ -740,12 +782,21 @@ fn run_watch(cwd: &Path, agent_flag: Option<&str>, json: bool, action: WatchActi
                 },
                 |a: &Added| {
                     format!(
-                        "watching {}{} — you will be sent a diff when a holder releases it",
+                        "watching {}{} — you will be sent {} when a holder releases it",
                         a.path,
                         if a.prefix {
                             "/ (and everything under it)"
                         } else {
                             ""
+                        },
+                        // A reserved key has no content, so the notice carries the
+                        // fact of release and no diff (pact-bsf). Promising a diff
+                        // here would be a promise pact cannot keep on exactly the
+                        // paths agents subscribe to while blocked.
+                        if lease::is_mutex(&a.path) {
+                            "word that it is free"
+                        } else {
+                            "a diff"
                         }
                     )
                 },
@@ -1612,6 +1663,28 @@ fn prior_owners(root: &Path, paths: &[String], agent: &str) -> Vec<String> {
 fn age_of(at: &str) -> Option<i64> {
     let then = chrono::DateTime::parse_from_rfc3339(at).ok()?;
     Some((chrono::Utc::now() - then.with_timezone(&chrono::Utc)).num_seconds())
+}
+
+/// `pact merge` — see [`crate::merge`] for why this is a command rather than
+/// five lines of protocol prose.
+fn run_merge(
+    cwd: &Path,
+    agent_flag: Option<&str>,
+    json: bool,
+    branch: &str,
+    verify: Option<&str>,
+    ttl: &str,
+) -> Result<()> {
+    let root = repo::find_repo_root(cwd)?;
+    let agent = identity::resolve_agent(agent_flag)?;
+    // Same grammar and the same exit 5 as `lease acquire --ttl`: one TTL syntax
+    // across the tool, so an agent that learned it once has learned it.
+    let ttl = lease::parse_ttl(ttl).map_err(|e| output::exit_with(USAGE_ERROR, e.to_string()))?;
+
+    let outcome = merge::merge(&root, &agent, branch, verify, ttl)?;
+    output::emit(json, &outcome, merge::describe);
+    merge::warn_if_unproven(&outcome);
+    Ok(())
 }
 
 fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseAction) -> Result<()> {
@@ -2619,10 +2692,19 @@ fn render_inbox_view(
                 g.latest_id.clone(),
             ]
         }));
+        // "changed under you" is wrong for a reserved key: nothing changed, a lock
+        // was let go (pact-bsf). Only claim a change when at least one group is a
+        // real file, so a waiter watching only mutexes is not told its lock moved.
+        let any_file = notices.iter().any(|g| !lease::is_mutex(&g.path));
         parts.push(format!(
-            "{}\n\n{} path(s) changed under you — `pact msg read <latest id>` for the newest diff",
+            "{}\n\n{} path(s) {} — `pact msg read <latest id>` for the newest",
             table(&rows),
             notices.len(),
+            if any_file {
+                "changed under you"
+            } else {
+                "were released"
+            },
         ));
     }
     parts.join("\n\n")

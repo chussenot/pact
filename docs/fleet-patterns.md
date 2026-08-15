@@ -145,6 +145,59 @@ own log cannot be reclassified after the fact**. New runs using the reserved pre
 get clean statistics; a legacy bare-directory lease keeps appearing as an ordinary
 path.
 
+## The self-merge mutex: `pact merge`
+
+The reserved-key pattern above has one use common enough to have earned its own
+command. A fleet with **no orchestrator** has nobody to merge for it, so every agent
+merges its own worktree into the shared branch — and the shared branch has to be
+serialized.
+
+```bash
+pact merge wt/wheelwright-millrace-ulk --verify 'cargo test --release'
+```
+
+That takes `.pact/internal/merge-to-<branch>` (derived from the branch you are on, so
+on `master` it is exactly the key fleets were already spelling by hand), merges with
+`--no-ff`, signs the merge commit, runs the verification, and releases.
+
+**Why a command and not five lines of protocol prose.** The hand-rolled version works
+— a four-agent run performed eight self-merges through it with `--check double-win`
+clean over 63 events, and no merge ever happened unheld. Three things went wrong
+anyway, none of them "the agents got it wrong":
+
+- **`git merge` has no `--trailer`.** It has `--signoff` and nothing else. So an agent
+  told to sign its commits with `git commit --trailer Pact-Agent=$PACT_AGENT` signs
+  every commit it authors and *cannot* sign the merge. Measured: 13 work commits
+  carried the trailer across five identities; all six merge commits did not, and
+  `--check commit-correlation` exited 1 on precisely that. The one commit that changed
+  the shared branch under a mutex — the commit the audit most wants attributed — was
+  structurally the only unattributable one. `pact merge` merges with `--no-commit` and
+  then commits, which is the only way a trailer reaches a merge.
+- **The hold is a test run, not a lock.** Measured holds were 25–64s, median ~37s, and
+  every second of that is the verification. Waiters should expect to wait that long,
+  and the refusal now comes from the same code path as `lease acquire`, with the same
+  holder-and-remaining reporting and the same exit 2.
+- **The red path was untested prose.** "Revert, and *keep* the mutex until green" is
+  the most dangerous instruction in the whole convention and the least often executed:
+  it runs while the shared branch is broken and peers are blocked behind it. It is now
+  code with a test. A failed verification resets the branch and **deliberately keeps
+  the lock**, telling you so and naming the release command.
+
+Two safety notes worth knowing before you use it:
+
+- It **refuses a dirty tree** — tracked changes only; untracked files are fine. The red
+  path resets `--hard`, and git would happily merge around unrelated dirty files that
+  the reset then destroys.
+- `--verify` is optional but its absence is reported, never silently treated as a pass.
+  `verified` is a three-state field in `--json` (`true`, `false`, `null`) for the same
+  reason.
+
+Checkpoint rotation — committing `.pact/events.jsonl` and `.pact/messages.jsonl` when
+they have gone stale — is a natural chore for whoever holds this mutex, and is
+deliberately **not** part of this command: committing files the caller did not name,
+inside the one command that runs while a shared branch is half-written, is the wrong
+place to be surprising.
+
 ## Which channel carries what
 
 Two mechanisms overlap, and picking wrongly is the most common source of noise in
