@@ -10,6 +10,33 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.9.5 - 2026-08-15
+#### Bug Fixes
+- **(doctor)** report the sidecar export, not a config key that answers for nobody - (a7614a6) - Clement HUSSENOT-DESENONGES
+- **(init)** the commit-both-logs instruction was impossible from a worktree (finding 1) - (5c518a9) - Clement HUSSENOT-DESENONGES
+- **(lease)** refuse a whitespace path, warn on one that does not exist (findings 3, 11) - (c07dd88) - Clement HUSSENOT-DESENONGES
+- **(lease)** an expiry describes the holder, not the sweeper (finding 5) - (32f157b) - Clement HUSSENOT-DESENONGES
+- **(lease)** release --all is identity-scoped, not cwd-scoped (finding 2) - (e84ca5c) - Clement HUSSENOT-DESENONGES
+- **(msg)** one body per message, and a stdin read that cannot block forever - (29f3714) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- **(changelog)** credit the fleet's field audit for the whole 0.9.x batch - (641fa56) - Clement HUSSENOT-DESENONGES
+- **(protocol)** a watch notice says what it is; --to-owner-of prose matches the code - (c8eedf6) - Clement HUSSENOT-DESENONGES
+- retire the mascot page and its index entries - (ee332f9) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(harness)** bless run 6's pw wrapper as scripts/pw, the standard fleet instrumentation - (5f9cfce) - Clement HUSSENOT-DESENONGES
+- **(lease)** --ttl takes the --since duration grammar - (9335b47) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(beads)** enable bd's audit sidecar in this repository - (1210813) - Clement HUSSENOT-DESENONGES
+- **(fleet)** put scripts/pw inside the gate, and ignore .harness/ - (950ce64) - Clement HUSSENOT-DESENONGES
+- **(pact)** the fleet's coordination record - (0b8b49f) - Clement HUSSENOT-DESENONGES
+- **(pact)** coordination record for the P1 batch and finding 3/11 - (055cb91) - Clement HUSSENOT-DESENONGES
+- Add interactions & events - (4a5ffd9) - Clement HUSSENOT-DESENONGES
+- Add interactions & events - (0566387) - Clement HUSSENOT-DESENONGES
+#### Refactoring
+- **(ui)** remove the mascot from pact ui - (0444a71) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.9.4 - 2026-08-14
 #### Features
 - **(audit)** correlate a hold to commits by its recorded HEAD range - (40d3dfe) - Clement HUSSENOT-DESENONGES
