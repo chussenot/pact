@@ -10,6 +10,40 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.10.0 - 2026-08-15
+#### Bug Fixes
+- **(ui)** the message pane no longer requires bd to be installed - (108de58) - Clement HUSSENOT-DESENONGES
+- **(ui)** a click on a scrolled message list landed on the wrong row - (8e2364e) - Clement HUSSENOT-DESENONGES
+- **(ui)** a click on a scrolled fleet table landed on the wrong row - (4cd9d3d) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- **(architecture)** pact ui has screens and a stack, not tabs - (8c43a70) - Clement HUSSENOT-DESENONGES
+- **(tui)** rewrite for the four screens, and call out that enter no longer releases - (dbdd51d) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(ui)** / narrows whatever list is focused, on every screen - (b1bedd4) - Clement HUSSENOT-DESENONGES
+- **(ui)** health is about the run, not just the repository - (f574aa7) - Clement HUSSENOT-DESENONGES
+- **(ui)** fleet screen is an agent roster and the contention graph - (f60e692) - Clement HUSSENOT-DESENONGES
+- **(ui)** drill into a path or an agent, and follow every name from there - (6d5fe2a) - Clement HUSSENOT-DESENONGES
+- **(ui)** name the watchers of a path off the per-tick cache - (efc51e4) - Clement HUSSENOT-DESENONGES
+- **(ui)** the Activity screen — a live event feed that separates stuck from finished - (054fc51) - Clement HUSSENOT-DESENONGES
+- **(ui)** messages shows the fleet's conversation, not one personal inbox - (b09db0c) - Clement HUSSENOT-DESENONGES
+- **(ui)** one navigation spine — enter drills in, esc goes back - (9a257e9) - Clement HUSSENOT-DESENONGES
+- **(ui)** read model — parse each store once per tick, project the rest - (4ba1d07) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- Add beads andf pact files - (4a647e2) - Clement HUSSENOT-DESENONGES
+- Add beads and pact files - (c9940c2) - Clement HUSSENOT-DESENONGES
+#### Refactoring
+- **(ui)** drop App::bd, dead since the message pane stopped gating on it - (73b8a46) - Clement HUSSENOT-DESENONGES
+- **(ui)** make src/tui.rs a module tree, one screen per file - (702daab) - Clement HUSSENOT-DESENONGES
+#### Style
+- **(ui)** rustfmt the pact-2ol regression test - (c717189) - Clement HUSSENOT-DESENONGES
+#### Tests
+- **(ui)** pin the scrolled-click invariant structurally, not per screen - (b77cf3b) - Clement HUSSENOT-DESENONGES
+- **(ui)** split the pact-2ol test's preconditions so a failure names one - (a5be6ef) - Clement HUSSENOT-DESENONGES
+- **(ui)** drop the message() fixture the hermetic test retired - (37b4124) - Clement HUSSENOT-DESENONGES
+- **(ui)** make the thread drill-in test hermetic instead of seeded - (6624b6c) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.9.5 - 2026-08-15
 #### Bug Fixes
 - **(doctor)** report the sidecar export, not a config key that answers for nobody - (a7614a6) - Clement HUSSENOT-DESENONGES
