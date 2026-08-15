@@ -87,6 +87,30 @@ const NOTICE: &str = "watch-notice";
 /// subject, so drift degrades the grouping instead of losing messages.
 pub const NOTICE_SUBJECT_MARKER: &str = " changed — released by ";
 
+/// The same join, for a notice that carries no diff because there was never any
+/// content to diff (pact-bsf).
+///
+/// A reserved key like `.pact/internal/merge-to-master` is a name, not a file, so
+/// "changed" would be a lie: nothing changed, the lock was let go. Two markers
+/// rather than one generalised string because [`notice_path`] must find whichever
+/// built the subject, and because the subject is read by an agent, not only parsed.
+pub const NOTICE_FREED_MARKER: &str = " freed — released by ";
+
+/// The path a notice subject names, whichever marker built it.
+///
+/// `split_once` rather than `split(..).next()`: the latter returns the whole string
+/// when the marker is absent, so trying two markers in sequence with it would have
+/// the first always "succeed" and the second never run.
+fn notice_path(subject: &str) -> &str {
+    for marker in [NOTICE_SUBJECT_MARKER, NOTICE_FREED_MARKER] {
+        if let Some((path, _)) = subject.split_once(marker) {
+            return path;
+        }
+    }
+    // Drift degrades the grouping instead of losing the message — see above.
+    subject
+}
+
 /// Past this many lines, [`append`] compacts down to [`KEEP_LINES`].
 ///
 /// The same pair as `events.jsonl`, on purpose: one discipline, one set of numbers
@@ -850,7 +874,7 @@ pub fn split_notices(messages: &[Message]) -> (Vec<&Message>, Vec<NoticeGroup>) 
         let path = m
             .subject
             .as_deref()
-            .and_then(|s| s.split(NOTICE_SUBJECT_MARKER).next())
+            .map(notice_path)
             .unwrap_or_default()
             .to_string();
         let unread = usize::from(!m.read);
@@ -1727,6 +1751,39 @@ mod tests {
         // Read state is per notice, not per group.
         assert_eq!((groups[0].count, groups[0].unread), (2, 1));
         assert_eq!((groups[1].count, groups[1].unread), (1, 1));
+    }
+
+    /// A freed notice (pact-bsf) carries the OTHER marker, and must group under
+    /// its path just like a diff notice — otherwise every mutex release would
+    /// group under its whole subject and a waiter's inbox would list one entry
+    /// per release instead of one per path.
+    #[test]
+    fn a_freed_notice_groups_under_its_path_like_a_diff_notice() {
+        let mutex = ".pact/internal/merge-to-master";
+        let mut freed = notice_msg("n1", "x", "sluice", "2026-08-15T17:08:43Z", false);
+        freed.subject = Some(format!("{mutex}{NOTICE_FREED_MARKER}sluice"));
+        let mut freed2 = notice_msg("n2", "x", "fuller", "2026-08-15T17:09:10Z", false);
+        freed2.subject = Some(format!("{mutex}{NOTICE_FREED_MARKER}fuller"));
+
+        let (_, groups) = split_notices(&[freed, freed2]);
+        assert_eq!(groups.len(), 1, "one path, one group: {groups:?}");
+        assert_eq!(groups[0].path, mutex);
+        assert_eq!(groups[0].count, 2);
+        assert_eq!(groups[0].latest_from, "fuller", "the latest releaser wins");
+    }
+
+    /// The two markers must not collide: a diff notice still parses with the
+    /// freed marker in the table, and vice versa.
+    #[test]
+    fn both_notice_markers_parse_their_own_path() {
+        assert_eq!(
+            notice_path(&format!("src/api.rs{NOTICE_SUBJECT_MARKER}alpha")),
+            "src/api.rs"
+        );
+        assert_eq!(
+            notice_path(&format!("src/api.rs{NOTICE_FREED_MARKER}alpha")),
+            "src/api.rs"
+        );
     }
 
     /// Drift must degrade the grouping, never lose a message. A notice whose

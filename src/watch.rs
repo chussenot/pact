@@ -373,6 +373,22 @@ fn cap(diff: &str, head: Option<&str>) -> String {
 /// answer to "I cannot tell what changed"; a notification saying so would be
 /// noise on every lease taken to create a file.
 pub fn notify_release(repo_root: &Path, holder: &str, released: &str, old_hash: Option<&str>) {
+    // A reserved key is a NAME, not a file (`lease::is_mutex`). There is no blob
+    // at acquire and none at release, so every content branch below returns
+    // before it sends anything — and the silence lands on exactly the paths a
+    // fleet serializes on, where somebody is most likely to be waiting.
+    //
+    // Measured in the millrace run (pact-bsf): an agent was refused the merge
+    // mutex, subscribed with `pact watch add` exactly as the protocol tells it
+    // to, and was never told when the path went free. The holder released 32s
+    // later; the waiter acquired 3m01s after that, having fallen back to
+    // polling. `pact audit` reported `watch 1 active; 0 diff(s) delivered`.
+    //
+    // What a waiter on a mutex wants is not a diff — it is the fact of release.
+    if crate::lease::is_mutex(released) {
+        notify_freed(repo_root, holder, released);
+        return;
+    }
     let Some(old_hash) = old_hash else { return };
     let new = crate::git_history::hash_objects(repo_root, &[released.to_string()]);
     let new_hash = new.get(released);
@@ -410,7 +426,6 @@ pub fn notify_release(repo_root: &Path, holder: &str, released: &str, old_hash: 
     let ctx = crate::repo::RepoContext::resolve(repo_root);
     let holder_branch = ctx.has_worktrees.then(|| ctx.branch()).flatten();
 
-    let about = [released.to_string()];
     // Built with the shared marker, because `pact msg inbox` parses the path
     // back out of it to group notices per path (pact-mqw.5). The const is the
     // only thing keeping the two halves from drifting apart.
@@ -443,6 +458,61 @@ pub fn notify_release(repo_root: &Path, holder: &str, released: &str, old_hash: 
         }
     );
 
+    deliver(repo_root, holder, released, &subject, &body, &subscribers);
+}
+
+/// Tell every subscriber to a reserved key that it is free (pact-bsf).
+///
+/// The counterpart to [`notify_release`]'s diff path, for a lease that stands for
+/// something other than a file. There is nothing to diff and nothing to read into
+/// a working tree — the message IS the availability, so it says the one thing a
+/// waiter needs and nothing else.
+///
+/// Note what this deliberately does NOT do: it does not tell the waiter to go and
+/// acquire. Several may be watching one mutex and only one can win, so the notice
+/// reports a fact rather than issuing an instruction that would be wrong for
+/// everybody but the fastest reader.
+fn notify_freed(repo_root: &Path, holder: &str, released: &str) {
+    let subscribers = match subscribers_for(repo_root, released, holder) {
+        Ok(s) if !s.is_empty() => s,
+        _ => return,
+    };
+
+    let subject = format!("{released}{}{holder}", crate::msg::NOTICE_FREED_MARKER);
+    let body = format!(
+        "{holder} released {released}, which you are watching. It is free as of this \
+         message.\n\
+         \n\
+         This is a reserved key, not a file: there is no diff, because there was never \
+         any content to change. Nothing has appeared in your working tree and there is \
+         nothing here to read into it.\n\
+         \n\
+         If you were refused this path and are waiting on it, this is your signal to \
+         try again — but do not assume you will win it. Anyone else watching got this \
+         same message at the same moment, and only one of you can hold it.\n\
+         \n\
+         You are receiving this because you ran `pact watch add`. \
+         `pact watch rm {released}` stops it."
+    );
+
+    deliver(repo_root, holder, released, &subject, &body, &subscribers);
+}
+
+/// Send one notice per subscriber, and record each delivery or failure.
+///
+/// Shared by the diff path and the freed path so the two cannot drift in what
+/// they tag, how they thread, or whether they leave an event behind. Same
+/// infallible-by-signature contract as [`notify_release`]: a release has already
+/// landed by the time anything here runs.
+fn deliver(
+    repo_root: &Path,
+    holder: &str,
+    released: &str,
+    subject: &str,
+    body: &str,
+    subscribers: &[ActiveWatch],
+) {
+    let about = [released.to_string()];
     // No backend to locate any more (pact-as5.4). Delivery used to begin by finding
     // a `bd` binary and give up here if there was none — which meant the one part of
     // the protocol that runs WITHOUT an agent choosing to run it, on a path an agent
@@ -455,8 +525,8 @@ pub fn notify_release(repo_root: &Path, holder: &str, released: &str, old_hash: 
     for sub in subscribers {
         let draft = crate::msg::Draft {
             thread: None,
-            subject: Some(&subject),
-            body: &body,
+            subject: Some(subject),
+            body,
             // Tagged with the path, so the message follows the file the way
             // `--to-owner-of` messages do: whoever leases it next is told one
             // is waiting, even if this subscriber has exited.
@@ -786,6 +856,81 @@ mod tests {
             records.is_empty(),
             "no baseline must produce no event at all: {records:?}"
         );
+    }
+
+    /// pact-bsf, the regression this whole branch exists for: a reserved key has
+    /// no blob at acquire and none at release, so the content path sends nothing
+    /// and a waiter on the merge mutex is never told it went free.
+    #[test]
+    fn releasing_a_reserved_key_tells_its_watchers_it_is_free() {
+        let tmp = repo();
+        let root = tmp.path();
+        let mutex = ".pact/internal/merge-to-master";
+        add(root, "waiter", mutex).unwrap();
+
+        // `None` — exactly what the lock records for a path that is not a file,
+        // and precisely the argument that used to return before sending.
+        notify_release(root, "holder", mutex, None);
+
+        let inbox = crate::msg::inbox(root, "waiter", false).unwrap();
+        assert_eq!(inbox.len(), 1, "the waiter must be told: {inbox:?}");
+        let m = &inbox[0];
+        assert!(m.notice, "it is fanout, not correspondence");
+        assert!(
+            m.body.contains("free as of this message"),
+            "the notice must say the thing a waiter needs: {}",
+            m.body
+        );
+        assert!(
+            !m.body.contains("What changed while they held it"),
+            "it must not take the diff path's shape for a name: {}",
+            m.body
+        );
+        // And it is visible in the log, so `pact audit` can report delivery.
+        let (events, _) = crate::events::numbered(root).unwrap_or_default();
+        assert!(
+            events.iter().any(|(_, e)| e.kind == "notified"),
+            "delivery must leave an event: {events:?}"
+        );
+    }
+
+    /// The holder is not its own waiter here either — an agent that both watches
+    /// and takes a mutex would otherwise message itself on every release.
+    #[test]
+    fn a_reserved_key_release_does_not_notify_the_releasing_agent() {
+        let tmp = repo();
+        let root = tmp.path();
+        let mutex = ".pact/internal/merge-to-master";
+        add(root, "holder", mutex).unwrap();
+
+        notify_release(root, "holder", mutex, None);
+        assert!(crate::msg::inbox(root, "holder", false).unwrap().is_empty());
+    }
+
+    /// A directory lease is a mutex by the same rule (`lease::is_mutex`), and it
+    /// has no single blob either — so it takes the freed path, not silence.
+    #[test]
+    fn releasing_a_directory_lease_also_reports_it_as_freed() {
+        let tmp = repo();
+        let root = tmp.path();
+        add(root, "waiter", ".beads/").unwrap();
+
+        notify_release(root, "holder", ".beads/", None);
+        let inbox = crate::msg::inbox(root, "waiter", false).unwrap();
+        assert_eq!(inbox.len(), 1, "{inbox:?}");
+    }
+
+    /// The diff path must be untouched: a real file with no baseline still says
+    /// nothing, because "I cannot tell what changed" is not worth a message.
+    #[test]
+    fn a_plain_file_with_no_baseline_still_notifies_nobody() {
+        let tmp = repo();
+        let root = tmp.path();
+        add(root, "watcher", "src/api.rs").unwrap();
+        notify_release(root, "holder", "src/api.rs", None);
+        assert!(crate::msg::inbox(root, "watcher", false)
+            .unwrap()
+            .is_empty());
     }
 
     /// Reading must never create `.pact/` — audit and `watch ls` are

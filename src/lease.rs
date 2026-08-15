@@ -702,6 +702,33 @@ arrives as ONE argument, because zsh does not word-split it.";
 ///
 /// So the warning prints the RESOLVED path, never the argument as typed. Echoing the input
 /// is exactly what made the mistake convincing.
+/// The reserved namespace for a lease that stands for something other than a file.
+///
+/// Agents invented this pattern before pact had a word for it: in the quern run three
+/// holds were taken on `.beads` — a directory, not a file — to serialize their own bd
+/// writes. It worked, and it was the only non-file path leased in 57 acquires.
+/// docs/fleet-patterns.md now blesses it and gives it a home.
+pub const MUTEX_PREFIX: &str = ".pact/internal/";
+
+/// Is this lease a mutex rather than a claim on a file?
+///
+/// **Deliberately does not touch the filesystem.** `audit` reads a log that may
+/// describe a repository state that no longer exists, so a `std::fs` check would
+/// reclassify a since-deleted file as a mutex and make the same log produce
+/// different reports on different days. Two markers, both carried in the log itself:
+///
+/// - the reserved [`MUTEX_PREFIX`], which is self-describing;
+/// - a trailing slash, which is how an agent spells "this is a directory" and how
+///   `pact watch` already records a prefix subscription.
+///
+/// A bare directory name like `.beads` has neither, so quern's own log cannot be
+/// reclassified after the fact — new runs using the prefix get clean statistics, and
+/// a legacy bare-directory lease keeps appearing as an ordinary path. Said out loud in
+/// docs/fleet-patterns.md rather than left as a surprise.
+pub fn is_mutex(path: &str) -> bool {
+    path.starts_with(MUTEX_PREFIX) || path.ends_with('/')
+}
+
 pub(crate) fn resolve_claimable(repo_root: &Path, raw: &str) -> Result<String> {
     if raw.chars().any(char::is_whitespace) {
         anyhow::bail!(
@@ -710,7 +737,13 @@ pub(crate) fn resolve_claimable(repo_root: &Path, raw: &str) -> Result<String> {
         );
     }
     let relative = normalize_path(repo_root, raw);
-    if !repo_root.join(&relative).exists() {
+    // A reserved key stands for something that is not a file — a merge mutex, a
+    // shared store — so it is SUPPOSED to be absent from the working tree, and
+    // "this claim protects nothing" is exactly backwards: serializing peers is
+    // the entire thing it protects. Warning here trained agents to expect a
+    // complaint every time they took the one lock the protocol tells them to
+    // take (pact-bsf).
+    if !repo_root.join(&relative).exists() && !is_mutex(&relative) {
         crate::output::warn(&format!(
             "note: {relative} does not exist in the working tree (asked for {raw:?}, \
              resolved from the current directory). Fine for a file you are about to \

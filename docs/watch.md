@@ -170,6 +170,27 @@ Truncating costs more here than it would for a human. A cut diff degrades to
 "go and run `git show`", a second step off the critical path — the exact
 category of voluntary step this whole feature exists because agents skip.
 
+### Reserved keys get the fact, not a diff
+
+A lease on `.pact/internal/<purpose>` — a merge mutex, a store lock — stands for a
+name, not a file. There is no blob at acquire and none at release, so there is
+nothing to diff, and until pact-bsf a release on one sent **nothing at all**.
+
+That silence landed on exactly the paths a fleet serializes on. Measured in the
+millrace run: an agent was refused the merge mutex, subscribed with `pact watch add`
+exactly as the refusal advises, and was never told when it went free. The holder
+released 32 seconds later; the waiter acquired **3m01s after that**, having fallen
+back to polling. `pact audit` reported `watch 1 active; 0 diff(s) delivered`.
+
+A waiter on a mutex does not want a diff — it wants the fact of release. Releasing a
+reserved key now sends a short notice saying the path is free, carrying no diff and
+saying why there is none. It deliberately does **not** tell you to go and acquire:
+several agents may watch one mutex and only one can win, so the notice reports a fact
+rather than issuing an instruction that is wrong for everybody but the fastest reader.
+
+The file path is unchanged: a real file with no recorded baseline still notifies
+nobody, because "I cannot tell what changed" is not worth a message.
+
 ## Subscriptions
 
 Exact paths or directory prefixes. **No globs in v1.**

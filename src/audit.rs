@@ -793,32 +793,18 @@ pub struct Contended {
     pub mutex: bool,
 }
 
-/// The reserved namespace for a lease that stands for something other than a file.
+/// Re-exported from [`crate::lease`], where the definition now lives.
 ///
-/// Agents invented this pattern before pact had a word for it: in the quern run three
-/// holds were taken on `.beads` — a directory, not a file — to serialize their own bd
-/// writes. It worked, and it was the only non-file path leased in 57 acquires.
-/// docs/fleet-patterns.md now blesses it and gives it a home.
-pub const MUTEX_PREFIX: &str = ".pact/internal/";
-
-/// Is this lease a mutex rather than a claim on a file?
+/// "Is this lease a mutex rather than a claim on a file?" is a question about a
+/// lease, and three callers outside audit ask it — `lease` itself when deciding
+/// whether an absent path is worth warning about, `watch` when deciding whether a
+/// release can carry a diff, and `merge` when naming its key. Keeping the
+/// definition here made `audit` a dependency of all of them, which the benches
+/// (which compile `lease` and `watch` without it) refused to link.
 ///
-/// **Deliberately does not touch the filesystem.** `audit` reads a log that may
-/// describe a repository state that no longer exists, so a `std::fs` check would
-/// reclassify a since-deleted file as a mutex and make the same log produce
-/// different reports on different days. Two markers, both carried in the log itself:
-///
-/// - the reserved [`MUTEX_PREFIX`], which is self-describing;
-/// - a trailing slash, which is how an agent spells "this is a directory" and how
-///   `pact watch` already records a prefix subscription.
-///
-/// A bare directory name like `.beads` has neither, so quern's own log cannot be
-/// reclassified after the fact — new runs using the prefix get clean statistics, and
-/// a legacy bare-directory lease keeps appearing as an ordinary path. Said out loud in
-/// docs/fleet-patterns.md rather than left as a surprise.
-pub fn is_mutex(path: &str) -> bool {
-    path.starts_with(MUTEX_PREFIX) || path.ends_with('/')
-}
+/// Imported rather than re-exported: every caller now names `lease::is_mutex`
+/// directly, and a `pub use` here would only offer a second name for one thing.
+use crate::lease::is_mutex;
 
 /// `Check::CommitCorrelation`: a closed hold with no commit landing anywhere
 /// inside its own window.
