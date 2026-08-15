@@ -541,6 +541,186 @@ reasoning a commit subject cannot.
 - - -
 
 
+## Notes — unreleased
+
+**Everything in this section came from the fleet, not from us.** `docs/pact-findings.md`
+in the [quern](https://github.com/chussenot/quern) repository is a field audit of pact
+written by the agents that used it, across two runs: quern (35 agents, 249 coordination
+events) and treadle (29 agents, 317 events, 875 instrumented tool calls).
+
+It is worth reading for its method as much as its findings. It carries a **Withdrawn**
+section correcting its own false claims, on the stated principle that *"a findings list
+that only grows is not trustworthy"* — run 6's measurements overturned two of run 5's
+recalled ones, including a "pact caps multi-path acquires" story that was really zsh not
+word-splitting an unquoted variable. One finding was raised in priority only after it bit
+the orchestrator personally.
+
+Every fix below was **re-verified against the current source before being acted on**,
+because the doc itself demands that. All of them still reproduced two minor versions after
+they were measured.
+
+### Fixed
+
+- **`lease release --all` was cwd-scoped when the identity is the scope** (finding 2), and
+  this is the worst bug pact has shipped. From any directory but the repo root it released
+  nothing and reported *"held no leases"* while `lease ls` showed the leases in the same
+  second. The cause was a double normalization: paths read back out of the lease store are
+  already repo-relative, and re-resolving them against the process CWD turned `a.rs` into
+  `sub/a.rs`.
+  In the field an agent ran it, was told it held nothing, and exited; a peer later found
+  that lease live with 1721 seconds remaining and had to `--steal` from an agent that had
+  already finished. **It also corrupted the metrics every other finding is read through** —
+  a leaked lease later stolen reads as contention that never happened. Any `stale-holds` or
+  `double-win` number from those two runs has to be read with that in mind.
+  An empty result now names the store it searched, because that message is one an agent
+  stakes its exit on.
+
+- **The protocol told every agent to commit the coordination logs, which is impossible from
+  a worktree** (finding 1). Under the default shared scope every worktree resolves state to
+  the main checkout, so a worktree's copy is a stale tracked snapshot and `git add` finds
+  nothing to stage. Thirty-five agents each spent time discovering that; nine reported it
+  independently and unprompted. The protocol block now says the main checkout commits them
+  and a worktree agent must not try.
+  **The split-scope fix the finding preferred was rejected** — writing the logs per-worktree
+  would reintroduce divergent logs, real union merges, chain verification across merged
+  interleaves, and `audit` reading N files. The instruction was wrong, not the topology.
+- **`pact init` could leave the message store gitignored while giving it a merge
+  attribute.** Our bug, and half a fix: the `.gitattributes` half was made per-path when the
+  message store became committed, and the `.gitignore` half was left keyed on a `.pact/*`
+  sentinel, so every repository that had been through `pact init` before silently skipped
+  the new rule. `doctor` gains **message store survives a clone**, symmetric to the events
+  check — the guard the finding correctly identified as missing.
+
+- **An `expired` event described whoever swept the lock, not the holder** (finding 5). The
+  row is written by whichever process collects a lapsed lock — usually `lease ls` in the
+  main checkout, minutes after the holder exited — and it inherited that process's
+  invocation context. Measured in quern's own committed log: **2 of 3 expiries carried a
+  worktree attribution that was not the holder's**, and no later fix repairs a log already
+  on disk. The holder's context is now recorded on the lock at acquire; the sweeper goes in
+  a separate `collected_from` field that `--check topology` ignores.
+  `--check topology --expect worktrees` gains repeatable **`--allow-main <agent>`**, without
+  which it could not pass for any real fleet: run 5 failed it with 19 offending events, not
+  one of which was an agent working in the wrong place. Somebody must sit in the main
+  checkout, because that is where the coordination logs are committed from. The count of
+  excused events prints even on a pass.
+
+- **A lease or watch path containing whitespace is now refused, and one that does not exist
+  warns** (findings 3 and 11). An unquoted shell variable holding a list arrives as one
+  argument, so pact took a single lease on the literal string `a.rs b.rs`; three agents
+  independently concluded pact caps multi-path acquires at about fifteen paths. It does
+  not — forty take 0.560s — but past about five the joined name exceeds `NAME_MAX` and fails
+  with a raw `os error 36`.
+  The nonexistent-path warning prints the **resolved** path, never the argument as typed:
+  the orchestrator lost a lease to exactly this, running `pact lease acquire src/vm/mod.rs`
+  from the repo root on a project whose file was at `treadle/src/vm/mod.rs`. pact echoed the
+  path back and the lease protected nothing. Echoing the input is what made it convincing.
+
+- **`msg read` repeated the whole body once per recipient** (finding 8). A
+  15-recipient broadcast cost about 280KB to read, and it bit hardest on exactly the
+  messages that mattered, because that run's protocol REQUIRED hot-file changers to
+  broadcast to every dependent. The store was always correct — one send is one row —
+  so this was purely read-side rendering. One body now, with recipients named once as
+  a read/unread roster, plus `--brief` for triage. `--json` is unchanged, deliberately:
+  the per-recipient fan-out it returns is what keeps that shape byte-compatible.
+
+- **`msg send --body-file -` now refuses a tty immediately and bounds its read**
+  (finding 4). Reported as an indefinite hang that wedged the calling shell. It did
+  **not reproduce**, and could not be properly tested — the report's precondition is a
+  tty on stdin, which no test environment here has. Fixed defensively anyway, because
+  the failure mode is unbounded blocking in the tool an agent uses to report that it is
+  blocked. Marked open and unconfirmed. The protocol block stops advertising `-`.
+
+- **`doctor` stopped prescribing a bd config key as a capability test** (finding 6) —
+  but not for the reason the finding gave, and the difference is the point. The finding
+  said bd writes `audit.enabled` inertly and never creates the sidecar, leaving
+  `claim-lease-divergence` permanently unrunnable. **Re-measured, that is false**: the
+  sidecar works after `bd config set audit.enabled true`, warning and all, and
+  `BD_AUDIT_ENABLED=1` enables it with no warning at all. The check was runnable the
+  whole time.
+  Acting on the finding as written would have shipped a NEW bug — probing whether bd
+  admits an `audit` namespace returns false on a bd whose sidecar works fine. So the
+  signal is now the artifact pact actually consumes: does `.beads/interactions.jsonl`
+  exist. `bd config get` could not answer either way — it reports for keys nobody set,
+  and it cannot see an env var living in someone else's environment. doctor now spawns
+  bd once instead of twice, and says plainly what it cannot see rather than implying it
+  knows.
+
+- **`--ttl` accepts the same duration grammar as `--since`** (finding 7). It took bare
+  seconds while every other duration in pact took units, which is what made it a trap
+  rather than merely a limitation: an agent passed `--ttl 20` meaning twenty minutes,
+  got twenty seconds, and its lease lapsed mid-work. Two knock-on effects followed, both
+  observed — a `commit-correlation` finding for a commit landing under an expired lease,
+  and, because the lease EXPIRED rather than being released, every `pact watch`
+  subscriber on that path got no release diff. The watch guarantee silently did not fire.
+  `45m`, `2h`, `1d`, `2w` now work. A bare integer still means seconds, and one under two
+  minutes warns, naming both readings and holding anyway — a 20-second lease is a
+  legitimate short mutex, and `--ttl 20s` never warns, because saying the unit is how you
+  say you meant it. A malformed value stays exit 5: moving the grammar out of clap would
+  have quietly demoted it to 1, and exit codes are API.
+
+- **A `pact watch` release notice now says what it is, and names the branch** (finding
+  9). An agent did the protocol-correct thing — `watch add` on an interface it depended
+  on but did not own — then worked out that in a worktree fleet the notification is
+  structurally useless: the author writes that file on THEIR branch in THEIR worktree, so
+  it can never appear in the watcher's tree. Its words: *"their file can never reach mine;
+  waiting was structurally pointless."* It had a waiter running and killed it.
+  The notice now calls itself a contract notice rather than a code delivery and names the
+  branch that would make it consumable — **and only in a repository that has worktrees**.
+  In a plain checkout the notice really is a code delivery, because the diff describes the
+  file already in the reader's tree, so saying otherwise would be false. Both halves are
+  tested; without the negative one, deleting the gate would pass.
+
+- **`--to-owner-of`'s promise now matches its behaviour** (finding 10). The prose said a
+  message about a file *"still reaches whoever picks it up next"*, so a reader expected to
+  pre-address a path whose owner had not started — the single most useful moment to do it.
+  You cannot. The finding filed this as a defect and then withdrew it: pact refused an
+  unresolvable address, said why, and named the command that would show the truth. Measured
+  precisely, the constraint is that **someone must have leased the path at some point**, not
+  that it is held now. The block says that and points at `--to <agent>` for work that has
+  not started. Holding a message for a future holder is a queue with no expiry in a store
+  that is deliberately capped — a separate feature, not a docs fix.
+
+- **`scripts/pw`**, the per-call instrumentation wrapper, is now part of the repository
+  (adapted from the harness the treadle run wrote for itself). Every `pact` and `bd`
+  invocation appends one JSON line with argv, wall-time and exit code. That harness is
+  the entire reason run 6's findings are measured rather than recalled, and two of run
+  5's recalled claims were overturned by it.
+
+### Corrected in the findings, from re-measurement
+
+- pact does **not** truncate paths in `lease ls`. `{:<n}` pads and never cuts; the
+  "rendered truncated" in the report was the terminal wrapping a long line. Pinned by a test
+  so a future column change cannot introduce it.
+- Finding 4 (`msg send --body-file -` hangs) **did not reproduce** and could not be tested
+  where stdin is not a tty, which is the precondition the report names. Treated as open and
+  unconfirmed.
+
+- **bd's audit sidecar is not inert.** See finding 6 above — it works under either of two
+  levers, and bd names the key in three places (`bd audit --help`, `bd audit record`'s own
+  error text, and its generated `config.yaml`) against one that rejects it (`bd config
+  set`'s allowlist). That is a one-line allowlist omission upstream, not a broken feature.
+
+- **`bd create` now echoes the assigned id**, which was the root cause of finding 13's
+  accident — an author inferring the next sequential number was theirs and overwriting a
+  peer's fields. Not filed upstream. What survives is the residue: `bd update` performs no
+  assignee arbitration, while `bd close` correctly refuses a non-assignee.
+
+- **Finding 14 does not reproduce via `bd close`** — every close path is correct now. It
+  reproduces deterministically and worse via `bd update --status closed`, which stamps
+  `closed_at`, leaves `close_reason: null` and bypasses the assignee check. 13 and 14 are
+  one root cause: `bd update` is an unguarded back door around every guard `bd close`
+  enforces.
+
+- **The instrument that measured run 6 had a race**, found while adopting it. Its stderr
+  capture used a process substitution the shell does not wait for, so the excerpt could be
+  read empty for a command that had just printed why it failed — reproduced at 200/200
+  lost against 0/200 with the pipeline form now shipped. Run 6's data shows 878 of 938
+  records with empty stderr, but 15 non-zero exits did capture it, so the capture was
+  unreliable rather than always-lossy. It matters for one inference in the findings doc's
+  own *Withdrawn* section, which argues the SIGPIPE case partly from "every one a bd call
+  with empty stderr". The conclusion stands on exit code 141 alone; the corroboration was
+  partly measuring the instrument.
+
 ## Notes — 0.9.0
 
 **pact no longer has a runtime backend.** Messages were `bd` beads; they are now
