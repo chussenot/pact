@@ -533,21 +533,6 @@ mod tests {
         }
     }
 
-    fn message(id: &str, subject: &str, read: bool) -> msg::Message {
-        msg::Message {
-            id: id.to_string(),
-            thread: id.to_string(),
-            from: "agent-b".to_string(),
-            to: "agent-a".to_string(),
-            subject: Some(subject.to_string()),
-            body: format!("body of {id}"),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            read,
-            read_by: Vec::new(),
-            notice: false,
-        }
-    }
-
     /// An App with nothing on disk behind it. `repo_root` is empty, so any
     /// path that would touch a real `.pact/` errors into `status` instead of
     /// silently succeeding — which several tests below rely on.
