@@ -25,7 +25,7 @@ use chrono::Utc;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
 use ratatui::crossterm::event::KeyCode;
@@ -459,11 +459,15 @@ fn columns(area: Rect, roster_rows: usize) -> (Option<Rect>, Rect) {
 }
 
 /// How the right pane splits between the lease table and the waiting-on panel:
-/// a title line plus one row per blocked agent, never taking so much that the
-/// table it sits under loses its header and its first two rows. `None` when
-/// there is genuinely no room, so a very short terminal still shows the leases.
+/// a title line, one row per blocked agent, and a last line for the bound the
+/// panel is judged under — never taking so much that the table it sits under
+/// loses its header and its first two rows. `None` when there is genuinely no
+/// room, so a very short terminal still shows the leases.
+///
+/// The bound is the row that goes when the terminal is squeezed, because it is
+/// a caption and a blocked agent is a finding (pact-dwq).
 fn stack(right: Rect, blocked: usize) -> (Rect, Option<Rect>) {
-    let wanted = 1 + blocked.clamp(1, MAX_BLOCKED_ROWS) as u16;
+    let wanted = 2 + blocked.clamp(1, MAX_BLOCKED_ROWS) as u16;
     let height = wanted.min(right.height.saturating_sub(4));
     if height < 2 {
         return (right, None);
@@ -665,14 +669,29 @@ fn render_waiting(frame: &mut Frame, area: Rect, app: &App) {
         .waiting
         .as_ref()
         .map_or(DEFAULT_GRACE_SECS, |w| w.grace_secs);
-    let block = Block::default().borders(Borders::TOP).title(format!(
-        " {who} — live = holder's remaining + {} grace ",
-        lease::human_secs(grace)
-    ));
+    // The title carries only the short half. Ratatui truncates a block title
+    // SILENTLY, and this panel lives in the right-hand pane, so at real widths
+    // the sentence explaining the bound was the part that got cut — leaving
+    // "live = holder's remai" and implying exactly the invisible bound the
+    // grace is threaded through here to avoid (pact-dwq). Every test asserted
+    // on the rows, and a title is not a row.
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .title(format!(" {who} "));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines: Vec<Line> = if blocked.is_empty() {
+    // Stated inside the panel instead, where a Paragraph wraps rather than
+    // clips, and dim because it is a caption rather than a finding.
+    let bound = Line::from(Span::styled(
+        format!(
+            "live = the holder's remaining time + {} grace",
+            lease::human_secs(grace)
+        ),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let mut lines: Vec<Line> = if blocked.is_empty() {
         vec![Line::from(Span::styled(
             "nobody is blocked",
             Style::default().fg(Color::DarkGray),
@@ -680,7 +699,8 @@ fn render_waiting(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         blocked.iter().map(|b| blocked_line(app, b)).collect()
     };
-    frame.render_widget(Paragraph::new(lines), inner);
+    lines.push(bound);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 /// One edge, read left to right: who is stuck, on what, for how long, behind
@@ -1047,7 +1067,16 @@ mod tests {
         // one that did — that distinction is the point of the panel.
         assert!(rendered.contains("not subscribed"), "{rendered}");
         // And the window "live" was judged against is stated, not implied.
-        assert!(rendered.contains("live = holder's remaining"), "{rendered}");
+        //
+        // This assertion existed before pact-dwq and passed throughout it: at
+        // 160 columns the sentence fit in the block title it used to live in.
+        // The truncation only appears at widths an operator actually uses, so
+        // the gap was never the assertion — it was the terminal size. See
+        // `the_grace_bound_survives_at_a_real_terminal_width`.
+        assert!(
+            rendered.contains("live = the holder's remaining time"),
+            "{rendered}"
+        );
         assert!(rendered.contains("5m0s grace"), "{rendered}");
     }
 
@@ -1133,6 +1162,35 @@ mod tests {
     /// pinned the offset at 0 and put every click on a scrolled table one
     /// screenful of rows away from the one under the cursor.
     #[test]
+    /// pact-dwq. The panel threads `WaitingOn::grace_secs` all the way here so
+    /// it can state what "live" means rather than imply an invisible bound —
+    /// and then put that sentence in a Block title, which ratatui truncates
+    /// SILENTLY. At the real right-pane width the operator saw
+    /// "live = holder's remai".
+    ///
+    /// Asserts on the rendered BUFFER, not on the model: every other test of
+    /// this panel checks its rows, and the rows were never the problem.
+    #[test]
+    fn the_grace_bound_survives_at_a_real_terminal_width() {
+        let tmp = fixture();
+        let mut app = app(
+            tmp.path(),
+            Some("operator"),
+            vec![entry("orchestrator", "docs/tui.md", 600)],
+        );
+        // 100 columns: the width the truncation was observed at, and narrower
+        // than the 120 the other render tests use.
+        let rendered = drawn(&mut app, 100, 24);
+        assert!(
+            rendered.contains("grace"),
+            "the bound must be legible, not clipped: {rendered}"
+        );
+        assert!(
+            !rendered.contains("remai "),
+            "a clipped word means the title is truncating again: {rendered}"
+        );
+    }
+
     fn a_scrolled_table_still_maps_a_click_to_the_row_under_the_cursor() {
         let tmp = fixture();
         let leases: Vec<LeaseEntry> = (0..20)
@@ -1342,7 +1400,8 @@ mod tests {
         let right = Rect::new(0, 3, 80, 16);
         let (work, waiting) = stack(right, 40);
         assert!(work.height >= 4, "table kept {} lines", work.height);
-        assert!(waiting.unwrap().height <= 1 + MAX_BLOCKED_ROWS as u16);
+        // Title + the capped rows + the one line stating the bound (pact-dwq).
+        assert!(waiting.unwrap().height <= 2 + MAX_BLOCKED_ROWS as u16);
 
         // A terminal with no room at all still shows the leases.
         let (work, waiting) = stack(Rect::new(0, 3, 80, 5), 3);
