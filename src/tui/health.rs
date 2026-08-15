@@ -45,6 +45,8 @@ use ratatui::Frame;
 use super::nav::View;
 use super::widgets;
 use super::App;
+use chrono::{DateTime, Utc};
+
 use crate::audit::{self, Check, CheckReport, RetryStorm};
 use crate::doctor;
 use crate::lease::human_secs;
@@ -68,6 +70,9 @@ pub struct State {
 
     /// The offline audit checks over the current event log.
     pub behaviour: Vec<Group>,
+    /// The window `behaviour` was judged over, so the section header can say
+    /// what it actually applied instead of claiming "this run" over all time.
+    pub window: Window,
     /// How long the event log was when `behaviour` was computed.
     ///
     /// ponytail: the log is append-only, so its length is a sound "did the
@@ -264,17 +269,108 @@ fn refresh_behaviour(app: &mut App) {
         return;
     }
     app.health.behaviour_events = Some(events);
-    app.health.behaviour = behaviour_groups(&app.repo_root, app.data.storms());
+    let window = Window::of(app);
+    app.health.behaviour = behaviour_groups(&app.repo_root, app.data.storms(), window);
+    app.health.window = window;
+}
+
+/// How far back BEHAVIOUR looks when no work is in flight.
+///
+/// One hour rather than a session: an operator opening the dashboard mid-run
+/// wants the misbehaviour that is still worth acting on, and a fleet that
+/// finished yesterday is history, not health.
+const IDLE_WINDOW_SECS: i64 = 3600;
+
+/// The window BEHAVIOUR judges, and the words for it.
+///
+/// **Findings are filtered, never events.** `audit`'s own `since` filters the
+/// event log before `reconstruct` pairs opens with closes — so a lease held for
+/// four hours and STILL OPEN has its `acquired` cut away, no `Hold` is built,
+/// and `stale-holds` cannot report the single worst thing on the screen. Every
+/// check here therefore runs over the whole log, as it always did, and the
+/// window is applied to what came back.
+///
+/// The cut reaches back to cover the oldest live hold whenever there is one, so
+/// "this run" means the run rather than the last hour of it.
+#[derive(Clone, Copy)]
+pub struct Window {
+    cut: DateTime<Utc>,
+    /// True when the cut was pulled back by a live hold rather than the idle
+    /// default — the label says which, because a window nobody can see is the
+    /// defect this type exists to fix.
+    anchored_to_a_hold: bool,
+}
+
+impl Default for Window {
+    fn default() -> Self {
+        Window {
+            cut: Utc::now() - chrono::Duration::seconds(IDLE_WINDOW_SECS),
+            anchored_to_a_hold: false,
+        }
+    }
+}
+
+impl Window {
+    fn of(app: &App) -> Window {
+        let idle = Utc::now() - chrono::Duration::seconds(IDLE_WINDOW_SECS);
+        let oldest = app
+            .data
+            .leases()
+            .iter()
+            .filter_map(|e| DateTime::parse_from_rfc3339(&e.lease.acquired_at).ok())
+            .map(|t| t.with_timezone(&Utc))
+            .min();
+        match oldest {
+            Some(open) if open < idle => Window {
+                cut: open,
+                anchored_to_a_hold: true,
+            },
+            _ => Window {
+                cut: idle,
+                anchored_to_a_hold: false,
+            },
+        }
+    }
+
+    /// Did this happen inside the window? An unparsable stamp counts as inside:
+    /// dropping a finding because its timestamp is malformed would hide it, and
+    /// hiding findings is what this whole change exists to stop doing by
+    /// accident.
+    fn covers(&self, at: &str) -> bool {
+        match DateTime::parse_from_rfc3339(at) {
+            Ok(t) => t.with_timezone(&Utc) >= self.cut,
+            Err(_) => true,
+        }
+    }
+
+    /// A still-open hold is always in scope however old it is — it is a problem
+    /// happening now, and its age is the reason to care rather than to forget.
+    fn covers_hold(&self, closed_at: Option<&str>) -> bool {
+        match closed_at {
+            None => true,
+            Some(at) => self.covers(at),
+        }
+    }
+
+    fn label(&self) -> String {
+        let ago = (Utc::now() - self.cut).num_seconds().max(0);
+        if self.anchored_to_a_hold {
+            format!("this run — since the oldest live hold, {}", human_secs(ago))
+        } else {
+            format!("the last {}", human_secs(IDLE_WINDOW_SECS))
+        }
+    }
 }
 
 /// The offline checks. Every one of these reads `.pact/` (and, for
 /// `claim-lease-divergence`, the committed Beads export) and nothing else — no
 /// subprocess, so they are safe on the tick that a changed event log triggers.
-fn behaviour_groups(repo_root: &Path, storms: &[RetryStorm]) -> Vec<Group> {
+fn behaviour_groups(repo_root: &Path, storms: &[RetryStorm], w: Window) -> Vec<Group> {
     vec![
         check_group(repo_root, Check::StaleHolds, "stale-holds", |r| {
             r.stale_holds
                 .iter()
+                .filter(|h| w.covers_hold(h.closed_at.as_deref()))
                 .map(|h| Finding {
                     text: format!(
                         "{} — {} held it {} and never renewed",
@@ -289,6 +385,7 @@ fn behaviour_groups(repo_root: &Path, storms: &[RetryStorm]) -> Vec<Group> {
         check_group(repo_root, Check::DoubleWin, "double-win", |r| {
             r.double_wins
                 .iter()
+                .filter(|d| w.covers(&d.incoming_at))
                 .map(|d| Finding {
                     text: format!(
                         "{} — {} took it while {} still held it",
@@ -311,6 +408,7 @@ fn behaviour_groups(repo_root: &Path, storms: &[RetryStorm]) -> Vec<Group> {
             |r| {
                 r.silent_contentions
                     .iter()
+                    .filter(|s| w.covers(&s.refused_at))
                     .map(|s| Finding {
                         text: format!(
                             "{} — {} was refused, {} released it without a word",
@@ -328,6 +426,7 @@ fn behaviour_groups(repo_root: &Path, storms: &[RetryStorm]) -> Vec<Group> {
             |r| {
                 r.claim_divergences
                     .iter()
+                    .filter(|c| w.covers(&c.acquired_at))
                     .map(|c| Finding {
                         text: format!(
                             "{} — {} held it under {}, last assigned to {}",
@@ -506,7 +605,11 @@ fn build_rows(app: &App) -> Vec<Row> {
 
     rows.push(section(
         "BEHAVIOUR",
-        &format!("this run, over {} events", app.data.events().len()),
+        &format!(
+            "{}, over {} events",
+            app.health.window.label(),
+            app.data.events().len()
+        ),
     ));
     if app.health.behaviour.is_empty() {
         rows.push(note("behaviour", "press r to run the fleet checks"));
@@ -702,6 +805,55 @@ mod tests {
 
     fn app() -> App {
         app_at(PathBuf::new())
+    }
+
+    /// pact-c6b: a repository whose only sin is a past.
+    ///
+    /// BEHAVIOUR ran every check with `since: None`, so it judged the whole
+    /// event log. On this repo that was 617 events across days and 45
+    /// `stale-holds` findings from agents that finished hours earlier — which
+    /// pinned the header to `Health ✗` permanently. pact-pyt.8's first
+    /// acceptance criterion was that a failing check is impossible to miss from
+    /// another screen, and a light that is always red is a light nobody reads.
+    #[test]
+    fn an_old_lapsed_hold_is_history_and_a_live_one_is_not() {
+        let old = "2026-08-10T09:00:00+00:00"; // days ago
+        let idle = Window::default(); // nothing held: the last hour
+
+        assert!(
+            !idle.covers(old),
+            "a finding from days ago is history, not health"
+        );
+        // A hold that never closed is a problem happening NOW, and its age is
+        // the reason to care rather than the reason to forget it. This is why
+        // the window filters FINDINGS and not events: `audit`'s own `since`
+        // cuts the `acquired` away and no Hold is reconstructed at all.
+        assert!(
+            idle.covers_hold(None),
+            "a still-open hold is always in scope, however old"
+        );
+        assert!(!idle.covers_hold(Some(old)));
+        assert!(idle.covers_hold(Some(&Utc::now().to_rfc3339())));
+    }
+
+    /// The label has to name the window that was actually applied. Saying
+    /// "this run" over an all-time window was the defect twice: wrong data, and
+    /// a caption that hid it.
+    #[test]
+    fn the_label_names_the_window_it_used() {
+        assert_eq!(Window::default().label(), "the last 1h0m");
+
+        let anchored = Window {
+            cut: Utc::now() - chrono::Duration::seconds(7200),
+            anchored_to_a_hold: true,
+        };
+        assert!(
+            anchored
+                .label()
+                .starts_with("this run — since the oldest live hold"),
+            "{}",
+            anchored.label()
+        );
     }
 
     fn rendered(app: &mut App) -> String {
