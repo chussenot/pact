@@ -53,18 +53,65 @@ fn chaos(repo: &Path, extra: &[&str]) -> Output {
         .arg(repo.join("pids"))
         .args(extra)
         // pact must be findable for a non-dry run; harmless for a dry one.
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                Path::new(env!("CARGO_BIN_EXE_pact"))
-                    .parent()
-                    .unwrap()
-                    .display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        );
+        .env("PATH", path_with(&[]));
     cmd.output().expect("failed to run chaos.sh")
+}
+
+/// A PATH that finds the `pact` THIS RUN BUILT, plus `dirs`, plus the real one.
+///
+/// chaos.sh hard-requires pact (`need pact`), and inheriting the caller's PATH
+/// finds one only where `cargo install`/`mise run install` has put it — every
+/// developer's machine, and no CI runner. That is why two of these tests were
+/// green locally and red in CI for two days.
+///
+/// The built binary rather than an installed one is the load-bearing half: when
+/// the inherited PATH *did* resolve `pact`, it resolved to whatever version was
+/// installed, so a local pass was not evidence about the working tree at all.
+///
+/// The real PATH is kept on the end, never replaced: chaos needs `jq` and
+/// `sha256sum`, and a narrowed PATH makes it die at its own dependency check
+/// instead of reaching the rail under test.
+fn path_with(dirs: &[&Path]) -> String {
+    let built = Path::new(env!("CARGO_BIN_EXE_pact"))
+        .parent()
+        .expect("the test binary always has a parent directory");
+    let mut parts: Vec<String> = std::iter::once(built)
+        .chain(dirs.iter().copied())
+        .map(|d| d.display().to_string())
+        .collect();
+    parts.push(std::env::var("PATH").unwrap_or_default());
+    parts.join(":")
+}
+
+/// The `pact` chaos.sh resolves must be the one THIS RUN BUILT.
+///
+/// This is the test that can actually fail on a developer's machine, and it is
+/// the only one here that could have caught the CI outage locally. The two
+/// tests that were red in CI for two days built their own PATH and inherited
+/// `pact` from the environment — which resolves, on a machine that has ever run
+/// `cargo install`, to `$CARGO_HOME/bin/pact`. Cargo prepends `$CARGO_HOME/bin`
+/// to PATH for the processes it spawns, so no amount of stripping PATH before
+/// `cargo test` can reproduce CI's condition: the installed binary is put back.
+///
+/// Two things follow, and the second is why this test asserts identity rather
+/// than mere presence. CI has no `cargo install` step, so there is nothing in
+/// `$CARGO_HOME/bin` and chaos dies at `need pact`. And locally the tests were
+/// exercising WHATEVER VERSION WAS INSTALLED rather than the working tree — a
+/// green run said nothing about the code being tested.
+#[test]
+fn the_path_handed_to_chaos_finds_the_pact_this_run_built() {
+    let built = Path::new(env!("CARGO_BIN_EXE_pact"));
+    let path = path_with(&[]);
+    let found = path
+        .split(':')
+        .map(Path::new)
+        .find(|dir| dir.join("pact").is_file())
+        .map(|dir| dir.join("pact"))
+        .expect("chaos.sh hard-requires pact; it must be findable at all");
+    assert_eq!(
+        found, built,
+        "chaos would run an installed pact, not the one under test"
+    );
 }
 
 fn stderr(o: &Output) -> String {
@@ -326,17 +373,7 @@ fn a_hidden_backend_is_restored_even_when_chaos_is_killed() {
             "120",
         ])
         .env("HOME", tmp.path())
-        // The real PATH is kept, not replaced: chaos needs jq and
-        // sha256sum, and a narrowed PATH makes it die at its own
-        // dependency check instead of reaching the rail under test.
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                bin_dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+        .env("PATH", path_with(&[bin_dir.as_path()]))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -424,17 +461,7 @@ fn refuses_to_hide_a_backend_outside_home() {
             "backend-outage",
         ])
         .env("HOME", elsewhere.path())
-        // The real PATH is kept, not replaced: chaos needs jq and
-        // sha256sum, and a narrowed PATH makes it die at its own
-        // dependency check instead of reaching the rail under test.
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                bin_dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+        .env("PATH", path_with(&[bin_dir.as_path()]))
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
