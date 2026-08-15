@@ -10,6 +10,14 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.10.3 - 2026-08-15
+#### Bug Fixes
+- **(watch)** a released reserved key tells its watchers it is free - (aaf830b) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(merge)** pact merge takes the mutex, signs the merge, and proves it - (8435ba7) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.10.2 - 2026-08-15
 #### Miscellaneous Chores
 - Add events - (611d820) - Clement HUSSENOT-DESENONGES
