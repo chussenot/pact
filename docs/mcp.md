@@ -224,8 +224,7 @@ responses by `id`, so out-of-order delivery is protocol-legal; a client pairing
 by position was already wrong.
 
 The message tools cannot wedge that way any more — they read a file. `pact_doctor`
-still spawns `bd` twice (`--version` and `config get audit.enabled`), so the
-concurrency is not merely historical.
+still spawns `bd` once (`--version`), so the concurrency is not merely historical.
 
 ## Registering it
 

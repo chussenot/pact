@@ -3081,8 +3081,22 @@ pub fn render_check(r: &CheckReport) -> String {
 
     if r.check == "claim-lease-divergence" {
         if let Some(reason) = &r.claim_unavailable {
+            // pact-83r.6 / finding 6. "Could not run" on its own sends a reader to bd's
+            // `bd audit --help`, which tells them to run `bd config set audit.enabled
+            // true` — and bd 1.2.1 answers THAT with `"audit.enabled" is not a
+            // recognized config key` before honouring it anyway. Measured end to end:
+            // the key works, only bd's config-key allowlist disagrees. A reader who is
+            // not told that reasonably concludes the remediation failed and goes hunting
+            // for one that does not exist, which is how this check stayed unrun in the
+            // field. So the fix is named here, warning and all — `pact audit` never
+            // spawns bd, so it cannot check the outcome, only state it accurately.
             out.push(format!(
-                "  no beads data ({reason}) — claim-lease-divergence could not run"
+                "  no beads data ({reason}) — claim-lease-divergence could not run. bd's \
+                 audit sidecar is not recording: turn it on with `BD_AUDIT_ENABLED=1` in \
+                 the environment your agents run bd in, or `bd config set audit.enabled \
+                 true` to persist it — bd 1.2.1 warns that key is unrecognised and then \
+                 honours it, so the warning is not a failure. bd records from that point, \
+                 not retroactively, so this stays empty for work already done"
             ));
             return out.join("\n");
         }

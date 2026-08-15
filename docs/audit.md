@@ -395,20 +395,27 @@ never a false one. Three limits, all verified rather than assumed:
 1. **The export records CHANGES.** A bead assigned at creation and never
    reassigned has no `field=assignee` row and cannot be resolved at all. Measured
    in this repository: 5 of 264 rows are assignee changes; 257 are status.
-2. **The sidecar is opt-in.** bd writes `interactions.jsonl` only when
-   `audit.enabled` is on, and it is **off by default** — verified against bd 1.2.1
-   by running `bd update --assignee` with and without it. In a default bd
-   repository the file never appears and this check reports "no beads data"
-   forever.
+2. **The sidecar is opt-in, and off by default.** bd writes `interactions.jsonl`
+   only when its audit sidecar is recording — verified against bd 1.2.1 (634cbbc4b)
+   by running `bd update --assignee` with and without it. In a default bd repository
+   the file never appears and this check reports "no beads data" forever. Two levers
+   turn it on: `BD_AUDIT_ENABLED=1` in the environment bd runs in, or
+   `bd config set audit.enabled true` to persist it.
 
-   `pact doctor`'s **Beads audit sidecar** check warns when it is not recording,
-   and names the fix (`bd config set audit.enabled true`). Note *recording*, not
-   *present*: it asks bd `config get audit.enabled` rather than looking for the
-   file, because **a sidecar that recorded for a while and then stopped is the
-   dangerous case and looks perfectly healthy to an existence check.** This
-   repository is the proof — 264 rows on disk, `audit.enabled` false, nothing
-   written since 2026-08-12. An existence check calls that clean, and this check
-   would then be judging today's holds against frozen assignees.
+   **bd 1.2.1 warns that `audit.enabled` is "not a recognized config key" and then
+   honours it anyway.** Only bd's config-key allowlist disagrees with the rest of
+   bd, which names the key in `bd audit --help`, in `bd audit record`'s own error
+   text and in the `.beads/config.yaml` it generates. Measured both directions:
+   unset, `bd audit record` exits 1 and no file appears; set — or with the env var
+   — `bd update --assignee` appends the `field_change` row this check replays. Take
+   the warning as cosmetic, not as a failed remediation.
+
+   `pact doctor`'s **Beads audit sidecar** check warns when the file is absent, and
+   names both levers along with that warning. It deliberately does *not* claim
+   recording is currently on: `BD_AUDIT_ENABLED=1` lives in someone else's
+   environment and leaves nothing pact can read, while `bd config get audit.enabled`
+   answers for keys nobody set — so a config-derived verdict is wrong in both
+   directions, and doctor stopped asking for one (pact-83r.6).
 3. **Even recording, it lags.** It is a committed export, so an assignment made in
    the current session may not be in it yet.
 

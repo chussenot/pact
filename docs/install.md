@@ -228,19 +228,32 @@ asks when the task tracker misbehaves:
 There is no tested-version window any more, and nothing warns about one. pact used
 to warn outside `1.1.0 <= v < 1.3.0`, and that warning had earned its place: bd 1.2
 dropped `create --id --force`'s upsert, which pact's idempotent `msg send` was
-built on. The only `bd` calls left are two diagnostics that `pact doctor` runs —
-`bd --version` and `bd config get audit.enabled` — so a version pact has not tested
-cannot break anything, and warning about every future bd release would be noise.
+built on. The only `bd` call left is one diagnostic that `pact doctor` runs —
+`bd --version` — so a version pact has not tested cannot break anything, and
+warning about every future bd release would be noise.
 
 **Two reasons to install it anyway.** It is what agents track work in — the
 protocol pact writes into `AGENTS.md` tells them to. And
 [`pact audit --check claim-lease-divergence`](audit.md#--check-claim-lease-divergence)
 reads bd's committed audit sidecar, `.beads/interactions.jsonl`, which bd only
-writes when `audit.enabled` is on — off by default. Without it that check reports
-"no beads data" and passes, which is why `pact doctor` asks bd whether the sidecar
-is *recording* rather than merely whether the file exists: a sidecar that recorded
-for a while and then stopped looks healthy to an existence check and is not.
-`bd config set audit.enabled true` is the fix doctor names.
+writes when its audit sidecar is recording — off by default. Without it that check
+reports "no beads data" and passes, so `pact doctor` warns when the file is absent.
+
+Turn recording on either way:
+
+```bash
+export BD_AUDIT_ENABLED=1          # per-environment, no config write, no warning
+bd config set audit.enabled true   # persists in .beads/config.yaml
+```
+
+**bd 1.2.1 answers the second one with `Warning: "audit.enabled" is not a
+recognized config key` and then honours it anyway.** The warning is bd's config-key
+allowlist disagreeing with the rest of bd — `bd audit --help`, `bd audit record`'s
+own error text and the `.beads/config.yaml` bd generates all name the key — not the
+switch failing. Verified end to end against bd 1.2.1 (634cbbc4b): with it unset
+`bd audit record` exits 1 and writes nothing; with it set, or with
+`BD_AUDIT_ENABLED=1`, a plain `bd update --assignee` appends the `field_change` row
+this check replays. bd records from that point, not retroactively.
 
 `bd` is Go with an embedded Dolt database, and its store is `.beads/embeddeddolt/`.
 pact walks up from the working directory for the first `.beads/` and reads what made

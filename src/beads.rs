@@ -148,44 +148,6 @@ impl BeadsCli {
         Ok(self.run(repo_root, &["--version"])?.trim().to_string())
     }
 
-    /// Is bd's audit sidecar actually RECORDING, per bd itself?
-    ///
-    /// `Some(true)`/`Some(false)` from `bd config get audit.enabled`; `None` when bd
-    /// could not be asked at all, which is a different answer from "off" and must not
-    /// be reported as one.
-    ///
-    /// **Why a subprocess is right here and nowhere else.** pact-as5 removed bd from
-    /// every pact command's working path, and [`run`](Self::run) is private to keep it
-    /// that way. `doctor` is the exception by definition: its whole job is reporting
-    /// what is installed and how it is configured, and it already spawns bd for
-    /// [`version`](Self::version), so this adds no new dependency class — one more
-    /// question to a process doctor was going to start anyway.
-    ///
-    /// It exists because file existence is the wrong signal. This repository's own
-    /// sidecar EXISTS, with 264 rows, and `audit.enabled` is `false` — so it stopped
-    /// recording on 2026-08-12 and will never gain another row. An existence check
-    /// calls that healthy, which is the exact silence
-    /// [`interaction_assignees`] cannot afford: a check that reports
-    /// "no assignee history" and passes forever is indistinguishable from
-    /// "your fleet never diverged".
-    ///
-    /// bd prints `(not set)` for a key that was never configured and exits 0, which
-    /// reads as disabled — correct, since off is the default.
-    pub fn audit_sidecar_enabled(&self, repo_root: &Path) -> Option<bool> {
-        let out = self
-            .run(repo_root, &["config", "get", "audit.enabled"])
-            .ok()?;
-        let value = out.trim().to_ascii_lowercase();
-        // Match on the whole trimmed value, not a substring: `contains("true")` would
-        // read bd's own "(not set)" prose or a future "default: true" note as an
-        // answer about this repository.
-        match value.as_str() {
-            "true" => Some(true),
-            _ if value.contains("not set") || value == "false" => Some(false),
-            _ => None,
-        }
-    }
-
     /// Run `bd <args>` in `repo_root`, capturing stdout; the backend's own
     /// reason is surfaced on failure, from whichever stream it used.
     ///
@@ -193,7 +155,7 @@ impl BeadsCli {
     /// Beads process, and it has exactly two production callers — both of them
     /// questions `pact doctor` asks about the installation itself:
     /// [`version`](Self::version) and
-    /// [`audit_sidecar_enabled`](Self::audit_sidecar_enabled).
+    /// [`audit_namespace_supported`](Self::audit_namespace_supported).
     ///
     /// Private is the fence, not a coincidence: a `pub` generic subprocess runner is
     /// an open invitation to put `bd` back on a pact command's working path, which is
@@ -692,13 +654,25 @@ pub fn interaction_actors(repo_root: &Path) -> Option<Vec<String>> {
 /// 1. The export records CHANGES. A bead assigned at creation and never reassigned
 ///    has no `field=assignee` row and cannot be resolved at all. Measured in this
 ///    repo: 5 of 264 rows are assignee changes, 257 are status.
-/// 2. **The sidecar is opt-in.** bd writes `interactions.jsonl` only when
-///    `audit.enabled` is true, and it is off by default — bd 1.2.1's own `bd audit
-///    --help` says so, and `bd config get audit.enabled` reports `false` in this
-///    repository. So in a default bd repository the file never appears and every
-///    caller reports "no beads data" forever. `pact doctor`'s `Beads audit
-///    sidecar` check exists to say that out loud instead of leaving the reader to
-///    wonder why a check never fires.
+/// 2. **The sidecar is opt-in, off by default, and enabled by either of two levers
+///    — one of which pact cannot see.** `BD_AUDIT_ENABLED=1` in the environment of
+///    whoever runs bd works with no config write at all, and `bd config set
+///    audit.enabled true` persists it. So in a default bd repository the file never
+///    appears and every caller reports "no beads data" forever, which `pact
+///    doctor`'s `Beads audit sidecar` check exists to say out loud.
+///
+///    The measured detail matters, because pact got it wrong once in the other
+///    direction (pact-83r.6). bd 1.2.1 answers `bd config set audit.enabled true`
+///    with `Warning: "audit.enabled" is not a recognized config key` — and then
+///    exits 0, writes it, and **records from that point**, verified end to end
+///    against bd 1.2.1 (634cbbc4b): with it unset `bd audit record` exits 1 saying
+///    "set audit.enabled=true or BD_AUDIT_ENABLED=1" and writes nothing; with it set
+///    the same command exits 0, and a plain `bd update --assignee` appends the
+///    `kind:"field_change"` row this function replays. Only bd's config-key
+///    allowlist disagrees with the rest of bd — `audit.*` is missing from `bd config
+///    --help`'s namespace list while bd's own generated `.beads/config.yaml`
+///    documents the key in its comments. **The warning is spurious; the switch
+///    works.** Anything pact says here must not tell a reader otherwise.
 /// 3. Even enabled, it is a committed export and lags the live store, so an
 ///    assignment made in the current session may not be visible yet.
 ///
