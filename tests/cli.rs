@@ -1284,6 +1284,145 @@ fn msg_send_body_file_preserves_trailing_blank_lines_and_punctuation() {
     );
 }
 
+/// pact-83r.5: `--body-file -` must not be able to block forever.
+///
+/// UNCONFIRMED as a live bug — it did not reproduce on 0.9.4, and the report's
+/// precondition (a tty on stdin) is not reproducible from a test at all: a
+/// child's stdin here is a pipe or nothing. What IS testable is the bound, and
+/// it is the half that matters, because the hang was reported in `msg send` —
+/// the command an agent uses to report that it is blocked.
+///
+/// A pipe held open and never written to is the shape of the report: a producer
+/// attached, EOF never arriving. `PACT_STDIN_BODY_TIMEOUT_MS` exists so this
+/// takes half a second instead of the real 60.
+#[test]
+fn msg_send_body_file_dash_gives_up_on_stdin_that_never_ends() {
+    let tmp = init_repo();
+    let mut child = pact_cmd(
+        tmp.path(),
+        &["msg", "send", "--to", "reader-agent", "--body-file", "-"],
+    )
+    .env("PACT_AGENT", "sender-agent")
+    .env("PACT_STDIN_BODY_TIMEOUT_MS", "500")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("failed to run pact binary");
+    // The handle is held, not dropped: a pipe open with nothing written and no
+    // EOF coming is exactly the state that used to block forever.
+    let stdin = child.stdin.take().expect("stdin");
+    let out = child.wait_with_output().expect("pact should not hang");
+    drop(stdin);
+
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "giving up must not report success"
+    );
+    let err = stderr_of(&out);
+    assert!(
+        err.contains("no end of input"),
+        "the refusal must say what went wrong: {err}"
+    );
+    assert!(
+        err.contains("--body-file <path>"),
+        "and name the form that works: {err}"
+    );
+    // Nothing was sent, so nothing is waiting for the recipient.
+    let inbox = pact(tmp.path(), "reader-agent", &["msg", "inbox", "--json"]);
+    assert_ok(&inbox);
+    assert_eq!(json_stdout(&inbox).as_array().map(Vec::len), Some(0));
+}
+
+/// Empty stdin is still the existing empty-body error and not a hang: the guard
+/// added for pact-83r.5 must not have swallowed the case that already worked.
+#[test]
+fn msg_send_body_file_dash_still_refuses_an_empty_body() {
+    let tmp = init_repo();
+    let out = pact_cmd(
+        tmp.path(),
+        &["msg", "send", "--to", "reader-agent", "--body-file", "-"],
+    )
+    .env("PACT_AGENT", "sender-agent")
+    .stdin(Stdio::null())
+    .output()
+    .expect("failed to run pact binary");
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        stderr_of(&out).contains("empty message body"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+/// pact-83r.8: `msg read` rendered the body once per RECIPIENT, so reading a
+/// 15-recipient broadcast cost ~15× what it should — on exactly the messages a
+/// fleet's protocol forces to be broadcasts.
+///
+/// The store was never the problem and `--json` is pinned shape, so both halves
+/// are asserted here: the human render collapses, the JSON still fans out.
+#[test]
+fn msg_read_renders_a_broadcast_body_once_but_json_still_fans_out() {
+    let tmp = init_repo();
+    let recipients: Vec<String> = (0..15).map(|i| format!("agent-{i:02}")).collect();
+    let mut args = vec!["msg", "send", "--subject", "MAX_QUADS moved"];
+    for r in &recipients {
+        args.push("--to");
+        args.push(r);
+    }
+    args.push("the visitor signature changed");
+    let sent = pact(tmp.path(), "sender-agent", &args);
+    assert_ok(&sent);
+
+    let id = json_stdout(&pact(
+        tmp.path(),
+        "sender-agent",
+        &["msg", "sent", "--json"],
+    ))[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let read = pact(tmp.path(), "agent-00", &["msg", "read", &id]);
+    assert_ok(&read);
+    let text = stdout_of(&read);
+    assert_eq!(
+        text.matches("the visitor signature changed").count(),
+        1,
+        "the body must appear exactly once: {text}"
+    );
+    for r in &recipients {
+        assert_eq!(text.matches(r.as_str()).count(), 1, "{r} twice in {text}");
+    }
+    assert!(text.contains("read by agent-00"), "{text}");
+    assert!(text.contains("unread by agent-01"), "{text}");
+
+    // --brief: the envelope and the head, still one body.
+    let brief = pact(tmp.path(), "agent-00", &["msg", "read", &id, "--brief"]);
+    assert_ok(&brief);
+    let head = stdout_of(&brief);
+    assert!(head.contains("MAX_QUADS moved"), "{head}");
+    assert_eq!(
+        head.matches("the visitor signature changed").count(),
+        1,
+        "{head}"
+    );
+
+    // The machine shape is untouched: one object per recipient, as pinned.
+    let json = pact(tmp.path(), "agent-00", &["msg", "read", &id, "--json"]);
+    assert_ok(&json);
+    let rows = json_stdout(&json);
+    assert_eq!(rows.as_array().map(Vec::len), Some(recipients.len()));
+    let to: Vec<&str> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["to"].as_str().unwrap())
+        .collect();
+    assert_eq!(to, recipients, "--json must still be one row per recipient");
+}
+
 fn inbox_json(repo: &Path, agent: &str) -> serde_json::Value {
     let out = pact(repo, agent, &["msg", "inbox", "--json"]);
     assert_ok(&out);
