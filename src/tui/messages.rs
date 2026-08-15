@@ -516,6 +516,16 @@ mod tests {
         }
         let mut app = app_at(tmp.path(), None);
 
+        // Asserted separately from the scroll below so a failure says WHICH
+        // precondition broke. A bare "it did not scroll" is the same symptom
+        // whether the store came back empty or the widget declined to move,
+        // and those have nothing to do with each other.
+        assert_eq!(
+            app.messages.rows.len(),
+            40,
+            "the store must have been read before scrolling means anything"
+        );
+
         // Past the bottom of the pane, so the widget must scroll to show it.
         app.messages.list.select(Some(35));
         let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
@@ -526,7 +536,9 @@ mod tests {
         let offset = app.messages.list.offset();
         assert!(
             offset > 0,
-            "the list must have scrolled for this test to mean anything"
+            "render must write the offset back: {} rows, list_area {:?}",
+            app.messages.rows.len(),
+            app.messages.list_area
         );
 
         // Click the first visible data row. It is the row at `offset`, not row 0.
