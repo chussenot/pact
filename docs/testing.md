@@ -153,7 +153,9 @@ shell script would never think to do. This harness would have caught none of it.
 
 So it proves the **primitives** hold under contention, and says nothing about
 whether the protocol *around* them is understandable. Those need real fleets, and
-the evidence habit in the README is still how they get found.
+the evidence habit in the README is still how they get found — see
+[instrumenting a real fleet](#instrumenting-a-real-fleet) for the wrapper that
+makes what a real fleet did measurable instead of remembered.
 
 Narrower limits, all of them real:
 
@@ -351,3 +353,58 @@ records what it broke; whether the fleet then did something sensible is a
 question for `pact audit` over the same window, and ultimately for a human
 reading both logs side by side. The `--seed` and the timestamps are what let you
 line them up.
+
+## Instrumenting a real fleet
+
+The soak and chaos both replace agents with shell workers. The findings the
+harness cannot produce come from real fleets — and those arrive as agent prose,
+which is a bad instrument. [`scripts/pw`](../scripts/pw) is the standard fix, and
+the standard instrumentation for any pact fleet run: prefix every tool call with
+it and each one appends a JSON line recording what ran, how long it took and how
+it exited.
+
+```bash
+pw pact lease acquire src/api.rs --note "..."
+pw bd close treadle-x --reason "..."
+```
+
+```json
+{"at":"2026-08-14T09:12:31Z","agent":"api","tool":"pact","argv":"pact lease acquire src/api.rs --note ...","secs":0.043,"exit":0,"sigpipe":false,"stderr":""}
+```
+
+Logs land in `$PACT_HARNESS_DIR`, or `<repo root>/.harness` — the root pact
+itself resolves, so twenty agents in twenty worktrees write one directory rather
+than twenty. One file per agent (`$AGENT.jsonl`), which is what stops fifty of
+them contending on one log, and the same reasoning as pact's own per-agent read
+cursors. Set `PACT_HARNESS_DIR` to somewhere outside the checkout if you would
+rather the run left nothing in `git status`.
+
+Why it earns its place: run 5's findings were recalled from agent prose and **two
+of them were wrong**. Run 6 wrapped every call — 875 of them — and the log
+overturned both. "pact caps multi-path acquires" was zsh declining to word-split
+an unquoted variable, and "`bd close` fails silently under concurrency" was 46 of
+66 non-zero exits being 141, SIGPIPE from the agent's own `| head`. Neither
+correction was available to anyone reading a transcript.
+
+Three details in it are field evidence, and its comments say so where they sit:
+argv is flattened to one line because a `--reason` containing newlines tore one
+record across many and made 11 of the first 141 unparseable; TAB is stripped
+alongside newline because a raw U+0009 in a JSON string is as invalid as a raw
+newline; and exit 141 is flagged `sigpipe` rather than counted as a failure, so
+analysis can exclude a caller-side `| head` instead of reporting that bd fell
+over. `tests/harness.rs` holds each of those to the log line.
+
+It stays a `bash` script and is deliberately not a pact subcommand: most of its
+value is that it wraps *foreign* tools — in run 6 every call over a second came
+from bd — and pact shelling out to bd in order to time bd would put back the
+dependency 0.9.0 removed.
+
+Reading a run back is `jq`, because the format was chosen for that: slowest calls
+first,
+
+```bash
+jq -s 'sort_by(-.secs)[:10] | .[] | "\(.secs) \(.argv)"' .harness/*.jsonl
+```
+
+and real failures are the non-zero exits with `sigpipe` false — the distinction
+that cost run 5 a finding.
