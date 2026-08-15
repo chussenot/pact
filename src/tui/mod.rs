@@ -2,6 +2,29 @@
 //! (leases, messages) and bd's health. Built on ratatui + its bundled
 //! crossterm backend — reimplementing raw-mode terminal handling and a
 //! render loop by hand would just be a worse copy of what these already do.
+//!
+//! This file owns the process-shaped parts only: terminal setup, `App`, the
+//! event loop, and the dispatch that hands a frame or a keypress to whichever
+//! view is on top of the stack. One screen per module below, so the screens of
+//! one epic can be written in parallel instead of queueing on one file.
+//!
+//! Every module is declared here up front, stub or not: this is the single
+//! contention point in the tree, so nothing later has to edit it merely to
+//! register itself.
+
+// The navigation spine and the helpers both it and every view share.
+mod nav;
+mod widgets;
+
+// The read model each view projects from — parsed once per tick, not per view.
+mod data;
+
+// One module per screen.
+mod activity;
+mod detail;
+mod fleet;
+mod health;
+mod messages;
 
 use std::io::{self, Stdout};
 use std::path::PathBuf;
@@ -160,6 +183,11 @@ struct App {
     unread: usize,
     last_unread_refresh: Instant,
 
+    /// Every store under `.pact/` this dashboard reads, parsed once per tick.
+    /// Views project from here rather than re-reading a file each — see
+    /// `data.rs`.
+    data: data::Store,
+
     status: Option<String>,
     last_refresh: Instant,
 
@@ -197,6 +225,7 @@ impl App {
             // instead of a whole UNREAD_INTERVAL after launch — a message
             // already waiting at startup should show up right away.
             last_unread_refresh: now.checked_sub(UNREAD_INTERVAL).unwrap_or(now),
+            data: data::Store::default(),
             status: None,
             last_refresh: now,
             header_area: Rect::default(),
@@ -204,6 +233,7 @@ impl App {
             hovered_tab: None,
             hovered_row: None,
         };
+        app.data.refresh(&app.repo_root);
         app.refresh_leases();
         app
     }
@@ -234,6 +264,9 @@ impl App {
     }
 
     fn refresh_active_tab(&mut self) {
+        // Once per tick, before any view asks for anything: the whole point of
+        // the read model is that N views cost one parse, not N.
+        self.data.refresh(&self.repo_root);
         match self.tab {
             Tab::Leases => self.refresh_leases(),
             Tab::Messages => self.refresh_messages(),
@@ -1045,6 +1078,7 @@ mod tests {
             doctor_report: None,
             unread: 0,
             last_unread_refresh: Instant::now(),
+            data: data::Store::default(),
             status: None,
             last_refresh: Instant::now(),
             header_area: Rect::new(0, 0, 80, 1),
