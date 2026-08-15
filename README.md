@@ -226,7 +226,7 @@ The full evidence, and the design decisions each run forced, is in the studies:
 | [messaging.md](docs/messaging.md) | the message store, threading, read state, addressing a path, and the 0.9.0 cutover |
 | [architecture.md](docs/architecture.md) | what is stored where, what is committed, and the non-goals in full |
 | [mcp.md](docs/mcp.md) | the optional read-only MCP server: the six tools, and why it cannot write |
-| [tui.md](docs/tui.md) | `pact ui` — tabs, keybindings, and the `ui` build feature |
+| [tui.md](docs/tui.md) | `pact ui` — the four screens, the drill-in stack, keybindings, and the `ui` build feature |
 | [telemetry.md](docs/telemetry.md) | the optional OpenTelemetry export: what leaves the machine and what never does |
 | [watch.md](docs/watch.md) | `pact watch`: subscribing to paths, and why interface notification rides `lease release` instead of asking |
 | [audit.md](docs/audit.md) | `pact audit`: what each check proves, and what it deliberately cannot see |
