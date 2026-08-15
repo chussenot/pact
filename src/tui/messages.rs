@@ -397,10 +397,19 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let list = List::new(items)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("> ");
-    frame.render_stateful_widget(list, inner, &mut app.messages.list.clone());
+    // The REAL state, never a clone: `render_stateful_widget` writes the scroll
+    // offset it computed into whatever it is handed, and `row_at` reads that
+    // offset back off `app.messages.list`. Rendering through a clone dropped it,
+    // pinning the offset at 0, so every click on a scrolled list resolved a
+    // screenful of rows away (pact-2ol).
+    frame.render_stateful_widget(list, inner, &mut app.messages.list);
 }
 
-fn message_list_item<'a>(app: &App, index: usize, row: &'a Row) -> ListItem<'a> {
+/// `'static` rather than borrowing `row`: the content is a `format!`, so it is
+/// owned already, and a borrow here would keep `app` immutably borrowed through
+/// the render call — which is exactly what forced the offset-dropping clone the
+/// caller used to need.
+fn message_list_item(app: &App, index: usize, row: &Row) -> ListItem<'static> {
     let marker = if row.read { "  " } else { "* " };
     let mut style = if row.read {
         Style::default().fg(Color::DarkGray)
@@ -481,6 +490,44 @@ mod tests {
 
     fn lines(app: &App) -> Vec<&str> {
         app.messages.rows.iter().map(|r| r.line.as_str()).collect()
+    }
+
+    /// pact-2ol, in this file. `render_stateful_widget` writes the scroll offset
+    /// it computed into the state it is handed; rendering through a `.clone()`
+    /// dropped it, so `app.messages.list.offset()` — which `row_at` reads — was
+    /// pinned at 0 and every click on a scrolled list resolved a screenful away.
+    ///
+    /// Invisible below one viewport of rows, which is how it survived in two
+    /// call sites: it needs a list longer than the pane to reproduce at all.
+    #[test]
+    fn a_click_on_a_scrolled_list_lands_on_the_row_under_the_cursor() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let tmp = repo();
+        for i in 0..40 {
+            send(tmp.path(), "agent-a", "agent-b", &format!("subject {i:02}"), false);
+        }
+        let mut app = app_at(tmp.path(), None);
+
+        // Past the bottom of the pane, so the widget must scroll to show it.
+        app.messages.list.select(Some(35));
+        let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
+        terminal.draw(|frame| super::super::draw(frame, &mut app)).unwrap();
+
+        let offset = app.messages.list.offset();
+        assert!(
+            offset > 0,
+            "the list must have scrolled for this test to mean anything"
+        );
+
+        // Click the first visible data row. It is the row at `offset`, not row 0.
+        // x from the rect, not 0: the list is inside a bordered block, so column
+        // 0 is the border and hit-tests to None.
+        let y = app.messages.list_area.y;
+        let x = app.messages.list_area.x;
+        let hit = row_at(&app, x, y).expect("a row under the cursor");
+        assert_eq!(hit, offset, "click resolved {hit}, cursor was over {offset}");
     }
 
     /// The headline defect: the operator is not a fleet member, and with no
