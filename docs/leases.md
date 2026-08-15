@@ -469,6 +469,37 @@ Recalibrating is a measurement rather than a guess, and safely so:
 [`pact audit --check stale-holds`](audit.md#--check-stale-holds) judges each hold
 against the TTL **it recorded**, so moving the default cannot rewrite the past.
 
+### `--ttl` takes a duration, and a small bare number warns
+
+`--ttl` accepts the same `<n><unit>` grammar as
+[`pact audit --since`](audit.md) — `s`, `m`, `h`, `d`, `w` — so `--ttl 45m`,
+`--ttl 2h` and `--ttl 1d` all mean what they read as. It did not, once, and the
+inconsistency was the trap: an agent passed `--ttl 20` meaning twenty minutes,
+got twenty seconds, and its lease lapsed mid-work. A second tried `--ttl 3m` and
+had it rejected, because `--ttl` was bare seconds while every other duration in
+pact took units.
+
+The damage was not the short lease. It was what an *expiry* costs that a release
+does not: the agent's commit landed under a lease that had already lapsed, which
+[`--check commit-correlation`](audit.md#--check-commit-correlation) reports as a
+commit nobody held, and because the lease expired rather than being released,
+every [`pact watch`](watch.md) subscriber on that path got no release diff. The
+watch guarantee did not fire and nothing said so.
+
+A bare number still means seconds — scripts pass them, and `--ttl 2700` has to
+keep working — so `--ttl 20` will go on meaning twenty seconds forever. Being
+told is therefore the only thing that saves the next agent, and a bare value
+under 120 prints a warning naming the unit it was read as and the spelling that
+would have meant minutes. It **warns and holds anyway**, because a 20-second
+lease is a real idiom: a short mutex over a directory some tool is about to write
+behind you, blessed as `pact-b7x.3` and visible in `pact audit` as its own
+category rather than as contention. An explicit `--ttl 20s` never warns; saying
+the unit is how you say you meant it.
+
+One grammar, not two: `src/lease.rs`'s unit table is the same as
+`audit::parse_since`'s, and `ttl_grammar_matches_since_grammar` fails if either
+is edited alone.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Free
@@ -633,8 +664,9 @@ labels, the sweep, `pact audit` — has to know either mechanism exists.
 
 ### `--ttl` has no upper bound, but expiry math does
 
-`--ttl` takes a bare `u64` with no range check — nothing stops `--ttl
-18446744073709551615`. `ttl_secs` feeds `chrono::Duration::seconds` as an
+`--ttl` has no range check — nothing stops `--ttl 18446744073709551615`, and
+the duration grammar above only widens that (`--ttl 99999999999w` saturates
+rather than erroring). `ttl_secs` feeds `chrono::Duration::seconds` as an
 `i64`, though, and a bit-for-bit cast turns any value at or past 2^63 negative:
 a lease asked to last "forever" used to read back as already expired the
 instant anything checked it. `ttl_as_i64` (`src/lease.rs`) is the one

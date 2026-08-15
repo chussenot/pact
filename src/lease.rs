@@ -70,6 +70,64 @@ pub fn ttl_as_i64(ttl_secs: u64) -> i64 {
         .min(MAX_TTL_SECS)
 }
 
+/// Below this, a *unitless* `--ttl` is more likely a typo than an intent, and
+/// says so. Two minutes: long enough that no plausible "I meant minutes" slip
+/// lands above it, short enough that the deliberate short-mutex idiom below is
+/// the only thing it ever catches.
+const BARE_TTL_SUSPICIOUS_SECS: u64 = 120;
+
+/// `--ttl`: bare seconds, or `<n><unit>` with unit in `smhdw` — the same
+/// duration grammar [`crate::audit::parse_since`] takes.
+///
+/// The unit table is deliberately identical to `parse_since`'s, because two
+/// duration dialects in one CLI is how this became a trap: an agent passed
+/// `--ttl 20` meaning twenty minutes, got twenty seconds, and its lease lapsed
+/// mid-work — so the commit landed under an expired lease, and because the
+/// lease *expired* rather than being released, every `pact watch` subscriber on
+/// that path got no release diff. A second agent tried `--ttl 3m` and had it
+/// rejected. `ttl_grammar_matches_since_grammar` fails if the two ever drift.
+///
+/// A bare integer still means seconds — scripts pass them and `--ttl 2700` must
+/// keep working — so `--ttl 20` will go on meaning twenty seconds forever. Being
+/// told is therefore the only thing that saves the next agent, which is why a
+/// small bare value warns. It warns rather than rejects: a 20-second lease is a
+/// blessed idiom (pact-b7x.3) for a short mutex over a directory some tool is
+/// about to write behind you.
+pub fn parse_ttl(s: &str) -> Result<u64> {
+    let t = s.trim();
+    let (num, unit) = t.split_at(t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len()));
+    let n: u64 = num
+        .parse()
+        .with_context(|| format!("--ttl {t}: expected seconds or a duration like 45m"))?;
+    let mult = match unit {
+        "" => {
+            if n < BARE_TTL_SUSPICIOUS_SECS {
+                crate::output::warn(&format!(
+                    "warning: --ttl {n} means {n} SECONDS ({}). --ttl takes seconds when \
+                     bare, or a unit: {n}m, {n}h, {n}d, {n}w. Holding anyway — if you meant \
+                     a short mutex, this is right; if you meant minutes, say {n}m.",
+                    human_secs(n as i64)
+                ));
+            }
+            1
+        }
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        "w" => 604800,
+        other => {
+            return Err(anyhow::anyhow!(
+                "--ttl {t}: unknown unit \"{other}\"; use s, m, h, d or w"
+            ))
+        }
+    };
+    // Saturate rather than reject: `ttl_as_i64` already clamps to MAX_TTL_SECS,
+    // so an absurd input lands on "forever" exactly as `--ttl 99999999999` did
+    // before this parser existed.
+    Ok(n.saturating_mul(mult))
+}
+
 /// Sanity bound on how old a lease's computed age may plausibly be before
 /// `is_expired` trusts it enough to auto-reclaim (pact-m7j.4.4, forward clock
 /// jump).
@@ -3030,6 +3088,45 @@ mod tests {
         assert_eq!(human_secs(59), "59s");
         assert_eq!(human_secs(125), "2m5s");
         assert_eq!(human_secs(3725), "1h2m");
+    }
+
+    #[test]
+    fn ttl_takes_units_and_bare_seconds() {
+        assert_eq!(parse_ttl("3m").unwrap(), 180);
+        assert_eq!(parse_ttl("90m").unwrap(), 5400);
+        assert_eq!(parse_ttl("24h").unwrap(), 86400);
+        assert_eq!(parse_ttl("7d").unwrap(), 604800);
+        assert_eq!(parse_ttl("2w").unwrap(), 1209600);
+        assert_eq!(parse_ttl("45s").unwrap(), 45);
+        // Bare is seconds, unchanged — including the default and the blessed
+        // short-mutex idiom, which must still SUCCEED, not just warn.
+        assert_eq!(parse_ttl("2700").unwrap(), DEFAULT_TTL_SECS);
+        assert_eq!(parse_ttl("20").unwrap(), 20);
+        assert_eq!(parse_ttl(" 3m ").unwrap(), 180);
+        // Absurd values saturate onto "forever" rather than erroring, because
+        // `ttl_as_i64` clamps and that is what `--ttl 99999999999` already did.
+        assert!(ttl_as_i64(parse_ttl("99999999999w").unwrap()) == MAX_TTL_SECS);
+
+        for bad in ["3q", "m", "", "3 m", "-5", "3.5h", "1h30m"] {
+            assert!(parse_ttl(bad).is_err(), "{bad} should not parse");
+        }
+    }
+
+    /// The whole point of finding 7: `--ttl` and `--since` must not be two
+    /// dialects. This fails the day either unit table is edited alone.
+    #[test]
+    fn ttl_grammar_matches_since_grammar() {
+        for d in ["45s", "3m", "90m", "24h", "7d", "2w"] {
+            let back = (Utc::now() - crate::audit::parse_since(d).unwrap()).num_seconds();
+            let ttl = parse_ttl(d).unwrap() as i64;
+            assert!(
+                (ttl - back).abs() <= 1,
+                "--ttl {d} = {ttl}s but --since {d} = {back}s back"
+            );
+        }
+        // ...and both reject the same unit.
+        assert!(parse_ttl("3y").is_err());
+        assert!(crate::audit::parse_since("3y").is_err());
     }
 
     #[test]
