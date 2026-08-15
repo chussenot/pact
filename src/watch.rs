@@ -394,6 +394,22 @@ pub fn notify_release(repo_root: &Path, holder: &str, released: &str, old_hash: 
         .map(|d| cap(&d, head.as_deref()))
         .unwrap_or_else(|| "(git produced no diff for this change)".to_string());
 
+    // The branch the holder is on, and only when this repository actually has
+    // linked worktrees — the same gate `lease::worktree_stamp` applies to the
+    // lock's `branch` field, resolved from the same `repo_root`, in the same
+    // process, so the two cannot disagree.
+    //
+    // The gate is the whole point rather than a byte-compat detail (pact-83r.9 /
+    // finding 9). In a single checkout the notice IS a code delivery: the diff
+    // describes the file sitting in the reader's own tree. In a worktree fleet it
+    // can never be — the holder wrote it on their branch in their worktree, so
+    // nothing arrives under the reader until that branch merges and they merge
+    // that. An agent that had subscribed exactly as the protocol asks worked this
+    // out for itself and killed the waiter it had started; the notice had given it
+    // no reason to expect otherwise.
+    let ctx = crate::repo::RepoContext::resolve(repo_root);
+    let holder_branch = ctx.has_worktrees.then(|| ctx.branch()).flatten();
+
     let about = [released.to_string()];
     // Built with the shared marker, because `pact msg inbox` parses the path
     // back out of it to group notices per path (pact-mqw.5). The const is the
@@ -405,7 +421,7 @@ pub fn notify_release(repo_root: &Path, holder: &str, released: &str, old_hash: 
          {diff}\n\
          \n\
          Holder's HEAD at release: {}\n\
-         \n\
+         {}\n\
          Questions, or a contract you need changed back? Reply to {holder} in \
          THIS thread — `pact msg inbox` shows its id, then \
          `pact msg send --to {holder} --thread <id> \"...\"`. A reply without \
@@ -414,7 +430,17 @@ pub fn notify_release(repo_root: &Path, holder: &str, released: &str, old_hash: 
          \n\
          You are receiving this because you ran `pact watch add`. \
          `pact watch rm {released}` stops it.",
-        head.as_deref().unwrap_or("(unknown)")
+        head.as_deref().unwrap_or("(unknown)"),
+        match &holder_branch {
+            Some(b) => format!(
+                "\nThis is a contract notice, not a code delivery: {holder} wrote this on \
+                 branch {b}, in their own worktree. It cannot appear in your tree until {b} \
+                 merges and you merge that. Read the diff for what the contract now says and \
+                 carry on — the file will not change under you, so there is nothing to wait \
+                 for.\n"
+            ),
+            None => String::new(),
+        }
     );
 
     // No backend to locate any more (pact-as5.4). Delivery used to begin by finding

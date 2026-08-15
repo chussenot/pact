@@ -813,6 +813,76 @@ fn the_fallback_warning_prints_only_once_per_invocation() {
     );
 }
 
+/// pact-83r.9 / finding 9. A subscriber who did exactly what the protocol asks
+/// — `watch add` on an interface it depended on but did not own — received a
+/// diff of a file that could never appear in its tree, because the author wrote
+/// it on their branch in their worktree. It worked that out for itself, wrote
+/// "their file can never reach mine; waiting was structurally pointless", and
+/// killed the waiter it had started.
+///
+/// So the notice names the branch and says what it is. Both halves of the gate
+/// are asserted together, because the gate is the claim: in a plain checkout the
+/// notice really IS a code delivery — the diff describes the file already in the
+/// reader's tree — and the paragraph would be a lie there.
+#[test]
+fn a_release_notice_is_a_contract_notice_only_where_worktrees_make_it_one() {
+    if !have_git() {
+        eprintln!("SKIP: no git on PATH");
+        return;
+    }
+
+    let (_tmp, main, wt) = repo_with_worktree("fleet/api", "wt-api");
+    assert!(pact(&main, "watcher", &["watch", "add", "src/api.ts"])
+        .status
+        .success());
+    let acquired = pact(&wt, "author", &["lease", "acquire", "src/api.ts"]);
+    assert!(acquired.status.success(), "{}", stderr(&acquired));
+    std::fs::write(wt.join("src/api.ts"), "export const x = 2;\n").unwrap();
+    let released = pact(&wt, "author", &["lease", "release", "src/api.ts"]);
+    assert!(released.status.success(), "{}", stderr(&released));
+
+    // The store, not `msg inbox`: the claim is about the delivered body, and
+    // inbox collapses notices to one row per path.
+    let store = std::fs::read_to_string(main.join(".pact/messages.jsonl")).unwrap();
+    assert!(
+        store.contains("contract notice, not a code delivery"),
+        "the notice must say what it is: {store}"
+    );
+    assert!(
+        store.contains("branch fleet/api"),
+        "and name the branch that carries the change: {store}"
+    );
+
+    // Same release, in a repository git has never given a linked worktree.
+    let plain = tempfile::tempdir().unwrap();
+    let root = plain.path().canonicalize().unwrap();
+    git_ok(&root, &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/api.ts"), "export const x = 1;\n").unwrap();
+    git_ok(&root, &["add", "."]);
+    git_ok(&root, &["commit", "--quiet", "-m", "initial"]);
+
+    assert!(pact(&root, "watcher", &["watch", "add", "src/api.ts"])
+        .status
+        .success());
+    assert!(pact(&root, "author", &["lease", "acquire", "src/api.ts"])
+        .status
+        .success());
+    std::fs::write(root.join("src/api.ts"), "export const x = 2;\n").unwrap();
+    let released = pact(&root, "author", &["lease", "release", "src/api.ts"]);
+    assert!(released.status.success(), "{}", stderr(&released));
+
+    let store = std::fs::read_to_string(root.join(".pact/messages.jsonl")).unwrap();
+    assert!(
+        store.contains("released src/api.ts"),
+        "a notice was still delivered: {store}"
+    );
+    assert!(
+        !store.contains("contract notice"),
+        "but here the diff IS the file in the reader's tree: {store}"
+    );
+}
+
 /// The zero-change claim, from the outside: an ordinary checkout reports no
 /// worktree, keeps state at `<root>/.pact`, and writes lock files with no
 /// `branch`/`worktree` keys at all — not null, absent.
