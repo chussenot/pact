@@ -10,6 +10,16 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.10.1 - 2026-08-15
+#### Bug Fixes
+- **(ui)** restore the scrolled-click test a bad insertion orphaned - (756f763) - Clement HUSSENOT-DESENONGES
+- **(ui)** the waiting-on panel states its bound where it cannot be clipped - (7bfad45) - Clement HUSSENOT-DESENONGES
+- **(ui)** Health judges the run, not every event ever recorded - (305c3c4) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- Add pact and beads files - (63553e4) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.10.0 - 2026-08-15
 #### Bug Fixes
 - **(ui)** the message pane no longer requires bd to be installed - (108de58) - Clement HUSSENOT-DESENONGES
