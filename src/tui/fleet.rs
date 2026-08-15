@@ -34,6 +34,7 @@ use super::data::{Blocked, WaitingOn, DEFAULT_GRACE_SECS};
 use super::nav::View;
 use super::widgets;
 use super::App;
+use crate::agents::AgentInfo;
 use crate::lease::{self, LeaseEntry};
 
 /// Total width of the roster column, its separating rule included.
@@ -127,6 +128,11 @@ pub fn refresh(app: &mut App) {
     reselect_roster(app);
     reselect_work(app);
 
+    // The "n of m shown" indicator, over the lease table: sixty leases in one
+    // path-sorted table is the case `/` exists for.
+    let (shown, total) = (work_rows(app).len(), scoped_rows(app).len());
+    app.filter.note(shown, total);
+
     // What `agents::list()` and friends would have written to stderr. Never
     // over the force-release prompt, which is the one status an operator is
     // mid-decision on.
@@ -141,7 +147,7 @@ pub fn refresh(app: &mut App) {
 /// agent that has fallen out of the roster entirely falls back to `(all
 /// leases)`, which is the row that can never disappear.
 fn reselect_roster(app: &mut App) {
-    let names: Vec<String> = app.data.roster().iter().map(|a| a.name.clone()).collect();
+    let names: Vec<String> = roster_rows(app).iter().map(|a| a.name.clone()).collect();
     app.fleet.agent = app.fleet.agent.take().filter(|a| names.contains(a));
     let index = match (&app.fleet.agent, names.is_empty()) {
         (_, true) => None,
@@ -234,10 +240,27 @@ pub fn help() -> &'static str {
 /// between, so the pane folds away and the lease table takes the whole width
 /// rather than sitting next to a column containing one dummy row.
 fn roster_len(app: &App) -> usize {
-    match app.data.roster().len() {
+    match roster_rows(app).len() {
         0 => 0,
         n => n + 1,
     }
+}
+
+/// The roster as rendered, narrowed by the filter — and the ONE list every
+/// index on this pane means, so `row_at`, `select`, `on_enter` and rendering
+/// cannot disagree about which agent row 3 is.
+///
+/// The selected agent is never filtered out from under the cursor. It scopes
+/// the whole right-hand pane, so hiding it would silently re-scope the screen
+/// to `(all leases)` while the operator was typing a path.
+fn roster_rows(app: &App) -> Vec<&AgentInfo> {
+    app.data
+        .roster()
+        .iter()
+        .filter(|a| {
+            app.filter.matches(&[&a.name]) || app.fleet.agent.as_deref() == Some(a.name.as_str())
+        })
+        .collect()
 }
 
 /// Where the keyboard actually is. With no roster there is only one list, so a
@@ -250,8 +273,9 @@ fn focus(app: &App) -> Focus {
     }
 }
 
-/// The leases the right pane shows: the selected agent's, or all of them.
-fn work_rows(app: &App) -> Vec<&LeaseEntry> {
+/// The leases the right pane shows: the selected agent's, or all of them —
+/// before the filter, which is what "of m" in the indicator counts.
+fn scoped_rows(app: &App) -> Vec<&LeaseEntry> {
     match app.fleet.agent.as_deref() {
         Some(agent) => app
             .fleet
@@ -263,12 +287,33 @@ fn work_rows(app: &App) -> Vec<&LeaseEntry> {
     }
 }
 
+/// The rows the lease table actually shows. Narrowed HERE, at the one place
+/// this pane is projected, so the filtered list is the list `row_at` hit-tests
+/// and `select` indexes into — a filter applied at render time only is a click
+/// landing on a different lease than the cursor, with `x` one key away.
+///
+/// A lease exposes its path, its holder and its note: "who has src/lease.rs",
+/// "what is docs-story holding" and "which of these are about the parser" are
+/// the three questions a sixty-row table cannot answer by eye.
+fn work_rows(app: &App) -> Vec<&LeaseEntry> {
+    scoped_rows(app)
+        .into_iter()
+        .filter(|e| {
+            app.filter.matches(&[
+                &e.lease.path,
+                &e.lease.agent,
+                e.lease.note.as_deref().unwrap_or(""),
+            ])
+        })
+        .collect()
+}
+
 /// The agent on the selected roster row, or `None` on the `(all leases)` row.
 fn selected_agent(app: &App) -> Option<String> {
     app.fleet
         .roster
         .selected()
-        .and_then(|i| app.data.roster().get(i))
+        .and_then(|i| roster_rows(app).get(i).copied())
         .map(|a| a.name.clone())
 }
 
@@ -287,7 +332,7 @@ fn select_work(app: &mut App, index: Option<usize>) {
 
 fn select_roster(app: &mut App, index: Option<usize>) {
     let agent = index
-        .and_then(|i| app.data.roster().get(i))
+        .and_then(|i| roster_rows(app).get(i).copied())
         .map(|a| a.name.clone());
     app.fleet.roster.select(index);
     if app.fleet.agent == agent {
@@ -484,10 +529,8 @@ fn render_roster(frame: &mut Frame, area: Rect, app: &mut App) {
         .style(Style::default().add_modifier(Modifier::BOLD));
 
     let now = Utc::now();
-    let mut rows: Vec<Row<'static>> = app
-        .data
-        .roster()
-        .iter()
+    let mut rows: Vec<Row<'static>> = roster_rows(app)
+        .into_iter()
         .enumerate()
         .map(|(index, info)| {
             // A name that cannot pass `identity::validate` is one no pact
@@ -1180,6 +1223,116 @@ mod tests {
         // And so does a terminal too narrow to split.
         let narrow = Rect::new(0, 3, 60, 16);
         assert_eq!(columns(narrow, 4), (None, narrow));
+    }
+
+    /// Type a query straight into the shared filter — the path mod.rs's key
+    /// handler takes — without going through `refresh`, which would re-read the
+    /// (lock-file-free) fixture and drop the seeded leases.
+    fn query(app: &mut App, text: &str) {
+        app.filter.open();
+        for c in text.chars() {
+            app.filter.key(KeyCode::Char(c));
+        }
+    }
+
+    /// pact-pyt.9: sixty leases in one path-sorted table is the case this
+    /// exists for. A lease is matched on any of the three things an operator
+    /// looks for it by.
+    #[test]
+    fn the_filter_narrows_the_lease_table_by_path_holder_or_note() {
+        let tmp = fixture();
+        let mut noted = entry("quern", "src/audit.rs", 120);
+        noted.lease.note = Some("rewriting the summary".to_string());
+        let mut app = app(
+            tmp.path(),
+            Some("operator"),
+            vec![entry("orchestrator", "docs/tui.md", 600), noted],
+        );
+        assert_eq!(work_rows(&app).len(), 2);
+
+        query(&mut app, "docs/");
+        assert_eq!(work_rows(&app).len(), 1, "by path");
+        app.filter.clear();
+
+        query(&mut app, "quern");
+        assert_eq!(work_rows(&app).len(), 1, "by holder");
+        app.filter.clear();
+
+        query(&mut app, "summary");
+        assert_eq!(work_rows(&app).len(), 1, "by note");
+    }
+
+    /// The pact-2ol class of defect, which cost this fleet two gate cycles: a
+    /// click must land on the row the cursor is over, and `row_at`'s index must
+    /// be into the same list `select` indexes into — on a screen where a key
+    /// away is `x`.
+    #[test]
+    fn a_click_on_a_filtered_table_selects_the_lease_under_the_cursor() {
+        let tmp = fixture();
+        let mut app = app(
+            tmp.path(),
+            Some("operator"),
+            vec![
+                entry("orchestrator", "docs/tui.md", 600),
+                entry("quern", "src/audit.rs", 120),
+                entry("quern", "src/audit_test.rs", 130),
+            ],
+        );
+        // `(all leases)`, so the work pane is the whole table.
+        let all = roster_len(&app) - 1;
+        select(&mut app, all);
+        query(&mut app, "src/");
+
+        let (_, work) = columns(app.content_area, roster_len(&app));
+        // The second row of what is DRAWN is src/audit_test.rs — the second row
+        // of the unfiltered table is src/audit.rs, which is what an index into
+        // the wrong list would select.
+        let y = work.y + 1 + 1;
+        let index = row_at(&app, work.x, y).expect("a data row");
+        select(&mut app, index);
+        assert_eq!(app.fleet.selected.as_deref(), Some("src/audit_test.rs"));
+
+        // And past the end of the narrowed table nothing is hit, rather than a
+        // row that is only there when the filter is off.
+        assert_eq!(row_at(&app, work.x, work.y + 1 + 2), None);
+    }
+
+    /// A filter must not silently re-scope the screen. The roster row that is
+    /// selected drives the whole right pane, so it stays visible whatever the
+    /// query — otherwise typing a path would drop you back to `(all leases)`
+    /// and widen the very table you were narrowing.
+    #[test]
+    fn narrowing_the_roster_never_hides_the_agent_the_work_pane_is_scoped_to() {
+        let tmp = fixture();
+        let mut app = app(
+            tmp.path(),
+            Some("operator"),
+            vec![entry("orchestrator", "docs/tui.md", 600)],
+        );
+        let index = roster_rows(&app)
+            .iter()
+            .position(|a| a.name == "orchestrator")
+            .unwrap();
+        select(&mut app, index);
+        assert_eq!(app.fleet.agent.as_deref(), Some("orchestrator"));
+
+        query(&mut app, "docs/tui.md");
+        let names: Vec<&str> = roster_rows(&app).iter().map(|a| a.name.as_str()).collect();
+        assert!(
+            names.contains(&"orchestrator"),
+            "the selected agent stays: {names:?}"
+        );
+        assert!(
+            !names.contains(&"poller"),
+            "everyone else narrows: {names:?}"
+        );
+
+        // And the cursor is still on that agent, not on whoever moved up into
+        // its row number.
+        reselect_roster(&mut app);
+        assert_eq!(app.fleet.agent.as_deref(), Some("orchestrator"));
+        let row = app.fleet.roster.selected().unwrap();
+        assert_eq!(roster_rows(&app)[row].name, "orchestrator");
     }
 
     /// The waiting-on panel never takes the table's header and first rows with

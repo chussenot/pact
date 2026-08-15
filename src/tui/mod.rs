@@ -82,7 +82,8 @@ const EXPORT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// The keys that mean the same thing on every screen, and therefore belong in
 /// the help line after whatever the current screen adds.
-const GLOBAL_HELP: &str = "enter: open  esc: back  tab: screen  1-4: jump  r: refresh  q: quit";
+const GLOBAL_HELP: &str =
+    "enter: open  esc: back  tab: screen  1-4: jump  /: filter  r: refresh  q: quit";
 
 /// Hand a call to whichever module owns the current screen.
 ///
@@ -150,6 +151,12 @@ struct App {
     /// Views project from here rather than re-reading a file each.
     data: data::Store,
 
+    /// The incremental filter over whatever list is focused. One, on `App`,
+    /// because the query, the narrowing and Esc's meaning are the same on every
+    /// screen; only which fields a row exposes is per-screen. It belongs to the
+    /// list it was typed over, so every navigation clears it.
+    filter: widgets::Filter,
+
     // One per screen, each owned by its own module.
     fleet: fleet::State,
     messages: messages::State,
@@ -184,6 +191,7 @@ impl App {
             agent,
             nav: Nav::default(),
             data: data::Store::default(),
+            filter: widgets::Filter::default(),
             fleet: fleet::State::default(),
             activity: activity::State::default(),
             messages: messages::State::default(),
@@ -207,8 +215,7 @@ impl App {
         // Once per tick, before any view asks for anything: the whole point of
         // the read model is that N views cost one parse, not N.
         self.data.refresh(&self.repo_root);
-        let screen = self.nav.current().screen();
-        dispatch!(screen, refresh(self));
+        self.reproject();
         messages::refresh_unread_if_due(self);
         // Same reasoning, second badge: the Health indicator has to be current
         // from ANY screen — an operator who never opens Health would otherwise
@@ -219,6 +226,15 @@ impl App {
         self.last_refresh = Instant::now();
     }
 
+    /// Re-project the current view from the read model **without re-reading
+    /// it**. This is what a filter keystroke runs: narrowing is over rows that
+    /// were already parsed this tick, so typing costs one projection, not one
+    /// parse of every store per character.
+    fn reproject(&mut self) {
+        let screen = self.nav.current().screen();
+        dispatch!(screen, refresh(self));
+    }
+
     /// Enter: drill in. Never mutates — `on_enter` takes `&App`, so that is a
     /// compile error rather than a code review.
     fn open_selected(&mut self) {
@@ -227,6 +243,9 @@ impl App {
             self.nav.push(view);
             self.status = None;
             self.hovered_row = None;
+            // A query belongs to the list it was typed over; the view being
+            // opened has a different one.
+            self.filter.clear();
             self.refresh_current_view();
         }
     }
@@ -238,7 +257,15 @@ impl App {
     /// anything else: it clears an armed force-release and the status line,
     /// which is the transient state a user pressing Esc at the top is asking to
     /// be rid of.
+    ///
+    /// An open filter is cleared FIRST, before anything is popped. Esc still
+    /// means exactly one thing — get rid of the transient state in front of you
+    /// — and the filter is what is in front of the view stack.
     fn back(&mut self) {
+        if self.filter.clear() {
+            self.reproject();
+            return;
+        }
         if self.nav.pop() {
             self.status = None;
             self.hovered_row = None;
@@ -260,6 +287,7 @@ impl App {
         }
         self.nav.set_root(root.clone());
         self.status = None;
+        self.filter.clear();
         // Stale from the previous screen's list — cleared here rather than left
         // to the next mouse-move event, so a keyboard-driven switch never shows
         // a leftover highlight on an unrelated row.
@@ -319,7 +347,7 @@ fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if is_quit(key.code, key.modifiers) {
+                    if is_quit(key.code, key.modifiers, app.filter.is_open()) {
                         return Ok(());
                     }
                     handle_key(app, key.code);
@@ -337,7 +365,25 @@ fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
 /// else belongs to the current view, movement included, because movement is
 /// selection state and selection state belongs to the list that owns it.
 fn handle_key(app: &mut App, code: KeyCode) {
+    // While the filter is open every printable key types, including the ones
+    // that are commands otherwise — `x` above all, which releases a lease. The
+    // keys that are not characters (arrows, Enter, Tab, Esc) keep working, so
+    // you can still move, open and go back mid-query.
+    if app.filter.key(code) {
+        // Narrowing moves the list under the cursor, and an armed release is
+        // against a row the operator was looking at before that.
+        fleet::cancel_confirm(app);
+        app.reproject();
+        return;
+    }
     match code {
+        // Only ever reached with the filter closed — an open one took the key
+        // above, so a `/` inside a query is a character like any other.
+        KeyCode::Char('/') => {
+            app.filter.open();
+            app.status = None;
+            return app.reproject();
+        }
         KeyCode::Tab => return app.cycle_root(1),
         KeyCode::BackTab => return app.cycle_root(-1),
         KeyCode::Char(c @ '1'..='4') => {
@@ -411,9 +457,12 @@ fn update_hover(app: &mut App, x: u16, y: u16) {
     };
 }
 
-fn is_quit(code: KeyCode, modifiers: KeyModifiers) -> bool {
-    matches!(code, KeyCode::Char('q'))
-        || (matches!(code, KeyCode::Char('c')) && modifiers.contains(KeyModifiers::CONTROL))
+/// Ctrl-C always quits. Bare `q` quits only when no filter is open — while one
+/// is, every printable key types, and a dashboard that exited because the
+/// operator searched for "queue" would be worse than useless.
+fn is_quit(code: KeyCode, modifiers: KeyModifiers, filtering: bool) -> bool {
+    (matches!(code, KeyCode::Char('c')) && modifiers.contains(KeyModifiers::CONTROL))
+        || (!filtering && matches!(code, KeyCode::Char('q')))
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
@@ -491,6 +540,16 @@ fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
+    // The filter takes the status bar over rather than drawing a bar of its
+    // own: a line inside the content area would push every row down one while
+    // `row_at` kept the old arithmetic, and a click would land on the wrong row.
+    if let Some(indicator) = app.filter.indicator() {
+        frame.render_widget(
+            Paragraph::new(Line::from(indicator)).style(Style::default().fg(Color::Cyan)),
+            area,
+        );
+        return;
+    }
     let screen = app.nav.current().screen();
     let help = format!("{}  {GLOBAL_HELP}", dispatch!(screen, help()));
     let line = match &app.status {
@@ -544,6 +603,7 @@ mod tests {
             agent: agent.map(str::to_string),
             nav: Nav::default(),
             data: data::Store::default(),
+            filter: widgets::Filter::default(),
             fleet: fleet::State::default(),
             activity: activity::State::default(),
             messages: messages::State::default(),
@@ -576,11 +636,20 @@ mod tests {
 
     #[test]
     fn quits_on_q_or_ctrl_c_only() {
-        assert!(is_quit(KeyCode::Char('q'), KeyModifiers::NONE));
-        assert!(is_quit(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        assert!(!is_quit(KeyCode::Char('c'), KeyModifiers::NONE));
-        assert!(!is_quit(KeyCode::Char('x'), KeyModifiers::NONE));
-        assert!(!is_quit(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(is_quit(KeyCode::Char('q'), KeyModifiers::NONE, false));
+        assert!(is_quit(KeyCode::Char('c'), KeyModifiers::CONTROL, false));
+        assert!(!is_quit(KeyCode::Char('c'), KeyModifiers::NONE, false));
+        assert!(!is_quit(KeyCode::Char('x'), KeyModifiers::NONE, false));
+        assert!(!is_quit(KeyCode::Enter, KeyModifiers::NONE, false));
+    }
+
+    /// Every printable key types while the filter is open, `q` included — a
+    /// dashboard that exited because the operator searched for "queue" would be
+    /// worse than no filter. Ctrl-C is not a character and still quits.
+    #[test]
+    fn a_bare_q_types_while_filtering_but_ctrl_c_still_quits() {
+        assert!(!is_quit(KeyCode::Char('q'), KeyModifiers::NONE, true));
+        assert!(is_quit(KeyCode::Char('c'), KeyModifiers::CONTROL, true));
     }
 
     /// The spine, through the key handler an operator actually presses.
@@ -1008,6 +1077,167 @@ mod tests {
 
         handle_key(&mut app, KeyCode::Esc);
         assert_eq!(app.nav.current(), &View::Messages);
+    }
+
+    /// pact-pyt.9 end to end, through the keys an operator presses, on a REAL
+    /// store: `/`, incremental narrowing, the indicator, and Esc clearing the
+    /// filter before it pops anything.
+    #[test]
+    fn slash_filters_the_focused_list_and_esc_clears_before_it_navigates() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        for (from, subject) in [
+            ("agent-b", "renamed foo()"),
+            ("agent-c", "the parser is mine"),
+            ("agent-d", "renamed bar()"),
+        ] {
+            msg::send(
+                tmp.path(),
+                from,
+                &["agent-a".to_string()],
+                msg::Draft {
+                    thread: None,
+                    subject: Some(subject),
+                    body: "body",
+                    about: &[],
+                    notice: false,
+                },
+            )
+            .unwrap();
+        }
+
+        let mut app = app_with(Some("agent-a"), vec![]);
+        app.repo_root = tmp.path().to_path_buf();
+        app.jump_root(2); // Messages
+        assert_eq!(app.messages.rows.len(), 3);
+
+        handle_key(&mut app, KeyCode::Char('/'));
+        assert_eq!(app.messages.rows.len(), 3, "an empty query hides nothing");
+
+        // Incremental: every character re-narrows, with no submit key.
+        for c in "renamed".chars() {
+            handle_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.messages.rows.len(), 2);
+
+        // The indicator, in the status bar — where it costs no row of the
+        // content area and therefore cannot shift a row out from under a click.
+        let mut terminal = Terminal::new(TestBackend::new(120, 14)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(rendered.contains("/renamed"), "{rendered}");
+        assert!(rendered.contains("2 of 3 shown"), "{rendered}");
+
+        for c in " foo".chars() {
+            handle_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.messages.rows.len(), 1);
+        for _ in 0..4 {
+            handle_key(&mut app, KeyCode::Backspace);
+        }
+        assert_eq!(app.messages.rows.len(), 2, "backspace widens again");
+
+        // Enter still opens what is selected, and takes the query with it: it
+        // belonged to the list, and the thread is a different one.
+        handle_key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.nav.current(), View::Thread(_)));
+        assert!(!app.filter.is_open(), "drilling in clears it");
+        handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.nav.current(), &View::Messages);
+
+        // Esc on an open filter clears it and nothing else...
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.messages.rows.len(), 0);
+        handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.messages.rows.len(), 3);
+        assert_eq!(app.nav.current(), &View::Messages);
+        // ...and the status bar goes back to the help line.
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(render_to_string(&terminal).contains("/: filter"));
+    }
+
+    /// The spine's rule, with a filter in the way: Esc still means one thing —
+    /// get rid of what is in front of you — so it takes the filter first and
+    /// the drill-in second, never both at once.
+    #[test]
+    fn esc_takes_the_filter_first_and_the_view_second() {
+        let mut app = app_with(Some("agent-a"), vec![entry("a", "src/lease.rs", false)]);
+        handle_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.nav.current(), &View::Path("src/lease.rs".into()));
+
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('z'));
+        handle_key(&mut app, KeyCode::Esc);
+        assert!(!app.filter.is_open());
+        assert_eq!(
+            app.nav.current(),
+            &View::Path("src/lease.rs".into()),
+            "the first Esc must not also pop"
+        );
+
+        handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.nav.current(), &View::Fleet);
+    }
+
+    /// While the filter is open every printable key types. The dangerous one is
+    /// `x` — Fleet's release key — and the surprising one is `1`..`4`.
+    #[test]
+    fn a_command_key_types_into_the_query_instead_of_running() {
+        let mut app = app_with(Some("agent-a"), vec![entry("agent-b", "shared.rs", false)]);
+        handle_key(&mut app, KeyCode::Char('/'));
+
+        handle_key(&mut app, KeyCode::Char('x'));
+        assert_eq!(
+            app.fleet.confirm_release, None,
+            "x must not arm a release mid-query"
+        );
+        handle_key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.nav.current(), &View::Fleet, "digits do not jump roots");
+
+        // Arrows are not characters, so movement still works while filtering.
+        handle_key(&mut app, KeyCode::Down);
+        assert_eq!(app.fleet.roster.selected().or(Some(0)), Some(0));
+    }
+
+    /// A query belongs to the list it was typed over. Carrying it onto another
+    /// screen would hide rows there for a reason the operator has forgotten.
+    /// (Enter's half of this is in the message-list test above, which has rows
+    /// to open.)
+    #[test]
+    fn switching_root_clears_the_filter() {
+        let mut app = app_with(Some("agent-a"), vec![]);
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('z'));
+        assert!(app.filter.is_open());
+
+        handle_key(&mut app, KeyCode::Tab);
+        assert!(!app.filter.is_open(), "Tab clears it");
+
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('z'));
+        app.jump_root(0);
+        assert!(!app.filter.is_open(), "a digit jump clears it");
+    }
+
+    /// Every screen has a list and every screen narrows it — no screen renders
+    /// a query it has not applied, and none panics on a query that matches
+    /// nothing.
+    #[test]
+    fn every_root_filters_and_none_panics_on_a_query_that_matches_nothing() {
+        let mut app = app_with(None, vec![]);
+        let mut terminal = Terminal::new(TestBackend::new(110, 20)).unwrap();
+        for index in 0..View::roots().len() {
+            app.jump_root(index);
+            handle_key(&mut app, KeyCode::Char('/'));
+            for c in "zzqq".chars() {
+                handle_key(&mut app, KeyCode::Char(c));
+            }
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let rendered = render_to_string(&terminal);
+            assert!(rendered.contains("/zzqq"), "root {index}: {rendered}");
+            assert!(rendered.contains("of"), "root {index}: {rendered}");
+        }
     }
 
     #[test]

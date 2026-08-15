@@ -119,7 +119,7 @@ fn refresh_list(app: &mut App) {
         None
     };
     let (authored, groups) = msg::split_notices(app.data.messages());
-    let rows: Vec<Row> = authored
+    let mut rows: Vec<Row> = authored
         .into_iter()
         .filter(|m| match &mine {
             Some(me) => &m.to == me,
@@ -152,7 +152,18 @@ fn refresh_list(app: &mut App) {
         })
         .collect();
 
+    // Counted before the filter: the tab badge is about the mail in scope, and a
+    // badge that a query could talk down to zero would hide the arriving message
+    // it exists to announce.
     app.messages.unread = rows.iter().filter(|r| !r.read).count();
+
+    // `line` is already "from -> to  subject", which is exactly the three fields
+    // this list is searched by — one string rather than three, so the row and
+    // what it matches on cannot drift.
+    let total = rows.len();
+    rows.retain(|row| app.filter.matches(&[&row.line]));
+    app.filter.note(rows.len(), total);
+
     app.messages.rows = rows;
     app.messages.notices = notices;
 

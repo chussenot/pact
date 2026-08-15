@@ -600,7 +600,19 @@ fn group_rows(prefix: &str, groups: &[Group]) -> Vec<Row> {
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     // Built here and hit-tested from here: `row_at` reads exactly the rows this
     // just drew, which is `tab_rects`' discipline applied to a list.
-    app.health.rows = build_rows(app);
+    let all = build_rows(app);
+    // Filtered by the row's text: a check name and its findings read the same
+    // way here, so "stale" narrows to the check and what it found. Built and
+    // narrowed in one place, and hit-tested from `app.health.rows` — the list
+    // `row_at` reads is the list that was drawn.
+    let total = all.len();
+    let rows: Vec<Row> = all
+        .into_iter()
+        .filter(|row| app.filter.matches(&[&row.text]))
+        .collect();
+    app.filter.note(rows.len(), total);
+    app.health.rows = rows;
+
     let index = {
         let keys: Vec<&str> = app.health.rows.iter().map(|r| r.key.as_str()).collect();
         widgets::reselect(
@@ -673,6 +685,7 @@ mod tests {
             agent: Some("operator".to_string()),
             nav: super::super::nav::Nav::default(),
             data: super::super::data::Store::default(),
+            filter: super::super::widgets::Filter::default(),
             fleet: super::super::fleet::State::default(),
             activity: super::super::activity::State::default(),
             messages: super::super::messages::State::default(),

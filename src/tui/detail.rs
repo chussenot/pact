@@ -120,6 +120,16 @@ pub fn refresh(app: &mut App) {
         _ => Vec::new(),
     };
 
+    // One flat list of lines, so it is filtered by the line: a heading that
+    // does not match goes with its section. Narrowed here rather than at render
+    // time, so `row_at` and `select` agree with what is on screen.
+    let total = rows.len();
+    let rows: Vec<Row> = rows
+        .into_iter()
+        .filter(|row| app.filter.matches(&[&row.text]))
+        .collect();
+    app.filter.note(rows.len(), total);
+
     if app.detail.built_for.as_ref() != Some(&view) {
         app.detail.selected = None;
         app.detail.list = ListState::default();

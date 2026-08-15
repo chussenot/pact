@@ -6,6 +6,7 @@
 //! [`row_at`] is what a click, a hover and a scroll all ask, so they cannot
 //! disagree about which row is under the cursor.
 
+use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 
@@ -109,6 +110,117 @@ pub fn is_hovered_not_selected(
 
 pub fn hover_style() -> Style {
     Style::default().bg(Color::Rgb(50, 50, 65))
+}
+
+/// The incremental filter over whatever list the current screen is showing.
+///
+/// One of these, on `App`, rather than one per screen: the query, the
+/// narrowing, the "n of m shown" indicator and Esc's meaning are the same
+/// everywhere, and five copies of that would drift. What is per-screen is only
+/// **which fields a row exposes** — each view calls [`Filter::matches`] with the
+/// strings its own rows are made of, at the one place it projects them.
+///
+/// Two rules it exists to keep:
+///
+/// - **Filtering narrows the projected rows, never a store.** Everything comes
+///   off the read model that was parsed once this tick; typing re-parses
+///   nothing.
+/// - **A filtered list still hit-tests.** Because the narrowing happens where a
+///   screen builds its rows, `row_at` and `select` see the same, already-narrow
+///   list — the alternative (filtering at render time only) is a click landing
+///   on a different row than the cursor, with `x` one key away.
+#[derive(Default)]
+pub struct Filter {
+    /// Open means filtering. A closed filter always has an empty query, so
+    /// there is no state where rows are hidden and nothing says so.
+    open: bool,
+    query: String,
+    /// The query, lowercased once, rather than per row per tick.
+    folded: String,
+    shown: usize,
+    total: usize,
+}
+
+impl Filter {
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// `/`. An empty query matches everything, so opening changes nothing on
+    /// screen except the status bar — which is the point: you see the filter
+    /// before it hides anything.
+    pub fn open(&mut self) {
+        self.open = true;
+    }
+
+    /// Esc, and every navigation. `true` when there was something to clear —
+    /// which is what makes Esc clear the filter FIRST and pop the view only
+    /// once there is no filter left.
+    pub fn clear(&mut self) -> bool {
+        let had = self.open;
+        self.open = false;
+        self.query.clear();
+        self.folded.clear();
+        self.shown = 0;
+        self.total = 0;
+        had
+    }
+
+    /// A keypress while the filter is open. `true` when it was typing rather
+    /// than a command — the caller must then re-project, and must not let the
+    /// key through to the screen, or `x` would release a lease mid-query.
+    pub fn key(&mut self, code: KeyCode) -> bool {
+        if !self.open {
+            return false;
+        }
+        match code {
+            KeyCode::Char(c) => self.query.push(c),
+            // An empty query stays open rather than closing on the last
+            // backspace: leaving the bar is Esc's job, and a filter that
+            // vanished mid-edit would take the next keystroke as a command.
+            KeyCode::Backspace => {
+                self.query.pop();
+            }
+            _ => return false,
+        }
+        self.folded = self.query.to_lowercase();
+        true
+    }
+
+    /// Does a row survive? `fields` is what this screen's rows expose — a path,
+    /// a holder, a subject. Case-insensitive substring, one field at a time: a
+    /// query never spans two columns, so "a b" cannot match by straddling the
+    /// gap between them.
+    pub fn matches(&self, fields: &[&str]) -> bool {
+        if self.folded.is_empty() {
+            return true;
+        }
+        fields
+            .iter()
+            .any(|field| field.to_lowercase().contains(&self.folded))
+    }
+
+    /// What survived, out of what the screen would have shown. Recorded by the
+    /// view that did the narrowing, because only it knows what its rows are.
+    pub fn note(&mut self, shown: usize, total: usize) {
+        self.shown = shown;
+        self.total = total;
+    }
+
+    /// The status-bar line, or `None` when no filter is open.
+    ///
+    /// It goes in the status bar and not in a bar of its own on purpose: an
+    /// extra line inside the content area would shift every row down by one
+    /// while `row_at` kept the old arithmetic, which is exactly the click-lands-
+    /// on-the-wrong-row defect this epic already paid for once.
+    pub fn indicator(&self) -> Option<String> {
+        self.open.then(|| {
+            format!(
+                "/{}   {} of {} shown   esc: clear",
+                self.query, self.shown, self.total
+            )
+        })
+    }
 }
 
 #[cfg(test)]
@@ -215,6 +327,98 @@ mod tests {
         assert_eq!(reselect(&after, None, None), Some(0));
         // an empty list has nothing to select
         assert_eq!(reselect(&[], Some("a.rs"), Some(0)), None);
+    }
+
+    #[test]
+    fn a_query_narrows_incrementally_and_case_insensitively() {
+        let mut filter = Filter::default();
+        // Closed, and therefore matching everything: `/` has to be pressed
+        // before a single row can be hidden.
+        assert!(filter.matches(&["src/lease.rs"]));
+        assert!(filter.indicator().is_none());
+
+        filter.open();
+        assert!(
+            filter.matches(&["src/lease.rs"]),
+            "an empty query hides nothing"
+        );
+        assert_eq!(
+            filter.indicator().as_deref(),
+            Some("/   0 of 0 shown   esc: clear")
+        );
+
+        for c in "LEA".chars() {
+            assert!(filter.key(KeyCode::Char(c)));
+        }
+        assert!(filter.matches(&["src/lease.rs"]), "case-insensitive");
+        assert!(!filter.matches(&["src/audit.rs"]));
+        // ...and it narrows as you type, rather than only on a submit key.
+        assert!(filter.key(KeyCode::Char('s')));
+        assert!(filter.matches(&["src/lease.rs"]));
+        assert!(filter.key(KeyCode::Char('x')));
+        assert!(!filter.matches(&["src/lease.rs"]));
+        assert!(filter.key(KeyCode::Backspace));
+        assert!(filter.matches(&["src/lease.rs"]));
+    }
+
+    /// One field at a time. Joining the columns and searching the join would
+    /// let a query match by straddling the gap between two of them — "rs docs"
+    /// hitting a row simply because a path column ends where the next begins.
+    #[test]
+    fn a_query_matches_one_field_and_never_straddles_two() {
+        let mut filter = Filter::default();
+        filter.open();
+        for c in "rs doc".chars() {
+            filter.key(KeyCode::Char(c));
+        }
+        assert!(!filter.matches(&["src/lease.rs", "docs-story"]));
+        assert!(filter.matches(&["a note about rs docs", "docs-story"]));
+    }
+
+    /// Esc clears the filter FIRST and reports that it did, which is what lets
+    /// the caller pop the view only once there is nothing left to clear — the
+    /// spine's one-meaning-for-Esc rule, kept.
+    #[test]
+    fn esc_clears_the_filter_first_and_only_then_has_nothing_to_do() {
+        let mut filter = Filter::default();
+        assert!(
+            !filter.clear(),
+            "nothing open: Esc belongs to the view stack"
+        );
+
+        filter.open();
+        filter.key(KeyCode::Char('x'));
+        assert!(filter.clear(), "Esc consumed by the filter");
+        assert!(!filter.is_open());
+        assert!(filter.matches(&["anything"]), "the query went with it");
+        assert!(!filter.clear(), "the next Esc pops the view");
+    }
+
+    /// A closed filter never eats a keypress: `x` releases a lease on Fleet,
+    /// and typing state must not be able to swallow it invisibly.
+    #[test]
+    fn keys_are_only_taken_while_the_filter_is_open() {
+        let mut filter = Filter::default();
+        assert!(!filter.key(KeyCode::Char('x')));
+        filter.open();
+        assert!(filter.key(KeyCode::Char('x')));
+        // Non-character keys stay with the view even while open — arrows still
+        // move, Enter still opens, Esc still means Esc.
+        assert!(!filter.key(KeyCode::Down));
+        assert!(!filter.key(KeyCode::Enter));
+        assert!(!filter.key(KeyCode::Esc));
+    }
+
+    #[test]
+    fn the_indicator_says_how_many_of_how_many_survived() {
+        let mut filter = Filter::default();
+        filter.open();
+        filter.key(KeyCode::Char('a'));
+        filter.note(3, 60);
+        assert_eq!(
+            filter.indicator().as_deref(),
+            Some("/a   3 of 60 shown   esc: clear")
+        );
     }
 
     #[test]

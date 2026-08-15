@@ -266,8 +266,22 @@ pub fn refresh(app: &mut App) {
         Some(Context::Path(path)) => tail(app.data.events_by_path(path)),
         None => app.data.feed(FEED_LIMIT).iter().collect(),
     };
-    let rows = feed_rows(&events);
+    let mut rows = feed_rows(&events);
+    // The rate is about the fleet, not about the query: "24 events / 5 min" has
+    // to keep meaning "is anything happening at all" while you read one agent's
+    // three of them.
     let recent = rate(&events, chrono::Utc::now(), RATE_WINDOW_SECS);
+
+    // Narrowed here, where the feed is projected, so the rows `row_at` and
+    // `select` index into are the rows on screen. An event exposes the four
+    // fields it is read by: who acted, what they did, on what, and the detail
+    // that carries the contention chain.
+    let total = rows.len();
+    rows.retain(|row| {
+        app.filter
+            .matches(&[&row.agent, &row.kind, &row.target, &row.detail])
+    });
+    app.filter.note(rows.len(), total);
 
     app.activity.rows = rows;
     app.activity.recent = recent;
