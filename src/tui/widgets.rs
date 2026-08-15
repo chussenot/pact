@@ -428,4 +428,88 @@ mod tests {
         assert_eq!(step(3, None, 1), Some(1));
         assert_eq!(step(0, Some(0), 1), None);
     }
+
+    /// pact-2ol, pinned structurally rather than per screen.
+    ///
+    /// `render_stateful_widget` records the scroll offset it computed into the
+    /// state it is handed. Every screen here reads that offset back — through
+    /// `row_at` — to decide which row a click landed on. Hand it a `.clone()`
+    /// and the offset goes to a temporary: the real state stays at 0, and every
+    /// click on a scrolled list resolves a screenful away. On Fleet that is one
+    /// key from `x`, which releases somebody's lease.
+    ///
+    /// It shipped in 0.9.5 in two call sites, survived the module split into
+    /// two more, and was invisible in both because it needs a list longer than
+    /// its pane to show at all. Two screens now have behavioural tests for it
+    /// (`fleet`, `messages`); this covers the other three, and — the reason it
+    /// is written this way — every screen added after today.
+    ///
+    /// ponytail: a source-text assertion, which is a blunt instrument. The
+    /// alternative is a fixture and a TestBackend per screen, which is what the
+    /// two behavioural tests already cost, and it would still say nothing about
+    /// the next module. Upgrade path if this ever gets fiddly: a wrapper in this
+    /// file that owns the call and takes `&mut TableState` by construction.
+    #[test]
+    fn no_screen_renders_a_stateful_widget_through_a_clone() {
+        const CALL: &str = "render_stateful_widget";
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui");
+        let mut checked = 0;
+
+        for entry in std::fs::read_dir(&dir).expect("src/tui must be readable") {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+
+            // Walk each call and scan to its matching close paren, so a call
+            // split across lines (detail.rs) reads the same as a one-liner.
+            //
+            // Comments are skipped, and that is not a nicety: three modules
+            // EXPLAIN this defect in prose above the fixed call, so a scanner
+            // that counted a mention would read the explanation and then scan
+            // the unrelated code after it. The first draft of this test did
+            // exactly that and failed on fleet.rs's `Cell::from(...clone())`.
+            for (at, _) in src.match_indices(CALL) {
+                let line_start = src[..at].rfind('\n').map_or(0, |i| i + 1);
+                if src[line_start..at].contains("//") {
+                    continue; // a mention, not a call
+                }
+                let after = &src[at + CALL.len()..];
+                let Some(open) = after.find('(') else { break };
+                let mut depth = 0usize;
+                let mut end = after.len();
+                for (i, c) in after[open..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = open + i;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let args = &after[open..end];
+                assert!(
+                    !args.contains(".clone()"),
+                    "{}: {CALL} was handed a clone, so the scroll offset it \
+                     computes is dropped and row_at hit-tests against 0 \
+                     (pact-2ol). Pass the real state, or take-and-restore it \
+                     as detail.rs does.\n  args: {args}",
+                    path.display(),
+                );
+                checked += 1;
+            }
+        }
+
+        // A guard that silently matches nothing is worse than no guard: if the
+        // call is ever renamed or wrapped, this must fail rather than pass.
+        assert!(
+            checked >= 5,
+            "expected a stateful render on every screen, found {checked}"
+        );
+    }
 }
