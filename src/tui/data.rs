@@ -314,6 +314,26 @@ impl Store {
             .collect()
     }
 
+    /// Who is subscribed to `path` as of `at`, prefix watches included.
+    ///
+    /// The registry replayed by `watch::was_subscribed_at`, exactly as
+    /// [`Self::waiting_on`] replays it — never a second coverage rule here, for
+    /// the reason `watch::covers` is private in the first place: `src/render`
+    /// must not match `src/renderer.rs`, and a `starts_with` written twice will
+    /// get that wrong in one of the two places.
+    ///
+    /// Added for pact-pyt.4's path view, which has to answer "who hears about
+    /// this release" off the per-tick cache rather than by reading
+    /// `.pact/watches.jsonl` itself.
+    pub fn subscribers(&self, path: &str, at: DateTime<Utc>) -> Vec<&str> {
+        let at = at.to_rfc3339();
+        let mut agents: Vec<&str> = self.watches.iter().map(|w| w.agent.as_str()).collect();
+        agents.sort_unstable();
+        agents.dedup();
+        agents.retain(|agent| watch::was_subscribed_at(&self.watches, agent, path, &at));
+        agents
+    }
+
     // --------------------------------------------------------- waiting-on
 
     /// Who is blocked, on what, held by whom — the contention graph the event
