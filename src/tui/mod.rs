@@ -962,28 +962,52 @@ mod tests {
         assert!(rendered.contains("bd (beads) not found"));
     }
 
+    /// A REAL store, not a seeded cache. Enter pushes `View::Thread`, and the
+    /// refresh that follows re-fetches the thread from `repo_root` — so a
+    /// fixture assigned straight to `app.messages.thread` is overwritten with
+    /// the empty result of reading an empty path before it can ever be drawn.
+    /// The seeded version of this test asserted against that empty pane and
+    /// failed on the `thread` body while passing on the block title, which
+    /// reads like a rendering bug and is not one.
     #[test]
     fn a_message_opens_into_its_thread_and_esc_returns_to_the_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let root = tmp.path();
+        let sent = msg::send(
+            root,
+            "agent-b",
+            &["agent-a".to_string()],
+            msg::Draft {
+                thread: None,
+                subject: Some("renamed foo()"),
+                body: "the signature lost its second parameter",
+                about: &[],
+                notice: false,
+            },
+        )
+        .unwrap();
+        let id = sent[0].id.clone();
+
         let mut app = app_with(Some("agent-a"), vec![]);
+        app.repo_root = root.to_path_buf();
         app.nav.set_root(View::Messages);
         app.bd = Ok(BeadsCli { binary: "bd" });
-        app.messages.messages = vec![message("msg-1", "renamed foo()", true)];
+        app.refresh_current_view();
         app.messages.list.select(Some(0));
-        // Stands in for the fetch refresh() does; repo_root here is empty.
-        app.messages.thread = Some((
-            "msg-1".to_string(),
-            vec![message("msg-1", "renamed foo()", true)],
-        ));
 
         handle_key(&mut app, KeyCode::Enter);
-        assert_eq!(app.nav.current(), &View::Thread("msg-1".into()));
+        assert_eq!(app.nav.current(), &View::Thread(id.clone()));
 
         let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = render_to_string(&terminal);
-        assert!(rendered.contains("thread"));
-        assert!(rendered.contains("renamed foo()"));
-        assert!(rendered.contains("body of msg-1"));
+        assert!(rendered.contains("thread"), "{rendered}");
+        assert!(rendered.contains("renamed foo()"), "{rendered}");
+        assert!(
+            rendered.contains("the signature lost its second parameter"),
+            "{rendered}"
+        );
 
         handle_key(&mut app, KeyCode::Esc);
         assert_eq!(app.nav.current(), &View::Messages);
