@@ -10,6 +10,14 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.10.2 - 2026-08-15
+#### Miscellaneous Chores
+- Add events - (611d820) - Clement HUSSENOT-DESENONGES
+#### Tests
+- **(chaos)** run the pact we built, not the one that happens to be installed - (960b92a) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.10.1 - 2026-08-15
 #### Bug Fixes
 - **(ui)** restore the scrolled-click test a bad insertion orphaned - (756f763) - Clement HUSSENOT-DESENONGES
