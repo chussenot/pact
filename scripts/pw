@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# pw — pact/bd wrapper. Run 6 instrumentation.
+#
+# Run 5 learned that `bd close` fails silently under fleet load, and that
+# `pact msg send --body-file -` can hang, only because two agents happened to
+# mention it in prose. This makes the harness a measured subject instead: every
+# invocation appends one JSON line with the command, wall-time, exit code and
+# a stderr excerpt.
+#
+# Both of run 5's stories were then overturned by this log: the multi-path
+# acquire "cap" was zsh not word-splitting an unquoted variable, and 46 of the
+# 66 non-zero exits were 141 — SIGPIPE from the agent's own `| head`.
+#
+# Usage:  pw pact lease acquire foo --note "..."
+#         pw bd close treadle-x --reason "..."
+#
+# It wraps foreign tools, which is most of its value: in run 6 every call over
+# a second came from bd. That is also why it is not a pact subcommand — pact
+# shelling out to bd to time bd would put back the dependency 0.9.0 removed.
+#
+# The log is append-only and one line per call, mirroring pact's own logs.
+# It is per-agent, so 50 agents do not contend on it.
+set -uo pipefail
+
+AGENT="${PACT_AGENT:-unknown}"
+
+# $PACT_HARNESS_DIR, else <repo root>/.harness. The root is the one pact itself
+# resolves: `--git-common-dir` names the MAIN checkout's .git even from a linked
+# worktree, so a 20-agent fleet spread over 20 worktrees writes one directory
+# instead of 20 — the same reason `pact whoami` reports a pact dir outside the
+# worktree you ran it from. Relative from the main checkout ("../.git"), absolute
+# from a worktree; dirname+cd+pwd normalises both. No repo at all: fall back to
+# the working directory rather than refusing to run.
+if [ -n "${PACT_HARNESS_DIR:-}" ]; then
+	LOGDIR="$PACT_HARNESS_DIR"
+elif common=$(git rev-parse --git-common-dir 2>/dev/null) &&
+	root=$(cd "$(dirname "$common")" && pwd); then
+	LOGDIR="$root/.harness"
+else
+	LOGDIR="$PWD/.harness"
+fi
+mkdir -p "$LOGDIR"
+LOG="$LOGDIR/$AGENT.jsonl"
+
+start=$(date +%s.%N)
+err=$(mktemp)
+# stderr is teed through a PIPE, not a process substitution: the shell waits for
+# a pipeline to finish, so "$err" is complete by the time it is read. With `2>
+# >(tee …)` the wrapper raced its own tee and could log an empty excerpt for a
+# command that had just printed the reason it failed. fd 3 carries stdout past
+# the tee untouched, so `pw … | head` still sees exactly what the tool wrote.
+{ "$@" 2>&1 1>&3 | tee "$err" >&2; rc=${PIPESTATUS[0]}; } 3>&1
+end=$(date +%s.%N)
+
+dur=$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.3f", b-a}')
+# First 200 chars of stderr, flattened to one line. Newline, CR and TAB all
+# have to go: a raw U+0009 inside a JSON string is as invalid as a raw newline,
+# and the first pass at this fixed argv while leaving stderr on the old filter
+# (bead .47). Same treatment for both fields, so they cannot drift again.
+tail_err=$(head -c 200 "$err" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g')
+rm -f "$err"
+
+# 141 = 128+SIGPIPE: the command was killed because the CALLER stopped reading
+# (`... | head`), not because it failed. Recording that as a failure would have
+# the harness report claim bd/pact fell over when they did not — it showed up
+# three times in the first wave. Flag it so the analysis can exclude it, and
+# keep the raw code so nothing is hidden.
+sigpipe=false
+[ "$rc" = 141 ] && sigpipe=true
+
+# argv must be flattened to ONE line: a --reason or --note containing newlines
+# (they routinely do) would otherwise split one record across many lines and the
+# log would no longer be one-JSON-object-per-line. This is the same torn-line
+# failure the previous run went looking for in pact's own store; the wrapper had
+# it, and 11 of the first 141 records were unparseable before this was fixed.
+# Truncated to 400 chars because a full close reason is prose, not telemetry.
+cmd=$(printf '%s ' "$@" | tr '\n\r\t' '   ' | head -c 400 | sed 's/\\/\\\\/g; s/"/\\"/g; s/ *$//')
+printf '{"at":"%s","agent":"%s","tool":"%s","argv":"%s","secs":%s,"exit":%s,"sigpipe":%s,"stderr":"%s"}\n' \
+	"$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$AGENT" "$1" "$cmd" "$dur" "$rc" "$sigpipe" "$tail_err" >>"$LOG"
+
+exit "$rc"
