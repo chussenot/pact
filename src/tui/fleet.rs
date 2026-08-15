@@ -1161,15 +1161,17 @@ mod tests {
     /// offset, keeps agreeing with what is on screen. A state cloned per frame
     /// pinned the offset at 0 and put every click on a scrolled table one
     /// screenful of rows away from the one under the cursor.
-    #[test]
     /// pact-dwq. The panel threads `WaitingOn::grace_secs` all the way here so
     /// it can state what "live" means rather than imply an invisible bound —
     /// and then put that sentence in a Block title, which ratatui truncates
     /// SILENTLY. At the real right-pane width the operator saw
     /// "live = holder's remai".
     ///
-    /// Asserts on the rendered BUFFER, not on the model: every other test of
-    /// this panel checks its rows, and the rows were never the problem.
+    /// The coverage was not missing — `the_waiting_on_panel_names_...` already
+    /// asserted the bound appears in the rendered buffer, and passed all the
+    /// way through, because it renders at 160 columns where the title fitted.
+    /// The gap was the WIDTH. This renders at 100, and also fails on a clipped
+    /// word so a future title that overflows is caught rather than shortened.
     #[test]
     fn the_grace_bound_survives_at_a_real_terminal_width() {
         let tmp = fixture();
@@ -1191,6 +1193,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn a_scrolled_table_still_maps_a_click_to_the_row_under_the_cursor() {
         let tmp = fixture();
         let leases: Vec<LeaseEntry> = (0..20)
