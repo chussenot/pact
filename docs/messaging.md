@@ -457,15 +457,42 @@ splits. The footer restores the two-step: scan, then read what matters.
 throw away:
 
 ```
-[pact-msg-9c4b3064b6844eb5] from: msg-fix  to: docs-writer
+[pact-msg-9c4b3064b6844eb5] from: msg-fix  to: unread by docs-writer
 subject: src/msg.rs ready: Message.from + all_messages()
 at: 2026-08-07T09:42:43Z  thread: pact-msg-9c4b3064b6844eb5
 
 src/msg.rs is done and compiles clean on its own. Contract exactly as frozen.
 ```
 
-An unread message picks up a `(unread)` marker after `to:`, and a message whose
-author bd never recorded shows `from: ?`.
+A message whose author pact never recorded shows `from: ?`.
+
+### One body per message, not one per recipient
+
+`to:` is a **roster**: every recipient named exactly once, split by whether they
+have acknowledged it.
+
+```
+[pact-msg-f7c0848b0c58b839] from: cli-wire  to: read by tui-dev, docs-writer — unread by lease-fix, msg-fix
+```
+
+That is a fix, not a flourish. `--json` returns one object per recipient — a
+deliberate shape, so `jq -r .to` gets an agent name and not an array — and the
+human renderer used to walk the same fan-out, printing the **whole body once per
+recipient**. A 15-recipient broadcast cost about 280KB to read; one agent spent
+149KB reading four messages. It bit hardest on the messages that mattered most,
+because the protocol requires whoever changes a hot file to tell every dependent,
+so the widest broadcast is by construction the one nobody can afford to read.
+
+The renderer now groups the fan-out back into one message. `--json` is
+unchanged — still one row per recipient, still byte-compatible with what
+consumers pinned to. Nothing is lost in the roster either: the union of its two
+lists *is* the recipient list, and "who still owes this a look" is the question a
+sender actually has, which the old per-copy `(unread)` marker could only answer
+one recipient at a time.
+
+`pact msg read <id> --brief` gives the envelope, the subject and the first five
+lines of each body — enough to tell a warning from a status ping on a thread too
+long to read whole. The id for reading it in full is on the line above either way.
 
 `pact msg inbox --full` prints every message through that same renderer — one
 full-text format, not two — for when you genuinely do want the whole inbox.
@@ -602,6 +629,21 @@ positional argument, that either gets mangled or gets abandoned — agents
 reported simply dropping content rather than hand-escaping it. `--body-file`
 takes it from a file or, with `-`, from stdin.
 
+**`-` will not wait forever.** A fleet reported `--body-file -` hanging past 120
+seconds and leaving the shell unusable. It does not reproduce on 0.9.4, and the
+precondition it names — a tty on stdin — cannot be reproduced from a test either,
+so treat it as **open and unconfirmed**. It is guarded regardless, because of
+where it sits: `msg send` is the command an agent uses to report that it is
+blocked, so a hang there is the one hang an agent cannot report its way out of.
+
+Two guards, for the two ways a read never returns. A tty on stdin means no
+producer is attached at all, which is a mistake and not slowness, so it is
+refused immediately and points at `--body-file <path>`. Anything else gets a
+60-second ceiling — generous on purpose, because a legitimate producer may be
+slow; it is a bound on the failure, not a latency target. Either way nothing is
+sent, so a retry cannot duplicate. Empty stdin is unaffected and still gives the
+empty-body error.
+
 Exactly one trailing newline is stripped — the one a text file ends with, which
 is punctuation rather than content. Not all trailing whitespace: a body ending in
 a blank line, or in an indented code block, arrives as written. An all-whitespace body is refused: silently sending an empty message
@@ -715,7 +757,7 @@ data point.
 pact msg send (--to <agent>... | --to-owner-of <path>...) [--thread <id>] [--subject <text>] [--skip <agent>...] (<body> | --body-file <path|->)
 pact msg inbox [--unread-only] [--full] [--include-watch | --watch-only]
 pact msg sent
-pact msg read <id>
+pact msg read <id> [--brief]
 ```
 
 All four need a git repository and a resolved agent identity — `--agent <name>` or

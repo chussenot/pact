@@ -342,7 +342,13 @@ enum MsgAction {
     /// List messages you sent, newest first, and whether they were read.
     Sent,
     /// Read a message (or its thread) by id.
-    Read { id: String },
+    Read {
+        id: String,
+        /// Envelope, subject and the first few lines of each body — for
+        /// deciding what to read in full, on a thread too long to read whole.
+        #[arg(long)]
+        brief: bool,
+    },
 }
 
 /// Usage errors get their own code so exit 2 means only what the README table
@@ -2012,10 +2018,17 @@ fn run_msg(cwd: &Path, agent_flag: Option<&str>, json: bool, action: MsgAction) 
             });
             Ok(())
         }
-        MsgAction::Read { id } => {
+        MsgAction::Read { id, brief } => {
             let thread = msg::read_thread(&root, &agent, &id)?;
+            // `--brief` is a RENDERING flag: `--json` is pinned shape and stays
+            // one object per recipient either way (pact-83r.8).
             output::emit(json, &thread, |thread: &Vec<msg::Message>| {
-                render_full(&thread.iter().collect::<Vec<_>>())
+                let flat = thread.iter().collect::<Vec<_>>();
+                if brief {
+                    render_brief(&flat)
+                } else {
+                    render_full(&flat)
+                }
             });
             Ok(())
         }
@@ -2129,14 +2142,64 @@ fn run_doctor(cwd: &Path, json: bool) -> Result<i32> {
     Ok(if report.healthy { 0 } else { 1 })
 }
 
+/// Ceiling on the stdin read, not a latency target: a legitimate producer may be
+/// slow, so this is generous on purpose. `PACT_STDIN_BODY_TIMEOUT_MS` overrides
+/// it — the only way a test can prove the bound exists without waiting it out.
+fn stdin_body_timeout() -> std::time::Duration {
+    match std::env::var("PACT_STDIN_BODY_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        Some(ms) => std::time::Duration::from_millis(ms),
+        None => std::time::Duration::from_secs(60),
+    }
+}
+
+/// `--body-file -` must not be able to block forever (pact-83r.5).
+///
+/// UNCONFIRMED: a fleet reported this hanging past 120 s and wedging the shell,
+/// and it does not reproduce on 0.9.4 — but it cannot be reproduced here either,
+/// because the report's precondition is a tty on stdin and no test environment
+/// has one. Guarded anyway, because of *where* the hang is: `msg send` is the
+/// tool an agent uses to report that it is blocked, so a hang there is the one
+/// an agent cannot report its way out of.
+///
+/// Two guards, for the two ways the read never returns. A tty means no producer
+/// is attached at all — that is a mistake, not slowness, so it is refused
+/// immediately and names the alternative. Everything else gets a bounded read;
+/// the reading thread is left blocked, which costs nothing because the process
+/// is about to exit either way.
+fn read_stdin_body() -> Result<String> {
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "--body-file - reads the body from stdin, but stdin is a terminal: \
+             nothing is feeding it, so the read would never return. Pipe the body \
+             in, or write it to a file and use --body-file <path>."
+        );
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = tx.send(std::io::stdin().read_to_string(&mut s).map(|_| s));
+    });
+    let timeout = stdin_body_timeout();
+    match rx.recv_timeout(timeout) {
+        Ok(r) => r.context("reading message body from stdin"),
+        Err(_) => anyhow::bail!(
+            "stdin gave no end of input after {}s — whatever is feeding \
+             --body-file - is not finishing. Write the body to a file and use \
+             --body-file <path>; nothing was sent.",
+            timeout.as_secs_f32(),
+        ),
+    }
+}
+
 /// `-` means stdin, so a multi-paragraph body full of quotes and backslashes
 /// never has to survive a shell (pact-rnc.3).
 fn read_body(path: &str) -> Result<String> {
     let raw = if path == "-" {
-        let mut s = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)
-            .context("reading message body from stdin")?;
-        s
+        read_stdin_body()?
     } else {
         std::fs::read_to_string(path)
             .with_context(|| format!("reading message body from {path}"))?
@@ -2582,23 +2645,103 @@ fn render_inbox(messages: &[&msg::Message]) -> String {
     )
 }
 
+/// One stored message, however many recipients it fanned out to (pact-83r.8).
+///
+/// [`msg::Message`] is one copy PER RECIPIENT so `--json` keeps `to` a single
+/// name, and that is not changing — a machine consumer is pinned to it. But a
+/// human renderer that walks the fan-out prints the body once per recipient: a
+/// 15-recipient broadcast cost ~280 KB to read, and it bit hardest on exactly the
+/// messages that mattered, because the run that measured it REQUIRED hot-file
+/// changers to broadcast to every dependent. Regrouping here collapses what the
+/// API layer legitimately fans out.
+///
+/// Copies of one message are adjacent in every listing pact builds (fan-out is
+/// per record), so this is a linear pass and not a sort.
+fn group_by_id<'a>(messages: &[&'a msg::Message]) -> Vec<Vec<&'a msg::Message>> {
+    let mut out: Vec<Vec<&msg::Message>> = Vec::new();
+    for m in messages {
+        match out.last_mut() {
+            Some(g) if g[0].id == m.id => g.push(m),
+            _ => out.push(vec![m]),
+        }
+    }
+    out
+}
+
+/// The recipients, once, split by whether they have acknowledged it.
+///
+/// The union of the two lists is the recipient list, so nobody is named twice —
+/// and "who still owes this a look" is the question a sender actually has, where
+/// the old per-copy `(unread)` marker only ever answered it one recipient at a
+/// time.
+fn roster(group: &[&msg::Message]) -> String {
+    let (read, unread): (Vec<&str>, Vec<&str>) = group
+        .iter()
+        .map(|m| m.to.as_str())
+        .partition(|to| group[0].read_by.iter().any(|a| a == to));
+    let mut parts = Vec::new();
+    if !read.is_empty() {
+        parts.push(format!("read by {}", read.join(", ")));
+    }
+    if !unread.is_empty() {
+        parts.push(format!("unread by {}", unread.join(", ")));
+    }
+    parts.join(" — ")
+}
+
 /// Full text with the envelope pact used to throw away: from, to, subject, time
 /// (pact-rnc.1). Shared by `msg read` and `msg inbox --full`, so a sender can
 /// finally read their own message back with its metadata.
 fn render_full(messages: &[&msg::Message]) -> String {
-    messages
+    group_by_id(messages)
         .iter()
-        .map(|m| {
+        .map(|g| {
+            let m = g[0];
             format!(
-                "[{}] from: {}  to: {}{}\nsubject: {}\nat: {}  thread: {}\n\n{}",
+                "[{}] from: {}  to: {}\nsubject: {}\nat: {}  thread: {}\n\n{}",
                 m.id,
                 if m.from.is_empty() { "?" } else { &m.from },
-                m.to,
-                if m.read { "" } else { "  (unread)" },
+                roster(g),
                 m.subject.as_deref().unwrap_or("(none)"),
                 m.created_at,
                 m.thread,
                 m.body,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n---\n")
+}
+
+/// How much of a body `--brief` shows. Enough to tell a warning from a status
+/// ping, which is the triage decision; the id to read it in full is on the line
+/// above either way.
+const BRIEF_LINES: usize = 5;
+
+/// `--brief`: envelope, subject and the head of the body, for deciding which of
+/// a thread's messages to read in full rather than reading all of them.
+fn render_brief(messages: &[&msg::Message]) -> String {
+    group_by_id(messages)
+        .iter()
+        .map(|g| {
+            let m = g[0];
+            let head: Vec<&str> = m.body.lines().take(BRIEF_LINES).collect();
+            let rest = m.body.lines().count().saturating_sub(head.len());
+            format!(
+                "[{}] from: {}  to: {}\nsubject: {}\nat: {}\n\n{}{}",
+                m.id,
+                if m.from.is_empty() { "?" } else { &m.from },
+                roster(g),
+                m.subject.as_deref().unwrap_or("(none)"),
+                m.created_at,
+                head.join("\n"),
+                if rest == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        "\n… {rest} more line(s) — `pact msg read {}` for the full text",
+                        m.id
+                    )
+                },
             )
         })
         .collect::<Vec<_>>()
@@ -2924,9 +3067,81 @@ mod tests {
         let m = message("pact-wisp-aaa", "msg-fix", "the body", true);
         let out = render_full(&[&m]);
         assert!(out.contains("from: msg-fix"), "{out}");
-        assert!(out.contains("to: cli-wire"), "{out}");
+        assert!(out.contains("to: read by cli-wire"), "{out}");
         assert!(out.contains("subject: a subject"), "{out}");
         assert!(out.contains("the body"), "{out}");
+    }
+
+    /// One stored message fanned out to N recipients, the shape `msg read`
+    /// hands the renderer.
+    fn broadcast(id: &str, body: &str, to: &[&str], read_by: &[&str]) -> Vec<msg::Message> {
+        to.iter()
+            .map(|t| msg::Message {
+                to: t.to_string(),
+                read: read_by.contains(t),
+                read_by: read_by.iter().map(|a| a.to_string()).collect(),
+                ..message(id, "msg-fix", body, false)
+            })
+            .collect()
+    }
+
+    /// pact-83r.8: the renderer used to walk the per-recipient fan-out, so a
+    /// 15-recipient broadcast printed the body 15 times — ~280 KB to read one
+    /// message, and worst on the broadcasts that mattered most.
+    #[test]
+    fn a_broadcast_renders_its_body_once_and_its_recipients_once() {
+        let to: Vec<String> = (0..15).map(|i| format!("agent-{i:02}")).collect();
+        let names: Vec<&str> = to.iter().map(String::as_str).collect();
+        let fanned = broadcast("pact-wisp-aaa", "MAX_QUADS moved", &names, &names[..2]);
+        let out = render_full(&fanned.iter().collect::<Vec<_>>());
+
+        assert_eq!(out.matches("MAX_QUADS moved").count(), 1, "{out}");
+        // One envelope, not fifteen — the id still appears twice, as the
+        // message's own and as its thread's.
+        assert_eq!(out.matches("subject: a subject").count(), 1, "{out}");
+        // Each recipient exactly once, split by who still owes it a look. The
+        // union of the two lists IS the recipient list, so naming them plainly
+        // as well would be the duplication this bead is about.
+        for name in &names {
+            assert_eq!(out.matches(name).count(), 1, "{name} twice in {out}");
+        }
+        assert!(
+            out.contains("to: read by agent-00, agent-01 — unread by agent-02"),
+            "{out}"
+        );
+    }
+
+    /// Two distinct messages in one thread still render as two.
+    #[test]
+    fn grouping_collapses_recipients_not_messages() {
+        let mut all = broadcast("pact-wisp-aaa", "the question", &["alpha", "bravo"], &[]);
+        all.extend(broadcast("pact-wisp-bbb", "the answer", &["msg-fix"], &[]));
+        let out = render_full(&all.iter().collect::<Vec<_>>());
+        assert_eq!(out.matches("\n---\n").count(), 1, "{out}");
+        assert!(
+            out.contains("the question") && out.contains("the answer"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn brief_shows_the_head_of_the_body_and_how_to_get_the_rest() {
+        let body = (0..12).map(|i| format!("line {i}\n")).collect::<String>();
+        let fanned = broadcast("pact-wisp-aaa", &body, &["alpha"], &[]);
+        let out = render_brief(&fanned.iter().collect::<Vec<_>>());
+        assert!(out.contains("subject: a subject"), "{out}");
+        assert!(out.contains("from: msg-fix"), "{out}");
+        assert!(out.contains("line 4") && !out.contains("line 5"), "{out}");
+        assert!(out.contains("… 7 more line(s)"), "{out}");
+        assert!(out.contains("pact msg read pact-wisp-aaa"), "{out}");
+
+        // A body that fits is shown whole, with no dangling "more lines" tail.
+        let short = broadcast("pact-wisp-bbb", "one line", &["alpha"], &[]);
+        let out = render_brief(&short.iter().collect::<Vec<_>>());
+        assert!(
+            out.contains("one line") && !out.contains("more line(s)"),
+            "{out}"
+        );
     }
 
     #[test]
