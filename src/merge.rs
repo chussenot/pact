@@ -49,6 +49,7 @@
 //! runs while a shared branch is half-written is the wrong place to be clever.
 //! It belongs in its own command that this one could call.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -79,6 +80,11 @@ pub struct MergeOutcome {
     /// The merge commit, absent when there was nothing to merge.
     pub merge_commit: Option<String>,
     pub already_up_to_date: bool,
+    /// The merge landed on a branch that was ALREADY failing, having added no
+    /// new failure of its own. Distinct from `verified: Some(false)` alone,
+    /// which would read as "this merge broke it".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub landed_on_red: bool,
     /// `None` when no `--verify` command was given — which is not the same as
     /// passing, and is why this is a three-state field rather than a bool.
     pub verified: Option<bool>,
@@ -124,6 +130,82 @@ fn dirty_tracked(repo_root: &Path) -> Result<Vec<String>> {
         &["status", "--porcelain", "--untracked-files=no"],
     )?;
     Ok(stdout.lines().map(str::to_string).collect())
+}
+
+/// One run of the verification command.
+struct Verified {
+    passed: bool,
+    /// The names of the tests that failed, when the output was in a shape this
+    /// recognises. Empty for a failure it could not attribute — which is why
+    /// `passed` is carried separately and never inferred from emptiness.
+    failures: BTreeSet<String>,
+}
+
+/// Run the verification command, echoing its output and remembering what failed.
+///
+/// Output is captured rather than inherited so the failing-test set can be
+/// compared against the pre-merge base, then printed in full — an agent watching
+/// a long suite still sees everything, just at the end rather than streaming.
+fn run_verify(repo_root: &Path, verify: &str) -> Result<Verified> {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(verify)
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("could not run the verification command: {verify}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    output::line(&text);
+    Ok(Verified {
+        passed: out.status.success(),
+        failures: failing_tests(&text),
+    })
+}
+
+/// Test names from a libtest-style run: `test some::name ... FAILED`.
+///
+/// Deliberately narrow. A verification command can be anything, and guessing at
+/// an unfamiliar format would produce a *wrong* failure set — which, compared
+/// against a baseline, decides whether an agent's work is reverted. An
+/// unrecognised format yields an empty set, and an empty set never satisfies the
+/// subset test below unless the base failed identically, so the conservative
+/// path is the one taken when this cannot read the output.
+fn failing_tests(text: &str) -> BTreeSet<String> {
+    text.lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            let name = l.strip_prefix("test ")?.strip_suffix(" ... FAILED")?;
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect()
+}
+
+/// Redo a merge that was reverted for somebody else's breakage.
+fn reapply(repo_root: &Path, branch: &str, into: &str, agent: &str) -> Result<String> {
+    let (ok, _, stderr) = git(repo_root, &["merge", "--no-ff", "--no-commit", branch])?;
+    if !ok {
+        let _ = git(repo_root, &["merge", "--abort"]);
+        bail!("could not re-apply the merge after the baseline check: {stderr}");
+    }
+    let (ok, _, stderr) = git(
+        repo_root,
+        &[
+            "commit",
+            "-m",
+            &format!("Merge {branch} into {into}"),
+            "--trailer",
+            &format!("Pact-Agent={agent}"),
+        ],
+    )?;
+    if !ok {
+        let _ = git(repo_root, &["merge", "--abort"]);
+        bail!("could not commit the re-applied merge: {stderr}");
+    }
+    head(repo_root)
 }
 
 fn head(repo_root: &Path) -> Result<String> {
@@ -217,6 +299,7 @@ fn merge_while_held(
         mutex: String::new(),
         merge_commit: None,
         already_up_to_date: false,
+        landed_on_red: false,
         verified: None,
     };
 
@@ -267,19 +350,8 @@ fn merge_while_held(
         return Ok(outcome);
     };
 
-    // Inherited stdio, not captured: a verification is usually a test suite that
-    // runs for tens of seconds, and an agent watching a silent terminal cannot
-    // tell it from a hang — which is the exact confusion the mutex wait already
-    // causes.
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(verify)
-        .current_dir(repo_root)
-        .stdin(Stdio::null())
-        .status()
-        .with_context(|| format!("could not run the verification command: {verify}"));
-    let status = match status {
-        Ok(s) => s,
+    let post = match run_verify(repo_root, verify) {
+        Ok(v) => v,
         Err(e) => {
             // The command could not even start, so nothing was proved. Undo the
             // merge and give the lock back: this is not a broken branch.
@@ -288,13 +360,81 @@ fn merge_while_held(
         }
     };
 
-    if status.success() {
+    if post.passed {
         outcome.verified = Some(true);
         return Ok(outcome);
     }
 
-    // Red. Undo the merge, and KEEP the mutex: until somebody proves this branch
-    // green again, no peer should be merging on top of it.
+    // Red — but is it red because of THIS merge?
+    //
+    // The first version of this gate asked "is the branch green?", which is the
+    // right question only when the branch was green to begin with. Under
+    // sustained upstream breakage it inverts: an agent merging unrelated work
+    // onto an already-red master fails a verification it did not break, has its
+    // good work reverted, and is handed a mutex it did not earn. Since the fixes
+    // FOR the breakage are themselves merges, and merges are gated on green,
+    // master can never recover. Measured on a live fleet: three saboteur
+    // regressions inside 15 minutes, then 25 minutes in which not one agent
+    // merge landed.
+    //
+    // So ask the question that was always meant: did I make it worse? Re-run the
+    // verification on the pre-merge base and compare which tests failed. The
+    // baseline run costs a second test cycle, but only on the red path — a green
+    // merge, which is the common case, still runs the suite exactly once.
+    let baseline = match git(repo_root, &["reset", "--hard", before]) {
+        Ok((true, _, _)) => run_verify(repo_root, verify).ok(),
+        _ => None,
+    };
+
+    if let Some(base) = &baseline {
+        // `!post.failures.is_empty()` is load-bearing: the empty set is a subset
+        // of everything, so without it a verification whose output this cannot
+        // attribute — `exit 1` with no libtest report — would satisfy the check
+        // trivially and land on a red branch. Unattributable means unproven, and
+        // unproven takes the conservative path.
+        if !base.passed && !post.failures.is_empty() && post.failures.is_subset(&base.failures) {
+            // Not this agent's doing. Re-apply the merge and get out of the way:
+            // blocking every unrelated change behind somebody else's breakage is
+            // the livelock this branch exists to prevent.
+            match reapply(repo_root, branch, into, agent) {
+                Ok(commit) => {
+                    outcome.merge_commit = Some(commit);
+                    outcome.verified = Some(false);
+                    outcome.landed_on_red = true;
+                    output::warn(&format!(
+                        "note: {into} was ALREADY failing before this merge, and this merge \
+                         added no new failure, so it was landed rather than reverted. \
+                         {} test(s) are failing and none of them are yours. The mutex is \
+                         released. Somebody still has to fix {into} — check whether a bead \
+                         already exists for it before filing another.",
+                        base.failures.len()
+                    ));
+                    return Ok(outcome);
+                }
+                Err(e) => return Err(Failure::HoldingBroken(e)),
+            }
+        }
+    }
+
+    // Either the base was green, or this merge added failures the base did not
+    // have. Both mean the merger owns it. Undo, and KEEP the mutex: until
+    // somebody proves this branch green again, no peer should merge on top.
+    let new_failures: Vec<&str> = match &baseline {
+        Some(base) => post
+            .failures
+            .difference(&base.failures)
+            .map(String::as_str)
+            .collect(),
+        None => Vec::new(),
+    };
+    let added = if new_failures.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nFailures this merge ADDED, which the base did not have:\n  {}\n",
+            new_failures.join("\n  ")
+        )
+    };
     let (reset_ok, _, reset_err) = match git(repo_root, &["reset", "--hard", before]) {
         Ok(t) => t,
         Err(e) => return Err(Failure::HoldingBroken(e)),
@@ -310,7 +450,7 @@ fn merge_while_held(
     };
 
     Err(Failure::HoldingBroken(anyhow::anyhow!(
-        "verification failed after merging {branch} into {into}, so {reverted}\n\
+        "verification failed after merging {branch} into {into}, so {reverted}{added}\n\
          \n\
          YOU STILL HOLD THE MERGE MUTEX, deliberately: a peer merging onto a \
          branch that has just failed its own oracle would bury the cause. Fix \
@@ -329,10 +469,16 @@ pub fn describe(o: &MergeOutcome) -> String {
     }
     let commit = o.merge_commit.as_deref().unwrap_or("(unknown)");
     let short = commit.get(..12).unwrap_or(commit);
-    let proof = match o.verified {
-        Some(true) => "verified".to_string(),
-        Some(false) => "NOT verified".to_string(),
-        None => "unverified (no --verify given)".to_string(),
+    let proof = match (o.verified, o.landed_on_red) {
+        (Some(true), _) => "verified".to_string(),
+        (Some(false), true) => {
+            format!(
+                "{} was already failing; this merge added nothing new",
+                o.into
+            )
+        }
+        (Some(false), false) => "NOT verified".to_string(),
+        (None, _) => "unverified (no --verify given)".to_string(),
     };
     format!(
         "merged {} into {} as {short}, signed Pact-Agent={} — {proof}",
@@ -520,6 +666,131 @@ mod tests {
             output::code_for(&err),
             2,
             "contention is exit 2, as it is for `lease acquire`: {err:#}"
+        );
+    }
+
+    /// A verification whose output this understands: it prints a libtest-style
+    /// report from a tracked file and fails if anything in it FAILED. Lets a
+    /// test set the base's failures and the branch's independently.
+    const VERIFY: &str = "cat report.txt; ! grep -q FAILED report.txt";
+
+    fn with_report(root: &Path, contents: &str, msg: &str) {
+        std::fs::write(root.join("report.txt"), contents).unwrap();
+        git(root, &["add", "-A"]).unwrap();
+        git(root, &["commit", "-q", "-m", msg]).unwrap();
+    }
+
+    /// The livelock this gate was rewritten for. Master is already failing when
+    /// the agent arrives; its merge adds no new failure; blocking it would mean
+    /// nothing can ever land, INCLUDING the fixes for the failure.
+    #[test]
+    fn a_merge_that_adds_no_new_failure_lands_on_an_already_red_branch() {
+        let tmp = repo();
+        let root = tmp.path();
+        with_report(
+            root,
+            "test a ... FAILED\n",
+            "master is broken by somebody else",
+        );
+
+        git(root, &["checkout", "-q", "-b", "unrelated"]).unwrap();
+        std::fs::write(root.join("f.txt"), "unrelated work\n").unwrap();
+        git(root, &["add", "-A"]).unwrap();
+        git(root, &["commit", "-q", "-m", "unrelated"]).unwrap();
+        git(root, &["checkout", "-q", "master"]).unwrap();
+
+        let out = merge(root, "penstock", "unrelated", Some(VERIFY), 600).unwrap();
+        assert!(out.landed_on_red, "it must land: {out:?}");
+        assert_eq!(out.verified, Some(false), "and must not claim to be proved");
+        assert!(out.merge_commit.is_some());
+
+        // The work is really on master, and signed.
+        let line = subject_and_trailer(root, "HEAD");
+        assert_eq!(line, "Merge unrelated into master|penstock", "{line}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "unrelated work\n"
+        );
+
+        // And the mutex is released — holding it would block the fleet behind
+        // a breakage this agent did not cause.
+        let held = lease::list(root, true).unwrap();
+        assert!(
+            !held.iter().any(|l| l.lease.path == mutex_key("master")),
+            "must not hold the mutex for somebody else's breakage: {held:?}"
+        );
+    }
+
+    /// The other half: a red base does not become a licence to add failures.
+    #[test]
+    fn a_merge_that_adds_a_new_failure_is_still_reverted_and_still_holds() {
+        let tmp = repo();
+        let root = tmp.path();
+        with_report(
+            root,
+            "test a ... FAILED\n",
+            "master is broken by somebody else",
+        );
+        let before = head(root).unwrap();
+
+        git(root, &["checkout", "-q", "-b", "worse"]).unwrap();
+        std::fs::write(
+            root.join("report.txt"),
+            "test a ... FAILED\ntest b ... FAILED\n",
+        )
+        .unwrap();
+        git(root, &["add", "-A"]).unwrap();
+        git(root, &["commit", "-q", "-m", "adds a failure"]).unwrap();
+        git(root, &["checkout", "-q", "master"]).unwrap();
+
+        let err = merge(root, "pitwheel", "worse", Some(VERIFY), 600).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("YOU STILL HOLD THE MERGE MUTEX"), "{msg}");
+        assert!(
+            msg.contains("Failures this merge ADDED") && msg.contains("b"),
+            "it must name what this merge broke: {msg}"
+        );
+        assert_eq!(head(root).unwrap(), before, "the merge must be undone");
+        assert!(lease::list(root, true)
+            .unwrap()
+            .iter()
+            .any(|l| l.lease.path == mutex_key("master")));
+    }
+
+    #[test]
+    fn failing_test_names_are_read_from_a_libtest_report() {
+        let text = "running 3 tests\ntest alpha ... ok\ntest beta::gamma ... FAILED\n\
+                    test delta ... FAILED\n\ntest result: FAILED. 1 passed; 2 failed;\n";
+        let got = failing_tests(text);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(
+            got.contains("beta::gamma") && got.contains("delta"),
+            "{got:?}"
+        );
+    }
+
+    /// An unreadable report must not be treated as "no failures" — that would
+    /// make every unrecognised red base look identical to a green one and land
+    /// merges that should have been held.
+    #[test]
+    fn an_unrecognised_verification_format_yields_no_names_and_still_holds() {
+        assert!(failing_tests("make: *** [test] Error 1\n").is_empty());
+
+        let tmp = repo();
+        let root = tmp.path();
+        branch_with_change(root, "feature", "changed\n");
+        // Fails, but says nothing this can attribute, on both base and merge.
+        let err = merge(
+            root,
+            "a",
+            "feature",
+            Some("echo opaque failure; exit 1"),
+            600,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("YOU STILL HOLD THE MERGE MUTEX"),
+            "an unattributable failure must take the conservative path"
         );
     }
 
