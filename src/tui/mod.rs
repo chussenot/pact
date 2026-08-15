@@ -218,6 +218,12 @@ impl App {
         let screen = self.nav.current().screen();
         dispatch!(screen, refresh(self));
         messages::refresh_unread_if_due(self);
+        // Same reasoning, second badge: the Health indicator has to be current
+        // from ANY screen — an operator who never opens Health would otherwise
+        // never learn a setup check is failing — and doctor spawns `bd`, so it
+        // has a clock of its own (`health::SETUP_INTERVAL`) rather than this
+        // one.
+        health::refresh_setup_if_due(self);
         self.last_refresh = Instant::now();
     }
 
@@ -290,6 +296,10 @@ fn root_labels(app: &App) -> Vec<String> {
             View::Messages if app.messages.unread > 0 => {
                 format!("Messages ({})", app.messages.unread)
             }
+            // The other badge: `Health !` / `Health ✗`. Demoting 25 setup
+            // checks to a collapsed line must not lose the one job the tab was
+            // doing — making a failing check impossible to miss from anywhere.
+            View::Health => health::tab_label(app),
             other => other.label(),
         })
         .collect()
