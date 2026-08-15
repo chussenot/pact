@@ -56,7 +56,6 @@ reader trusts it. Two consequences you must live by:
 | `docs/tui.md` | `pact ui` tabs, keybindings, the `ui` feature |
 | `docs/telemetry.md` | the optional OTel export: what leaves the machine, what never does |
 | `docs/development.md` | build, test, the CI gates and why each exists, the canary |
-| `docs/mascot-animations.md` | mascot gestures, triggers, frame data |
 
 New material goes in the page that already owns that surface. Create a new page
 only when a subject has no owner and is too large to host — and add it to the

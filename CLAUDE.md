@@ -55,8 +55,8 @@ audit.enabled`, plus two read-only parses of `.beads/interactions.jsonl`),
 protocol block), `watch.rs` (path subscriptions, and the diff delivered on
 release), `audit.rs` (offline analysis of the event log) with `git_history.rs`
 (the only place that shells out to `git` for history), `doctor.rs`,
-`identity.rs`, `output.rs`, `repo.rs`, and `tui.rs` + `mascot.rs` (the
-`pact ui` dashboard).
+`identity.rs`, `output.rs`, `repo.rs`, and `tui.rs` (the `pact ui`
+dashboard).
 
 Invariants worth knowing, because each was broken at least once:
 
@@ -96,7 +96,7 @@ is, the non-goals, provenance. It holds no exit-code table; that contract lives 
 `cli.md` (the command/exit-code contract), `onboarding.md`, `leases.md`,
 `messaging.md`, `watch.md`, `architecture.md`, `mcp.md`, `tui.md`,
 `telemetry.md`, `development.md`, `testing.md`, `audit.md`,
-`fleet-patterns.md`, `mascot-animations.md`.
+`fleet-patterns.md`.
 
 Every page under `docs/` opens with YAML front matter (`title`, `description`,
 `audience`); a new page needs one too. `README.md` has it as well. The three
