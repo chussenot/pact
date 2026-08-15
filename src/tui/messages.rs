@@ -337,13 +337,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         render_thread(frame, area, app, &id);
         return;
     }
-    if let Err(e) = &app.bd {
-        frame.render_widget(
-            Paragraph::new(e.as_str()).style(Style::default().fg(Color::Red)),
-            area,
-        );
-        return;
-    }
+    // No `app.bd` gate. Messages live in `.pact/messages.jsonl` and have had
+    // nothing to do with the issue tracker since 0.9.0, when exit 3 ("Beads
+    // backend unavailable") was retired — `msg send`/`inbox`/`read`/`sent` all
+    // work with no `bd` installed at all. This screen nevertheless refused to
+    // draw the fleet's conversation without it, which is the one situation
+    // where an operator most needs to read it: a fresh clone, no tooling.
+    // Caught by the no-backend leg of `mise run test`, which hides bd from PATH.
 
     // Notices get their own pane, sized to what there is: separating machine
     // output from correspondence is the readable half of this bead.

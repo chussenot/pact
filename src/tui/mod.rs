@@ -944,17 +944,29 @@ mod tests {
     }
 
     #[test]
-    fn messages_screen_shows_bd_missing_error_inline() {
+    /// Inverted deliberately. This used to assert that a missing `bd` REPLACED
+    /// the message pane with "bd (beads) not found" — which was true of the
+    /// dashboard and false of pact: messages moved into
+    /// `.pact/messages.jsonl` in 0.9.0 and exit 3 was retired with them, so the
+    /// whole `msg` surface works with no `bd` on PATH. The screen refused to
+    /// draw the fleet's conversation in exactly the situation where an operator
+    /// most needs to read it — a fresh clone with no tooling installed.
+    ///
+    /// The old assertion is what kept the gate there, so it had to go with it.
+    fn a_missing_bd_does_not_hide_the_conversation() {
         let mut app = app_with(Some("agent-a"), vec![]);
         app.nav.set_root(View::Messages);
-        // app_with already seeds `bd` as Err, matching "bd not on PATH".
+        // app_with seeds `bd` as Err, matching "bd not on PATH".
 
         let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let rendered = render_to_string(&terminal);
         assert!(rendered.contains("Messages"));
-        assert!(rendered.contains("bd (beads) not found"));
+        assert!(
+            !rendered.contains("bd (beads) not found"),
+            "the message store does not need bd: {rendered}"
+        );
     }
 
     /// A REAL store, not a seeded cache. Enter pushes `View::Thread`, and the
