@@ -87,6 +87,8 @@ would put unrelated agents into each other's replies. It carries:
 
 - the path, the holder, and what they changed as a unified diff
 - the holder's `HEAD` short hash at release
+- **in a repository with worktrees, the branch the change is on** — and that the
+  notice is a contract notice rather than a code delivery ([why](#the-worktree-caveat))
 - **how to reply in the same thread**, naming the holder
 - a reminder that `pact watch rm <path>` stops it
 
@@ -234,6 +236,38 @@ The content is correct — that really is what the holder changed. But a
 subscriber sees the change *pre-merge*, and if the merge alters it, what
 finally lands may differ. Treat it as early warning rather than as the final
 word: it arrives while there is still time to object, which is the point.
+
+### So the notice says which branch, and that it is not a delivery
+
+A subscriber's reasonable next move on "`src/x.rs` changed — released by peer"
+is to go and look at `src/x.rs`. In a worktree fleet that file is unchanged and
+will stay unchanged: the holder wrote it on **their** branch in **their**
+worktree, and the only path into the subscriber's tree is orchestrator-merges-to-
+shared, then subscriber-merges-shared.
+
+An agent that had done exactly what the protocol asks — `watch add` on an
+interface it depended on but did not own — worked this out for itself, wrote
+*"their file can never reach mine; waiting was structurally pointless"*, and
+killed the waiter it had started. Nothing in the notice had told it otherwise.
+
+So when — and **only** when — the repository has linked worktrees, the notice
+adds:
+
+```
+This is a contract notice, not a code delivery: agent-a wrote this on branch
+fleet/agent-a, in their own worktree. It cannot appear in your tree until
+fleet/agent-a merges and you merge that. Read the diff for what the contract
+now says and carry on — the file will not change under you, so there is
+nothing to wait for.
+```
+
+The gate is the same `has_worktrees` test that decides whether a lock file
+carries `branch` at all, resolved from the same repository root in the same
+process, so the notice and the lease cannot disagree about where the holder was.
+In a plain checkout it is omitted, because there the notice really *is* a code
+delivery — the diff describes the file already sitting in the reader's tree, and
+a paragraph explaining that it does not would be a lie plus four lines of
+context.
 
 ## Event kinds
 

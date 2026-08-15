@@ -146,6 +146,10 @@ this protocol whenever you touch shared files or hand off work to others.
   resolved to has exited. So when you are handing off work, address the FILE.
   And read what `pact lease acquire` tells you before you edit: a message
   waiting on a path is usually the reason the last agent stopped.
+  **Someone must have held it first.** pact resolves `--to-owner-of` through the
+  record of who has leased the path, so a path nobody has ever leased has no
+  owner to address and the send is refused outright. You cannot pre-address work
+  that has not started — for that, name the agent with `--to`.
 - **On exit 2, use the number in the refusal — do not poll.** The refusal tells you
   how long the holder has left. Wait on THAT order of magnitude, or better, take the
   advice pact prints with it: subscribe with `pact watch add <path>` and pick up
@@ -165,9 +169,9 @@ this protocol whenever you touch shared files or hand off work to others.
   exists with `pact agents` first — a mistyped name sends into the void. One
   decision that affects several agents goes out as ONE message: repeat `--to`
   and they all land in a single thread anyone can read and reply into.
-- **Use a file for anything longer than a sentence**: `--body-file <path>`, or
-  `--body-file -` for stdin. Quotes, backslashes and aligned tables do not
-  survive a shell, and handing over an API is exactly that kind of content.
+- **Use a file for anything longer than a sentence**: `--body-file <path>`.
+  Quotes, backslashes and aligned tables do not survive a shell, and handing
+  over an API is exactly that kind of content.
 - **Read and reply in the same thread**: `pact msg inbox` lists one line per
   message; `pact msg read <id>` shows one in full together with its whole
   thread. Reply with `pact msg send --to <sender> --thread <id> "..."` — a
@@ -185,6 +189,11 @@ this protocol whenever you touch shared files or hand off work to others.
   protocol started reserving messages for what needs something back, 28 agents
   sent 4 messages between them, and the one that mattered was the only reason a
   runtime panic did not ship.
+  **In a worktree fleet a notice is a contract notice, not a code delivery.** It
+  names the branch the change is on; that change cannot appear in your tree until
+  the branch merges and you merge that. Read the diff for what the contract now
+  says and keep going — waiting for the file to change under you is waiting for
+  something that structurally cannot happen.
 - **Read your inbox at task start AND before your final commit.** The first
   tells you what changed under you before you plan; the second catches the
   interface change that landed while you were working, which is exactly when it
