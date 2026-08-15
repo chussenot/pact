@@ -375,7 +375,11 @@ impl ReleaseOutcome {
     }
 }
 
-#[derive(Debug, Serialize)]
+// `Clone` so a reader can keep a snapshot of what `peek` returned without
+// re-scanning `.pact/leases/`: `pact ui` parses every store once per tick and
+// hands the views a copy, rather than each view scanning the lock directory for
+// itself (pact-pyt.11).
+#[derive(Debug, Clone, Serialize)]
 pub struct LeaseEntry {
     pub lease: LeaseInfo,
     pub age_secs: i64,
