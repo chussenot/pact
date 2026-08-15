@@ -405,35 +405,43 @@ pub fn checks(root: &Path) -> DoctorReport {
 
     // pact-as5.5: `pact audit --check claim-lease-divergence` is the only thing
     // left that asks a Beads-side question, and it reads the committed
-    // `.beads/interactions.jsonl` export. bd writes that sidecar ONLY when
-    // `audit.enabled` is on, and it is OFF BY DEFAULT — bd 1.2.1's own `bd audit
-    // --help` says so ("This optional JSONL sidecar is disabled by default"), and
-    // `bd config get audit.enabled` reports `false` even in this repository, whose
-    // sidecar was enabled at some point and has recorded nothing since.
+    // `.beads/interactions.jsonl` export. bd writes that sidecar only when its audit
+    // sidecar is recording, and `bd audit --help` says it is off by default.
     //
     // So the check is effectively opt-in, and its failure mode is silence: it
     // reports "no assignee history" and PASSES, forever, which is
     // indistinguishable from "your fleet never diverged". That is the one thing
-    // doctor exists to prevent, so it says so and names the switch. Warns rather
-    // than fails: the sidecar is genuinely optional and a repo that does not want
-    // it is not broken.
+    // doctor exists to prevent, so it says so. Warns rather than fails: the sidecar
+    // is genuinely optional and a repo that does not want it is not broken.
     //
-    // Existence is the WRONG signal on its own, so bd is asked whether the sidecar
-    // is actually recording. This repository proves why: its sidecar exists with 264
-    // rows AND `audit.enabled` is `false`, so it stopped on 2026-08-12 and will never
-    // gain another. An existence check calls that healthy.
+    // pact-83r.6 / field-audit finding 6: what is asked changed, because doctor used
+    // to ask `bd config get audit.enabled` and report the answer as the verdict. That
+    // read cannot support the verdict, for two measured reasons:
     //
-    // Asking costs no new dependency class — doctor already spawns bd for its version
-    // on the check above, and reporting what is installed and how it is configured is
-    // doctor's entire job. When bd cannot be asked, existence is the fallback and the
-    // detail says the recording state is unconfirmed rather than implying it is fine.
+    //   1. bd answers for a key nobody set. `bd config get anything.at.all` prints
+    //      `(not set)` and exits 0, and after `bd config set audit.enabled true` — a
+    //      command bd greets with `Warning: "audit.enabled" is not a recognized
+    //      config key` and then honours anyway — the get reads back `true`. So the
+    //      read reports this repository's `config.yaml`, and reports it whether or
+    //      not bd's own allowlist agrees the key exists.
+    //   2. `BD_AUDIT_ENABLED=1` enables the sidecar with NO config write at all. It
+    //      lives in the environment of whoever runs bd, which is not doctor's
+    //      process, so nothing pact can read reflects it.
+    //
+    // Together those mean pact cannot honestly answer "is recording on right now",
+    // and a check that answers it anyway will call a correctly-configured repo broken
+    // (env-var route, key unset) as readily as the reverse. So the check stops
+    // claiming it and reports the fact it can stand behind: whether the export file
+    // pact actually reads exists. That file is proof recording happened, which is the
+    // question `pact audit --check claim-lease-divergence` cares about — and no bd is
+    // spawned to learn it.
+    //
+    // Warns rather than fails either way: the sidecar is genuinely optional and a
+    // repo that does not want it is not broken. What is worth a warning is believing
+    // a check runs when it cannot.
     let beads_dir = root.join(".beads");
-    let recording = beads::BeadsCli::locate()
-        .ok()
-        .and_then(|cli| cli.audit_sidecar_enabled(root));
     checks.push(sidecar_check(
         beads_dir.is_dir(),
-        recording,
         beads_dir.join("interactions.jsonl").is_file(),
     ));
 
@@ -976,17 +984,37 @@ fn clone_reach_check(
     }
 }
 
-/// The `Beads audit sidecar` verdict, as a pure function of the three facts it
-/// depends on — so all six states are testable without a bd installation deciding
-/// the answer.
+/// The `Beads audit sidecar` verdict, as a pure function of the two facts it depends
+/// on — so every state is testable, and no bd installation gets a vote.
 ///
 /// Every state is `ok: true`. The sidecar is genuinely optional and a repo that does
 /// not want it is not broken; what is worth a warning is believing a check runs when
 /// it cannot.
-fn sidecar_check(beads_dir: bool, recording: Option<bool>, sidecar: bool) -> DoctorCheck {
+///
+/// **It reports the file, not the switch, and that is the whole of pact-83r.6.** The
+/// question a reader wants answered is "is recording on", and pact cannot answer it:
+/// `BD_AUDIT_ENABLED=1` enables the sidecar from the environment of whoever runs bd,
+/// leaving nothing in the config for pact to read, while `bd config get
+/// audit.enabled` answers for a key nobody set. Between them, a config-derived
+/// verdict is wrong in both directions — it calls an env-var-enabled repo "OFF", and
+/// calls a repo where somebody typed the key "on" whether or not a row was ever
+/// written. So the check reports the artifact pact actually consumes: the export
+/// file. Its presence is proof recording happened, and its absence is exactly the
+/// condition under which `claim-lease-divergence` finds nothing.
+///
+/// The cost is the old "on, but stale" state, which is gone. It was never a fact —
+/// it was `config get` disagreeing with the filesystem, and it fired on a repo
+/// recording perfectly well through the env var. Losing an artefact of a broken
+/// probe is the point of replacing the probe rather than adding to it.
+///
+/// **The remediation names both levers and pre-empts bd's spurious warning**, because
+/// that warning is the actual trap here: bd 1.2.1 greets `bd config set audit.enabled
+/// true` with `"audit.enabled" is not a recognized config key` and then honours it
+/// (verified end to end — see [`beads::interaction_assignees`]). A reader who sees
+/// that and concludes the fix failed will go looking for a different one that does
+/// not exist.
+fn sidecar_check(beads_dir: bool, sidecar: bool) -> DoctorCheck {
     let name = "Beads audit sidecar";
-    let switch = "turn it on with `bd config set audit.enabled true`; bd records from that \
-                  point, not retroactively";
     if !beads_dir {
         return DoctorCheck {
             name,
@@ -995,57 +1023,28 @@ fn sidecar_check(beads_dir: bool, recording: Option<bool>, sidecar: bool) -> Doc
             detail: "no .beads/ — not applicable".to_string(),
         };
     }
-    let (warn, detail) = match (recording, sidecar) {
-        (Some(true), true) => (
+    let (warn, detail) = if sidecar {
+        (
             false,
-            "on, and .beads/interactions.jsonl is present — `pact audit --check \
-             claim-lease-divergence` has data to read"
+            ".beads/interactions.jsonl is present — `pact audit --check \
+             claim-lease-divergence` has data to read. Whether bd is still recording is \
+             not something pact can see (`BD_AUDIT_ENABLED=1` leaves no trace in bd's \
+             config), so check the newest row's date if this repo has been quiet"
                 .to_string(),
-        ),
-        // Recording with nothing written yet: correct, and self-resolving.
-        (Some(true), false) => (
-            false,
-            "on; no .beads/interactions.jsonl yet, which resolves itself on the next bead \
-             change"
+        )
+    } else {
+        (
+            true,
+            "no .beads/interactions.jsonl, so `pact audit --check claim-lease-divergence` \
+             finds nothing and `Beads actor attribution` above has no actors — both pass \
+             in silence, which is indistinguishable from a clean fleet. Turn recording on \
+             with `BD_AUDIT_ENABLED=1` in the environment your agents run bd in, or `bd \
+             config set audit.enabled true` to persist it — bd 1.2.1 answers that one \
+             with `\"audit.enabled\" is not a recognized config key` and then honours it \
+             anyway, so the warning is bd's allowlist being wrong, not the switch \
+             failing. bd records from that point, not retroactively"
                 .to_string(),
-        ),
-        // THE CASE AN EXISTENCE CHECK MISSES, and the reason bd is asked at all: rows on
-        // disk, recording switched off. Every file check calls this healthy. This
-        // repository was in exactly that state — 264 rows, last written 2026-08-12,
-        // `audit.enabled` false.
-        (Some(false), true) => (
-            true,
-            format!(
-                "OFF, but .beads/interactions.jsonl exists — so it holds only history from \
-                 whenever recording last stopped, and `pact audit --check \
-                 claim-lease-divergence` will silently judge new holds against stale \
-                 assignees; {switch}"
-            ),
-        ),
-        (Some(false), false) => (
-            true,
-            format!(
-                "off (the default), so there is no .beads/interactions.jsonl and `pact audit \
-                 --check claim-lease-divergence` can never find anything, nor can `Beads \
-                 actor attribution` above; {switch}"
-            ),
-        ),
-        // bd could not be asked: existence is all there is, and the detail says so rather
-        // than implying the recording state was checked.
-        (None, true) => (
-            false,
-            ".beads/interactions.jsonl present, but bd could not be asked whether it is \
-             still recording — the rows may be history only"
-                .to_string(),
-        ),
-        (None, false) => (
-            true,
-            format!(
-                "no .beads/interactions.jsonl, and bd could not be asked whether the sidecar \
-                 is on; if it is off (the default) `pact audit --check \
-                 claim-lease-divergence` can never find anything — {switch}"
-            ),
-        ),
+        )
     };
     DoctorCheck {
         name,
@@ -1357,75 +1356,78 @@ mod tests {
         assert!(c.detail.contains("not applicable"), "{}", c.detail);
     }
 
-    /// All six states of the sidecar verdict, decided without a bd installation getting
+    /// Every state of the sidecar verdict, decided without a bd installation getting
     /// a vote — which is the point of `sidecar_check` being pure. An earlier cut called
     /// `checks()` and so silently asserted whatever the test machine's own bd config
     /// happened to say.
     #[test]
     fn the_sidecar_verdict_warns_exactly_when_a_check_would_silently_not_run() {
         // Nothing to say about a repo with no issue tracker.
-        let none = sidecar_check(false, None, false);
+        let none = sidecar_check(false, false);
         assert!(none.ok && !none.warn, "{}", none.detail);
         assert!(none.detail.contains("not applicable"));
 
-        for (recording, sidecar, should_warn, why) in [
-            (
-                Some(true),
-                true,
-                false,
-                "recording, with data: nothing to report",
-            ),
-            (
-                Some(true),
-                false,
-                false,
-                "recording, empty: resolves itself",
-            ),
-            (
-                Some(false),
-                true,
-                true,
-                "OFF with rows on disk — the case an existence check calls healthy",
-            ),
-            (
-                Some(false),
-                false,
-                true,
-                "off and empty: the check can never run",
-            ),
-            (
-                None,
-                true,
-                false,
-                "unasked, with rows: existence is all there is",
-            ),
-            (None, false, true, "unasked and empty: probably off, say so"),
+        for (sidecar, should_warn, why) in [
+            (true, false, "the export exists: the check has data to read"),
+            (false, true, "absent: the check passes in silence forever"),
         ] {
-            let c = sidecar_check(true, recording, sidecar);
+            let c = sidecar_check(true, sidecar);
             assert!(c.ok, "an optional sidecar must never FAIL doctor: {why}");
             assert_eq!(c.warn, should_warn, "{why}: {}", c.detail);
-            if should_warn {
-                assert!(
-                    c.detail.contains("audit.enabled"),
-                    "a warning must name the switch: {}",
-                    c.detail
-                );
-                assert!(
-                    c.detail.contains("claim-lease-divergence"),
-                    "and what cannot run: {}",
-                    c.detail
-                );
-            }
+            assert!(
+                c.detail.contains("claim-lease-divergence"),
+                "every state must name what depends on it: {}",
+                c.detail
+            );
         }
+    }
 
-        // The stale case must not read as the healthy one.
-        let stale = sidecar_check(true, Some(false), true);
-        let live = sidecar_check(true, Some(true), true);
-        assert!(stale.detail.contains("stale"), "{}", stale.detail);
+    /// pact-83r.6, and why it is worth its own test: the remediation must stay TRUE
+    /// and stay COMPLETE.
+    ///
+    /// bd 1.2.1 rejects `audit.enabled` from its config-key allowlist, prints a
+    /// warning, and then honours the key anyway — measured end to end, both
+    /// directions, in a throwaway repo. So doctor must keep naming the command
+    /// (dropping it strands a reader whose switch works) AND must pre-empt the
+    /// warning, or the reader concludes the fix failed and hunts for one that does
+    /// not exist. `BD_AUDIT_ENABLED=1` is bd's second lever, needs no config write and
+    /// warns about nothing, so omitting it omits the easy answer.
+    ///
+    /// An earlier cut of this bead asserted the opposite — that the key is inert and
+    /// the sidecar cannot be enabled at all — on the strength of a field report nobody
+    /// had re-measured. These assertions exist so that claim cannot come back.
+    #[test]
+    fn the_sidecar_remediation_names_both_levers_and_pre_empts_bds_spurious_warning() {
+        let absent = sidecar_check(true, false);
+
         assert!(
-            !live.detail.contains("stale"),
-            "a recording sidecar is not stale: {}",
-            live.detail
+            absent.detail.contains("bd config set audit.enabled true"),
+            "the config lever works on bd 1.2.1 and must still be named: {}",
+            absent.detail
+        );
+        assert!(
+            absent.detail.contains("BD_AUDIT_ENABLED=1"),
+            "the env lever needs no config write and warns about nothing: {}",
+            absent.detail
+        );
+        assert!(
+            absent.detail.contains("not a recognized config key"),
+            "a reader not warned about bd's warning will think it failed: {}",
+            absent.detail
+        );
+        assert!(
+            absent.detail.contains("honours it"),
+            "and must be told the warning is spurious, not merely shown it: {}",
+            absent.detail
+        );
+
+        // The present case must not claim recording is still ON: pact cannot see the
+        // env lever, so that is precisely the assertion it is not entitled to make.
+        let present = sidecar_check(true, true);
+        assert!(
+            present.detail.contains("not something pact can see"),
+            "a check must not imply it verified what it cannot: {}",
+            present.detail
         );
     }
 

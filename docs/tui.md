@@ -142,12 +142,12 @@ here that the CLI does not emit, fails CI:
 | `one Beads store` | warns (`!`) when `.beads/` holds two backends' stores |
 | `Beads CLI` | which binary, which version — informational, since no pact command depends on `bd` at run time |
 | `Beads actor attribution` | warns (`!`) when multiple pact agent identities never appear as any Beads actor — direct `bd` commands bypassing pact's `--actor` |
-| `Beads audit sidecar` | asks bd whether its audit sidecar is RECORDING, not merely whether `.beads/interactions.jsonl` exists. Warns (`!`) when recording is off — including when the file is present but stale, which every existence check reads as healthy — because `pact audit --check claim-lease-divergence` then judges new holds against frozen assignees, or finds nothing at all. Never fails: the sidecar is optional |
+| `Beads audit sidecar` | whether `.beads/interactions.jsonl` — the export `pact audit --check claim-lease-divergence` reads — exists at all. Warns (`!`) when it does not, because that check and `Beads actor attribution` then pass in silence, which is indistinguishable from a clean fleet; the warning names both ways to turn recording on and pre-empts bd's spurious "not a recognized config key". Never fails: the sidecar is optional. Deliberately does **not** claim recording is currently on — `BD_AUDIT_ENABLED=1` leaves no trace pact can read |
 | `stale leases` | how many, without collecting them |
 | `corrupt leases` | lock files pact cannot read, which only a human can clear |
 | `orphaned staging files` | `staging-*`/`tmp-*` debris left by a write that crashed mid-rename |
 | `stale wait markers` | `.pact/waits/` markers a conflict left behind that nobody retried or swept — informational only, never a failure |
 
-Lazy-loaded (only checked once you visit the tab, or press `r`), since it spawns bd twice — `--version`, and `config get audit.enabled` for the sidecar check. Messages is lazy-loaded too, though it no longer needs to be: it reads a file. The terminal is restored even if the app
+Lazy-loaded (only checked once you visit the tab, or press `r`), since it spawns bd for `--version`. The sidecar check used to add a second spawn (`config get audit.enabled`) and no longer does — it reads the filesystem. Messages is lazy-loaded too, though it no longer needs to be: it reads a file. The terminal is restored even if the app
 panics — a crashed TUI leaving your shell in raw mode is exactly the kind of
 papercut pact tries not to introduce.

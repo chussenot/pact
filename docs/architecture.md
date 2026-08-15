@@ -538,11 +538,13 @@ side effect, and asking twice gave two answers. Collecting is now confined to
 ## Locating the Beads store: the store decides, not the cwd
 
 `src/beads.rs` is the only place pact has ever spawned a Beads process, and since
-0.9.0 exactly two things spawn one, both of them diagnostics: `bd --version` and
-`bd config get audit.enabled`, for `pact doctor` (and `--version` for
-`pact whoami`) to report. The subprocess runner behind them is **private**, which is
-a fence rather than a tidy-up: a public generic `bd` runner is an open invitation to
-put the issue tracker back on a pact command's hot path.
+0.9.0 exactly one thing does, a diagnostic: `bd --version`, for `pact doctor` and
+`pact whoami` to report. The `Beads audit sidecar` check used to add a second
+(`bd config get audit.enabled`) and no longer does — it reads the filesystem,
+because that read could not answer the question it was asked (pact-83r.6). The
+subprocess runner behind it is **private**, which is a fence rather than a tidy-up:
+a public generic `bd` runner is an open invitation to put the issue tracker back on
+a pact command's hot path.
 
 It still walks up for the first `.beads/` and reads what made it, rather than
 trusting the working directory — in a linked worktree there is usually no `.beads/`
