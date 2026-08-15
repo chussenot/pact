@@ -91,7 +91,7 @@ jobs:
       - name: shellcheck scripts/
         # scripts/chaos.sh is destructive, so "shellcheck-clean" is enforced
         # rather than asserted in a comment. See mise.toml for the severity note.
-        run: shellcheck --severity=warning scripts/*.sh
+        run: shellcheck --severity=warning scripts/*.sh scripts/pw
 
   # Conventional-commit lint, PRs only.
   #

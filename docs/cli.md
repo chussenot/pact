@@ -48,7 +48,7 @@ pact lease release --all
 pact msg send (--to <agent>... | --to-owner-of <path>...) [--thread <id>] [--subject <text>] [--skip <agent>...] (<body> | --body-file <path|->)
 pact msg inbox [--unread-only] [--full] [--include-watch | --watch-only]
 pact msg sent
-pact msg read <id>
+pact msg read <id> [--brief]
 pact watch add <path>
 pact watch rm <path>
 pact watch ls

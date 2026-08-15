@@ -152,7 +152,7 @@ description = "shellcheck every script in scripts/, at warning severity."
 #
 # This exists because scripts/chaos.sh is destructive, and "shellcheck-clean"
 # had to be a property something enforces rather than a sentence in its header.
-run = "shellcheck --severity=warning scripts/*.sh"
+run = "shellcheck --severity=warning scripts/*.sh scripts/pw"
 
 [tasks.check]
 description = "Run the full CI check locally: fmt, lint, test, otel, docs — serially, as CI does."

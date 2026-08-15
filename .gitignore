@@ -18,6 +18,12 @@
 # per-machine; committing it would have every clone inherit peers' read state.
 .pact/read/
 
+# Per-agent instrumentation from scripts/pw — one JSONL line per tool call, per
+# agent, per run. Run-local for the same reason .pact/leases/ is: it describes one
+# execution, not the repository. A fleet analysing its own run reads it in place;
+# anything worth keeping gets summarised into docs/studies/.
+.harness/
+
 # Generated agent-workflow scripts (.claude/settings.json is tracked)
 .claude/workflows/
 
