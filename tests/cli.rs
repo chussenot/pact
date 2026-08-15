@@ -485,6 +485,101 @@ fn release_takes_many_paths_and_a_refusal_does_not_abort_the_others() {
     );
 }
 
+/// Finding 7: `--ttl` used to take bare seconds only, while `pact audit --since`
+/// took `90m`/`24h`/`7d`. An agent passed `--ttl 20` meaning twenty minutes, got
+/// twenty seconds, and its lease lapsed mid-work — a commit under an expired
+/// lease, and no release diff for any `pact watch` subscriber, because the lease
+/// expired instead of being released. A second agent tried `--ttl 3m` and was
+/// refused. Both spellings have to work now, and the recorded `ttl_secs` is the
+/// only proof the unit was applied rather than swallowed.
+#[test]
+fn ttl_takes_the_since_duration_grammar() {
+    let tmp = init_repo();
+    let repo = tmp.path();
+    for (spelling, secs) in [("3m", 180), ("90m", 5400), ("24h", 86400), ("2w", 1209600)] {
+        let path = format!("f-{spelling}.rs");
+        let out = pact(
+            repo,
+            "agent-ttl",
+            &["lease", "acquire", &path, "--ttl", spelling, "--json"],
+        );
+        assert_ok(&out);
+        assert_eq!(
+            json_stdout(&out)["lease"]["ttl_secs"],
+            secs,
+            "--ttl {spelling} must record {secs}s"
+        );
+    }
+}
+
+/// The load-bearing half of finding 7. `--ttl 20` keeps meaning twenty seconds
+/// forever — scripts pass bare integers — so being *told* is the only thing that
+/// saves the next agent. It must warn and still succeed: a 20-second lease is the
+/// blessed short-mutex idiom (pact-b7x.3) for a directory a tool is about to
+/// write behind you.
+#[test]
+fn a_small_bare_ttl_warns_about_the_unit_and_still_succeeds() {
+    let tmp = init_repo();
+    let repo = tmp.path();
+    let out = pact(
+        repo,
+        "agent-ttl",
+        &["lease", "acquire", ".beads/", "--ttl", "20", "--json"],
+    );
+    assert_ok(&out);
+    assert_eq!(json_stdout(&out)["lease"]["ttl_secs"], 20);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("SECONDS") && stderr.contains("20m"),
+        "must name the unit it used and the spelling that meant minutes: {stderr}"
+    );
+
+    // A TTL that is plainly deliberate says nothing.
+    let quiet = pact(
+        repo,
+        "agent-ttl",
+        &["lease", "acquire", "big.rs", "--ttl", "2700"],
+    );
+    assert_ok(&quiet);
+    assert!(
+        !stderr_of(&quiet).contains("SECONDS"),
+        "the default must not warn: {}",
+        stderr_of(&quiet)
+    );
+
+    // ...and a unit spelling never warns, however small.
+    let unit = pact(
+        repo,
+        "agent-ttl",
+        &["lease", "acquire", "small.rs", "--ttl", "20s"],
+    );
+    assert_ok(&unit);
+    assert!(
+        !stderr_of(&unit).contains("SECONDS"),
+        "an explicit unit is unambiguous: {}",
+        stderr_of(&unit)
+    );
+}
+
+/// A bad `--ttl` stayed exit 5 when the grammar moved out of clap's
+/// `value_parser` into pact's own. Exit codes are API (docs/cli.md).
+#[test]
+fn a_bad_ttl_is_still_a_usage_error() {
+    let tmp = init_repo();
+    let repo = tmp.path();
+    let out = pact(
+        repo,
+        "agent-ttl",
+        &["lease", "acquire", "f.rs", "--ttl", "3q"],
+    );
+    assert_eq!(out.status.code(), Some(5), "stderr: {}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("s, m, h, d or w"),
+        "must name the units it takes: {}",
+        stderr_of(&out)
+    );
+}
+
 /// pact-mqw.7, half two: a lease that lapsed and had its lock collected must not
 /// report as a clean release.
 ///

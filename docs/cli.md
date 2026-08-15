@@ -41,7 +41,7 @@ made. That is also why the MCP server is read-only — see
 
 ```
 # ─── agents run these, while they work ───────────────────────────────────────
-pact lease acquire <path>... [--ttl <seconds>] [--steal] [--note <text>]
+pact lease acquire <path>... [--ttl <duration>] [--steal] [--note <text>]
 pact lease renew <path>
 pact lease release <path>... [--force]
 pact lease release --all
@@ -89,6 +89,13 @@ Every subcommand accepts a global `--agent <name>` (or `PACT_AGENT` env var)
 and `--json` flag. `--all` on `release` is mutually exclusive with both
 `<path>` and `--force`; `--body-file` is mutually exclusive with the positional
 body. clap rejects those combinations rather than silently ignoring one.
+
+**`<duration>` is one grammar everywhere it appears** — `<n><unit>` with unit in
+`s`, `m`, `h`, `d`, `w`, so `45m`, `24h`, `7d`, `2w` all mean what they read as
+to both `lease acquire --ttl` and `audit --since`. A bare number is seconds, for
+the scripts that already pass one. `--ttl` warns on a bare value under 120 and
+holds anyway ([why](leases.md#--ttl-takes-a-duration-and-a-small-bare-number-warns));
+a malformed one is a usage error, exit 5.
 
 `init --force` writes through a live lease on a file `init` would rewrite;
 without it `init` exits 2 and writes nothing at all

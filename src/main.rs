@@ -241,8 +241,10 @@ enum LeaseAction {
         /// is held by someone else, none are taken.
         #[arg(required = true, num_args = 1..)]
         paths: Vec<String>,
-        #[arg(long, default_value_t = lease::DEFAULT_TTL_SECS)]
-        ttl: u64,
+        /// How long to hold. A bare number is SECONDS (the default 2700 is 45
+        /// minutes); or give a unit, as `--since` takes: 45m, 2h, 1d, 2w.
+        #[arg(long, default_value_t = lease::DEFAULT_TTL_SECS.to_string())]
+        ttl: String,
         /// Force takeover of a non-expired lease.
         #[arg(long)]
         steal: bool,
@@ -1622,6 +1624,14 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
             note,
         } => {
             let agent = identity::resolve_agent(agent_flag)?;
+            // Parsed here rather than in a clap `value_parser` because a bare
+            // small value must WARN and still succeed, and a parser that writes
+            // to stderr would also fire while clap renders the default in
+            // `--help`.
+            // A bad `--ttl` stays exit 5: clap raised it as an invalid value
+            // before the grammar moved out of clap, and the exit code is API.
+            let ttl = lease::parse_ttl(&ttl)
+                .map_err(|e| output::exit_with(USAGE_ERROR, e.to_string()))?;
             // Look up prior owners BEFORE acquiring: the acquire appends its own
             // event, which would make the caller the answer to its own question.
             let prior = prior_owners(&root, &paths, &agent);
@@ -3336,7 +3346,7 @@ mod tests {
         let acquire = Command::Lease {
             action: LeaseAction::Acquire {
                 paths: vec!["src/secret.rs".to_string()],
-                ttl: 900,
+                ttl: "900".to_string(),
                 steal: false,
                 note: Some("rewriting the auth module".to_string()),
             },
