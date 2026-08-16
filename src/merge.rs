@@ -291,6 +291,63 @@ fn reapply(repo_root: &Path, branch: &str, into: &str, agent: &str) -> Result<St
     head(repo_root)
 }
 
+/// Resolve what the caller named into something `git merge` accepts (pact-3v6).
+///
+/// Agents think in worktrees — they create `wt/<agent>-<bead>` and pass it back —
+/// and most of the time the branch takes the same name, so the two are
+/// interchangeable and the difference stays hidden. It stops being hidden the
+/// moment they diverge: one agent's worktree was `wt/damsel-millrace-9eg` while
+/// its branch was `damsel-millrace-9eg`, and passing the path failed with git's
+/// bare "not something we can merge" — in the middle of recovering that agent's
+/// abandoned work, which is the worst possible moment to be guessing at argument
+/// forms.
+fn resolve_branch(repo_root: &Path, arg: &str) -> Result<String> {
+    // A real ref wins outright: a branch and a directory could share a name, and
+    // the ref is what the caller almost certainly meant.
+    if let Ok((true, _, _)) = git(repo_root, &["rev-parse", "--verify", "--quiet", arg]) {
+        return Ok(arg.to_string());
+    }
+
+    let worktrees = worktree_branches(repo_root);
+    let arg_path = repo_root.join(arg);
+    for (path, branch) in &worktrees {
+        if Path::new(path) == arg_path || path.ends_with(arg.trim_end_matches('/')) {
+            return Ok(branch.clone());
+        }
+    }
+
+    let candidates: Vec<&str> = worktrees.iter().map(|(_, b)| b.as_str()).collect();
+    let suggestion = if candidates.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nBranches checked out in this repository's worktrees:\n  {}",
+            candidates.join("\n  ")
+        )
+    };
+    bail!("{arg:?} is neither a branch nor a worktree of this repository.{suggestion}")
+}
+
+/// `(worktree path, branch)` for every linked worktree with a branch checked
+/// out. A detached worktree has no branch and is skipped.
+fn worktree_branches(repo_root: &Path) -> Vec<(String, String)> {
+    let Ok((true, stdout, _)) = git(repo_root, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut current: Option<String> = None;
+    for line in stdout.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            current = Some(p.to_string());
+        } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+            if let Some(p) = current.take() {
+                out.push((p, b.to_string()));
+            }
+        }
+    }
+    out
+}
+
 fn head(repo_root: &Path) -> Result<String> {
     let (ok, stdout, stderr) = git(repo_root, &["rev-parse", "HEAD"])?;
     if !ok {
@@ -335,6 +392,10 @@ pub fn merge(
             COORDINATION_PREFIXES.join(", ")
         );
     }
+
+    // Resolved before the mutex: a bad argument should cost nobody a wait, and
+    // the resolved name is what every later step and the outcome report use.
+    let branch = &resolve_branch(repo_root, branch)?;
 
     let key = mutex_key(&into);
     let before = head(repo_root)?;
@@ -410,7 +471,17 @@ fn merge_while_held(
     let (has_merge_head, _, _) =
         git(repo_root, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).map_err(Failure::Clean)?;
     if !has_merge_head {
+        // pact-f26: "already up to date" alone cannot tell an agent whether its
+        // work is on this branch. It usually is — a retry after a merge that
+        // landed reaches exactly here — and an agent that reads this as "nothing
+        // happened" goes looking through git log to find out. Name the commit
+        // that already contains the branch, so the message answers the question
+        // the caller actually has.
         outcome.already_up_to_date = true;
+        outcome.merge_commit = git(repo_root, &["rev-parse", "--verify", "--quiet", branch])
+            .ok()
+            .filter(|(ok, _, _)| *ok)
+            .map(|(_, sha, _)| sha.trim().to_string());
         return Ok(outcome);
     }
 
@@ -559,7 +630,15 @@ fn merge_while_held(
 /// describe different things.
 pub fn describe(o: &MergeOutcome) -> String {
     if o.already_up_to_date {
-        return format!("{} was already up to date with {}", o.into, o.branch);
+        return match &o.merge_commit {
+            Some(sha) => format!(
+                "{} already contains {} ({}) — nothing to merge",
+                o.into,
+                o.branch,
+                sha.get(..12).unwrap_or(sha)
+            ),
+            None => format!("{} was already up to date with {}", o.into, o.branch),
+        };
     }
     let commit = o.merge_commit.as_deref().unwrap_or("(unknown)");
     let short = commit.get(..12).unwrap_or(commit);
@@ -715,8 +794,10 @@ mod tests {
 
         let out = merge(root, "fuller", "stale", Some("true"), 600, false).unwrap();
         assert!(out.already_up_to_date);
-        assert!(out.merge_commit.is_none());
-        assert!(describe(&out).contains("already up to date"), "{out:?}");
+        // Since pact-f26 this names the commit that already contains the branch
+        // rather than leaving the caller to find out with `git log`.
+        assert!(out.merge_commit.is_some(), "{out:?}");
+        assert!(describe(&out).contains("already contains stale"), "{out:?}");
 
         let held = lease::list(root, true).unwrap();
         assert!(!held.iter().any(|l| l.lease.path == mutex_key("master")));
@@ -852,6 +933,77 @@ mod tests {
             std::fs::read_to_string(root.join("f.txt")).unwrap(),
             "base\n"
         );
+    }
+
+    /// pact-3v6: agents pass the worktree they made, and the branch may not
+    /// share its name.
+    #[test]
+    fn a_worktree_path_resolves_to_the_branch_it_has_checked_out() {
+        let tmp = repo();
+        let root = tmp.path();
+        // A branch whose name deliberately differs from its worktree directory,
+        // which is exactly the case that failed in the field.
+        git(root, &["branch", "damsel-millrace-9eg"]).unwrap();
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "wt/damsel-millrace-9eg",
+                "damsel-millrace-9eg",
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_branch(root, "wt/damsel-millrace-9eg").unwrap(),
+            "damsel-millrace-9eg"
+        );
+        // The bare branch name still works, unchanged.
+        assert_eq!(
+            resolve_branch(root, "damsel-millrace-9eg").unwrap(),
+            "damsel-millrace-9eg"
+        );
+    }
+
+    /// And an argument that is neither names what it could have been, instead of
+    /// letting git say "not something we can merge".
+    #[test]
+    fn an_unresolvable_argument_lists_the_worktree_branches() {
+        let tmp = repo();
+        let root = tmp.path();
+        git(root, &["branch", "real-branch"]).unwrap();
+        git(root, &["worktree", "add", "-q", "wt/a", "real-branch"]).unwrap();
+
+        let err = resolve_branch(root, "wt/typo").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("neither a branch nor a worktree"), "{msg}");
+        assert!(
+            msg.contains("real-branch"),
+            "it must name the candidates: {msg}"
+        );
+    }
+
+    /// pact-f26: "already up to date" could not tell an agent whether its work
+    /// was on the branch. Naming the commit answers the question it actually has.
+    #[test]
+    fn an_up_to_date_merge_names_the_commit_that_already_contains_the_branch() {
+        let tmp = repo();
+        let root = tmp.path();
+        branch_with_change(root, "feature", "changed\n");
+        merge(root, "a", "feature", Some("true"), 600, false).unwrap();
+
+        // Same merge again — the retry a dirty-tree refusal used to provoke.
+        let again = merge(root, "a", "feature", Some("true"), 600, false).unwrap();
+        assert!(again.already_up_to_date);
+        assert!(
+            again.merge_commit.is_some(),
+            "it must say WHERE the work is: {again:?}"
+        );
+        let text = describe(&again);
+        assert!(text.contains("already contains feature"), "{text}");
+        assert!(text.contains("nothing to merge"), "{text}");
     }
 
     #[test]
