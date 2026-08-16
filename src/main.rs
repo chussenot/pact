@@ -179,9 +179,15 @@ enum Command {
     /// if and only if a double-win appears in a real events log". If this check
     /// ever exits 1, that output IS the evidence that bead is waiting for.
     Audit {
-        /// `double-win`, `stale-holds`, `chain-integrity` or
-        /// `commit-correlation`. Omit for a summary.
-        #[arg(long)]
+        /// Which check to run. Omit for a summary.
+        ///
+        /// `--expect` and `--allow-main` apply to `topology` only; every other
+        /// check ignores them.
+        // The possible values come from `audit::Check::NAMES` rather than from a
+        // hand-written doc comment, which is what had drifted to four of the
+        // nine (pact-98u). Not stated in the help itself: a reader wants the
+        // list, not its history.
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(audit::Check::NAMES))]
         check: Option<String>,
         /// Only events at or after this point: RFC3339, or a duration back from
         /// now such as `90m`, `24h`, `7d`, `2w`.

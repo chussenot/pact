@@ -229,6 +229,49 @@ impl Expect {
 }
 
 impl Check {
+    /// Every check `--check` accepts, in the order they are documented.
+    ///
+    /// The single source of truth (pact-98u). `--check`'s help text used to be a
+    /// hand-written doc comment and had drifted to naming **four** of the nine —
+    /// omitting `topology` and `retry-storm`, the two newest and the two a fleet
+    /// run most wants, while `--expect`'s own help two options away referred to
+    /// "`--check topology`" by name. Anyone picking a check from `--help` would
+    /// silently skip more than half of them.
+    ///
+    /// clap renders this list itself now, so the help cannot say something the
+    /// parser does not accept.
+    pub const NAMES: [&'static str; 9] = [
+        "double-win",
+        "stale-holds",
+        "chain-integrity",
+        "commit-correlation",
+        "merge-divergence",
+        "claim-lease-divergence",
+        "retry-storm",
+        "silent-contention",
+        "topology",
+    ];
+
+    /// The name this check is spelled with on the command line.
+    ///
+    /// Exhaustive on purpose: adding a variant without adding its name is a
+    /// compile error here, and the round-trip test below then fails if it was
+    /// not also added to [`Check::NAMES`]. That pair is what keeps the help,
+    /// the parser and the enum from drifting apart again.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Check::DoubleWin => "double-win",
+            Check::StaleHolds => "stale-holds",
+            Check::ChainIntegrity => "chain-integrity",
+            Check::CommitCorrelation => "commit-correlation",
+            Check::MergeDivergence => "merge-divergence",
+            Check::ClaimLeaseDivergence => "claim-lease-divergence",
+            Check::RetryStorm => "retry-storm",
+            Check::SilentContention => "silent-contention",
+            Check::Topology(_) => "topology",
+        }
+    }
+
     /// `expect` is only meaningful for `topology`; every other check ignores
     /// it, and clap requires `--check` alongside it so it cannot be passed
     /// alone.
@@ -249,11 +292,15 @@ impl Check {
                 // summary says the same thing without a flag.
                 None => Expect::Any,
             })),
-            other => Err(anyhow::anyhow!(
-                "unknown check \"{other}\"; expected double-win, stale-holds, chain-integrity, \
-                 commit-correlation, merge-divergence, claim-lease-divergence, retry-storm, \
-                 silent-contention or topology"
-            )),
+            other => {
+                // Built from NAMES rather than written out, so this message and
+                // the help text cannot disagree about what exists.
+                let (last, rest) = Check::NAMES.split_last().expect("NAMES is non-empty");
+                Err(anyhow::anyhow!(
+                    "unknown check \"{other}\"; expected {} or {last}",
+                    rest.join(", ")
+                ))
+            }
         }
     }
 }
@@ -1846,17 +1893,11 @@ pub fn run_check(
     let (holds, doubles, orphaned_closes) = reconstruct(&events);
 
     let mut report = CheckReport {
-        check: match check {
-            Check::DoubleWin => "double-win",
-            Check::StaleHolds => "stale-holds",
-            Check::ChainIntegrity => "chain-integrity",
-            Check::CommitCorrelation => "commit-correlation",
-            Check::Topology(_) => "topology",
-            Check::MergeDivergence => "merge-divergence",
-            Check::ClaimLeaseDivergence => "claim-lease-divergence",
-            Check::RetryStorm => "retry-storm",
-            Check::SilentContention => "silent-contention",
-        },
+        // `Check::name`, not a second exhaustive match: this one existed
+        // alongside the parser and the help text, and the three had already
+        // drifted apart once (pact-98u). What a report calls a check, what the
+        // parser accepts and what `--help` lists are now one list.
+        check: check.name(),
         events_scanned: events.len(),
         excluded_by_annotation: loaded.excluded,
         unparseable_lines: unparseable,
@@ -3556,6 +3597,38 @@ mod tests {
     ///
     /// Nothing in the lease log looks wrong, because nothing in the lease protocol
     /// WAS wrong. The evidence is entirely in the content hashes.
+    /// pact-98u. `--check`'s help had drifted to naming four of the nine checks,
+    /// omitting `topology` and `retry-storm` — the two a fleet run most wants,
+    /// and one of which `--expect`'s own help referred to by name two options
+    /// away. This is the guard against it happening again: every name must
+    /// parse, and every parsed check must answer with the name it came from.
+    #[test]
+    fn every_documented_check_name_parses_and_round_trips() {
+        for name in Check::NAMES {
+            let parsed = Check::parse(name, None, &[])
+                .unwrap_or_else(|e| panic!("NAMES lists {name:?} but parse rejects it: {e:#}"));
+            assert_eq!(
+                parsed.name(),
+                name,
+                "{name:?} parsed to a check that calls itself something else"
+            );
+        }
+    }
+
+    /// The other direction: a name the parser accepts but NAMES omits would be
+    /// invisible in `--help` and unreachable through clap's value parser, which
+    /// is exactly the bug. `Check::name` is exhaustive, so a new variant forces
+    /// a compile error there; this catches the case where it was named but not
+    /// listed.
+    #[test]
+    fn the_unknown_check_error_names_every_check_that_exists() {
+        let err = format!("{:#}", Check::parse("nonsense", None, &[]).unwrap_err());
+        for name in Check::NAMES {
+            assert!(err.contains(name), "the error omits {name:?}: {err}");
+        }
+        assert!(err.contains("nonsense"), "{err}");
+    }
+
     #[test]
     fn merge_divergence_flags_an_acquire_from_a_copy_the_releaser_never_left() {
         let tmp = with_log(&[
