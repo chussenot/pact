@@ -2466,6 +2466,135 @@ fn collect_expired(repo_root: &Path, lock_path: &Path, lease: &LeaseInfo) {
     }
 }
 
+/// What a sweep did to one hold.
+#[derive(Debug, Clone, Serialize)]
+pub struct Swept {
+    pub path: String,
+    /// The agent whose hold this was.
+    pub holder: String,
+    /// Seconds past its own TTL, when it had lapsed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub past_ttl_secs: Option<i64>,
+    /// Seconds since that holder's last event of any kind, when the log knows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_silent_secs: Option<i64>,
+    /// Reclaimed, or left alone because the holder still looks alive.
+    pub reclaimed: bool,
+}
+
+/// Why a hold was eligible to be swept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sweep {
+    /// Only holds past their own TTL. Nobody's, by the lease's own terms.
+    Expired,
+    /// Also holds still inside their TTL whose holder has gone silent for
+    /// longer than half of it — what `lease ls` labels SUSPECT.
+    Suspect,
+}
+
+/// Reclaim holds whose holder is gone, and record that it was a RECOVERY
+/// (pact-51g, pact-dyo).
+///
+/// ## Why this is not `--steal`
+///
+/// `--steal` overrides a live claim on the caller's assertion that the holder
+/// is gone. It writes `displaced` + `stolen`, which is exactly what trampling a
+/// working peer writes, so `pact audit --check double-win` reports both
+/// identically. Measured over one 12-agent run: **six double-wins, every one a
+/// steal against a peer that had genuinely died.** A fleet's most responsible
+/// behaviour appeared in the audit as its worst, and nothing in the log could
+/// separate them.
+///
+/// This reclaims on pact's own evidence instead of the caller's word, and
+/// records that evidence: how far past TTL the hold was, and how long its holder
+/// had been silent. A reader — or `--check double-win` — can then tell recovery
+/// from trampling.
+///
+/// ## Why `Sweep::Expired` alone would not have helped
+///
+/// The bead that asked for this proposed sweeping expired holds. That is the
+/// safe case and it is the default here, but it would not have prevented one of
+/// those six: every one was a hold still INSIDE its 45-minute TTL (32 minutes,
+/// 24 minutes, 19 minutes) whose holder had died. Recovering those is what a
+/// fleet actually needs, which is what [`Sweep::Suspect`] is for — and why it is
+/// opt-in rather than the default, because a silent holder may yet come back
+/// and an expired one is nobody's by definition.
+pub fn sweep(repo_root: &Path, agent: &str, mode: Sweep, paths: &[String]) -> Result<Vec<Swept>> {
+    let wanted: Vec<String> = paths.iter().map(|p| normalize_path(repo_root, p)).collect();
+
+    let mut swept = Vec::new();
+    for (lock_path, entry) in scan(repo_root)? {
+        let lease = &entry.lease;
+        if !wanted.is_empty() && !wanted.contains(&lease.path) {
+            continue;
+        }
+        // Never your own: sweeping is for holders who cannot release, and
+        // `release` is right there for the ones who can.
+        if lease.agent == agent {
+            continue;
+        }
+
+        let eligible = entry.expired || (mode == Sweep::Suspect && entry.suspect);
+        let past_ttl = entry
+            .expired
+            .then(|| -entry.remaining_secs)
+            .filter(|s| *s > 0);
+
+        if !eligible {
+            swept.push(Swept {
+                path: lease.path.clone(),
+                holder: lease.agent.clone(),
+                past_ttl_secs: past_ttl,
+                holder_silent_secs: entry.holder_silent_secs,
+                reclaimed: false,
+            });
+            continue;
+        }
+
+        if std::fs::remove_file(&lock_path).is_err() {
+            // Another sweeper won the unlink. One lapse, one event.
+            continue;
+        }
+        count_transition("reclaimed");
+        record_hold(lease, "reclaimed");
+        let evidence = match (past_ttl, entry.holder_silent_secs) {
+            (Some(past), _) => format!(
+                "lapsed {} past its {}s ttl",
+                human_secs(past),
+                lease.ttl_secs
+            ),
+            (None, Some(silent)) => format!(
+                "holder silent {} against a {}s ttl",
+                human_secs(silent),
+                lease.ttl_secs
+            ),
+            (None, None) => "holder never seen in the event log".to_string(),
+        };
+        // The SWEEPER is the agent here, unlike `expired`, which describes the
+        // holder because nobody chose it. A reclaim is somebody's deliberate
+        // act and the log has to say whose.
+        log_event(
+            repo_root,
+            agent,
+            "reclaimed",
+            &lease.path,
+            Some(format!("reclaimed from {}: {evidence}", lease.agent)),
+            lease.ttl_secs,
+            None,
+            lease.invoked_from.clone(),
+        );
+        swept.push(Swept {
+            path: lease.path.clone(),
+            holder: lease.agent.clone(),
+            past_ttl_secs: past_ttl,
+            holder_silent_secs: entry.holder_silent_secs,
+            reclaimed: true,
+        });
+    }
+    swept.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(swept)
+}
+
 /// Release every lease held by `agent`, so "release everything I hold" is one
 /// call that cannot be half-forgotten (pact-rnc.8). Returns the released paths,
 /// sorted; holding nothing is success with an empty Vec.
@@ -2922,6 +3051,151 @@ mod tests {
 
         let (lease, now) = lease_aged(ttl, ttl as i64 + GRACE_SECS + 1);
         assert!(is_expired(&lease, now), "ttl+grace+1s should be expired");
+    }
+
+    /// pact-51g/pact-dyo. The default is the safe case: a hold past its own TTL
+    /// is nobody's by the lease's own terms.
+    #[test]
+    fn sweep_reclaims_a_lapsed_hold_and_leaves_live_ones_alone() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim_at(
+            root,
+            "dead",
+            "lapsed.rs",
+            120,
+            Utc::now() - Duration::seconds(600),
+        );
+        acquire(root, "busy", "working.rs", 2700, false, None).unwrap();
+
+        let swept = sweep(root, "rescuer", Sweep::Expired, &[]).unwrap();
+        let taken: Vec<_> = swept.iter().filter(|s| s.reclaimed).collect();
+        assert_eq!(taken.len(), 1, "{swept:?}");
+        assert_eq!(taken[0].path, "lapsed.rs");
+        assert_eq!(taken[0].holder, "dead");
+
+        // The working peer is reported, not touched — an agent that swept
+        // nothing needs to know which of the two reasons applied.
+        let left: Vec<_> = swept.iter().filter(|s| !s.reclaimed).collect();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].path, "working.rs");
+        assert!(peek(root, false)
+            .unwrap()
+            .iter()
+            .any(|e| e.lease.path == "working.rs"));
+    }
+
+    /// The case `--expired` alone would not have caught, and the reason
+    /// `--suspect` exists: every double-win in the millrace run was a steal of a
+    /// hold still INSIDE its TTL whose holder had died.
+    #[test]
+    fn sweep_suspect_reclaims_a_hold_inside_its_ttl_whose_holder_went_silent() {
+        let tmp = repo();
+        let root = tmp.path();
+        let ttl = 600u64;
+        let long_ago = Utc::now() - Duration::seconds(400);
+        claim_at(root, "stalled", "printer.rs", ttl, long_ago);
+        events::append(
+            root,
+            &events::Event {
+                at: long_ago.to_rfc3339(),
+                agent: "stalled".to_string(),
+                kind: "acquired".to_string(),
+                path: Some("printer.rs".to_string()),
+                ttl_secs: Some(ttl),
+                ..blank_event()
+            },
+        );
+
+        // Not lapsed, so the safe mode leaves it.
+        let safe = sweep(root, "rescuer", Sweep::Expired, &[]).unwrap();
+        assert!(!safe[0].reclaimed, "still inside its ttl: {safe:?}");
+
+        let swept = sweep(root, "rescuer", Sweep::Suspect, &[]).unwrap();
+        assert!(swept[0].reclaimed, "{swept:?}");
+        assert_eq!(swept[0].holder, "stalled");
+        assert!(swept[0].holder_silent_secs.unwrap() >= 400);
+    }
+
+    /// The whole point: a reclaim must not look like a steal in the log.
+    #[test]
+    fn a_reclaim_is_recorded_under_the_sweeper_and_names_its_evidence() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim_at(
+            root,
+            "dead",
+            "x.rs",
+            120,
+            Utc::now() - Duration::seconds(600),
+        );
+        sweep(root, "rescuer", Sweep::Expired, &[]).unwrap();
+
+        let (events, _) = events::numbered(root).unwrap();
+        let ev = events
+            .iter()
+            .map(|(_, e)| e)
+            .find(|e| e.kind == "reclaimed")
+            .expect("a reclaim must leave a reclaimed event");
+        assert_eq!(
+            ev.agent, "rescuer",
+            "the SWEEPER owns this row, not the holder"
+        );
+        assert_eq!(ev.path.as_deref(), Some("x.rs"));
+        let detail = ev.detail.clone().unwrap_or_default();
+        assert!(
+            detail.contains("dead"),
+            "it must name whose hold it was: {detail}"
+        );
+        assert!(detail.contains("ttl"), "and the evidence: {detail}");
+        // Not a steal: `stolen`/`displaced` are what --check double-win reads.
+        assert!(
+            !events
+                .iter()
+                .any(|(_, e)| e.kind == "stolen" || e.kind == "displaced"),
+            "a reclaim must not write the events a steal writes"
+        );
+    }
+
+    /// Sweeping your own hold is release's job, and quietly doing it here would
+    /// let an agent "recover" from itself.
+    #[test]
+    fn sweep_never_touches_the_sweepers_own_hold() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim_at(
+            root,
+            "me",
+            "mine.rs",
+            120,
+            Utc::now() - Duration::seconds(600),
+        );
+        let swept = sweep(root, "me", Sweep::Suspect, &[]).unwrap();
+        assert!(swept.is_empty(), "{swept:?}");
+        assert_eq!(
+            peek(root, true).unwrap().len(),
+            1,
+            "the lock is still there"
+        );
+    }
+
+    /// Named paths limit the sweep, so recovering one file does not silently
+    /// reclaim every abandoned hold in the repository.
+    #[test]
+    fn sweep_can_be_limited_to_named_paths() {
+        let tmp = repo();
+        let root = tmp.path();
+        let old = Utc::now() - Duration::seconds(600);
+        claim_at(root, "dead", "a.rs", 120, old);
+        claim_at(root, "dead", "b.rs", 120, old);
+
+        let swept = sweep(root, "rescuer", Sweep::Expired, &["a.rs".to_string()]).unwrap();
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].path, "a.rs");
+        assert!(peek(root, true)
+            .unwrap()
+            .iter()
+            .any(|e| e.lease.path == "b.rs"));
     }
 
     /// pact-mqw.6: a stalled holder is strictly worse than a crashed one, and the
@@ -3650,6 +3924,38 @@ mod tests {
     /// Same as `claim_aged`, but takes the exact `acquired_at` instant rather
     /// than an age relative to the real wall clock — needed to plant a lease
     /// relative to a fabricated clock watermark instead of real "now".
+    /// An `Event` with every optional field empty, so a test can name only the
+    /// three or four fields it is actually about. `Event` has no `Default` on
+    /// purpose — every production writer should have to think about each field —
+    /// but a test planting a fixture is not that.
+    fn blank_event() -> events::Event {
+        events::Event {
+            at: String::new(),
+            agent: String::new(),
+            kind: String::new(),
+            path: None,
+            detail: None,
+            ttl_secs: None,
+            covers_lines: None,
+            actor: None,
+            displaced: None,
+            chain_hash: None,
+            invoked_from: None,
+            collected_from: None,
+            scope: None,
+            pact_version: None,
+            content_hash: None,
+            subscriber: None,
+            message_id: None,
+            protocol_hash: None,
+            head: None,
+            holder: None,
+            holder_remaining_secs: None,
+            holder_branch: None,
+            holder_worktree: None,
+        }
+    }
+
     fn claim_at(root: &Path, agent: &str, path: &str, ttl_secs: u64, acquired_at: DateTime<Utc>) {
         let lease = LeaseInfo {
             agent: agent.into(),

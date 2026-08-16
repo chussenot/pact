@@ -309,6 +309,25 @@ enum LeaseAction {
         #[arg(long)]
         all: bool,
     },
+    /// Reclaim holds whose holder is gone, recorded as recovery not as a steal.
+    ///
+    /// `--steal` overrides a live claim on your word, and writes exactly what
+    /// trampling a working peer writes — so the audit cannot tell the two
+    /// apart. This reclaims on pact's own evidence and records it: how far past
+    /// its TTL the hold was, and how long its holder had been silent.
+    ///
+    /// By default only holds past their own TTL, which are nobody's by the
+    /// lease's own terms. `--suspect` also takes holds still inside their TTL
+    /// whose holder has gone quiet for more than half of it — the case that
+    /// produced every double-win in one measured fleet run, because a dead
+    /// agent's 45-minute lease reads as live for 45 minutes.
+    Sweep {
+        /// Limit to these paths. Omit to sweep every eligible hold.
+        path: Vec<String>,
+        /// Also reclaim holds `lease ls` labels SUSPECT, not only lapsed ones.
+        #[arg(long)]
+        suspect: bool,
+    },
     /// List active leases.
     Ls {
         /// Include expired leases in the listing.
@@ -545,6 +564,7 @@ fn subcommand_name(command: &Command) -> &'static str {
             LeaseAction::Acquire { .. } => "lease acquire",
             LeaseAction::Renew { .. } => "lease renew",
             LeaseAction::Release { .. } => "lease release",
+            LeaseAction::Sweep { .. } => "lease sweep",
             LeaseAction::Ls { .. } => "lease ls",
         },
         Command::Merge { .. } => "merge",
@@ -1704,6 +1724,18 @@ fn run_merge(
     Ok(())
 }
 
+/// How long a swept hold's holder had been gone, in whichever terms the log
+/// can actually support — the TTL it outlived, or the silence since its last
+/// event. Never both, because saying "lapsed 3m ago, silent 40m" invites the
+/// reader to work out which one the decision rested on.
+fn describe_absence(e: &lease::Swept) -> String {
+    match (e.past_ttl_secs, e.holder_silent_secs) {
+        (Some(past), _) => format!("lapsed {} ago", human_secs(past)),
+        (None, Some(silent)) => format!("silent {}", human_secs(silent)),
+        (None, None) => "never seen in the event log".to_string(),
+    }
+}
+
 fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseAction) -> Result<()> {
     let root = repo::find_repo_root(cwd)?;
     match action {
@@ -1874,6 +1906,51 @@ fn run_lease(cwd: &Path, agent_flag: Option<&str>, json: bool, action: LeaseActi
                     rs.iter().map(Released::line).collect::<Vec<_>>().join("\n")
                 });
             }
+            Ok(())
+        }
+        LeaseAction::Sweep { path, suspect } => {
+            let agent = identity::resolve_agent(agent_flag)?;
+            let mode = if suspect {
+                lease::Sweep::Suspect
+            } else {
+                lease::Sweep::Expired
+            };
+            let swept = lease::sweep(&root, &agent, mode, &path)?;
+            output::emit(json, &swept, |s: &Vec<lease::Swept>| {
+                let (taken, left): (Vec<_>, Vec<_>) = s.iter().partition(|e| e.reclaimed);
+                if taken.is_empty() && left.is_empty() {
+                    return "nothing to sweep — no lease here is held by an absent agent".into();
+                }
+                let mut out = Vec::new();
+                for e in &taken {
+                    out.push(format!(
+                        "reclaimed {} from {} ({})",
+                        e.path,
+                        e.holder,
+                        describe_absence(e)
+                    ));
+                }
+                // Named, not merely counted: an agent that swept nothing needs
+                // to know whether that is because nothing was abandoned or
+                // because what it wanted is still somebody's.
+                for e in &left {
+                    out.push(format!(
+                        "left {} alone — {} still looks alive ({})",
+                        e.path,
+                        e.holder,
+                        describe_absence(e)
+                    ));
+                }
+                if !taken.is_empty() {
+                    out.push(String::new());
+                    out.push(
+                        "Recorded as `reclaimed`, not `stolen`: the audit can tell this \
+                         from trampling a live peer."
+                            .into(),
+                    );
+                }
+                out.join("\n")
+            });
             Ok(())
         }
         LeaseAction::Ls { all } => {

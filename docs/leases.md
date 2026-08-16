@@ -13,6 +13,47 @@ nothing stops you from `git push --force` over a coworker's branch. The point
 isn't to make that impossible; it's to make coordinating cheap enough that
 agents actually do it.
 
+## Reclaiming a hold whose holder is gone
+
+`--steal` overrides a live claim on your assertion that the holder is gone. It
+writes `displaced` + `stolen` — which is exactly what trampling a working peer
+writes, so [`--check double-win`](audit.md) reports both identically. Measured
+over one 12-agent run: **six double-wins, every one a steal against a peer that
+had genuinely died.** A fleet's most responsible behaviour appeared in the audit
+as its worst, and nothing in the log could separate them.
+
+```bash
+pact lease sweep                 # holds past their own TTL
+pact lease sweep --suspect       # also holds whose holder has gone quiet
+pact lease sweep --suspect src/parser.rs
+```
+
+`sweep` reclaims on pact's own evidence rather than your word, and records that
+evidence: a `reclaimed` event under **the sweeper**, naming the previous holder
+and either how far past its TTL the hold was or how long that holder had been
+silent. It refuses a hold whose holder still looks alive, and says so per path
+rather than silently doing nothing — an agent that swept nothing needs to know
+which of the two reasons applied. It never touches your own holds; `release` is
+for those.
+
+**Why `--suspect` exists, and why it is not the default.** Sweeping only expired
+holds is the safe case — such a hold is nobody's by the lease's own terms — but
+it would not have prevented any of those six double-wins. Every one was a hold
+still *inside* its 45-minute TTL (32 minutes, 24, 19) whose holder had died. A
+dead agent's lease reads as live for as long as its TTL says, which is precisely
+the window a fleet needs to recover in. `--suspect` takes those, using the same
+silence threshold `lease ls` labels SUSPECT with; it is opt-in because a quiet
+holder may yet come back and an expired one cannot.
+
+**The gap this closes in `lease ls`.** A hold quiet but inside its TTL is loudly
+`SUSPECT: quiet 8m12s`. A hold *past* its TTL is collected as a side effect of
+the listing and leaves nothing behind — `lease ls` simply says "no active
+leases". So the signal went quiet exactly where certainty was highest, and an
+agent doing peer recovery saw nothing to recover. Two agents in one run reported
+opposite experiences of SUSPECT for this reason. `sweep` is the deliberate,
+accountable version of what the listing was doing silently.
+
+
 ## What pact refuses, and what it only warns about
 
 **A path containing whitespace is refused.** No source file in a normal repository has one,
