@@ -10,6 +10,17 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.10.4 - 2026-08-16
+#### Bug Fixes
+- **(audit)** --check's help named four of the nine checks that exist - (d7b67f4) - Clement HUSSENOT-DESENONGES
+- **(merge)** take a worktree path, and say where the work already is - (54d9a8c) - Clement HUSSENOT-DESENONGES
+- **(merge)** coordination-log churn is not a dirty tree, and a revert must not eat it - (af5f5b7) - Clement HUSSENOT-DESENONGES
+- **(merge)** ask whether THIS merge broke the branch, not whether it is green - (6947738) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(lease)** pact lease sweep — reclaim a dead holder's lease, recorded as recovery - (93826e1) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.10.3 - 2026-08-15
 #### Bug Fixes
 - **(watch)** a released reserved key tells its watchers it is free - (aaf830b) - Clement HUSSENOT-DESENONGES
