@@ -122,6 +122,14 @@ enum Command {
         /// minutes rather than three quarters of an hour.
         #[arg(long, default_value = "30m")]
         ttl: String,
+        /// Merge even though the working tree has uncommitted tracked changes.
+        ///
+        /// Coordination state under `.pact/`, `.beads/` and `.harness/` is
+        /// already exempt and is preserved across a failed verification's
+        /// revert, so this is only for real work you have decided is safe to
+        /// lose to the hard reset that revert performs.
+        #[arg(long)]
+        allow_dirty: bool,
     },
     /// Threaded messages between agents, via the Beads CLI.
     Msg {
@@ -646,6 +654,7 @@ fn run(cli: Cli) -> Result<i32> {
             branch,
             verify,
             ttl,
+            allow_dirty,
         } => run_merge(
             &cwd,
             cli.agent.as_deref(),
@@ -653,6 +662,7 @@ fn run(cli: Cli) -> Result<i32> {
             &branch,
             verify.as_deref(),
             &ttl,
+            allow_dirty,
         )
         .map(|()| 0),
         Command::Msg { action } => {
@@ -1674,6 +1684,7 @@ fn run_merge(
     branch: &str,
     verify: Option<&str>,
     ttl: &str,
+    allow_dirty: bool,
 ) -> Result<()> {
     let root = repo::find_repo_root(cwd)?;
     let agent = identity::resolve_agent(agent_flag)?;
@@ -1681,7 +1692,7 @@ fn run_merge(
     // across the tool, so an agent that learned it once has learned it.
     let ttl = lease::parse_ttl(ttl).map_err(|e| output::exit_with(USAGE_ERROR, e.to_string()))?;
 
-    let outcome = merge::merge(&root, &agent, branch, verify, ttl)?;
+    let outcome = merge::merge(&root, &agent, branch, verify, ttl, allow_dirty)?;
     output::emit(json, &outcome, merge::describe);
     merge::warn_if_unproven(&outcome);
     Ok(())

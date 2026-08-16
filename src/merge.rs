@@ -50,7 +50,7 @@
 //! It belongs in its own command that this one could call.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
@@ -117,19 +117,102 @@ fn git(repo_root: &Path, args: &[&str]) -> Result<(bool, String, String)> {
     ))
 }
 
-/// Tracked changes in the working tree, ignoring untracked files.
+/// Append-only state that a fleet writes continuously, and that is never the
+/// work a merge is about (pact-wrc).
+///
+/// In a fleet every agent shares one main checkout, so these churn constantly:
+/// a peer taking a lease writes `.pact/events.jsonl`, a notice writes
+/// `.pact/messages.jsonl`, any `bd` call writes `.beads/interactions.jsonl`,
+/// any `pw` call writes `.harness/*.jsonl`. Measured across one 12-agent run:
+/// the dirty-tree guard refused **every** merge attempt one agent made — 8 of 8,
+/// zero exceptions — and another had a single merge fail 15 retries. Each
+/// refusal was answered with a content-free "checkpoint the logs" commit purely
+/// to get past the guard. It never once prevented data loss; it only ever cost
+/// merges.
+const COORDINATION_PREFIXES: [&str; 3] = [".pact/", ".beads/", ".harness/"];
+
+fn is_coordination_state(path: &str) -> bool {
+    COORDINATION_PREFIXES.iter().any(|p| path.starts_with(p))
+}
+
+/// The path a `git status --porcelain` line refers to.
+///
+/// `XY <path>`, and for a rename `XY <old> -> <new>`. The new name is the one
+/// that exists in the tree, so it is the one that decides whether this is
+/// coordination state.
+fn porcelain_path(line: &str) -> &str {
+    let rest = line.get(3..).unwrap_or("").trim();
+    match rest.split_once(" -> ") {
+        Some((_, new)) => new,
+        None => rest,
+    }
+}
+
+/// Tracked changes in the working tree that a merge would be right to worry
+/// about: untracked files excluded (`reset --hard` does not touch them), and
+/// coordination state excluded (see [`COORDINATION_PREFIXES`]).
 ///
 /// The red path resets `--hard`, which would take uncommitted work with it. A
 /// merge onto a dirty tree is refused rather than risked: git itself would
 /// refuse a conflicting merge, but it would happily merge around unrelated
-/// dirty files that the later reset then destroys. Untracked files are exempt
-/// because `reset --hard` does not touch them.
+/// dirty files that the later reset then destroys. That reasoning is sound for
+/// source; it is wrong for logs whose whole purpose is to be appended to by
+/// somebody else while you work — and which this module now preserves across
+/// the reset rather than merely ignoring (see [`protect_coordination_state`]).
 fn dirty_tracked(repo_root: &Path) -> Result<Vec<String>> {
     let (_, stdout, _) = git(
         repo_root,
         &["status", "--porcelain", "--untracked-files=no"],
     )?;
-    Ok(stdout.lines().map(str::to_string).collect())
+    Ok(stdout
+        .lines()
+        .filter(|l| !is_coordination_state(porcelain_path(l)))
+        .map(str::to_string)
+        .collect())
+}
+
+/// Read the coordination logs so the red path can put them back.
+///
+/// Excluding them from the dirty check is not enough on its own: `reset --hard`
+/// would still revert them to their committed state and silently drop whatever
+/// events, messages or interactions peers appended while this merge ran. Those
+/// are append-only history that the protocol tells agents to commit, so losing a
+/// tail of them to somebody else's failed merge would be exactly the data loss
+/// the guard exists to prevent — just moved.
+fn protect_coordination_state(repo_root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let Ok((_, stdout, _)) = git(
+        repo_root,
+        &["status", "--porcelain", "--untracked-files=no"],
+    ) else {
+        return Vec::new();
+    };
+    stdout
+        .lines()
+        .map(porcelain_path)
+        .filter(|p| is_coordination_state(p))
+        .filter_map(|p| {
+            let full = repo_root.join(p);
+            std::fs::read(&full).ok().map(|bytes| (full, bytes))
+        })
+        .collect()
+}
+
+/// Put back what [`protect_coordination_state`] saved, after a `reset --hard`.
+///
+/// Wholesale rather than merged: these files are append-only, so the saved copy
+/// is a superset of whatever the reset restored. A write that fails is not worth
+/// failing the merge over — the branch state is what the caller is waiting on —
+/// but it is worth not being silent about, so it warns.
+fn restore_coordination_state(saved: Vec<(PathBuf, Vec<u8>)>) {
+    for (path, bytes) in saved {
+        if std::fs::write(&path, bytes).is_err() {
+            output::warn(&format!(
+                "note: could not restore {} after reverting the merge; \
+                 coordination history appended during it may be lost",
+                path.display()
+            ));
+        }
+    }
 }
 
 /// One run of the verification command.
@@ -228,6 +311,7 @@ pub fn merge(
     branch: &str,
     verify: Option<&str>,
     ttl_secs: u64,
+    allow_dirty: bool,
 ) -> Result<MergeOutcome> {
     let ctx = repo::RepoContext::resolve(repo_root);
     let into = ctx.branch().context(
@@ -239,12 +323,16 @@ pub fn merge(
     // refusing while holding would block every peer for the length of the
     // diagnosis.
     let dirty = dirty_tracked(repo_root)?;
-    if !dirty.is_empty() {
+    if !dirty.is_empty() && !allow_dirty {
         bail!(
             "the working tree has uncommitted tracked changes, and a failed \
-             verification resets --hard:\n{}\n\ncommit or stash them first — \
-             `pact merge` will not risk work it did not create.",
-            dirty.join("\n")
+             verification resets --hard:\n{}\n\ncommit or stash them first, or \
+             pass --allow-dirty if you know they are safe to lose — `pact merge` \
+             will not risk work it did not create.\n\n\
+             (Coordination state under {} is already exempt and preserved across \
+             a revert, so this is real work.)",
+            dirty.join("\n"),
+            COORDINATION_PREFIXES.join(", ")
         );
     }
 
@@ -355,7 +443,9 @@ fn merge_while_held(
         Err(e) => {
             // The command could not even start, so nothing was proved. Undo the
             // merge and give the lock back: this is not a broken branch.
+            let saved = protect_coordination_state(repo_root);
             let _ = git(repo_root, &["reset", "--hard", before]);
+            restore_coordination_state(saved);
             return Err(Failure::Clean(e));
         }
     };
@@ -381,10 +471,12 @@ fn merge_while_held(
     // verification on the pre-merge base and compare which tests failed. The
     // baseline run costs a second test cycle, but only on the red path — a green
     // merge, which is the common case, still runs the suite exactly once.
+    let saved = protect_coordination_state(repo_root);
     let baseline = match git(repo_root, &["reset", "--hard", before]) {
         Ok((true, _, _)) => run_verify(repo_root, verify).ok(),
         _ => None,
     };
+    restore_coordination_state(saved);
 
     if let Some(base) = &baseline {
         // `!post.failures.is_empty()` is load-bearing: the empty set is a subset
@@ -435,10 +527,12 @@ fn merge_while_held(
             new_failures.join("\n  ")
         )
     };
+    let saved = protect_coordination_state(repo_root);
     let (reset_ok, _, reset_err) = match git(repo_root, &["reset", "--hard", before]) {
         Ok(t) => t,
         Err(e) => return Err(Failure::HoldingBroken(e)),
     };
+    restore_coordination_state(saved);
     let reverted = if reset_ok {
         format!("the merge was reverted; {into} is back at {before}.")
     } else {
@@ -566,7 +660,7 @@ mod tests {
         let root = tmp.path();
         branch_with_change(root, "feature", "changed\n");
 
-        let out = merge(root, "wheelwright", "feature", Some("true"), 600).unwrap();
+        let out = merge(root, "wheelwright", "feature", Some("true"), 600, false).unwrap();
         assert_eq!(out.verified, Some(true));
         assert!(!out.already_up_to_date);
 
@@ -591,7 +685,7 @@ mod tests {
         branch_with_change(root, "bad", "broken\n");
         let before = head(root).unwrap();
 
-        let err = merge(root, "sluice", "bad", Some("false"), 600).unwrap_err();
+        let err = merge(root, "sluice", "bad", Some("false"), 600, false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("YOU STILL HOLD THE MERGE MUTEX"), "{msg}");
         assert!(msg.contains("pact lease release"), "{msg}");
@@ -619,7 +713,7 @@ mod tests {
         let root = tmp.path();
         git(root, &["branch", "stale"]).unwrap();
 
-        let out = merge(root, "fuller", "stale", Some("true"), 600).unwrap();
+        let out = merge(root, "fuller", "stale", Some("true"), 600, false).unwrap();
         assert!(out.already_up_to_date);
         assert!(out.merge_commit.is_none());
         assert!(describe(&out).contains("already up to date"), "{out:?}");
@@ -637,7 +731,7 @@ mod tests {
         branch_with_change(root, "feature", "changed\n");
         std::fs::write(root.join("f.txt"), "local edit not committed\n").unwrap();
 
-        let err = merge(root, "millwright", "feature", Some("true"), 600).unwrap_err();
+        let err = merge(root, "millwright", "feature", Some("true"), 600, false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("uncommitted tracked changes"), "{msg}");
 
@@ -658,15 +752,141 @@ mod tests {
         branch_with_change(root, "bad", "broken\n");
 
         // Leaves the mutex held, on purpose.
-        merge(root, "sluice", "bad", Some("false"), 600).unwrap_err();
+        merge(root, "sluice", "bad", Some("false"), 600, false).unwrap_err();
 
         branch_with_change(root, "other", "other\n");
-        let err = merge(root, "fuller", "other", Some("true"), 600).unwrap_err();
+        let err = merge(root, "fuller", "other", Some("true"), 600, false).unwrap_err();
         assert_eq!(
             output::code_for(&err),
             2,
             "contention is exit 2, as it is for `lease acquire`: {err:#}"
         );
+    }
+
+    /// pact-wrc: the guard refused every merge one agent attempted, because a
+    /// shared checkout's coordination logs are never clean.
+    #[test]
+    fn coordination_state_churn_does_not_look_like_a_dirty_tree() {
+        let tmp = repo();
+        let root = tmp.path();
+        // Track them first, the way a real repo does: `pact init` re-includes
+        // events.jsonl and messages.jsonl, and the harness logs get committed.
+        for (dir, name) in [
+            (".pact", "events.jsonl"),
+            (".pact", "messages.jsonl"),
+            (".beads", "interactions.jsonl"),
+            (".harness", "agent-01.jsonl"),
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join(name), "{}\n").unwrap();
+        }
+        // The fixture gitignores .pact/; force-add so these are genuinely tracked.
+        git(root, &["add", "-f", ".pact", ".beads", ".harness"]).unwrap();
+        git(root, &["commit", "-q", "-m", "coordination state"]).unwrap();
+
+        // Now a peer appends to every one of them while we work.
+        for (dir, name) in [
+            (".pact", "events.jsonl"),
+            (".pact", "messages.jsonl"),
+            (".beads", "interactions.jsonl"),
+            (".harness", "agent-01.jsonl"),
+        ] {
+            std::fs::write(root.join(dir).join(name), "{}\n{\"peer\":1}\n").unwrap();
+        }
+        assert!(
+            dirty_tracked(root).unwrap().is_empty(),
+            "a peer appending to the logs must not block a merge: {:?}",
+            dirty_tracked(root).unwrap()
+        );
+
+        // Real work still counts.
+        std::fs::write(root.join("f.txt"), "uncommitted source\n").unwrap();
+        assert_eq!(dirty_tracked(root).unwrap().len(), 1);
+    }
+
+    /// And the merge really goes through with the logs dirty.
+    #[test]
+    fn a_merge_succeeds_while_the_coordination_logs_are_dirty() {
+        let tmp = repo();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".pact")).unwrap();
+        std::fs::write(root.join(".pact/events.jsonl"), "{}\n").unwrap();
+        git(root, &["add", "-f", ".pact"]).unwrap();
+        git(root, &["commit", "-q", "-m", "logs"]).unwrap();
+        branch_with_change(root, "feature", "changed\n");
+        std::fs::write(root.join(".pact/events.jsonl"), "{}\n{\"peer\":1}\n").unwrap();
+
+        let out = merge(root, "penstock", "feature", Some("true"), 600, false).unwrap();
+        assert_eq!(out.verified, Some(true), "{out:?}");
+    }
+
+    /// Excluding them from the check is not enough: a failed verification resets
+    /// --hard, which would silently drop whatever peers appended while we ran.
+    #[test]
+    fn a_reverted_merge_preserves_what_peers_appended_to_the_logs() {
+        let tmp = repo();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".pact")).unwrap();
+        std::fs::write(root.join(".pact/events.jsonl"), "committed\n").unwrap();
+        git(root, &["add", "-f", ".pact"]).unwrap();
+        git(root, &["commit", "-q", "-m", "logs"]).unwrap();
+        branch_with_change(root, "bad", "broken\n");
+
+        // A peer appends while our merge is in flight.
+        let appended = "committed\nappended-by-a-peer\n";
+        std::fs::write(root.join(".pact/events.jsonl"), appended).unwrap();
+
+        // Verification fails, so the merge is reverted with reset --hard.
+        merge(root, "sluicegate", "bad", Some("false"), 600, false).unwrap_err();
+
+        // Not an exact match: pact appends its OWN lease events to this file
+        // while merging, so the assertion is that nothing was LOST — both the
+        // peer's line and pact's own writes survive the reset --hard.
+        let after = std::fs::read_to_string(root.join(".pact/events.jsonl")).unwrap();
+        assert!(
+            after.starts_with(appended),
+            "the revert must not eat coordination history a peer wrote: {after:?}"
+        );
+        // The source revert still happened.
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "base\n"
+        );
+    }
+
+    #[test]
+    fn porcelain_paths_are_read_including_renames() {
+        assert_eq!(
+            porcelain_path(" M .pact/events.jsonl"),
+            ".pact/events.jsonl"
+        );
+        assert_eq!(porcelain_path("?? src/new.rs"), "src/new.rs");
+        assert_eq!(
+            porcelain_path("R  old.rs -> .beads/x.jsonl"),
+            ".beads/x.jsonl"
+        );
+        assert!(is_coordination_state(".harness/a.jsonl"));
+        assert!(!is_coordination_state("src/pact/thing.rs"));
+    }
+
+    /// --allow-dirty is for real work the caller has decided is safe to lose.
+    #[test]
+    fn allow_dirty_overrides_the_guard_for_real_work() {
+        let tmp = repo();
+        let root = tmp.path();
+        // A tracked file the merge does not touch. Staging one the merge DOES
+        // touch is refused by git itself, before pact's guard is even reached.
+        std::fs::write(root.join("other.txt"), "committed\n").unwrap();
+        git(root, &["add", "-A"]).unwrap();
+        git(root, &["commit", "-q", "-m", "other"]).unwrap();
+        branch_with_change(root, "feature", "changed\n");
+        std::fs::write(root.join("other.txt"), "uncommitted work\n").unwrap();
+
+        let err = merge(root, "a", "feature", Some("true"), 600, false).unwrap_err();
+        assert!(format!("{err:#}").contains("--allow-dirty"), "{err:#}");
+
+        let out = merge(root, "a", "feature", Some("true"), 600, true).unwrap();
+        assert_eq!(out.verified, Some(true), "{out:?}");
     }
 
     /// A verification whose output this understands: it prints a libtest-style
@@ -699,7 +919,7 @@ mod tests {
         git(root, &["commit", "-q", "-m", "unrelated"]).unwrap();
         git(root, &["checkout", "-q", "master"]).unwrap();
 
-        let out = merge(root, "penstock", "unrelated", Some(VERIFY), 600).unwrap();
+        let out = merge(root, "penstock", "unrelated", Some(VERIFY), 600, false).unwrap();
         assert!(out.landed_on_red, "it must land: {out:?}");
         assert_eq!(out.verified, Some(false), "and must not claim to be proved");
         assert!(out.merge_commit.is_some());
@@ -743,7 +963,7 @@ mod tests {
         git(root, &["commit", "-q", "-m", "adds a failure"]).unwrap();
         git(root, &["checkout", "-q", "master"]).unwrap();
 
-        let err = merge(root, "pitwheel", "worse", Some(VERIFY), 600).unwrap_err();
+        let err = merge(root, "pitwheel", "worse", Some(VERIFY), 600, false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("YOU STILL HOLD THE MERGE MUTEX"), "{msg}");
         assert!(
@@ -786,6 +1006,7 @@ mod tests {
             "feature",
             Some("echo opaque failure; exit 1"),
             600,
+            false,
         )
         .unwrap_err();
         assert!(
@@ -802,7 +1023,7 @@ mod tests {
         let root = tmp.path();
         branch_with_change(root, "feature", "changed\n");
 
-        let out = merge(root, "a", "feature", None, 600).unwrap();
+        let out = merge(root, "a", "feature", None, 600, false).unwrap();
         assert_eq!(out.verified, None);
         assert!(describe(&out).contains("unverified"), "{}", describe(&out));
     }

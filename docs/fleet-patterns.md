@@ -187,7 +187,14 @@ Two safety notes worth knowing before you use it:
 
 - It **refuses a dirty tree** — tracked changes only; untracked files are fine. The red
   path resets `--hard`, and git would happily merge around unrelated dirty files that
-  the reset then destroys.
+  the reset then destroys. **Coordination state is exempt**: `.pact/`, `.beads/` and
+  `.harness/` churn continuously in a shared checkout — a peer taking a lease, sending
+  a notice or running any `bd` call writes to them — and treating that as a dirty tree
+  refused every merge one agent attempted in a 12-agent run, 8 of 8. Those files are
+  also *preserved across the revert*, because excluding them from the check without
+  protecting them would just move the data loss: `reset --hard` would drop whatever
+  peers appended while your merge ran. `--allow-dirty` overrides the guard for real
+  work you have decided is safe to lose.
 - `--verify` is optional but its absence is reported, never silently treated as a pass.
   `verified` is a three-state field in `--json` (`true`, `false`, `null`) for the same
   reason.
