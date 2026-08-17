@@ -61,7 +61,13 @@ pub const CHAIN_GENESIS: &str = "genesis";
 /// live claim was overridden via `--steal`. Both are immediately followed by a
 /// `"stolen"` row under the incoming agent, so `owner_of` still resolves to the
 /// new holder.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Default` exists so a literal can elide the kind-specific fields it has no
+/// opinion about — this schema has grown one optional field per kind for years,
+/// and without it every addition is a mechanical edit to every construction site,
+/// which is where a wrong `None` gets pasted. A defaulted `Event` is not a valid
+/// row (`at`, `agent` and `kind` are empty); build one only as
+/// `Event { at, agent, kind, ..Default::default() }`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Event {
     /// RFC3339.
     pub at: String,
@@ -272,6 +278,58 @@ pub struct Event {
     /// The holder's worktree, when the lock recorded one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder_worktree: Option<String>,
+    /// `kind: "context"` only — the run-policy key this row sets.
+    ///
+    /// See [`CONTEXT_KIND`] for why these rows exist at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_key: Option<String>,
+    /// `kind: "context"` only — the value, verbatim. Free text: a policy name, a
+    /// topology expectation, or an operator's sentence about the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_value: Option<String>,
+}
+
+/// The kind that records **the constraints a run operated under**, as opposed to
+/// what the fleet did inside them.
+///
+/// Behaviour events answer "what happened". They cannot answer "was that a choice
+/// or an instruction", and read alone they invite the reader to supply a
+/// mechanism for something that was simply ordered. arkanoid-rs's
+/// `docs/pact-audit.md` is the worked example: an external diagnosis read one
+/// 6,167-line commit and concluded agents had "reasonably deferred" to a single
+/// integration commit because "the git index is the one shared resource pact
+/// doesn't cover" — an emergent mechanism, inferred. The log was consistent with
+/// that story and with the truth, which was that every one of the 15 agent
+/// prompts carried the instruction *"Do NOT run `git add` or `git commit`"*, and
+/// the squash was a human asking for it afterwards in those words. The same
+/// document corrects a second reading the same way: 8 holds by 8 agents on one
+/// file looked like contention pact had arbitrated, when the orchestrating
+/// workflow had sequenced every stage before any agent ran a pact command.
+///
+/// So a context row is not metadata. It is the half of the record that makes the
+/// other half interpretable, and it is written into the same log, under the same
+/// chain hash, because a policy kept somewhere else is a policy that will not be
+/// there when someone audits the run two months later.
+///
+/// Excluded from behaviour statistics for the same reason [`crate::audit`]
+/// excludes annotations: a row describing the run is not a thing the fleet did.
+pub const CONTEXT_KIND: &str = "context";
+
+/// The context in force at the end of `events`: the last value set for each key.
+///
+/// Last-wins rather than first: a run that revises its policy mid-flight has
+/// genuinely changed it, and the earlier row stays in the log as history.
+pub fn active_context(events: &[(usize, Event)]) -> std::collections::BTreeMap<String, String> {
+    let mut active = std::collections::BTreeMap::new();
+    for (_, e) in events {
+        if e.kind != CONTEXT_KIND {
+            continue;
+        }
+        if let (Some(k), Some(v)) = (&e.context_key, &e.context_value) {
+            active.insert(k.clone(), v.clone());
+        }
+    }
+    active
 }
 
 /// For appending: creates `.pact/` if needed.
@@ -1161,6 +1219,7 @@ mod tests {
             holder_remaining_secs: None,
             holder_branch: None,
             holder_worktree: None,
+            ..Default::default()
         }
     }
 

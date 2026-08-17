@@ -6185,3 +6185,223 @@ fn fix_narrows_an_ignore_rule_that_would_lose_the_logs() {
         "and so must what agents said to each other: {after}"
     );
 }
+
+// ------------------------------------------------------- run-context recording
+
+/// A context row is an event like any other: it lands in the same log, under the
+/// same chain hash. That is the point — a policy kept somewhere else is a policy
+/// that will not be there when someone audits the run two months later.
+#[test]
+fn context_set_appends_a_chained_event() {
+    let tmp = init_repo();
+    assert_ok(&pact(
+        tmp.path(),
+        "orch",
+        &["context", "set", "commit-policy", "none"],
+    ));
+    assert_ok(&pact(
+        tmp.path(),
+        "orch",
+        &["context", "set", "scheduler", "waves"],
+    ));
+
+    let log = std::fs::read_to_string(tmp.path().join(".pact/events.jsonl")).unwrap();
+    let rows: Vec<serde_json::Value> = log
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2, "{log}");
+    assert_eq!(rows[0]["kind"], "context");
+    assert_eq!(rows[0]["context_key"], "commit-policy");
+    assert_eq!(rows[0]["context_value"], "none");
+    assert_eq!(
+        rows[0]["agent"], "orch",
+        "who declared it is part of the record"
+    );
+    for r in &rows {
+        assert!(
+            r["chain_hash"].as_str().is_some_and(|h| !h.is_empty()),
+            "context rows chain like everything else: {r}"
+        );
+    }
+    assert_ne!(
+        rows[0]["chain_hash"], rows[1]["chain_hash"],
+        "the second row chains from the first: {log}"
+    );
+}
+
+/// Last-wins, and the earlier row survives. A run that revised its policy
+/// mid-flight did revise it, and flattening that to one value would hide exactly
+/// what an audit is looking for.
+#[test]
+fn context_set_twice_keeps_both_rows_and_the_later_value_wins() {
+    let tmp = init_repo();
+    pact(
+        tmp.path(),
+        "orch",
+        &["context", "set", "commit-policy", "none"],
+    );
+    pact(
+        tmp.path(),
+        "orch",
+        &["context", "set", "commit-policy", "per-task"],
+    );
+
+    let log = std::fs::read_to_string(tmp.path().join(".pact/events.jsonl")).unwrap();
+    assert_eq!(
+        log.lines().filter(|l| !l.trim().is_empty()).count(),
+        2,
+        "{log}"
+    );
+
+    let out = pact(tmp.path(), "orch", &["audit", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["context"]["commit-policy"], "per-task", "{report}");
+}
+
+/// The key is the half that has to stay parseable, so a row always renders
+/// unambiguously as `key=value`. The value is free text precisely because
+/// nothing has to parse it.
+#[test]
+fn context_refuses_a_key_that_would_render_ambiguously() {
+    let tmp = init_repo();
+    for bad in ["commit=policy", "commit policy", ""] {
+        let out = pact(tmp.path(), "orch", &["context", "set", bad, "none"]);
+        assert_eq!(
+            out.status.code(),
+            Some(5),
+            "{bad:?} must be a usage error: {out:?}"
+        );
+    }
+    // A value with both is fine.
+    assert_ok(&pact(
+        tmp.path(),
+        "orch",
+        &["context", "set", "note", "held for review = human asked"],
+    ));
+}
+
+/// Context describes the run; it is not something the fleet did. Counting it as
+/// behaviour would inflate every total with the operator's own declarations —
+/// the same reason annotations are excluded.
+#[test]
+fn context_rows_are_not_counted_as_behaviour() {
+    let tmp = init_repo();
+    pact(
+        tmp.path(),
+        "orch",
+        &["context", "set", "commit-policy", "none"],
+    );
+    pact(tmp.path(), "worker-a", &["lease", "acquire", "src/x.rs"]);
+    pact(tmp.path(), "worker-a", &["lease", "release", "src/x.rs"]);
+
+    let out = pact(tmp.path(), "orch", &["audit", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["events"], 2,
+        "the acquire and the release, not the policy: {report}"
+    );
+    assert_eq!(report["context"]["commit-policy"], "none", "{report}");
+}
+
+/// The summary states the constraints before the numbers, and says so plainly
+/// when there are none — a reader who has already formed a story from the
+/// statistics is the one this line has to reach first.
+#[test]
+fn the_summary_header_carries_the_active_context() {
+    let tmp = init_repo();
+    pact(tmp.path(), "worker-a", &["lease", "acquire", "src/x.rs"]);
+    pact(tmp.path(), "worker-a", &["lease", "release", "src/x.rs"]);
+
+    let bare = pact(tmp.path(), "orch", &["audit"]);
+    let bare = String::from_utf8_lossy(&bare.stdout);
+    assert!(bare.contains("none recorded"), "{bare}");
+
+    pact(
+        tmp.path(),
+        "orch",
+        &["context", "set", "scheduler", "pre-serialized"],
+    );
+    let out = pact(tmp.path(), "orch", &["audit"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("scheduler=pre-serialized"), "{text}");
+}
+
+/// The arkanoid case, as a test. A hold with no commit behind it is a finding
+/// when agents were free to commit and the policy working when they were not,
+/// and the two produce identical event logs. Without the context row this check
+/// answers the wrong question in silence.
+#[test]
+fn commit_policy_none_makes_commit_correlation_report_not_evaluated() {
+    let tmp = init_repo();
+    pact(tmp.path(), "worker-a", &["lease", "acquire", "src/x.rs"]);
+    pact(tmp.path(), "worker-a", &["lease", "release", "src/x.rs"]);
+
+    // Without the context row the check runs and says something about commits.
+    let before = pact(
+        tmp.path(),
+        "orch",
+        &["audit", "--check", "commit-correlation"],
+    );
+    let before = String::from_utf8_lossy(&before.stdout);
+    assert!(
+        !before.contains("not evaluated"),
+        "with no policy recorded it must actually run: {before}"
+    );
+
+    pact(
+        tmp.path(),
+        "orch",
+        &["context", "set", "commit-policy", "none"],
+    );
+
+    let out = pact(
+        tmp.path(),
+        "orch",
+        &["audit", "--check", "commit-correlation"],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("commit policy: none — correlation not evaluated"),
+        "{text}"
+    );
+    let json = pact(
+        tmp.path(),
+        "orch",
+        &["audit", "--check", "commit-correlation", "--json"],
+    );
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["commit_policy_skipped"], "none", "{report}");
+}
+
+/// A fleet that declared its topology at run start should not have to repeat it
+/// on the command line two hours later — that repetition is where the declared
+/// and the audited drift apart.
+#[test]
+fn topology_reads_its_expectation_from_context_when_expect_is_absent() {
+    let tmp = init_repo();
+    pact(tmp.path(), "worker-a", &["lease", "acquire", "src/x.rs"]);
+    pact(
+        tmp.path(),
+        "orch",
+        &["context", "set", "topology-expectation", "main"],
+    );
+
+    let out = pact(
+        tmp.path(),
+        "orch",
+        &["audit", "--check", "topology", "--json"],
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["expected_topology"], "main", "{report}");
+
+    // An explicit flag still wins over the recorded expectation.
+    let out = pact(
+        tmp.path(),
+        "orch",
+        &["audit", "--check", "topology", "--expect", "any", "--json"],
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["expected_topology"], "any", "{report}");
+}

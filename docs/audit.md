@@ -868,6 +868,65 @@ uncommitted and had been read by nothing, so it was replaced rather than
 corrected-in-place; the append-only discipline protects recorded history, and a
 botched write nobody has seen is not history.
 
+## What the log cannot tell you
+
+**A behaviour event without a context event is ambiguous between choice and
+instruction, and the log does not mark which.** Every `acquired`, `released` and
+`refused` row records what an agent did. None of them records what the agent was
+*told*, so a reader with only the behaviour half will reach for a mechanism to
+explain a pattern that was simply ordered — and the log will be perfectly
+consistent with the invention.
+
+The worked example is arkanoid-rs's [`docs/pact-audit.md`][arkanoid], written by
+the orchestrating session to correct an external diagnosis of its own 15-agent
+build. The diagnosis read the commit history — one commit, 6,167 insertions —
+and concluded that agents had "reasonably deferred" to a single integration
+commit because "in a shared checkout, the git index is the one shared resource
+pact doesn't cover". A plausible emergent mechanism, and wrong. What actually
+happened is that the human operator was asked before the run whether to commit
+per milestone, chose to leave everything uncommitted, and every one of the 15
+agent prompts then carried the instruction *"Do NOT run `git add` or `git
+commit`"*. The 6,167-line commit was a human afterwards saying "commit the rest
+as one commit", verbatim. **No agent ever attempted a commit, successful or
+not** — so that repository contains zero evidence about whether pact can
+coordinate concurrent commits. The question never came up.
+
+The same document corrects a second reading the same way: 8 holds by 8 agents on
+`src/render.rs` looked like contention pact's acquire/steal path had arbitrated,
+when the orchestrating workflow had sequenced every stage itself before any agent
+ran a pact command. Leases were a safety net under an already-serialized
+schedule, not the thing doing the serializing. Zero `refused` events is equally
+consistent with "pact does not record refusals" and with "nobody ever raced" —
+and only the run's own operator could say which.
+
+Both corrections have the same shape, and it is not a flaw in the diagnosis's
+reasoning: **the constraints were not in the log, so they could not be read out
+of it.** That is what [`pact context set`](cli.md) exists to fix. A run that
+records
+
+```bash
+pact context set commit-policy none
+pact context set scheduler pre-serialized
+```
+
+writes those into `.pact/events.jsonl` under the same chain hash as everything
+else, `pact audit` prints them in the summary header above the numbers they
+qualify, and `--check commit-correlation` answers `commit policy: none —
+correlation not evaluated` instead of reporting holds with no commits as though
+that were a finding. The starter vocabulary is in
+[fleet-patterns.md](fleet-patterns.md#recording-the-constraints-a-run-ran-under).
+
+A summary with no context says so, in those terms, every time:
+
+```
+  context  none recorded — behaviour here cannot be told apart from instruction
+```
+
+That line is not a nag about an unset option. It is the honest statement of what
+the rest of the report can and cannot support.
+
+[arkanoid]: https://github.com/chussenot/arkanoid
+
 ## What audit deliberately cannot see
 
 **The Beads store.** Audit never opens `.beads/`, a Dolt directory or a SQLite

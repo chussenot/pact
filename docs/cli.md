@@ -56,6 +56,7 @@ pact watch rm <path>
 pact watch ls
 
 # ─── humans run these, around a run ──────────────────────────────────────────
+pact context set <key> <value>
 pact plan lint <manifest>
 pact init [--print] [--no-commit] [--force]
 pact doctor [--fix]
@@ -142,6 +143,29 @@ It needs no repository: unlike every other command it reads no state, and a
 shell profile is sourced from `$HOME` rather than from a checkout. Regenerate
 it after upgrading pact — a script written by an older binary completes that
 binary's commands, which is the one way this can still go stale.
+
+**`pact context set <key> <value>` records a constraint the run operates under**,
+as a `context` row in `.pact/events.jsonl`, chain-hashed like every other event.
+It is not metadata kept alongside the log; it is in the log, because the whole
+point is that it still be there when someone audits the run months later.
+
+Keys are free-form — no whitespace and no `=`, so a row always renders
+unambiguously as `key=value`; the value is free text and may contain both.
+Setting a key twice keeps both rows and the later value wins, because a run that
+revised its policy did revise it. Context rows are **not** counted as behaviour
+by `pact audit`, for the same reason annotations are not: a row describing the
+run is not a thing the fleet did.
+
+Two checks read it. `--check commit-correlation` reports
+`commit policy: none — correlation not evaluated` under `commit-policy=none` or
+`orchestrator-only`, instead of reporting holds-without-commits as findings when
+no agent was permitted to commit. `--check topology` takes its expectation from
+`topology-expectation` when `--expect` is absent, so a run is audited against
+what it declared rather than what someone remembers; an explicit `--expect` still
+wins. The starter vocabulary is in
+[fleet-patterns.md](fleet-patterns.md#recording-the-constraints-a-run-ran-under),
+and *why* this exists is
+[audit.md](audit.md#what-the-log-cannot-tell-you).
 
 `audit --export <path>` writes one combined JSON snapshot — the summary,
 every named check and `pact doctor`'s checks — to a file, orthogonal to

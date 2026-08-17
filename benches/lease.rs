@@ -422,6 +422,7 @@ fn seed_event() -> events::Event {
         holder_remaining_secs: None,
         holder_branch: None,
         holder_worktree: None,
+        ..Default::default()
     }
 }
 

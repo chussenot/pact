@@ -172,6 +172,16 @@ pub enum Expect {
     Main,
     /// Nothing to fail — report the distribution and exit 0.
     Any,
+    /// `--expect` was not passed: take the expectation from the run's own record
+    /// (`topology-expectation` in context), and fall back to [`Expect::Any`] when
+    /// the run never declared one.
+    ///
+    /// Resolved at check time rather than at parse time, because the context
+    /// lives in the event log and the log has not been read yet when clap builds
+    /// the `Check`. A fleet that declared its topology at run start should not
+    /// have to repeat it on the command line two hours later — that repetition is
+    /// exactly where the declared and the audited drift apart.
+    FromContext,
 }
 
 impl Expect {
@@ -196,6 +206,12 @@ impl Expect {
             Expect::Worktrees { .. } => "worktrees",
             Expect::Main => "main",
             Expect::Any => "any",
+            // Unreachable by construction: `run_check` resolves `FromContext`
+            // into one of the three above before anything reads it. Labelled
+            // distinctly rather than aliased to "any" so that if it ever does
+            // leak into a report, the report says something odd instead of
+            // something plausible and wrong.
+            Expect::FromContext => "from-context (unresolved)",
         }
     }
 
@@ -218,7 +234,9 @@ impl Expect {
     /// in one sentence and cannot drift.
     fn satisfied_by(&self, invoked_from: &str) -> bool {
         match self {
-            Expect::Any => true,
+            // Same unreachable case as `label`. Permissive, so a leak can only
+            // ever fail to report a violation — never invent one.
+            Expect::Any | Expect::FromContext => true,
             Expect::Main => invoked_from == "main",
             // "outside" is not a worktree: it means pact ran somewhere that is
             // not under this repository at all, which is the one value that
@@ -287,10 +305,12 @@ impl Check {
             "silent-contention" => Ok(Check::SilentContention),
             "topology" => Ok(Check::Topology(match expect {
                 Some(e) => Expect::parse(e, allow_main)?,
-                // Defaulting to `any` rather than erroring: `--check topology`
-                // alone is a legitimate "show me the distribution", and the
-                // summary says the same thing without a flag.
-                None => Expect::Any,
+                // Not `Any` directly: the run may have declared its own
+                // expectation, and `FromContext` defers that lookup to check
+                // time, where the log has actually been read. It falls back to
+                // `Any` when nothing was declared, so `--check topology` alone
+                // still means "show me the distribution".
+                None => Expect::FromContext,
             })),
             other => {
                 // Built from NAMES rather than written out, so this message and
@@ -1002,6 +1022,13 @@ pub const SHORT_TTL_SECS: i64 = 300;
 
 #[derive(Debug, Serialize)]
 pub struct Summary {
+    /// The constraints this run operated under, from `pact context set`.
+    ///
+    /// Printed in the header rather than buried, because it is what decides how
+    /// every number below should be read: "8 holds on one file" means one thing
+    /// under a free-running scheduler and another under `scheduler=pre-serialized`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub context: std::collections::BTreeMap<String, String>,
     pub events: usize,
     /// Events dropped because an annotation covers their line. Reported so the
     /// exclusion is itself visible: a statistic that quietly omits data is a
@@ -1111,6 +1138,19 @@ pub struct Summary {
 #[derive(Debug, Serialize)]
 pub struct CheckReport {
     pub check: &'static str,
+    /// The constraints the run operated under — the same map the summary prints.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub context: std::collections::BTreeMap<String, String>,
+    /// `Check::CommitCorrelation` only: `Some(policy)` when the recorded
+    /// `commit-policy` means correlating holds against commits answers nothing.
+    ///
+    /// The distinction this draws is the whole point of the context record.
+    /// "No commit was found for 26 holds" and "no agent was permitted to commit"
+    /// produce identical event logs, and only the first is a finding. Reported
+    /// as its own field rather than as zero findings, because silence is what
+    /// let arkanoid-rs's audit read a policy as an emergent workaround.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_policy_skipped: Option<String>,
     pub events_scanned: usize,
     /// Events an annotation excluded. A check that silently skipped data would be
     /// the same defect as a statistic that did.
@@ -1574,6 +1614,14 @@ struct Loaded {
     /// The annotations themselves, so a report can say what was excluded and why
     /// rather than only how many.
     annotations: Vec<Annotation>,
+    /// The constraints the run operated under: the last value set for each key.
+    ///
+    /// **Deliberately not filtered by `--since`.** A policy declared at run start
+    /// is the policy in force three hours later, and dropping it because it falls
+    /// outside the window would leave a report showing behaviour with the
+    /// constraints stripped off — precisely the reading this records exist to
+    /// prevent (see [`crate::events::CONTEXT_KIND`]).
+    context: std::collections::BTreeMap<String, String>,
 }
 
 /// A correction: which lines are not real history, and who says so.
@@ -1631,6 +1679,11 @@ fn load(
         });
     }
 
+    // Computed from `all`, before the window and the annotation filter below:
+    // see `Loaded::context` for why a policy outside `--since` is still the
+    // policy that was in force.
+    let context = crate::events::active_context(&all);
+
     let mut excluded = 0;
     let events: Vec<(usize, Event)> = all
         .into_iter()
@@ -1639,6 +1692,12 @@ fn load(
             // `--include-annotated` says: counting them as events would inflate
             // every total with records that describe the log rather than the fleet.
             if e.kind == ANNOTATION_KIND {
+                return false;
+            }
+            // A row describing the run is not a thing the fleet did. Counting
+            // context as behaviour would inflate every total with the operator's
+            // own declarations — the same reason annotations are dropped above.
+            if e.kind == crate::events::CONTEXT_KIND {
                 return false;
             }
             if !include_annotated && covered.contains(line) {
@@ -1654,6 +1713,7 @@ fn load(
         .collect();
 
     Ok(Loaded {
+        context,
         events,
         unparseable,
         excluded,
@@ -1818,6 +1878,7 @@ pub fn summary(
     });
 
     Ok(Summary {
+        context: loaded.context,
         events: events.len(),
         contention: contention_stats(&events),
         excluded_by_annotation: loaded.excluded,
@@ -1898,6 +1959,8 @@ pub fn run_check(
         // drifted apart once (pact-98u). What a report calls a check, what the
         // parser accepts and what `--help` lists are now one list.
         check: check.name(),
+        context: loaded.context.clone(),
+        commit_policy_skipped: None,
         events_scanned: events.len(),
         excluded_by_annotation: loaded.excluded,
         unparseable_lines: unparseable,
@@ -1980,7 +2043,15 @@ pub fn run_check(
             report.chain_tracked = tracked;
             report.chain_untracked = untracked;
         }
-        Check::CommitCorrelation => correlate_commits(repo_root, &events, &holds, &mut report),
+        Check::CommitCorrelation => match loaded.context.get("commit-policy").map(String::as_str) {
+            // A policy that forbade committing makes the correlation vacuous, and
+            // a vacuous check must say so rather than return an empty finding
+            // list that reads as a clean bill of health.
+            Some(policy @ ("none" | "orchestrator-only")) => {
+                report.commit_policy_skipped = Some(policy.to_string());
+            }
+            _ => correlate_commits(repo_root, &events, &holds, &mut report),
+        },
         Check::MergeDivergence => {
             let (divergences, unhashed) = merge_divergences(&events);
             report.merge_divergences = divergences;
@@ -1990,6 +2061,17 @@ pub fn run_check(
         Check::RetryStorm => retry_storms(&events, &mut report),
         Check::SilentContention => silent_contentions(repo_root, &events, &holds, &mut report),
         Check::Topology(ref expect) => {
+            let resolved;
+            let expect = match expect {
+                Expect::FromContext => {
+                    resolved = match loaded.context.get("topology-expectation") {
+                        Some(declared) => Expect::parse(declared, &[]).unwrap_or(Expect::Any),
+                        None => Expect::Any,
+                    };
+                    &resolved
+                }
+                other => other,
+            };
             report.expected_topology = Some(expect.label());
             let allowed = expect.allowed_from_main();
             let mut by_point: BTreeMap<String, usize> = BTreeMap::new();
@@ -2766,8 +2848,19 @@ fn secs(n: i64) -> String {
 
 pub fn render_summary(s: &Summary) -> String {
     if s.events == 0 {
+        // Context rows are not behaviour, so a run that has declared its policy
+        // and not yet done anything lands here. Say what was declared rather
+        // than only that nothing happened: "constraints recorded, no behaviour
+        // yet" is a different state from "nothing here at all", and the operator
+        // who just ran `pact context set` is checking precisely that it landed.
+        let declared = if s.context.is_empty() {
+            String::new()
+        } else {
+            let pairs: Vec<String> = s.context.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            format!("\n  context  {}", pairs.join("  "))
+        };
         return format!(
-            "no coordination history yet{}\n\n\
+            "no coordination history yet{}{declared}\n\n\
              .pact/events.jsonl is written by the lease commands; run one and it appears. \
              If this repository HAS been used, the log may predate events-log preservation \
              — see docs/audit.md.",
@@ -2785,6 +2878,18 @@ pub fn render_summary(s: &Summary) -> String {
         s.events,
         s.agents.len()
     ));
+    // Before the numbers, not after: a reader who has already formed a story
+    // from the statistics is the reader this line exists to reach first.
+    if s.context.is_empty() {
+        out.push(
+            "  context  none recorded — behaviour here cannot be told apart from instruction \
+             (`pact context set`, docs/audit.md)"
+                .to_string(),
+        );
+    } else {
+        let pairs: Vec<String> = s.context.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        out.push(format!("  context  {}", pairs.join("  ")));
+    }
     if let (Some(a), Some(b)) = (&s.first_event_at, &s.last_event_at) {
         out.push(format!("  span   {a}  ->  {b}"));
     }
@@ -3155,6 +3260,20 @@ pub fn render_check(r: &CheckReport) -> String {
     }
 
     if r.check == "commit-correlation" {
+        // Before the git check: a policy that forbade committing makes the
+        // question vacuous whether or not git is readable, and answering
+        // "could not run" would blame the wrong thing.
+        if let Some(policy) = &r.commit_policy_skipped {
+            out.push(format!(
+                "  commit policy: {policy} — correlation not evaluated"
+            ));
+            out.push(
+                "  no agent in this run was permitted to commit, so holds without commits are \
+                 the policy working, not a finding"
+                    .to_string(),
+            );
+            return out.join("\n");
+        }
         if let Some(reason) = &r.git_unavailable {
             out.push(format!(
                 "  git history unavailable ({reason}) — commit-correlation could not run"
@@ -5109,6 +5228,7 @@ mod tests {
             holder_remaining_secs: None,
             holder_branch: None,
             holder_worktree: None,
+            ..Default::default()
         }
     }
 

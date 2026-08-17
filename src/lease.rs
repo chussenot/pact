@@ -1280,6 +1280,7 @@ fn log_event(
             holder_remaining_secs: None,
             holder_branch: None,
             holder_worktree: None,
+            ..Default::default()
         },
     );
 }
@@ -1947,6 +1948,7 @@ fn acquire_inner(
                         holder_remaining_secs: Some(remaining),
                         holder_branch: existing.branch.clone(),
                         holder_worktree: existing.worktree.clone(),
+                        ..Default::default()
                     },
                 );
                 // The one thing a refused agent most needs and was never told:
@@ -2277,6 +2279,7 @@ fn release_relative(
                     holder_remaining_secs: None,
                     holder_branch: None,
                     holder_worktree: None,
+                    ..Default::default()
                 },
             );
             count_transition("force_released");
@@ -2363,6 +2366,7 @@ fn release_relative(
                     holder_remaining_secs: None,
                     holder_branch: None,
                     holder_worktree: None,
+                    ..Default::default()
                 },
             );
             count_transition("force_released");
@@ -3275,6 +3279,7 @@ mod tests {
                 holder_remaining_secs: None,
                 holder_branch: None,
                 holder_worktree: None,
+                ..Default::default()
             },
         );
         let (suspect, silent) = suspect_of("printer.rs");
@@ -3339,6 +3344,7 @@ mod tests {
                 holder_remaining_secs: None,
                 holder_branch: None,
                 holder_worktree: None,
+                ..Default::default()
             },
         );
         assert!(
@@ -3965,6 +3971,7 @@ mod tests {
             holder_remaining_secs: None,
             holder_branch: None,
             holder_worktree: None,
+            ..Default::default()
         }
     }
 

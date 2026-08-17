@@ -151,6 +151,17 @@ enum Command {
         /// bash, zsh, fish, elvish or powershell.
         shell: clap_complete::Shell,
     },
+    /// Record the constraints this run operates under, in the same log as its
+    /// behaviour.
+    ///
+    /// Behaviour events say what a fleet did; they cannot say whether it was a
+    /// choice or an instruction, and a reader with only half the record will
+    /// supply a mechanism for something that was simply ordered. See
+    /// docs/audit.md, "what the log cannot tell you".
+    Context {
+        #[command(subcommand)]
+        action: ContextAction,
+    },
     /// Check a wave plan before you spawn a fleet.
     Plan {
         #[command(subcommand)]
@@ -344,6 +355,27 @@ enum LeaseAction {
         /// Include expired leases in the listing.
         #[arg(long)]
         all: bool,
+    },
+}
+
+/// `pact context <action>`.
+#[derive(Subcommand)]
+enum ContextAction {
+    /// Record a constraint this run operates under.
+    ///
+    /// Appends a `context` row to `.pact/events.jsonl`, chain-hashed like every
+    /// other event, so the policy a fleet worked under lives in the same log as
+    /// what it did. Keys are free-form; docs/fleet-patterns.md carries a starter
+    /// vocabulary (`commit-policy`, `scheduler`, `topology-expectation`).
+    ///
+    /// Setting a key again records the new value and keeps the old row: the
+    /// active value is the last one, and the change itself is history.
+    Set {
+        /// e.g. `commit-policy`. No whitespace and no `=`, so a row always
+        /// renders unambiguously as `key=value`.
+        key: String,
+        /// e.g. `none`, `per-task`, `orchestrator-only`. Free text.
+        value: String,
     },
 }
 
@@ -586,6 +618,9 @@ fn subcommand_name(command: &Command) -> &'static str {
             MsgAction::Read { .. } => "msg read",
         },
         Command::Log { .. } => "log",
+        Command::Context { action } => match action {
+            ContextAction::Set { .. } => "context set",
+        },
         Command::Plan { action } => match action {
             PlanAction::Lint { .. } => "plan lint",
         },
@@ -665,6 +700,11 @@ fn run(cli: Cli) -> Result<i32> {
         // `doctor` reports failure as an exit code rather than an error,
         // because its report *is* the output; everything else succeeds or
         // raises, and `Ok(())` means exit 0.
+        Command::Context { action } => match action {
+            ContextAction::Set { key, value } => {
+                run_context_set(&cwd, cli.json, &key, &value, cli.agent.as_deref()).map(|()| 0)
+            }
+        },
         Command::Plan { action } => match action {
             PlanAction::Lint { manifest } => run_plan_lint(&cwd, cli.json, &manifest),
         },
@@ -812,6 +852,7 @@ fn run_watch(cwd: &Path, agent_flag: Option<&str>, json: bool, action: WatchActi
                     holder_remaining_secs: None,
                     holder_branch: None,
                     holder_worktree: None,
+                    ..Default::default()
                 },
             );
             #[derive(serde::Serialize)]
@@ -879,6 +920,7 @@ fn run_watch(cwd: &Path, agent_flag: Option<&str>, json: bool, action: WatchActi
                         holder_remaining_secs: None,
                         holder_branch: None,
                         holder_worktree: None,
+                        ..Default::default()
                     },
                 );
             }
@@ -2296,6 +2338,81 @@ fn run_plan_lint(cwd: &Path, json: bool, manifest: &str) -> Result<i32> {
     let report = plan::run(&root, Path::new(manifest))?;
     output::emit(json, &report, plan::render);
     Ok(i32::from(report.errors() > 0))
+}
+
+/// `pact context set <key> <value>`.
+///
+/// One append, chain-hashed with everything else, because the constraints a run
+/// operated under belong in the same log as its behaviour — see
+/// [`events::CONTEXT_KIND`] for the failure this exists to prevent.
+///
+/// Deliberately NOT idempotent: setting a key twice records both rows and the
+/// later one wins. A run that revised its policy mid-flight did revise it, and
+/// flattening that to one value would hide exactly the kind of thing an audit is
+/// looking for.
+fn run_context_set(
+    cwd: &Path,
+    json: bool,
+    key: &str,
+    value: &str,
+    agent_flag: Option<&str>,
+) -> Result<()> {
+    let root = repo::find_repo_root(cwd)?;
+    // An identity, like every other row: "who declared this policy" is as much
+    // part of the record as the policy, and an orchestrator setting it is the
+    // normal case.
+    let agent = identity::resolve_agent(agent_flag)?;
+
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(output::exit_with(5, "a context key cannot be empty"));
+    }
+    // `=` and whitespace are refused so a row always renders unambiguously as
+    // `key=value` — in `pact log`, in the audit header, and in any script that
+    // splits on the first `=`. The value is free text precisely because it is
+    // the half nothing has to parse.
+    if key.contains('=') || key.chars().any(char::is_whitespace) {
+        return Err(output::exit_with(
+            5,
+            format!(
+                "invalid context key {key:?}: no whitespace and no '=' (the value may contain both)"
+            ),
+        ));
+    }
+
+    events::append(
+        &root,
+        &events::Event {
+            at: chrono::Utc::now().to_rfc3339(),
+            agent: agent.clone(),
+            kind: events::CONTEXT_KIND.to_string(),
+            context_key: Some(key.to_string()),
+            context_value: Some(value.to_string()),
+            ..Default::default()
+        },
+    );
+
+    #[derive(serde::Serialize)]
+    struct ContextReport<'a> {
+        key: &'a str,
+        value: &'a str,
+        agent: &'a str,
+    }
+    output::emit(
+        json,
+        &ContextReport {
+            key,
+            value,
+            agent: &agent,
+        },
+        |r: &ContextReport| {
+            format!(
+                "recorded {}={} for this run (by {})",
+                r.key, r.value, r.agent
+            )
+        },
+    );
+    Ok(())
 }
 
 fn run_doctor(cwd: &Path, json: bool, fix: bool, agent_flag: Option<&str>) -> Result<i32> {

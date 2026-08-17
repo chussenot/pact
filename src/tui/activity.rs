@@ -524,6 +524,7 @@ mod tests {
                 holder_remaining_secs: None,
                 holder_branch: None,
                 holder_worktree: None,
+                ..Default::default()
             },
         )
     }

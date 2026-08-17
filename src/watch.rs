@@ -565,6 +565,7 @@ fn deliver(
                         holder_remaining_secs: None,
                         holder_branch: None,
                         holder_worktree: None,
+                        ..Default::default()
                     },
                 );
             }
@@ -610,6 +611,7 @@ fn log_failure(repo_root: &Path, holder: &str, released: &str, sub: Option<&str>
             holder_remaining_secs: None,
             holder_branch: None,
             holder_worktree: None,
+            ..Default::default()
         },
     );
 }

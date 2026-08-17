@@ -17,7 +17,50 @@ starts from something better than a guess.
 For the numbers — which runs, how many agents, what each measured — see
 [studies/field-runs.md](studies/field-runs.md).
 
+## Recording the constraints a run ran under
+
+**Do this before you spawn the first agent.** A fleet's log records what it did,
+never what it was told, and the two are indistinguishable afterwards — see
+[audit.md, "what the log cannot tell you"](audit.md#what-the-log-cannot-tell-you)
+for the case where an audit read a top-down instruction as an emergent
+mechanism and built a feature recommendation on it.
+
+```bash
+pact context set commit-policy none
+pact context set scheduler pre-serialized
+pact context set topology-expectation worktrees
+```
+
+Keys are free-form. This is the starter vocabulary, and it covers the three
+things an auditor most often has to guess:
+
+| Key | Values | What it stops a reader inferring |
+|---|---|---|
+| `commit-policy` | `none`, `per-task`, `orchestrator-only` | that holds without commits are agents failing to commit, when they were told not to. `none` and `orchestrator-only` make `--check commit-correlation` report `correlation not evaluated` rather than findings |
+| `scheduler` | `waves`, `free-run`, `pre-serialized` | that repeated holds on one file were contention pact arbitrated, when the harness had already ordered them |
+| `topology-expectation` | `worktrees`, `main`, `any` | nothing — but `--check topology` reads it when `--expect` is absent, so the run is audited against what it declared instead of what someone remembers |
+
+Anything else is an operator note, and worth writing when it is the kind of thing
+you would otherwise put in a message to yourself:
+
+```bash
+pact context set note "agents told to leave the tree dirty for human review"
+```
+
+Setting a key again records the new value and keeps the old row. A run that
+changed policy mid-flight changed it, and that is history worth having.
+
+**Put these lines in the orchestrator's own prompt template, not in a runbook.**
+The orchestrator is the one process that exists before the fleet and outlives it,
+and a step that lives only in a human's memory is a step that is skipped on the
+run that most needs it. In the pattern below, the context rows go in at step 0 —
+before the worktrees, because they describe the decision that chose the topology.
+
 ## The orchestrated-wave pattern
+
+**0. The orchestrator records the run's constraints** (above), so the log it is
+about to fill can be read back without guessing.
+
 
 One orchestrator, agents in waves, one git worktree per agent per wave.
 
