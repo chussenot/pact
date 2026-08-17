@@ -2920,13 +2920,22 @@ pub fn corrupt_count(repo_root: &Path) -> Result<usize> {
 /// no `.lock` extension by construction. Surfaced here so `pact doctor` can
 /// say so instead of the directory silently accumulating debris.
 pub fn orphan_temp_count(repo_root: &Path) -> Result<usize> {
+    orphan_temp_files(repo_root).map(|f| f.len())
+}
+
+/// The staging debris itself, so counting it and clearing it cannot disagree.
+///
+/// `doctor` reports the count and `doctor --fix` removes the files; two separate
+/// walks of `.pact/leases/` would drift the moment either grew a rule about what
+/// counts as debris, and the failure mode of that drift is deleting a lock file.
+pub fn orphan_temp_files(repo_root: &Path) -> Result<Vec<PathBuf>> {
     let leases_dir = crate::repo::pact_dir_path(repo_root).join("leases");
     let dir = match std::fs::read_dir(&leases_dir) {
         Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", leases_dir.display())),
     };
-    let mut count = 0;
+    let mut found = Vec::new();
     for entry in dir {
         let entry = entry?;
         let path = entry.path();
@@ -2936,9 +2945,12 @@ pub fn orphan_temp_count(repo_root: &Path) -> Result<usize> {
         if path.extension().and_then(|e| e.to_str()) == Some("lock") {
             continue;
         }
-        count += 1;
+        found.push(path);
     }
-    Ok(count)
+    // Deterministic, so a report and the removal that follows list the same
+    // files in the same order.
+    found.sort();
+    Ok(found)
 }
 
 /// Count `.pact/waits/*.wait` markers ([`mark_conflict`]'s breadcrumbs) that

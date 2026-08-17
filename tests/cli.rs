@@ -5975,3 +5975,213 @@ fn which_git() -> Result<std::path::PathBuf, ()> {
         })
         .ok_or(())
 }
+
+// --------------------------------------------------------- pact doctor --fix
+
+/// The invariant `--fix` is the explicit opt-out from: a question must not
+/// mutate. Bare `doctor` has to stay a question, so this asserts on the files
+/// rather than on the exit code — an exit code would not notice a rewrite.
+#[test]
+fn bare_doctor_still_changes_nothing() {
+    let tmp = init_repo();
+    pact(tmp.path(), "operator", &["init", "--no-commit"]);
+    std::fs::write(tmp.path().join("AGENTS.md"), "stale, and deliberately so\n").unwrap();
+
+    let before = std::fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+    let out = pact(tmp.path(), "operator", &["doctor"]);
+    let after = std::fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+
+    assert_eq!(before, after, "doctor must not repair anything on its own");
+    assert_eq!(out.status.code(), Some(1), "a stale block is a failure");
+}
+
+/// The four things pact owns, broken at once, because they are repaired
+/// together: a managed block that has gone stale, a CLAUDE.md that no longer
+/// reaches the protocol, an ignore rule that would lose the logs at the next
+/// clone, and pact's own staging debris.
+#[test]
+fn fix_repairs_what_pact_owns_and_says_so() {
+    let tmp = init_repo();
+    pact(tmp.path(), "operator", &["init", "--no-commit"]);
+
+    std::fs::write(tmp.path().join("AGENTS.md"), "stale\n").unwrap();
+    std::fs::remove_file(tmp.path().join("CLAUDE.md")).ok();
+
+    // A REAL claim, taken through pact, sitting in the same directory as the
+    // debris. Writing a plausible-looking `.lock` by hand does not test this:
+    // an unparsable one reads as a CORRUPT lease, which is a different check
+    // and one --fix deliberately refuses. Telling a claim from debris is the
+    // whole job of this repair, so the claim has to be real.
+    pact(tmp.path(), "peer", &["lease", "acquire", "src/real.rs"]);
+    let leases = tmp.path().join(".pact/leases");
+    std::fs::write(leases.join("staging-1-ThreadId(1)-1"), b"{}").unwrap();
+    let lock = leases.join("src__real.rs.lock");
+    assert!(lock.exists(), "the fixture's own claim must exist");
+
+    let out = pact(tmp.path(), "operator", &["doctor", "--fix"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        std::fs::read_to_string(tmp.path().join("AGENTS.md"))
+            .unwrap()
+            .contains("pact coordination protocol"),
+        "the managed block must be back: {text}"
+    );
+    assert!(
+        tmp.path().join("CLAUDE.md").exists(),
+        "CLAUDE.md must reach the protocol again: {text}"
+    );
+    assert!(
+        !leases.join("staging-1-ThreadId(1)-1").exists(),
+        "staging debris must be removed: {text}"
+    );
+    // The one file in that directory --fix must never touch. Debris and a live
+    // claim sit side by side, and telling them apart is the whole job.
+    assert!(lock.exists(), "a .lock is a claim, not debris: {text}");
+    assert!(text.contains("fixed"), "it must say what it did: {text}");
+}
+
+/// A repair that cannot be trusted is a repair nobody runs. `--fix` writes the
+/// same files `init` does, so it inherits the same refusal: a tool that tells
+/// agents to lease what they write must not write through a live claim.
+#[test]
+fn fix_refuses_to_write_through_another_agents_lease() {
+    let tmp = init_repo();
+    pact(tmp.path(), "operator", &["init", "--no-commit"]);
+    std::fs::write(tmp.path().join("AGENTS.md"), "stale\n").unwrap();
+
+    pact(tmp.path(), "peer", &["lease", "acquire", "AGENTS.md"]);
+
+    let out = pact(tmp.path(), "operator", &["doctor", "--fix"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a lease conflict is exit 2, as it is for init"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap(),
+        "stale\n",
+        "refusing must write NOTHING, not write and then complain"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("peer"), "name the holder: {err}");
+}
+
+/// The checks pact deliberately will not repair have to be visible, not
+/// silently skipped: an operator staring at a red check needs to know whether
+/// pact tried and failed or never tried at all.
+#[test]
+fn fix_names_the_checks_it_refuses_and_why() {
+    let tmp = init_repo();
+    pact(tmp.path(), "operator", &["init", "--no-commit"]);
+    // A lock pact cannot parse — evidence, and only a human can judge it.
+    let leases = tmp.path().join(".pact/leases");
+    std::fs::create_dir_all(&leases).unwrap();
+    std::fs::write(leases.join("src__broken.rs.lock"), b"not json at all").unwrap();
+
+    let out = pact(tmp.path(), "operator", &["doctor", "--fix"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    assert!(text.contains("not fixed, deliberately"), "{text}");
+    assert!(text.contains("corrupt leases"), "{text}");
+    assert!(
+        leases.join("src__broken.rs.lock").exists(),
+        "a corrupt lock is evidence and must survive --fix: {text}"
+    );
+    assert_eq!(out.status.code(), Some(1), "it is still unhealthy");
+}
+
+/// Idempotence, which is what makes it safe to put in a script.
+#[test]
+fn fix_on_a_healthy_repo_writes_nothing_and_exits_zero() {
+    let tmp = init_repo();
+    pact(tmp.path(), "operator", &["init", "--no-commit"]);
+    let first = pact(tmp.path(), "operator", &["doctor", "--fix"]);
+    assert_eq!(first.status.code(), Some(0), "{:?}", first);
+
+    let agents = std::fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+    let second = pact(tmp.path(), "operator", &["doctor", "--fix"]);
+    assert_eq!(second.status.code(), Some(0));
+    assert_eq!(
+        agents,
+        std::fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap(),
+        "a second --fix must be a no-op"
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains("nothing to repair"),
+        "{:?}",
+        second
+    );
+}
+
+/// `--fix` is a repair, not a release step. Committing would put the operator's
+/// working tree into a commit they did not ask for.
+#[test]
+fn fix_never_commits() {
+    let tmp = init_repo();
+    pact(tmp.path(), "operator", &["init", "--no-commit"]);
+    std::fs::write(tmp.path().join("AGENTS.md"), "stale\n").unwrap();
+    pact(tmp.path(), "operator", &["doctor", "--fix"]);
+    // `init_repo` fakes `.git` as a plain directory, so there is no history to
+    // add to — the assertion is that nothing tried.
+    assert!(
+        !tmp.path().join(".git/COMMIT_EDITMSG").exists(),
+        "--fix must not commit"
+    );
+}
+
+/// The ignore rules are their own test because they need a REAL git repository:
+/// "does this reach a clone" is a question about tracking, and the fake `.git`
+/// directory the other tests use cannot answer it. A blanket `.pact/` is the
+/// shape that loses the event log and the message store at the next clone —
+/// the two files pact cannot reconstruct from anything else.
+#[test]
+fn fix_narrows_an_ignore_rule_that_would_lose_the_logs() {
+    let Some(tmp) = git_repo("fix_narrows_an_ignore_rule") else {
+        return;
+    };
+    // AFTER init, not before: `init` runs the same `ensure_gitignore` this
+    // repair does, so a blanket rule written first is narrowed on the way in
+    // and the fixture is never broken at all.
+    pact(tmp.path(), "operator", &["init", "--no-commit"]);
+    // The logs have to EXIST before the rule can swallow them: `reach` asks
+    // `git ls-files --others --ignored`, which lists a path only when git would
+    // actually refuse to add it — and git will not refuse to add a file that is
+    // not there. A lease writes the event log; a message writes the store.
+    pact(tmp.path(), "operator", &["lease", "acquire", "src/x.rs"]);
+    pact(
+        tmp.path(),
+        "operator",
+        &["msg", "send", "--to", "operator", "hello"],
+    );
+    std::fs::write(tmp.path().join(".gitignore"), ".pact/\n").unwrap();
+
+    let before = pact(tmp.path(), "operator", &["doctor", "--json"]);
+    let before: serde_json::Value = serde_json::from_slice(&before.stdout).unwrap();
+    let unhappy = |r: &serde_json::Value, name: &str| {
+        r["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .map(|c| c["ok"] != true || c["warn"] == true)
+            .unwrap_or(false)
+    };
+    assert!(
+        unhappy(&before, "event log survives a clone"),
+        "the fixture must actually be broken first: {before}"
+    );
+
+    pact(tmp.path(), "operator", &["doctor", "--fix"]);
+
+    let after = pact(tmp.path(), "operator", &["doctor", "--json"]);
+    let after: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    assert!(
+        !unhappy(&after, "event log survives a clone"),
+        "the log must reach a clone now: {after}"
+    );
+    assert!(
+        !unhappy(&after, "message store survives a clone"),
+        "and so must what agents said to each other: {after}"
+    );
+}

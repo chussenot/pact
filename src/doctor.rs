@@ -1054,6 +1054,231 @@ fn sidecar_check(beads_dir: bool, sidecar: bool) -> DoctorCheck {
     }
 }
 
+// ------------------------------------------------------------------- --fix
+
+/// What one remediation did.
+#[derive(Debug, Serialize)]
+pub struct Repair {
+    /// The check this answers, spelled exactly as [`checks`] names it — so a
+    /// reader can line the two lists up, and so a renamed check fails the docs
+    /// gate rather than silently losing its repair.
+    pub check: &'static str,
+    /// `true` when this run changed something. A repair that found nothing to do
+    /// is reported too: "already fine" and "not attempted" must not look alike.
+    pub changed: bool,
+    pub detail: String,
+}
+
+/// A check `--fix` will not touch, and the reason, which is the useful half.
+///
+/// Listed rather than silently skipped. An operator who runs `--fix` and still
+/// sees a red check has to know whether pact tried and failed or never tried,
+/// and the difference decides what they do next.
+#[derive(Debug, Serialize)]
+pub struct Refusal {
+    pub check: &'static str,
+    pub why: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FixReport {
+    pub repairs: Vec<Repair>,
+    pub refused: Vec<Refusal>,
+    /// The checks as they stand AFTER the repairs — the answer to "did it work",
+    /// which a caller must not have to re-derive by running `doctor` again.
+    pub after: DoctorReport,
+}
+
+/// Everything `--fix` deliberately leaves alone.
+///
+/// A fixed table, never derived from `ok`/`warn`. The tempting rule — "repair
+/// the failures" — is wrong in both directions here: the gitignore checks only
+/// WARN and are the ones most worth fixing (the history dies at the next clone),
+/// while `corrupt leases` FAILS and must never be touched, because it is
+/// evidence and only a human can judge it.
+const REFUSALS: &[Refusal] = &[
+    Refusal {
+        check: "corrupt leases",
+        why: "a lock pact cannot read is evidence of what went wrong — only a human can judge whether it is safe to clear",
+    },
+    Refusal {
+        check: "no duplicated instruction blocks",
+        why: "the repeated heading is in another tool's block; pact editing a section it does not own is the bug, not the fix",
+    },
+    Refusal {
+        check: "write-set symlinks",
+        why: "a managed file symlinked outside the repository — writing it is what must not happen, so pact refuses rather than resolves",
+    },
+    Refusal {
+        check: "one Beads store",
+        why: "pact never writes to .beads/; which backend a repo keeps is the tracker's business and yours",
+    },
+    Refusal {
+        check: "stale wait markers",
+        why: "ordinary fleet behaviour rather than damage: a marker is collected by the agent that left it, and it never affects health",
+    },
+];
+
+/// Repair what pact owns, and report what it will not touch.
+///
+/// **Every write here is a call into `pact init`'s own writers.** Not one line
+/// of "what belongs in .gitignore" or "what the managed block says" is spelled
+/// twice: a second implementation would drift from init's inside a release, and
+/// the two are supposed to produce the same repository.
+///
+/// The caller is responsible for the lease guard BEFORE calling this — the same
+/// `refuse_if_a_target_is_leased` that `init` runs, checked once over every
+/// candidate rather than per file, so a refusal cannot leave AGENTS.md rewritten
+/// and CLAUDE.md untouched.
+pub fn fix(root: &Path) -> FixReport {
+    let before = checks(root);
+    let failing = |name: &str| {
+        before
+            .checks
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| !c.ok || c.warn)
+            .unwrap_or(false)
+    };
+    let mut repairs = Vec::new();
+
+    // The managed block, and the files that must point at it. Run whenever any
+    // of the three is unhappy: `apply` is idempotent, and the three are one
+    // artifact in three files — repairing only the one that complained is how a
+    // repo ends up with a current AGENTS.md that CLAUDE.md no longer imports.
+    if failing("AGENTS.md block current")
+        || failing("CLAUDE.md reaches the protocol")
+        || failing("other instruction files current")
+    {
+        repairs.push(match agents_md::apply(root) {
+            Ok(path) => Repair {
+                check: "AGENTS.md block current",
+                changed: true,
+                detail: format!("rewrote the managed block in {}", path.display()),
+            },
+            Err(e) => Repair {
+                check: "AGENTS.md block current",
+                changed: false,
+                detail: format!("could not rewrite AGENTS.md: {e:#}"),
+            },
+        });
+        repairs.push(match agents_md::ensure_claude_md(root) {
+            Ok(agents_md::ClaudeMd::Managed(p)) => Repair {
+                check: "CLAUDE.md reaches the protocol",
+                changed: true,
+                detail: format!("{} now imports AGENTS.md", p.display()),
+            },
+            Ok(_) => Repair {
+                check: "CLAUDE.md reaches the protocol",
+                changed: false,
+                detail: "already reaches the protocol".to_string(),
+            },
+            Err(e) => Repair {
+                check: "CLAUDE.md reaches the protocol",
+                changed: false,
+                detail: format!("could not write CLAUDE.md: {e:#}"),
+            },
+        });
+        repairs.push(match agents_md::ensure_instruction_files(root) {
+            Ok(files) if files.is_empty() => Repair {
+                check: "other instruction files current",
+                changed: false,
+                detail: "no other instruction files in this repo".to_string(),
+            },
+            Ok(files) => Repair {
+                check: "other instruction files current",
+                changed: true,
+                detail: format!("pointed {} file(s) at AGENTS.md", files.len()),
+            },
+            Err(e) => Repair {
+                check: "other instruction files current",
+                changed: false,
+                detail: format!("could not update instruction files: {e:#}"),
+            },
+        });
+    }
+
+    // The three "survives a clone" checks are one rule in one file, so they get
+    // one repair rather than three that would each rewrite .gitignore.
+    if failing("event log survives a clone")
+        || failing("message store survives a clone")
+        || failing("protocol files reach a clone")
+    {
+        repairs.push(match agents_md::ensure_gitignore(root) {
+            Ok(()) => {
+                // Paired deliberately: once the event log is committed, an
+                // append-only file git merges line-by-line conflicts on every
+                // branch that touched it. init writes both together and so does
+                // this — a repo with one and not the other is a state init
+                // cannot produce.
+                let attrs = agents_md::ensure_gitattributes(root);
+                Repair {
+                    check: "event log survives a clone",
+                    changed: true,
+                    detail: match attrs {
+                        Ok(()) => ".gitignore narrowed so the logs reach a clone; .gitattributes set for their union merge".to_string(),
+                        Err(e) => format!(".gitignore narrowed, but .gitattributes failed: {e:#}"),
+                    },
+                }
+            }
+            Err(e) => Repair {
+                check: "event log survives a clone",
+                changed: false,
+                detail: format!("could not update .gitignore: {e:#}"),
+            },
+        });
+    }
+
+    // pact's own debris, and the only thing here that deletes anything. Removes
+    // exactly the files the check counted — same enumerator, so the two cannot
+    // disagree about what is debris and what is a lock.
+    if failing("orphaned staging files") {
+        repairs.push(match lease::orphan_temp_files(root) {
+            Ok(files) if files.is_empty() => Repair {
+                check: "orphaned staging files",
+                changed: false,
+                detail: "none left to remove".to_string(),
+            },
+            Ok(files) => {
+                let mut removed = 0;
+                let mut failed = Vec::new();
+                for f in &files {
+                    match std::fs::remove_file(f) {
+                        Ok(()) => removed += 1,
+                        Err(e) => failed.push(format!("{}: {e}", f.display())),
+                    }
+                }
+                Repair {
+                    check: "orphaned staging files",
+                    changed: removed > 0,
+                    detail: if failed.is_empty() {
+                        format!("removed {removed} staging file(s) from .pact/leases/")
+                    } else {
+                        format!("removed {removed}, could not remove: {}", failed.join("; "))
+                    },
+                }
+            }
+            Err(e) => Repair {
+                check: "orphaned staging files",
+                changed: false,
+                detail: format!("could not read .pact/leases/: {e:#}"),
+            },
+        });
+    }
+
+    FixReport {
+        repairs,
+        refused: REFUSALS
+            .iter()
+            .map(|r| Refusal {
+                check: r.check,
+                why: r.why,
+            })
+            .collect(),
+        after: checks(root),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn report(states: &[(bool, bool)]) -> DoctorReport {

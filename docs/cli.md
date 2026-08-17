@@ -58,7 +58,7 @@ pact watch ls
 # ─── humans run these, around a run ──────────────────────────────────────────
 pact plan lint <manifest>
 pact init [--print] [--no-commit] [--force]
-pact doctor
+pact doctor [--fix]
 pact audit [--check <double-win|stale-holds|chain-integrity|commit-correlation|merge-divergence|claim-lease-divergence|retry-storm|silent-contention|topology>] [--expect <worktrees|main|any>] [--since <rfc3339|duration>] [--include-annotated] [--compare <path>] [--export <path>] [--allow-main <agent>...]
 pact ui
 pact completion <bash|zsh|fish|elvish|powershell>
@@ -199,6 +199,37 @@ Beads stores in one `.beads/`, or bd's audit sidecar switched off so
 tell the two apart. `pact whoami` is the one command that always exits 0: a
 missing identity, a missing `bd`, or an unreadable repo root are reported as
 `!` problems, not raised.
+
+**`pact doctor --fix` repairs what pact owns, and nothing else.** Bare `doctor`
+is a question and stays one — the flag is the explicit opt-out from *a question
+must not mutate*. What it repairs is exactly what `pact init` writes, by calling
+init's own writers rather than a second copy of them: the managed block, the
+files that must point at it (`CLAUDE.md`, `GEMINI.md` and friends), the ignore
+rules that decide whether the event log and message store reach a clone, and
+pact's own `staging-*` debris under `.pact/leases/`.
+
+It refuses the rest **by name, with the reason**, rather than passing over them
+in silence — an operator looking at a check that is still red has to know whether
+pact tried and failed or never tried:
+
+| Refused | Why |
+|---|---|
+| `corrupt leases` | a lock pact cannot read is evidence; only a human can judge whether clearing it is safe |
+| `no duplicated instruction blocks` | the repeated heading is in another tool's block, and pact editing a section it does not own is the bug |
+| `write-set symlinks` | a managed file symlinked outside the repository — writing it is precisely what must not happen |
+| `one Beads store` | pact never writes to `.beads/` |
+| `stale wait markers` | ordinary fleet behaviour rather than damage, and never part of health |
+
+Note the fixed set is not derived from `✗` versus `!`: the ignore rules only
+*warn* and are among the most worth repairing, while `corrupt leases` *fails* and
+must never be touched.
+
+It **never commits** — that is `init`'s job — and it obeys the same refusal
+`init` does, exiting 2 without writing anything when one of its targets is under
+another agent's lease. There is no `--force`, because `pact init --force` already
+is that command.
+
+Exit codes are doctor's: 0 once healthy, 1 with failures remaining, 2 refused.
 
 **A closed pipe is not one of these codes.** `pact … | head -1` used to panic
 mid-write and exit 101, which an agent reading only the status could not tell
