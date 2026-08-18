@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::path::Path;
 
-use crate::cli::refuse_if_a_target_is_leased;
+use super::init::refuse_if_a_target_is_leased;
 use crate::{agents_md, doctor, output, repo};
 
 pub(in crate::cli) fn run_doctor(
