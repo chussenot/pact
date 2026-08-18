@@ -104,11 +104,21 @@ jobs:
       - name: Open or update the self-audit issue
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
+          # GH_REPO, not REPO: this job deliberately does not check out the
+          # source it has no use for, so `gh issue list/comment/create` and
+          # `gh label create` have no git remote to infer the repository from
+          # and die with "fatal: not a git repository". GH_REPO is the name gh
+          # itself reads; REPO was a name nothing read, so every finding this
+          # workflow has ever produced went unfiled while the run went red.
+          #
+          # The `gh api` call below is the one that always worked, because it
+          # names the repository in its path — which is exactly why the gap
+          # survived: four broken calls and one working one, in one step.
+          GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          CHECKS="$(gh api "repos/$REPO/actions/runs/${{ github.run_id }}/jobs" \
+          CHECKS="$(gh api "repos/$GH_REPO/actions/runs/${{ github.run_id }}/jobs" \
             --jq '.jobs[] | select(.conclusion == "failure") | .name' | paste -sd', ' || echo unknown)"
           export CHECKS
           # Built in python: the body has backticks and an apostrophe, and in an

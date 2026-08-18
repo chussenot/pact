@@ -54,14 +54,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
-      # Both legs always run: "latest passed but pinned failed" is itself a
+      # Both legs always run: "latest passed but oldest failed" is itself a
       # diagnosis, and fail-fast would hide it. The legs differ only in WHICH bd
       # gets installed — pact has no tested-version gate to assert against any
       # more, because it has no runtime dependency to gate. Reading a real export
       # written by a newer bd is the thing under test.
       fail-fast: false
       matrix:
-        leg: [pinned, latest]
+        leg: [oldest, latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -76,26 +76,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # The tested range comes out of src/beads.rs. Restating it here would
-          # create a second copy that drifts from the code it describes, which
-          # is the exact failure this canary exists to catch.
-          # No `| head -1`: under pipefail, head exits first, sed takes SIGPIPE
-          # and the step dies with 141 and no output. That is exactly how the
-          # canary script failed its first two runs; this copy has only ever
-          # won the race.
-          triplet() {
-            local out
-            out="$(sed -nE "s/^const $1: \(u64, u64, u64\) = \(([0-9]+), ([0-9]+), ([0-9]+)\);/\1.\2.\3/p" src/beads.rs)"
-            printf '%s' "${out%%$'\n'*}"
-          }
-          MIN="$(triplet TESTED_BD_MIN)"
-          MAX="$(triplet TESTED_BD_MAX_EXCLUSIVE)"
-          if [ -z "$MIN" ] || [ -z "$MAX" ]; then
-            echo "::error::could not read TESTED_BD_MIN/MAX out of src/beads.rs — has the declaration changed shape?"
-            exit 1
-          fi
-          echo "tested range: $MIN <= v < $MAX"
-
+          # This step used to compute the non-latest leg from TESTED_BD_MIN /
+          # TESTED_BD_MAX_EXCLUSIVE in src/beads.rs. Both constants were deleted
+          # in bee71aa, which removed pact's runtime dependency on bd entirely —
+          # and the matrix comment above has said so ever since while this step
+          # kept reading them. The workflow failed 13 seconds in, every week,
+          # with its own "has the declaration changed shape?" error.
+          #
+          # There is nothing to derive from now, and inventing a constant to
+          # derive from would be a second copy kept in step by nobody. What this
+          # canary actually tests is whether pact can still READ a
+          # .beads/interactions.jsonl an arbitrary real bd wrote, so the useful
+          # pair is the widest format spread available: oldest published stable
+          # and newest. Neither needs maintaining, and neither can go stale.
+          #
           # Stable releases only: a pre-release is not what a user installs.
           gh release list --repo gastownhall/beads --limit 100 --json tagName,isPrerelease \
             -q '.[] | select(.isPrerelease | not) | .tagName' \
@@ -104,20 +98,11 @@ jobs:
           if [ "$LEG" = latest ]; then
             VERSION="$(tail -1 versions.txt)"
           else
-            # Newest release that is >= MIN and < MAX. sort -V does the ordering
-            # so there is no arithmetic on version components here.
-            VERSION="$(awk -v min="$MIN" -v max="$MAX" '
-              function cmp(a, b,   x, y, i) {
-                split(a, x, "."); split(b, y, ".")
-                for (i = 1; i <= 3; i++) { if (x[i] + 0 != y[i] + 0) return (x[i] + 0 < y[i] + 0) ? -1 : 1 }
-                return 0
-              }
-              cmp($0, min) >= 0 && cmp($0, max) < 0
-            ' versions.txt | tail -1)"
+            VERSION="$(head -1 versions.txt)"
           fi
 
           if [ -z "$VERSION" ]; then
-            echo "::error::no stable bd release found for leg=$LEG (range $MIN..$MAX). Releases seen:"
+            echo "::error::no stable bd release found for leg=$LEG. Releases seen:"
             cat versions.txt
             exit 1
           fi
