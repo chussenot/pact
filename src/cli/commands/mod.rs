@@ -6,6 +6,8 @@
 
 mod completion;
 mod context;
+mod plan;
 
 pub(super) use completion::run_completion;
 pub(super) use context::run_context_set;
+pub(super) use plan::run_plan_lint;

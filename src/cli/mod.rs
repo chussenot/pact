@@ -4,7 +4,7 @@ use crate::mcp;
 use crate::tui;
 use crate::{
     agents, agents_md, audit, beads, doctor, events, identity, lease, merge, msg, otel, output,
-    plan, repo, watch,
+    repo, watch,
 };
 
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ use lease::human_secs;
 mod commands;
 mod util;
 
-use commands::{run_completion, run_context_set};
+use commands::{run_completion, run_context_set, run_plan_lint};
 
 use util::{age_of, table};
 pub(crate) use util::{one_line, since};
@@ -2228,21 +2228,6 @@ fn run_log(cwd: &Path, json: bool, limit: usize) -> Result<()> {
 
     output::emit(json, &feed, |feed: &Vec<LogEvent>| render_log(feed));
     Ok(())
-}
-
-/// `pact plan lint <manifest>` — the contention-prevention step, as a check.
-///
-/// Returns the exit code rather than exiting, same shape as [`run_doctor`]: errors
-/// are 1, warnings alone are 0. Deliberately NOT a new exit code — the table just
-/// retired 3, and "errors found" is already what 1 means for `pact audit`.
-fn run_plan_lint(cwd: &Path, json: bool, manifest: &str) -> Result<i32> {
-    // A repo root only so that paths normalize exactly as `lease acquire` would:
-    // one file must be one path however the manifest spelled it, or this check and
-    // the lease it protects disagree about what they are discussing.
-    let root = repo::find_repo_root(cwd)?;
-    let report = plan::run(&root, Path::new(manifest))?;
-    output::emit(json, &report, plan::render);
-    Ok(i32::from(report.errors() > 0))
 }
 
 fn run_doctor(cwd: &Path, json: bool, fix: bool, agent_flag: Option<&str>) -> Result<i32> {
