@@ -3,8 +3,8 @@ use crate::mcp;
 #[cfg(feature = "ui")]
 use crate::tui;
 use crate::{
-    agents, agents_md, audit, beads, doctor, events, identity, lease, merge, msg, otel, output,
-    repo, watch,
+    agents, agents_md, audit, beads, doctor, events, identity, lease, msg, otel, output, repo,
+    watch,
 };
 
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ use lease::human_secs;
 mod commands;
 mod util;
 
-use commands::{run_completion, run_context_set, run_plan_lint};
+use commands::{run_completion, run_context_set, run_merge, run_plan_lint};
 
 use util::{age_of, table};
 pub(crate) use util::{one_line, since};
@@ -1657,29 +1657,6 @@ fn prior_owners(root: &Path, paths: &[String], agent: &str) -> Vec<String> {
             ))
         })
         .collect()
-}
-
-/// `pact merge` — see [`crate::merge`] for why this is a command rather than
-/// five lines of protocol prose.
-fn run_merge(
-    cwd: &Path,
-    agent_flag: Option<&str>,
-    json: bool,
-    branch: &str,
-    verify: Option<&str>,
-    ttl: &str,
-    allow_dirty: bool,
-) -> Result<()> {
-    let root = repo::find_repo_root(cwd)?;
-    let agent = identity::resolve_agent(agent_flag)?;
-    // Same grammar and the same exit 5 as `lease acquire --ttl`: one TTL syntax
-    // across the tool, so an agent that learned it once has learned it.
-    let ttl = lease::parse_ttl(ttl).map_err(|e| output::exit_with(USAGE_ERROR, e.to_string()))?;
-
-    let outcome = merge::merge(&root, &agent, branch, verify, ttl, allow_dirty)?;
-    output::emit(json, &outcome, merge::describe);
-    merge::warn_if_unproven(&outcome);
-    Ok(())
 }
 
 /// How long a swept hold's holder had been gone, in whichever terms the log
