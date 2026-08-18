@@ -10,6 +10,20 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.10.7 - 2026-08-18
+#### Bug Fixes
+- **(canary)** assert the sidecar against the export, not against bd's default - (b9bba3d) - Clement HUSSENOT-DESENONGES
+- **(canary)** pin the non-latest leg to bd 1.2.2 instead of oldest-published - (dc3bf17) - Clement HUSSENOT-DESENONGES
+- **(chaos)** compare the $HOME rail against a canonical $HOME - (21722c0) - Clement HUSSENOT-DESENONGES
+- **(ci)** run shellcheck on Linux only, where it is actually installed - (13ab856) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- Add beads and pact files - (b1b718d) - Clement HUSSENOT-DESENONGES
+- Add beads and pact files - (0299458) - Clement HUSSENOT-DESENONGES
+#### Refactoring
+- delete the dead code the suppressions were hiding - (81c826c) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.10.6 - 2026-08-18
 #### Bug Fixes
 - **(ci)** revive the two scheduled workflows, both dead for different reasons - (f7a3126) - Clement HUSSENOT-DESENONGES
