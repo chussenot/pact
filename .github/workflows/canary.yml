@@ -54,14 +54,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
-      # Both legs always run: "latest passed but oldest failed" is itself a
+      # Both legs always run: "latest passed but pinned failed" is itself a
       # diagnosis, and fail-fast would hide it. The legs differ only in WHICH bd
       # gets installed — pact has no tested-version gate to assert against any
       # more, because it has no runtime dependency to gate. Reading a real export
       # written by a newer bd is the thing under test.
       fail-fast: false
       matrix:
-        leg: [oldest, latest]
+        leg: [pinned, latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -76,20 +76,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # This step used to compute the non-latest leg from TESTED_BD_MIN /
-          # TESTED_BD_MAX_EXCLUSIVE in src/beads.rs. Both constants were deleted
-          # in bee71aa, which removed pact's runtime dependency on bd entirely —
-          # and the matrix comment above has said so ever since while this step
-          # kept reading them. The workflow failed 13 seconds in, every week,
-          # with its own "has the declaration changed shape?" error.
+          # The non-latest leg is PINNED to a literal, and the literal lives
+          # here rather than in src/beads.rs because it is a CI choice, not a
+          # claim about pact's runtime. pact has no version gate to derive from:
+          # TESTED_BD_MIN / TESTED_BD_MAX_EXCLUSIVE were deleted in bee71aa when
+          # bd stopped being a runtime dependency, and this step spent every
+          # scheduled run since then failing to read them.
           #
-          # There is nothing to derive from now, and inventing a constant to
-          # derive from would be a second copy kept in step by nobody. What this
-          # canary actually tests is whether pact can still READ a
-          # .beads/interactions.jsonl an arbitrary real bd wrote, so the useful
-          # pair is the widest format spread available: oldest published stable
-          # and newest. Neither needs maintaining, and neither can go stale.
+          # It was briefly "oldest published stable" instead, on the reasoning
+          # that the widest format spread is the best test of a parse-tolerant
+          # reader. That resolved to 0.9.1 and died at the next step: early bd
+          # releases carry NO downloadable assets, so there was nothing to
+          # install. Widest spread is worth having, but only across releases
+          # that actually ship a binary.
           #
+          # 1.2.2 is the version this project develops against. When it stops
+          # being that, change this line — and the leg is called "pinned"
+          # precisely so the next reader knows a human chose it.
+          PINNED=1.2.2
+
           # Stable releases only: a pre-release is not what a user installs.
           gh release list --repo gastownhall/beads --limit 100 --json tagName,isPrerelease \
             -q '.[] | select(.isPrerelease | not) | .tagName' \
@@ -98,7 +103,12 @@ jobs:
           if [ "$LEG" = latest ]; then
             VERSION="$(tail -1 versions.txt)"
           else
-            VERSION="$(head -1 versions.txt)"
+            VERSION="$PINNED"
+            if ! grep -qxF "$PINNED" versions.txt; then
+              echo "::error::pinned bd $PINNED is not a published stable release. Releases seen:"
+              cat versions.txt
+              exit 1
+            fi
           fi
 
           if [ -z "$VERSION" ]; then
