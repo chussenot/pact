@@ -10,6 +10,61 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.10.8 - 2026-08-18
+#### Bug Fixes
+- **(lease)** retarget the two literal src/lease.rs references - (a11f8a7) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- **(architecture)** map every module to the invariant it owns - (384f8ee) - Clement HUSSENOT-DESENONGES
+- **(audit)** say that render_check's call order is the output order - (668ecdc) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(protocol)** name the three git commands whose target is implicit - (ab6510d) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(pact)** record the module-split fleet's coordination log - (03f83a0) - Clement HUSSENOT-DESENONGES
+- Add pact and beads files - (a5916c5) - Clement HUSSENOT-DESENONGES
+#### Refactoring
+- **(audit)** extract double-win into audit/checks/ - (b7bb16b) - Clement HUSSENOT-DESENONGES
+- **(audit)** extract stale-holds into audit/checks/ - (c371101) - Clement HUSSENOT-DESENONGES
+- **(audit)** extract chain-integrity into audit/checks/ - (5413dea) - Clement HUSSENOT-DESENONGES
+- **(audit)** extract commit-correlation into audit/checks/ - (b5e2561) - Clement HUSSENOT-DESENONGES
+- **(audit)** extract topology into audit/checks/ - (d0e61df) - Clement HUSSENOT-DESENONGES
+- **(audit)** extract silent-contention into audit/checks/ - (306bb56) - Clement HUSSENOT-DESENONGES
+- **(audit)** extract retry-storm into audit/checks/ - (238e10e) - Clement HUSSENOT-DESENONGES
+- **(audit)** extract claim-lease-divergence into audit/checks/ - (1775e5c) - Clement HUSSENOT-DESENONGES
+- **(audit)** extract merge-divergence into audit/checks/ - (b54d0af) - Clement HUSSENOT-DESENONGES
+- **(audit)** extract --export and --compare into audit/export.rs - (c76c42a) - Clement HUSSENOT-DESENONGES
+- **(audit)** extract the summary into audit/summary.rs - (55a9501) - Clement HUSSENOT-DESENONGES
+- **(audit)** extract the shared test fixtures into audit/fixtures.rs - (71ebece) - Clement HUSSENOT-DESENONGES
+- **(audit)** extract the load pass into audit/context.rs - (eaca257) - Clement HUSSENOT-DESENONGES
+- **(audit)** extract the hold model into audit/model.rs - (173f058) - Clement HUSSENOT-DESENONGES
+- **(audit)** move audit.rs to audit/mod.rs - (50bd837) - Clement HUSSENOT-DESENONGES
+- **(cli)** leave cli/mod.rs holding nothing but the clap tree - (4248784) - Clement HUSSENOT-DESENONGES
+- **(cli)** extract mcp into cli/commands/ - (2ba6710) - Clement HUSSENOT-DESENONGES
+- **(cli)** extract ui into cli/commands/ - (cfa95d5) - Clement HUSSENOT-DESENONGES
+- **(cli)** extract msg into cli/commands/ - (aa44d96) - Clement HUSSENOT-DESENONGES
+- **(cli)** extract lease into cli/commands/ - (0800c01) - Clement HUSSENOT-DESENONGES
+- **(cli)** extract log into cli/commands/ - (8081f6b) - Clement HUSSENOT-DESENONGES
+- **(cli)** extract agents into cli/commands/ - (6e4da06) - Clement HUSSENOT-DESENONGES
+- **(cli)** extract whoami into cli/commands/ - (5bea713) - Clement HUSSENOT-DESENONGES
+- **(cli)** extract init into cli/commands/ - (826a706) - Clement HUSSENOT-DESENONGES
+- **(cli)** extract doctor into cli/commands/ - (72b03d4) - Clement HUSSENOT-DESENONGES
+- **(cli)** extract audit into cli/commands/ - (1958082) - Clement HUSSENOT-DESENONGES
+- **(cli)** extract watch into cli/commands/ - (8928a90) - Clement HUSSENOT-DESENONGES
+- **(cli)** extract merge into cli/commands/ - (f4d50d0) - Clement HUSSENOT-DESENONGES
+- **(cli)** extract plan lint into cli/commands/ - (917b088) - Clement HUSSENOT-DESENONGES
+- **(cli)** extract context set into cli/commands/ - (6a50cd3) - Clement HUSSENOT-DESENONGES
+- **(cli)** extract completion into cli/commands/ - (79bc517) - Clement HUSSENOT-DESENONGES
+- **(cli)** lift the shared listing helpers into cli/util.rs - (170150d) - Clement HUSSENOT-DESENONGES
+- **(cli)** move main.rs to cli/mod.rs, leaving main.rs as wiring - (ea19a0f) - Clement HUSSENOT-DESENONGES
+- **(lease)** extract release, --all and the sweep, emptying mod.rs - (f127aee) - Clement HUSSENOT-DESENONGES
+- **(lease)** extract acquire, takeover, verify and renew as ONE file - (1a256be) - Clement HUSSENOT-DESENONGES
+- **(lease)** extract the transition stamp and where it is recorded - (2c1c140) - Clement HUSSENOT-DESENONGES
+- **(lease)** extract the transition stamp and where it is recorded - (f159aa1) - Clement HUSSENOT-DESENONGES
+- **(lease)** extract the storage backend and the lock-directory scanners - (3146ed6) - Clement HUSSENOT-DESENONGES
+- **(lease)** extract the lease record and its path/TTL logic - (60b0fa9) - Clement HUSSENOT-DESENONGES
+- **(lease)** move lease.rs to lease/mod.rs - (da115cf) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.10.7 - 2026-08-18
 #### Bug Fixes
 - **(canary)** assert the sidecar against the export, not against bd's default - (b9bba3d) - Clement HUSSENOT-DESENONGES
