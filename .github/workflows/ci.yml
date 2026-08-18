@@ -89,8 +89,19 @@ jobs:
         run: ./scripts/check-docs.sh
 
       - name: shellcheck scripts/
+        # Linux only, like the check-docs step above: macOS runners do not ship
+        # shellcheck, and linting a shell script does not vary by runner OS —
+        # installing it there would cost setup time on every run for no signal
+        # the Linux leg has not already produced. The two runners exist to test
+        # pact on two platforms, not to lint one file twice.
+        #
+        # tests/harness.rs's pw_is_shellcheck_clean takes the other valid route
+        # for the same fact: it skips when shellcheck is absent, which is why
+        # `cargo test` passes on macOS while this step did not.
+        #
         # scripts/chaos.sh is destructive, so "shellcheck-clean" is enforced
         # rather than asserted in a comment. See mise.toml for the severity note.
+        if: runner.os == 'Linux'
         run: shellcheck --severity=warning scripts/*.sh scripts/pw
 
   # Conventional-commit lint, PRs only.
