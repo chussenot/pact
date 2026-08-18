@@ -157,14 +157,27 @@ printf '  %s\n' "$BEADS_CHECK"
 jq -e '.ok' <<<"$BEADS_CHECK" >/dev/null || fail "doctor could not use the real bd: $BEADS_CHECK"
 
 # The sidecar check must reflect reality, both ways — it is what tells a user the
-# claim-lease-divergence check cannot run. Right now the sidecar is OFF (bd's
-# default), so doctor must warn.
+# claim-lease-divergence check cannot run.
+#
+# Asserted against the FILE, not against a belief about bd's defaults. This
+# check used to demand a warning unconditionally, on the reasoning that "the
+# sidecar is OFF (bd's default)", and that was wrong twice over by the time it
+# next ran: a7614a6 changed doctor to report the export's presence rather than a
+# config key that answers for nobody, and bd's own `init` now writes the export.
+# A canary that hardcodes somebody else's default cannot detect that default
+# changing — it just breaks, which is exactly what happened.
 SIDECAR_CHECK="$(jq -c '.checks[] | select(.name == "Beads audit sidecar")' "$DOCTOR_JSON")"
 [ -n "$SIDECAR_CHECK" ] || fail "doctor has no \"Beads audit sidecar\" check: $(cat "$DOCTOR_JSON")"
 printf '  %s\n' "$SIDECAR_CHECK"
-jq -e '.warn' <<<"$SIDECAR_CHECK" >/dev/null ||
-	fail "bd's audit sidecar is off by default, so doctor must warn: $SIDECAR_CHECK"
-printf '  sidecar correctly reported as off\n'
+if [ -f .beads/interactions.jsonl ]; then
+	jq -e '.warn | not' <<<"$SIDECAR_CHECK" >/dev/null ||
+		fail "the export exists, so doctor must NOT warn: $SIDECAR_CHECK"
+	printf '  sidecar export present, correctly not warned\n'
+else
+	jq -e '.warn' <<<"$SIDECAR_CHECK" >/dev/null ||
+		fail "no export, so doctor must warn that the check cannot run: $SIDECAR_CHECK"
+	printf '  sidecar export absent, correctly warned\n'
+fi
 
 # ---------------------------------------- the real target: reading a real export
 #
