@@ -5780,43 +5780,176 @@ fn acquire_stamps_the_paths_content_hash_on_the_lease_and_the_event() {
     );
 }
 
+/// Every command node the binary exposes, discovered by walking `--help`
+/// recursively: the path of subcommands that reaches it, and the long flags it
+/// accepts. Asking the binary rather than listing them here is the whole point
+/// — a hardcoded list is the drift this feature exists to prevent,
+/// reintroduced in the test. clap's own `help` node is skipped: it is not
+/// pact's surface, and recursing into it never terminates usefully.
+fn command_tree(repo: &Path) -> Vec<(Vec<String>, Vec<String>)> {
+    let mut out: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+    let mut queue = vec![Vec::<String>::new()];
+    while let Some(path) = queue.pop() {
+        let mut args: Vec<&str> = path.iter().map(String::as_str).collect();
+        args.push("--help");
+        let help = stdout_of(&pact(repo, "agent", &args));
+
+        // `Commands:` is the compact, blank-line-terminated block at every
+        // depth — clap never switches that one to the long format.
+        let subs: Vec<String> = help
+            .lines()
+            .skip_while(|l| !l.trim_start().starts_with("Commands:"))
+            .skip(1)
+            .take_while(|l| !l.trim().is_empty())
+            .filter_map(|l| l.split_whitespace().next())
+            .filter(|w| *w != "help" && w.chars().all(|c| c.is_ascii_lowercase()))
+            .map(str::to_string)
+            .collect();
+
+        // `Options:` is NOT blank-line-terminated: a multi-paragraph doc
+        // comment makes clap switch to the long format, where blank lines
+        // separate options instead of ending the block (`pact audit --help`).
+        // So read to the end of the help and keep the lines that *start* an
+        // option; a wrapped description line never begins with `-`.
+        let flags: Vec<String> = help
+            .lines()
+            .skip_while(|l| !l.trim_start().starts_with("Options:"))
+            .skip(1)
+            .filter_map(|l| {
+                let line = l.trim_start();
+                if !line.starts_with('-') {
+                    return None;
+                }
+                // Covers both `      --ttl <TTL>` and `  -n, --limit <LIMIT>`.
+                let name: String = line
+                    .split_once("--")?
+                    .1
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect();
+                (!name.is_empty()).then(|| format!("--{name}"))
+            })
+            .collect();
+
+        for sub in subs {
+            let mut child = path.clone();
+            child.push(sub);
+            queue.push(child);
+        }
+        out.push((path, flags));
+    }
+    out
+}
+
+/// The names a generated completion script actually **offers**, as opposed to
+/// the ones it merely mentions.
+///
+/// A bare `script.contains(name)` is vacuous for short names: every script
+/// names the `acquire` subcommand, and `acquire` contains `ui`, so the
+/// assertion that used to stand here passed for `pact ui` whether or not the
+/// script completed it. Each generator emits a different structure, so each
+/// gets its own reader — matching loosely enough to share one is the vacuity
+/// again.
+fn completion_candidates(shell: &str, script: &str) -> std::collections::HashSet<String> {
+    /// A candidate name runs to the first character that cannot be in one:
+    /// the closing quote, bracket, `=` or space the generator put after it.
+    fn ident(s: &str) -> String {
+        s.chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect()
+    }
+
+    let mut out = std::collections::HashSet::new();
+    for line in script.lines() {
+        let line = line.trim();
+        match shell {
+            // One `opts="init whoami … --ttl --steal"` per command node.
+            "bash" => {
+                if let Some(list) = line
+                    .strip_prefix("opts=\"")
+                    .and_then(|r| r.strip_suffix('"'))
+                {
+                    out.extend(list.split_whitespace().map(str::to_string));
+                }
+            }
+            // `'acquire:desc'`, `'--ttl=[desc]'`, `'*--to=[desc]'` for a
+            // repeatable one, `'(--all)--force[desc]'` for an exclusive one.
+            "zsh" => {
+                if let Some(rest) = line.strip_prefix('\'') {
+                    let rest = match rest.strip_prefix('(') {
+                        Some(r) => r.split_once(')').map_or(r, |(_, tail)| tail),
+                        None => rest,
+                    };
+                    let name = ident(rest.trim_start_matches('*'));
+                    if !name.is_empty() {
+                        out.insert(name);
+                    }
+                }
+            }
+            // `-a "acquire"` offers a subcommand, `-l ttl` a long flag. Cut the
+            // description off first: it is free prose and would put words back
+            // in the set.
+            "fish" => {
+                let head = line.split_once(" -d ").map_or(line, |(h, _)| h);
+                out.extend(head.split(" -a \"").skip(1).map(ident));
+                out.extend(
+                    head.split(" -l ")
+                        .skip(1)
+                        .map(|p| format!("--{}", ident(p))),
+                );
+            }
+            // `cand acquire 'desc'` / `cand --ttl 'desc'`.
+            "elvish" => {
+                if let Some(rest) = line.strip_prefix("cand ") {
+                    out.insert(ident(rest));
+                }
+            }
+            // `[CompletionResult]::new('acquire', 'acquire', …)`.
+            "powershell" => {
+                if let Some((_, rest)) = line.split_once("::new('") {
+                    out.insert(ident(rest));
+                }
+            }
+            other => panic!("no candidate reader for {other}"),
+        }
+    }
+    out
+}
+
 /// The whole reason `completion` is a command rather than five checked-in
 /// scripts: it is generated from the same tree clap parses with, so it cannot
-/// drift. This asserts that property directly — every subcommand the binary
-/// has must appear in the script — rather than pinning a snapshot, which would
-/// itself need updating on every change and prove nothing about drift.
+/// drift. This asserts that property directly — every subcommand at every
+/// depth, and every long flag on each of them, must be *offered* by every
+/// shell's script — rather than pinning a snapshot, which would itself need
+/// updating on every change and prove nothing about drift.
 #[test]
 fn the_completion_script_covers_every_subcommand_the_binary_has() {
     let tmp = init_repo();
+    let tree = command_tree(tmp.path());
 
-    // Ask the binary, don't hardcode: a hardcoded list is the drift this
-    // feature exists to prevent, reintroduced in the test.
-    let help = stdout_of(&pact(tmp.path(), "agent", &["--help"]));
-    let subcommands: Vec<String> = help
-        .lines()
-        .skip_while(|l| !l.trim_start().starts_with("Commands:"))
-        .skip(1)
-        .take_while(|l| !l.trim().is_empty())
-        .filter_map(|l| l.split_whitespace().next())
-        .filter(|w| w.chars().all(|c| c.is_ascii_lowercase()))
-        .map(str::to_string)
-        .collect();
+    let nodes = tree.len();
+    let flags = tree.iter().map(|(_, f)| f.len()).sum::<usize>();
     assert!(
-        subcommands.len() >= 8,
-        "parsed too few subcommands from --help, the test is broken not the code: {subcommands:?}"
+        nodes >= 20 && flags >= 40,
+        "walked too little of the command tree, the test is broken not the code: \
+         {nodes} nodes, {flags} flags"
     );
 
-    for shell in ["bash", "zsh", "fish"] {
+    for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
         let out = pact(tmp.path(), "agent", &["completion", shell]);
         assert_ok(&out);
         let script = stdout_of(&out);
         assert!(!script.trim().is_empty(), "{shell} produced nothing");
-        for sub in &subcommands {
-            assert!(
-                script.contains(sub.as_str()),
-                "{shell} completion is missing the `{sub}` subcommand — generated \
-                 completions must not drift from the binary"
-            );
+        let offered = completion_candidates(shell, &script);
+        for (path, flags) in &tree {
+            for name in path.iter().chain(flags.iter()) {
+                assert!(
+                    offered.contains(name),
+                    "{shell} completion does not offer `{name}` (from `pact {}`) — \
+                     generated completions must not drift from the binary",
+                    path.join(" ")
+                );
+            }
         }
     }
 }
