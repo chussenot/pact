@@ -419,6 +419,89 @@ fn a_hidden_backend_is_restored_even_when_chaos_is_killed() {
     );
 }
 
+/// Rail 5, the other direction: a binary genuinely INSIDE $HOME must be hidden
+/// even when $HOME is reached through a symlink.
+///
+/// The rail canonicalises the binary's path with `pwd -P` and used to compare it
+/// against a raw `$HOME`, which asks whether two spellings of one place look
+/// alike. They need not. macOS is where this bit: temp directories live under
+/// /var/folders and /var is a symlink to /private/var, so the test above this
+/// one passed while `a_hidden_backend_is_restored_even_when_chaos_is_killed`
+/// timed out waiting for an outage the rail had silently skipped — green on
+/// every Linux runner, red on every macOS one.
+///
+/// It reproduces on Linux with an explicit symlink, which is why this test can
+/// protect the fix without a macOS runner. It fails against the unfixed rail.
+#[test]
+fn hides_a_backend_under_a_home_reached_through_a_symlink() {
+    if !have("bash") || !have("jq") {
+        eprintln!("SKIP: bash or jq missing");
+        return;
+    }
+    let tmp = armed_repo();
+
+    // The real home, and a symlink to it. HOME is set to the SYMLINK, so the
+    // binary's canonical path (through `real/`) and $HOME (through `link/`)
+    // name the same directory by different routes — exactly macOS's situation.
+    let home_real = tmp.path().join("real");
+    let bin_dir = home_real.join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let home_link = tmp.path().join("link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&home_real, &home_link).unwrap();
+    #[cfg(not(unix))]
+    {
+        eprintln!("SKIP: symlink semantics are unix-only");
+        return;
+    }
+
+    let fake_bd = bin_dir.join("bd");
+    std::fs::write(&fake_bd, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_bd, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = Command::new("bash")
+        .arg(script())
+        .arg("--repo")
+        .arg(tmp.path())
+        .arg("--pids")
+        .arg(tmp.path().join("pids"))
+        .args([
+            "--seed",
+            "5",
+            "--duration",
+            "3",
+            "--time-unit",
+            "sec",
+            "--interval-min",
+            "1",
+            "--interval-max",
+            "1",
+            "--actions",
+            "backend-outage",
+            "--outage-secs",
+            "1",
+        ])
+        .env("HOME", &home_link)
+        .env("PATH", path_with(&[bin_dir.as_path()]))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let d = decisions(tmp.path()).join("\n");
+    assert!(
+        !d.contains("SKIPPED") || !d.contains("outside"),
+        "the rail refused a binary that IS under $HOME, reached by symlink: {d}"
+    );
+    assert!(
+        d.contains("backend-outage"),
+        "the outage must have been decided at all: {d}"
+    );
+}
+
 /// Rail 5: a binary outside $HOME is a system path and is refused rather than
 /// renamed.
 #[test]

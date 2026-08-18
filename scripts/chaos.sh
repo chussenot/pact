@@ -469,8 +469,28 @@ do_backend_outage() {
 	fi
 	path="$(cd "$(dirname "$path")" && pwd -P)/$(basename "$path")"
 	# Rail 5. Renaming a binary out from under the machine is not a fleet fault.
+	#
+	# BOTH SIDES CANONICAL. `path` above went through `pwd -P`, which resolves
+	# symlinks; comparing it against a raw $HOME asks whether two spellings of
+	# the same place look alike, which they need not. macOS is where this bites
+	# hardest — temp dirs live under /var/folders and /var is a symlink to
+	# /private/var, so a $HOME under a tempdir never prefix-matches a path that
+	# has been resolved — but it is not a macOS quirk: any $HOME reached through
+	# a symlink (an automounted /home, a relocated one) got a rail that refused
+	# to hide a binary genuinely inside it. It failed closed, which is the safe
+	# direction, on the wrong question.
+	#
+	# An unreadable or unset $HOME is refused EXPLICITLY, not left to the glob.
+	# `case "$path" in ""/*)` expands to `/*`, which matches every absolute path
+	# there is — so the obvious "empty means nothing matches" fallback would have
+	# turned the rail inside out and allowed /usr/bin/bd.
+	home_p="$(cd "$HOME" 2>/dev/null && pwd -P)" || home_p=""
+	if [ -z "$home_p" ]; then
+		log_skip backend-outage "$path" "\$HOME is unset or unreadable; refusing to touch anything"
+		return
+	fi
 	case "$path" in
-	"$HOME"/*) ;;
+	"$home_p"/*) ;;
 	*)
 		log_skip backend-outage "$path" "outside \$HOME; refusing to touch a system path"
 		return
