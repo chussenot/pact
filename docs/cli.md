@@ -142,7 +142,10 @@ pact completion fish > ~/.config/fish/completions/pact.fish
 It needs no repository: unlike every other command it reads no state, and a
 shell profile is sourced from `$HOME` rather than from a checkout. Regenerate
 it after upgrading pact — a script written by an older binary completes that
-binary's commands, which is the one way this can still go stale.
+binary's commands, which is the one way this can still go stale. `mise run
+install` does that for you, rewriting whichever of those three files already
+exists; a shell that has already loaded one picks the new one up on its next
+start.
 
 **`pact context set <key> <value>` records a constraint the run operates under**,
 as a `context` row in `.pact/events.jsonl`, chain-hashed like every other event.

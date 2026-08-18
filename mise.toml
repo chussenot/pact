@@ -182,4 +182,18 @@ description = "Build and install the pact binary locally with every feature enab
 # Neither opt-in feature costs anything unasked — `otel` exports only when the
 # standard OTEL_* variables are set (+0 ms unconfigured, measured), and `mcp`
 # does nothing until a client spawns `pact mcp serve`.
-run = "cargo install --path . --force --features $PACT_ALL_FEATURES"
+run = [
+  "cargo install --path . --force --features $PACT_ALL_FEATURES",
+  """
+  # Refresh the generated completion scripts too. They are generated from the
+  # command tree, so they cannot drift from the binary that wrote them — but a
+  # shell caches the file, so an install leaves yesterday's commands completing
+  # until someone regenerates it by hand. Nobody does. Only directories that
+  # already exist are written, so on a machine without them this is a no-op.
+  refresh() { [ -d "$1" ] && pact completion "$2" > "$1/$3" && echo "completions: $1/$3"; true; }
+  command -v pact >/dev/null || exit 0
+  refresh "${ZDOTDIR:-$HOME}/.zsh/completions" zsh _pact
+  refresh "$HOME/.local/share/bash-completion/completions" bash pact
+  refresh "$HOME/.config/fish/completions" fish pact.fish
+  """,
+]
