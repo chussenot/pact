@@ -12,6 +12,7 @@ mod init;
 mod merge;
 mod plan;
 mod watch;
+mod whoami;
 
 pub(super) use audit::{run_audit, AuditArgs};
 pub(super) use completion::run_completion;
@@ -21,3 +22,4 @@ pub(super) use init::run_init;
 pub(super) use merge::run_merge;
 pub(super) use plan::run_plan_lint;
 pub(super) use watch::run_watch;
+pub(super) use whoami::run_whoami;
