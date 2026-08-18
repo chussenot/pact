@@ -1,3 +1,10 @@
+//! `pact ui` — the dashboard, until the operator quits it.
+//!
+//! Owns one line of policy in three: identity is resolved best-effort and
+//! discarded on failure. The dashboard is for a human watching a fleet, and
+//! that human may never have set `PACT_AGENT` — refusing to open would deny
+//! them the view precisely when they most need it.
+
 use anyhow::Result;
 use std::path::Path;
 

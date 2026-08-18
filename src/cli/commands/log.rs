@@ -1,3 +1,10 @@
+//! `pact log` — leases and messages as one chronological feed.
+//!
+//! Owns one flat row shape for both stores, argued on [`LogEvent`]: the
+//! question this command answers — is the fleet alive, and what is it doing —
+//! does not care which file a fact was read from, so the feed must not make the
+//! reader care either.
+
 use anyhow::Result;
 use std::path::Path;
 

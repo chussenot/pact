@@ -1,3 +1,13 @@
+//! `pact plan lint <manifest>` — contention prevention, as a check.
+//!
+//! Owns one agreement: paths are normalized through the repo root exactly as
+//! `lease acquire` would normalize them. A lint that resolved paths differently
+//! from the leases it exists to protect would pass a plan whose waves collide,
+//! which is precisely the failure it was written to catch.
+//!
+//! Returns an exit code rather than exiting — errors 1, warnings alone 0, and
+//! no new code invented for it. See [`run_plan_lint`].
+
 use anyhow::Result;
 use std::path::Path;
 

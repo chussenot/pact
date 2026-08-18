@@ -1,3 +1,10 @@
+//! `pact watch` — register, retire and list path subscriptions.
+//!
+//! Owns the reason this command has no exit code of its own: the registry is
+//! append-only and per-agent, so a subscription cannot conflict with anything.
+//! There is no contested state here to report, which is what makes `watch add`
+//! the safe answer to an exit 2 instead of a retry loop.
+
 use anyhow::Result;
 use std::path::Path;
 

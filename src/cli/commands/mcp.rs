@@ -1,3 +1,9 @@
+//! `pact mcp serve` — the read-only observation surface, on stdio.
+//!
+//! Owns the absence of an identity. An observer holds nothing and sends
+//! nothing, so there is no agent for it to be; the tools that need one take it
+//! as a parameter, because a single observer may watch several agents.
+
 use anyhow::Result;
 use std::path::Path;
 

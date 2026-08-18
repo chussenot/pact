@@ -1,3 +1,14 @@
+//! `pact init` — the managed block, the pointer files, the gitignore line.
+//!
+//! Owns the rule that init never writes through somebody's live claim. Every
+//! target is checked at once by [`refuse_if_a_target_is_leased`] — a peek, not
+//! an acquire, because asking a question must not mutate — and the check is
+//! all-or-nothing for the same reason `acquire_many` is: a refusal landing
+//! after AGENTS.md was already rewritten leaves a half-applied protocol.
+//!
+//! `doctor --fix` imports that function rather than restating the check, so
+//! the two commands cannot disagree about whose file it is.
+
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 

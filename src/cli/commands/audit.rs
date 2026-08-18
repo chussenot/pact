@@ -1,3 +1,10 @@
+//! `pact audit` — the flag surface, and the summary-or-check decision.
+//!
+//! Owns one rule, stated on [`run_audit`] below: a finding is a *result*, not
+//! an error. It is returned as an exit code rather than raised, so it can never
+//! print `error:` and can never be confused with a usage failure. The analysis
+//! itself lives in [`crate::audit`]; this file only decides which of it to run.
+
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 

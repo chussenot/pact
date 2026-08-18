@@ -1,3 +1,10 @@
+//! `pact completion <shell>` — the completion script, on stdout.
+//!
+//! Owns the guarantee that completions cannot drift from the parser: they are
+//! generated from `Cli::command()`, the same tree clap parses arguments with,
+//! so a new flag is completed the moment it is accepted. See [`run_completion`]
+//! for why that is worth a command instead of five checked-in scripts.
+
 use anyhow::Result;
 use clap::CommandFactory;
 

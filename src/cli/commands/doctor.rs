@@ -1,3 +1,13 @@
+//! `pact doctor` — running the checks, rendering the report, dispatching `--fix`.
+//!
+//! Owns one prerequisite that is deliberately NOT a report row: a missing repo
+//! root propagates as exit 4 instead of being folded into the findings. Without
+//! a repo there is nothing for any other check to be true or false about, so a
+//! report full of failures would describe the wrong problem.
+//!
+//! The repair half is `--fix`; its all-or-nothing lease guard is argued on
+//! [`run_doctor_fix`], and imported from [`super::init`] rather than copied.
+
 use anyhow::Result;
 use std::path::Path;
 

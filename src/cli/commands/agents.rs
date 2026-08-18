@@ -1,3 +1,11 @@
+//! `pact agents` — who is active, and whose file is this.
+//!
+//! Owns the answer to "whose file is this?", and owns it WITHOUT a registry:
+//! every answer is derived from the event log, so there is nothing to keep in
+//! sync and the answer outlives the release. A path is addressable after its
+//! holder has exited, which is what makes `msg send --to-owner-of` reach the
+//! next agent rather than a dead one.
+
 use anyhow::Result;
 use std::path::Path;
 

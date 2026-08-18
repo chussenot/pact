@@ -1,3 +1,11 @@
+//! `pact whoami` — everything pact resolved about its own environment.
+//!
+//! Owns the rule that this command must never fail. Every field is optional and
+//! every problem is collected into the report rather than raised, because
+//! `whoami` is what you run *because* something is already broken — a version
+//! of it that exits on the first unresolved thing would be silent in exactly
+//! the situation it exists for. Argued on [`Whoami`].
+
 use anyhow::Result;
 use std::path::Path;
 

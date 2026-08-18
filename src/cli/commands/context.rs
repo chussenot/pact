@@ -1,3 +1,9 @@
+//! `pact context set` — what the run was operating under.
+//!
+//! Owns the decision NOT to be idempotent. Setting a key twice records both
+//! rows and the later one wins, because a run that revised its policy mid-flight
+//! did revise it, and a log that overwrites cannot say so. See [`run_context_set`].
+
 use anyhow::Result;
 use std::path::Path;
 

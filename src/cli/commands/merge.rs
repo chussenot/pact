@@ -1,3 +1,10 @@
+//! `pact merge` — the mutex around an integration.
+//!
+//! Thin on purpose: the interesting part is [`crate::merge`]. What this file
+//! owns is that `--ttl` is parsed by [`crate::lease::parse_ttl`] and fails with
+//! the same exit 5 as everywhere else — one TTL grammar across the whole tool,
+//! rather than a second one that accepts almost the same strings.
+
 use anyhow::Result;
 use std::path::Path;
 
