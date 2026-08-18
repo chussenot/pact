@@ -50,6 +50,8 @@
 //! is not a lease conflict, so it must not be 2.
 
 mod context;
+#[cfg(test)]
+mod fixtures;
 mod model;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -3167,29 +3169,8 @@ pub fn render_check(r: &CheckReport) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::fixtures::*;
     use super::*;
-
-    /// Write a log and audit it. Takes raw lines so a test can plant a truncated
-    /// one, an unknown kind, or outright junk.
-    fn with_log(lines: &[&str]) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join(".git")).unwrap();
-        let pact = tmp.path().join(".pact");
-        std::fs::create_dir_all(&pact).unwrap();
-        std::fs::write(pact.join("events.jsonl"), lines.join("\n")).unwrap();
-        tmp
-    }
-
-    fn ev(at: &str, agent: &str, kind: &str, path: &str) -> String {
-        format!(r#"{{"at":"{at}","agent":"{agent}","kind":"{kind}","path":"{path}"}}"#)
-    }
-
-    /// A content-hash-bearing event, for the merge-divergence walk.
-    fn ev_hash(at: &str, agent: &str, kind: &str, path: &str, hash: &str) -> String {
-        format!(
-            r#"{{"at":"{at}","agent":"{agent}","kind":"{kind}","path":"{path}","content_hash":"{hash}"}}"#
-        )
-    }
 
     /// pact-mqw.3: the crucible shape. Two agents each correctly held one file at
     /// different times, each added a match arm to the SAME match statement on its
@@ -3381,17 +3362,6 @@ mod tests {
             "{}",
             render_check(&r)
         );
-    }
-
-    /// A refusal with the holder's remaining lease recorded (pact-1gv.1), so the
-    /// impatience half of retry-storm has something to judge.
-    fn ev_refused(at: &str, agent: &str, path: &str, holder: &str, remaining: i64) -> String {
-        // ONE line. The log is line-delimited, so a pretty-printed record is two
-        // torn lines rather than one event — which is exactly how the first cut of
-        // these tests reported zero findings against a log full of refusals.
-        format!(
-            r#"{{"at":"{at}","agent":"{agent}","kind":"refused","path":"{path}","holder":"{holder}","holder_remaining_secs":{remaining}}}"#
-        )
     }
 
     /// pact-1gv.3, the crucible shape reproduced: agent-02 refused src/eval.rs 33
@@ -3589,29 +3559,6 @@ mod tests {
         );
     }
 
-    /// An acquire whose note names a bead, which is the only thing
-    /// claim-lease-divergence reads off the event.
-    fn ev_note(at: &str, agent: &str, path: &str, note: &str) -> String {
-        format!(
-            r#"{{"at":"{at}","agent":"{agent}","kind":"acquired","path":"{path}","detail":"{note}"}}"#
-        )
-    }
-
-    /// Plant a Beads interactions export beside an existing log (pact-as5.6). Raw
-    /// lines, so a fixture can plant junk — parse-tolerance is this reader's whole
-    /// contract.
-    fn with_interactions(tmp: &tempfile::TempDir, lines: &[&str]) {
-        let beads = tmp.path().join(".beads");
-        std::fs::create_dir_all(&beads).unwrap();
-        std::fs::write(beads.join("interactions.jsonl"), lines.join("\n")).unwrap();
-    }
-
-    fn assignee_row(at: &str, issue: &str, new_value: &str) -> String {
-        format!(
-            r#"{{"id":"int-1","kind":"field_change","created_at":"{at}","actor":"someone","issue_id":"{issue}","extra":{{"field":"assignee","new_value":"{new_value}","old_value":""}}}}"#
-        )
-    }
-
     /// pact-as5.6: the assignee is reconstructed by replaying `field=assignee` rows
     /// from the committed export, with no `bd` subprocess anywhere. Three things at
     /// once, because they are one replay: the last row wins, a `field=status` row is
@@ -3723,20 +3670,6 @@ mod tests {
         assert!(r.claim_divergences.is_empty());
         assert_eq!(r.findings(), 0);
         assert!(r.claim_unavailable.is_some());
-    }
-
-    /// Plant watch records beside an existing log, so a fixture can say what an agent
-    /// was subscribed to and WHEN.
-    fn with_watches(tmp: &tempfile::TempDir, lines: &[&str]) {
-        std::fs::write(
-            tmp.path().join(".pact").join("watches.jsonl"),
-            lines.join("\n"),
-        )
-        .unwrap();
-    }
-
-    fn watch_rec(at: &str, agent: &str, kind: &str, path: &str) -> String {
-        format!(r#"{{"at":"{at}","agent":"{agent}","kind":"{kind}","path":"{path}"}}"#)
     }
 
     /// pact-7kv: somebody wanted a path, was told no, and learned nothing when it
@@ -4221,14 +4154,6 @@ mod tests {
         assert!(render_check(&r).contains("without a single renew"));
     }
 
-    /// A lease that lapsed is the same smell already realised, whatever its
-    /// duration.
-    fn ev_ttl(at: &str, agent: &str, kind: &str, path: &str, ttl: u64) -> String {
-        format!(
-            r#"{{"at":"{at}","agent":"{agent}","kind":"{kind}","path":"{path}","ttl_secs":{ttl}}}"#
-        )
-    }
-
     /// The assertion that makes raising the default safe. Each hold is judged
     /// against the TTL IT recorded, so a hold taken under a short TTL stays a
     /// finding no matter what the binary is compiled with — and one taken under a
@@ -4460,14 +4385,6 @@ mod tests {
         );
     }
 
-    fn annotation(covers: &[usize], note: &str) -> String {
-        let lines: Vec<String> = covers.iter().map(|n| n.to_string()).collect();
-        format!(
-            r#"{{"at":"2026-08-06T12:00:00Z","agent":"maintainer","kind":"annotation","detail":"{note}","covers_lines":[{}],"actor":"maintainer"}}"#,
-            lines.join(",")
-        )
-    }
-
     /// An annotation names lines that are not real history. They leave the
     /// statistics, and the fact that they left is reported — an exclusion nobody
     /// can see is indistinguishable from data that was never there.
@@ -4498,14 +4415,6 @@ mod tests {
         assert_eq!(raw.events, 4);
         assert_eq!(raw.excluded_by_annotation, 0);
         assert!(raw.agents.contains(&"ghost".to_string()));
-    }
-
-    fn annotation_with_actor(covers: &[usize], note: &str, actor: &str) -> String {
-        let lines: Vec<String> = covers.iter().map(|n| n.to_string()).collect();
-        format!(
-            r#"{{"at":"2026-08-06T12:00:00Z","agent":"maintainer","kind":"annotation","detail":"{note}","covers_lines":[{}],"actor":"{actor}"}}"#,
-            lines.join(",")
-        )
     }
 
     /// CURRENT (pre-fix) behavior, documented rather than changed: `actor` is
@@ -4705,38 +4614,6 @@ mod tests {
 
     // ----------------------------------------------------------- chain-integrity
 
-    /// A real, chain-hashed `Event`, built through the same struct pact itself
-    /// writes rather than through `ev()`'s bare JSON — `chain_hash` is computed
-    /// by `events::append`, so the fixture must go through it to get one at all.
-    fn chain_event(agent: &str, kind: &str, path: &str) -> Event {
-        Event {
-            at: Utc::now().to_rfc3339(),
-            agent: agent.to_string(),
-            kind: kind.to_string(),
-            path: Some(path.to_string()),
-            detail: None,
-            ttl_secs: None,
-            covers_lines: None,
-            actor: None,
-            displaced: None,
-            chain_hash: None,
-            invoked_from: None,
-            collected_from: None,
-            scope: None,
-            pact_version: None,
-            content_hash: None,
-            subscriber: None,
-            message_id: None,
-            protocol_hash: None,
-            head: None,
-            holder: None,
-            holder_remaining_secs: None,
-            holder_branch: None,
-            holder_worktree: None,
-            ..Default::default()
-        }
-    }
-
     /// pact-m7j.2.5's acceptance criteria: a hand-edited `chain_hash` — the
     /// shape a forged or tampered line actually takes on disk, since nobody but
     /// `append_bounded` can compute one that verifies — must be flagged, and
@@ -4832,12 +4709,6 @@ mod tests {
     }
 
     // ------------------------------------------------------------ topology
-
-    fn ev_from(at: &str, agent: &str, kind: &str, path: &str, from: &str) -> String {
-        format!(
-            r#"{{"at":"{at}","agent":"{agent}","kind":"{kind}","path":"{path}","invoked_from":"{from}","scope":"shared"}}"#
-        )
-    }
 
     #[test]
     fn the_summary_counts_events_by_where_pact_was_invoked() {
@@ -4988,10 +4859,6 @@ mod tests {
         );
     }
 
-    fn ev_meta(at: &str, agent: &str, kind: &str, path: &str, extra: &str) -> String {
-        format!(r#"{{"at":"{at}","agent":"{agent}","kind":"{kind}","path":"{path}"{extra}}}"#)
-    }
-
     /// pact-b73.1, from the field: grimcast spanned an upgrade from a pact
     /// that could not stamp the protocol to one that could, under ONE
     /// unchanged block — and was told its protocol had changed.
@@ -5088,86 +4955,6 @@ mod tests {
         let s = summary(tmp.path(), None, false).unwrap();
         assert_eq!(s.by_pact_version.len(), 1);
         assert!(!render_summary(&s).contains("UPGRADED"));
-    }
-
-    // ------------------------------------------------- commit-correlation
-    //
-    // `with_log`'s `.git` is a bare, empty directory — enough to satisfy
-    // `find_repo_root`, but not a real git repository `git log` can read.
-    // `Check::CommitCorrelation` needs a REAL repository, so these tests get
-    // their own fixture that actually runs `git init` and `git commit`.
-
-    fn with_git_log(lines: &[&str]) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args(["init", "--quiet"])
-            .status()
-            .unwrap();
-        assert!(status.success(), "git init failed");
-        let pact = tmp.path().join(".pact");
-        std::fs::create_dir_all(&pact).unwrap();
-        std::fs::write(pact.join("events.jsonl"), lines.join("\n")).unwrap();
-        tmp
-    }
-
-    /// Writes (or rewrites) `file` and commits it under `at`, an RFC3339
-    /// timestamp shared by author and committer date so the fixture's
-    /// commits line up exactly with the hand-written event timestamps above
-    /// them.
-    fn git_commit(repo: &std::path::Path, file: &str, at: &str) {
-        std::fs::write(repo.join(file), at).unwrap();
-        let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(args)
-                .env("GIT_AUTHOR_NAME", "tester")
-                .env("GIT_AUTHOR_EMAIL", "tester@example.com")
-                .env("GIT_AUTHOR_DATE", at)
-                .env("GIT_COMMITTER_NAME", "tester")
-                .env("GIT_COMMITTER_EMAIL", "tester@example.com")
-                .env("GIT_COMMITTER_DATE", at)
-                .status()
-                .unwrap()
-        };
-        assert!(run(&["add", file]).success());
-        assert!(run(&["commit", "--quiet", "-m", &format!("touch {file}")]).success());
-    }
-
-    /// [`git_commit`] with a `Pact-Agent` trailer, so a fixture can say which
-    /// agent made a commit — which is the fact git itself cannot supply, since
-    /// every agent in every fleet so far commits under one git identity.
-    fn git_commit_as(repo: &std::path::Path, file: &str, at: &str, agent: &str) {
-        if let Some(parent) = repo.join(file).parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(repo.join(file), format!("{at} {agent}")).unwrap();
-        let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(args)
-                .env("GIT_AUTHOR_NAME", "tester")
-                .env("GIT_AUTHOR_EMAIL", "tester@example.com")
-                .env("GIT_AUTHOR_DATE", at)
-                .env("GIT_COMMITTER_NAME", "tester")
-                .env("GIT_COMMITTER_EMAIL", "tester@example.com")
-                .env("GIT_COMMITTER_DATE", at)
-                .status()
-                .unwrap()
-        };
-        assert!(run(&["add", file]).success());
-        assert!(run(&[
-            "commit",
-            "--quiet",
-            "-m",
-            &format!("touch {file}"),
-            "--trailer",
-            &format!("Pact-Agent={agent}"),
-        ])
-        .success());
     }
 
     /// pact-mqw.10: "covered" was answering the wrong question.
@@ -5278,24 +5065,6 @@ mod tests {
         assert_eq!((r.commits_attributed, r.commits_unattributed), (2, 1));
         assert_eq!(r.cross_held_commits.len(), 1, "{:?}", r.cross_held_commits);
         assert_eq!(r.cross_held_commits[0].committer_agent, "rogue");
-    }
-
-    /// An event carrying `head` on both boundaries, for the range path.
-    fn ev_head(at: &str, agent: &str, kind: &str, path: &str, head: &str) -> String {
-        format!(
-            r#"{{"at":"{at}","agent":"{agent}","kind":"{kind}","path":"{path}","head":"{head}"}}"#
-        )
-    }
-
-    /// Short HEAD right now, so a fixture can record a hash git will actually resolve.
-    fn head_of(repo: &std::path::Path) -> String {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["rev-parse", "--short", "HEAD"])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     /// FINDING 5b: `--expect worktrees` could not pass for any real fleet, because in the
