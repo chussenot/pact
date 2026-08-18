@@ -8,8 +8,10 @@ mod completion;
 mod context;
 mod merge;
 mod plan;
+mod watch;
 
 pub(super) use completion::run_completion;
 pub(super) use context::run_context_set;
 pub(super) use merge::run_merge;
 pub(super) use plan::run_plan_lint;
+pub(super) use watch::run_watch;
