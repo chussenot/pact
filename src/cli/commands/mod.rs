@@ -5,5 +5,7 @@
 //! dispatch table stays the flat list of verbs it is.
 
 mod completion;
+mod context;
 
 pub(super) use completion::run_completion;
+pub(super) use context::run_context_set;

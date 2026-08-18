@@ -17,7 +17,7 @@ use lease::human_secs;
 mod commands;
 mod util;
 
-use commands::run_completion;
+use commands::{run_completion, run_context_set};
 
 use util::{age_of, table};
 pub(crate) use util::{one_line, since};
@@ -2243,81 +2243,6 @@ fn run_plan_lint(cwd: &Path, json: bool, manifest: &str) -> Result<i32> {
     let report = plan::run(&root, Path::new(manifest))?;
     output::emit(json, &report, plan::render);
     Ok(i32::from(report.errors() > 0))
-}
-
-/// `pact context set <key> <value>`.
-///
-/// One append, chain-hashed with everything else, because the constraints a run
-/// operated under belong in the same log as its behaviour — see
-/// [`events::CONTEXT_KIND`] for the failure this exists to prevent.
-///
-/// Deliberately NOT idempotent: setting a key twice records both rows and the
-/// later one wins. A run that revised its policy mid-flight did revise it, and
-/// flattening that to one value would hide exactly the kind of thing an audit is
-/// looking for.
-fn run_context_set(
-    cwd: &Path,
-    json: bool,
-    key: &str,
-    value: &str,
-    agent_flag: Option<&str>,
-) -> Result<()> {
-    let root = repo::find_repo_root(cwd)?;
-    // An identity, like every other row: "who declared this policy" is as much
-    // part of the record as the policy, and an orchestrator setting it is the
-    // normal case.
-    let agent = identity::resolve_agent(agent_flag)?;
-
-    let key = key.trim();
-    if key.is_empty() {
-        return Err(output::exit_with(5, "a context key cannot be empty"));
-    }
-    // `=` and whitespace are refused so a row always renders unambiguously as
-    // `key=value` — in `pact log`, in the audit header, and in any script that
-    // splits on the first `=`. The value is free text precisely because it is
-    // the half nothing has to parse.
-    if key.contains('=') || key.chars().any(char::is_whitespace) {
-        return Err(output::exit_with(
-            5,
-            format!(
-                "invalid context key {key:?}: no whitespace and no '=' (the value may contain both)"
-            ),
-        ));
-    }
-
-    events::append(
-        &root,
-        &events::Event {
-            at: chrono::Utc::now().to_rfc3339(),
-            agent: agent.clone(),
-            kind: events::CONTEXT_KIND.to_string(),
-            context_key: Some(key.to_string()),
-            context_value: Some(value.to_string()),
-            ..Default::default()
-        },
-    );
-
-    #[derive(serde::Serialize)]
-    struct ContextReport<'a> {
-        key: &'a str,
-        value: &'a str,
-        agent: &'a str,
-    }
-    output::emit(
-        json,
-        &ContextReport {
-            key,
-            value,
-            agent: &agent,
-        },
-        |r: &ContextReport| {
-            format!(
-                "recorded {}={} for this run (by {})",
-                r.key, r.value, r.agent
-            )
-        },
-    );
-    Ok(())
 }
 
 fn run_doctor(cwd: &Path, json: bool, fix: bool, agent_flag: Option<&str>) -> Result<i32> {
