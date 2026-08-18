@@ -131,7 +131,7 @@ enum Command {
         #[arg(long)]
         allow_dirty: bool,
     },
-    /// Threaded messages between agents, via the Beads CLI.
+    /// Threaded messages between agents, in pact's own append-only store.
     Msg {
         #[command(subcommand)]
         action: MsgAction,
@@ -292,7 +292,10 @@ enum WatchAction {
         path: String,
     },
     /// Unsubscribe from a path you are watching.
-    Rm { path: String },
+    Rm {
+        /// The path to stop watching, spelled as you subscribed to it.
+        path: String,
+    },
     /// List the subscriptions currently in force, for every agent.
     Ls,
 }
@@ -312,11 +315,17 @@ enum LeaseAction {
         /// Force takeover of a non-expired lease.
         #[arg(long)]
         steal: bool,
+        /// Why you are claiming these paths. Recorded with the lease and shown
+        /// by `lease ls`, `pact log` and `agents --for` — this IS the
+        /// announcement, so a message repeating it is a message nobody needed.
         #[arg(long)]
         note: Option<String>,
     },
     /// Refresh a lease you already hold, so a long task doesn't outlive it.
-    Renew { path: String },
+    Renew {
+        /// A path you already hold. Its TTL restarts from now.
+        path: String,
+    },
     /// Release leases you hold, or all of them with --all.
     Release {
         /// One or more paths, like `acquire`. Unlike `acquire` this is NOT
@@ -411,6 +420,8 @@ enum MsgAction {
         /// Reply within an existing thread; omit to start a new one.
         #[arg(long)]
         thread: Option<String>,
+        /// One-line summary. `msg inbox` gives it its own column; in `pact log`
+        /// it is the entry's detail, which falls back to the body without one.
         #[arg(long)]
         subject: Option<String>,
         /// Message body. Mutually exclusive with --body-file.
@@ -432,6 +443,7 @@ enum MsgAction {
     },
     /// List messages addressed to you, one line each.
     Inbox {
+        /// Leave out messages you have already read.
         #[arg(long)]
         unread_only: bool,
         /// Print every body in full instead of one line per message.
@@ -449,6 +461,8 @@ enum MsgAction {
     Sent,
     /// Read a message (or its thread) by id.
     Read {
+        /// Message id, as `msg inbox` prints it. Reading marks it read for you
+        /// — the only thing that tells the sender their message landed.
         id: String,
         /// Envelope, subject and the first few lines of each body — for
         /// deciding what to read in full, on a thread too long to read whole.
