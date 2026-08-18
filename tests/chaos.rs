@@ -206,6 +206,56 @@ fn refuses_pacts_own_checkout_even_when_armed() {
     );
 }
 
+/// A COPY of pact's sources is still pact's sources, and the sibling test above
+/// cannot prove that rail exists.
+///
+/// `refuses_pacts_own_checkout_even_when_armed` points chaos at
+/// `CARGO_MANIFEST_DIR`, so the canonical-path rail fires first and the content
+/// rail is never reached — the test passes whether or not the second guard
+/// works at all. It demonstrably did not: the `src/lease.rs` -> `src/lease/mod.rs`
+/// split (pact-aph.2) left `[ -f "$REPO/src/lease.rs" ]` false for every
+/// repository on earth, and this suite stayed green.
+///
+/// So this repo is at a DIFFERENT canonical path with the SAME content markers.
+/// Guard 1 cannot fire; if the refusal still arrives, guard 2 is what produced
+/// it. The assertion names guard 2's wording ("source checkout") rather than the
+/// shared "REFUSING TO RUN" prefix, because a test that accepts either message
+/// is the bug this test exists to prevent.
+#[test]
+fn refuses_a_copy_of_pacts_sources_at_a_path_that_is_not_pacts_own() {
+    if !have("bash") || !have("jq") {
+        eprintln!("SKIP: bash or jq missing");
+        return;
+    }
+    let repo = armed_repo();
+    // The two things the content guard reads, and nothing else: it is a guard,
+    // not a build, so a real checkout would prove no more than these do.
+    std::fs::create_dir_all(repo.path().join("src/lease")).unwrap();
+    std::fs::write(
+        repo.path().join("src/lease/mod.rs"),
+        "// pact's lease module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.path().join("Cargo.toml"),
+        "[package]\nname = \"pact\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+
+    let out = chaos(repo.path(), &["--dry-run"]);
+
+    assert!(
+        !out.status.success(),
+        "a copy of pact's sources must be refused, not injected into"
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("source checkout"),
+        "guard 2 must be the one that fired — guard 1 says 'own checkout', and \
+         accepting either is how this rail rotted unnoticed: {err}"
+    );
+}
+
 // ------------------------------------------------------------------- rail 3
 
 /// The allowlist and the cwd re-check, proven by survival rather than by
