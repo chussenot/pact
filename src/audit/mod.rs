@@ -562,6 +562,14 @@ pub(in crate::audit) fn secs(n: i64) -> String {
     crate::lease::human_secs(n)
 }
 
+/// Render one check's report, in print order.
+///
+/// The order of the calls below IS the output, and each check owns only the
+/// blocks it prints, not where they go — a shared header, then every check's
+/// scope lines, then the clean-run message, then every check's findings. A
+/// check that could not run at all stops here rather than in its own module, so
+/// that "return early" stays a decision of the renderer's and not nine
+/// independent ones.
 pub fn render_check(r: &CheckReport) -> String {
     let mut out = vec![format!(
         "{}: scanned {} event(s)",
@@ -634,23 +642,16 @@ pub fn render_check(r: &CheckReport) -> String {
     }
 
     checks::double_win::findings(r, &mut out);
-
     checks::stale_holds::findings(r, &mut out);
-
     checks::chain_integrity::findings(r, &mut out);
-
     checks::commit_correlation::findings(r, &mut out);
-
     checks::topology::findings(r, &mut out);
-
     checks::silent_contention::findings(r, &mut out);
-
     checks::retry_storm::findings(r, &mut out);
-
     checks::claim_lease_divergence::findings(r, &mut out);
-
     checks::merge_divergence::findings(r, &mut out);
-
+    // Last, and after every other check's findings: informational rather than a
+    // finding, which is why a clean commit-correlation run still reaches it.
     checks::commit_correlation::correlation_footer(r, &mut out);
 
     out.join("\n")
