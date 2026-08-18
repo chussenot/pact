@@ -148,7 +148,11 @@ enum Command {
     /// out of step with the binary the way a hand-written script would.
     /// Writes to stdout; see docs/cli.md for where each shell wants it.
     Completion {
-        /// bash, zsh, fish, elvish or powershell.
+        /// The shell whose syntax to emit. One clap cannot generate is a
+        /// usage error, not an empty script.
+        // Deliberately not a list: clap prints `[possible values: ...]` from
+        // `clap_complete::Shell` itself, and a second copy here is one more
+        // thing to forget when that enum grows.
         shell: clap_complete::Shell,
     },
     /// Record the constraints this run operates under, in the same log as its
@@ -223,10 +227,19 @@ enum Command {
         /// is always reported. Pass this to see the raw log as written.
         #[arg(long)]
         include_annotated: bool,
-        /// What `--check topology` should assert: `worktrees`, `main` or
-        /// `any`. Every stamped event must satisfy it — there is no
-        /// proportion threshold, deliberately (see docs/audit.md).
-        #[arg(long, requires = "check")]
+        /// What `--check topology` should assert. Every stamped event must
+        /// satisfy it — there is no proportion threshold, deliberately (see
+        /// docs/audit.md).
+        // The possible values come from `audit::Expect::NAMES` for the reason
+        // `--check`'s come from `Check::NAMES`: the list that used to be written
+        // out here, and the one in `Expect::parse`'s error, were pact-98u's
+        // exact shape one flag over — two hand-written copies that happened to
+        // still agree.
+        #[arg(
+            long,
+            requires = "check",
+            value_parser = clap::builder::PossibleValuesParser::new(audit::Expect::NAMES)
+        )]
         expect: Option<String>,
         /// An identity allowed to act from the main checkout under
         /// `--expect worktrees`; repeat for several.
@@ -312,7 +325,10 @@ enum LeaseAction {
         /// minutes); or give a unit, as `--since` takes: 45m, 2h, 1d, 2w.
         #[arg(long, default_value_t = lease::DEFAULT_TTL_SECS.to_string())]
         ttl: String,
-        /// Force takeover of a non-expired lease.
+        /// Take a lease its holder is still legitimately inside the TTL of.
+        /// Warns on stderr naming them, and records a `stolen`/`displaced`
+        /// pair — an override on your word. `lease sweep` reclaims on pact's
+        /// own evidence instead, for a holder you believe is gone.
         #[arg(long)]
         steal: bool,
         /// Why you are claiming these paths. Recorded with the lease and shown

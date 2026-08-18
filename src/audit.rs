@@ -185,9 +185,27 @@ pub enum Expect {
 }
 
 impl Expect {
+    /// Every value `--expect` accepts, in the order they are documented.
+    ///
+    /// The single source of truth, exactly as [`Check::NAMES`] is one flag over
+    /// (pact-98u): clap renders this into `--help` and refuses anything not on
+    /// it, and `parse`'s error below is built from it, so the help, the parser
+    /// and the error cannot disagree about what exists.
+    ///
+    /// [`Expect::FromContext`] is deliberately absent — it is what a *missing*
+    /// `--expect` means, not a value anyone can type. It stays out of clap's
+    /// possible values for that reason, and out of this list so nothing offers
+    /// it.
+    pub const NAMES: [&'static str; 3] = ["worktrees", "main", "any"];
+
     /// `allow_main` names the identities permitted to act from the main checkout, and is
     /// only meaningful for `worktrees` — the other two either have nothing to except or
     /// expect main already.
+    ///
+    /// Still fallible although clap validates the command line against
+    /// [`Expect::NAMES`]: the other caller is the run's own declared
+    /// `topology-expectation`, which comes out of the event log and was never
+    /// checked by anything.
     pub fn parse(s: &str, allow_main: &[String]) -> Result<Self> {
         match s {
             "worktrees" => Ok(Expect::Worktrees {
@@ -195,9 +213,15 @@ impl Expect {
             }),
             "main" => Ok(Expect::Main),
             "any" => Ok(Expect::Any),
-            other => Err(anyhow::anyhow!(
-                "unknown --expect \"{other}\"; expected worktrees, main or any"
-            )),
+            other => {
+                // Built from NAMES rather than written out, for the same reason
+                // `Check::parse`'s is.
+                let (last, rest) = Expect::NAMES.split_last().expect("NAMES is non-empty");
+                Err(anyhow::anyhow!(
+                    "unknown --expect \"{other}\"; expected {} or {last}",
+                    rest.join(", ")
+                ))
+            }
         }
     }
 
@@ -3748,6 +3772,28 @@ mod tests {
         assert!(err.contains("nonsense"), "{err}");
     }
 
+    /// The `--expect` half of the same guard. `Expect::label` is exhaustive, so
+    /// a new variant forces a compile error there; this catches the case where
+    /// it was labelled but never added to `NAMES`, which would leave it out of
+    /// `--help` and unreachable through clap's value parser — pact-98u exactly.
+    #[test]
+    fn every_expect_name_parses_and_round_trips() {
+        for name in Expect::NAMES {
+            let parsed = Expect::parse(name, &[])
+                .unwrap_or_else(|e| panic!("NAMES lists {name:?} but parse rejects it: {e:#}"));
+            assert_eq!(
+                parsed.label(),
+                name,
+                "{name:?} parsed to an expectation that calls itself something else"
+            );
+        }
+        let err = format!("{:#}", Expect::parse("mostly", &[]).unwrap_err());
+        for name in Expect::NAMES {
+            assert!(err.contains(name), "the error omits {name:?}: {err}");
+        }
+        assert!(err.contains("mostly"), "{err}");
+    }
+
     #[test]
     fn merge_divergence_flags_an_acquire_from_a_copy_the_releaser_never_left() {
         let tmp = with_log(&[
@@ -5473,7 +5519,9 @@ mod tests {
         let bad = Check::parse("topology", Some("mostly"), &[])
             .unwrap_err()
             .to_string();
-        assert!(bad.contains("worktrees, main or any"), "{bad}");
+        for name in Expect::NAMES {
+            assert!(bad.contains(name), "the error omits {name:?}: {bad}");
+        }
         let unknown = Check::parse("nope", None, &[]).unwrap_err().to_string();
         assert!(
             unknown.contains("topology"),
