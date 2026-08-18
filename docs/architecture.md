@@ -53,6 +53,119 @@ Every box other than "pact CLI" is a plain file. There's nothing in this diagram
 pact needs to keep alive between invocations, and nothing it needs installed
 beyond `git`.
 
+## Where the code lives
+
+This map is for the agent about to claim a file. It is not a directory
+listing — `ls` does that. The third column is the load-bearing one: it names
+the correctness argument each module *owns*, so that a plan's `files:` hint can
+point at the file that owns the thing being changed, and so the next person
+reaching for a split can tell a structural boundary from an incidental one.
+
+One rule before the tables, because it decides most leases: **`src/cli/commands/<verb>.rs`
+is the surface and `src/<verb>.rs` (or `src/<verb>/`) is the machinery.**
+`src/cli/commands/msg.rs` decides what `pact msg` accepts and prints;
+`src/msg.rs` decides what a message *is* and how it reaches disk. Changing what
+a command says needs the first; changing what it does needs the second; most
+real changes need both, and both must be leased.
+
+### `src/cli/` — the clap tree, and one file per verb
+
+| Path | Responsibility | Owned invariant |
+|---|---|---|
+| `main.rs` | The module list, the OTel span around the run, and the exit | Telemetry is flushed *before* `std::process::exit`, which skips destructors — a `Drop`-only flush would export exactly the successful runs and lose every failure |
+| `cli/mod.rs` | The whole clap tree (`Cli`, `Command` and the per-verb action enums), `--version`'s long form, `run`'s dispatch, and the clap-error → exit-code mapping | Holds no command logic at all, so the dispatch stays a flat list of verbs; `USAGE_ERROR` and `clap_outcome` live here because the exit-code contract is decided once, at the parse boundary |
+| `cli/util.rs` | The padded table, the relative age, the note flattened to one line | Every listing pact prints — `lease ls`, `log`, `msg inbox`, `msg sent`, `agents` — renders through these; a second copy is how two listings drift apart |
+| `cli/commands/mod.rs` | Re-exports each handler | Handlers are reached by name, not by path, so `run` never grows a module path in its match arms |
+| `cli/commands/lease.rs` | `acquire`, `renew`, `release`, `sweep`, `ls` and everything printed about a claim | The surface only — the race argument is one layer down in `lease/lifecycle.rs` and must not be restated here |
+| `cli/commands/msg.rs` | `send`, `inbox`, `sent`, `read` and every message rendering | `send`'s two age thresholds sit next to the warnings they gate, so a threshold cannot move without its warning |
+| `cli/commands/init.rs` | Writes the managed block, the pointer files and the `.pact/` gitignore line, and offers the commit | Refuses to write through a live lease on any target (`refuse_if_a_target_is_leased`) — a peek, not an acquire; `doctor --fix` imports the same function rather than copying the check |
+| `cli/commands/doctor.rs` | Runs `doctor::checks` and renders the report; dispatches `--fix` | A missing repo root is a hard prerequisite, propagated as exit 4 rather than folded into the report — without it no other check means anything |
+| `cli/commands/audit.rs` | `pact audit`'s flags (`AuditArgs`), and the summary-or-check decision | Returns an exit code instead of raising: a finding is a *result*, so it must not print `error:` and must not be confusable with a usage failure |
+| `cli/commands/plan.rs` | `pact plan lint <manifest>` | Normalizes paths through the repo root exactly as `lease acquire` would, or the check and the lease it protects disagree about what they are discussing; errors are 1, warnings alone are 0 |
+| `cli/commands/agents.rs` | `pact agents`, and `--for <path>` | Answers "whose file is this?" from the event log, so there is no agent registry to keep in sync and the answer survives the release |
+| `cli/commands/log.rs` | The merged lease+message activity feed | One flat row shape for both sources: the question `pact log` answers does not care which store a fact came from |
+| `cli/commands/watch.rs` | `watch add`/`rm`/`ls` | No exit code of its own — the registry is append-only and per-agent, so a subscription cannot conflict with anything |
+| `cli/commands/context.rs` | `pact context set` | Deliberately not idempotent: setting a key twice records both rows and the later one wins, because a run that revised its policy mid-flight did revise it |
+| `cli/commands/whoami.rs` | Everything pact resolved about its own environment | Every field is optional and problems are collected rather than raised — `whoami` is what you run *because* something is broken, so it must never be the thing that fails |
+| `cli/commands/merge.rs` | `pact merge` | Parses `--ttl` with `lease::parse_ttl` and fails with the same exit 5: one TTL grammar across the tool |
+| `cli/commands/completion.rs` | `pact completion <shell>` | Generated from `Cli::command()` — the tree clap actually parses with — so a new flag cannot leave the completions behind |
+| `cli/commands/mcp.rs` | `pact mcp serve` (feature `mcp`) | Resolves no identity: an observer holds nothing and sends nothing, so there is no agent for it to be |
+| `cli/commands/ui.rs` | `pact ui` (feature `ui`) | Identity is best-effort — the dashboard must open for a human who never set `PACT_AGENT` |
+
+### `src/lease/` — the advisory claim
+
+| Path | Responsibility | Owned invariant |
+|---|---|---|
+| `lease/mod.rs` | Re-export facade over the four public submodules, plus the test fixtures every submodule shares | `context_stamp` is `use`d, not `pub use`d: nothing outside `lease/` can stamp a lease transition |
+| `lease/lifecycle.rs` | `acquire` and its expired-takeover and `--steal` paths, `verify_own_lease`, `renew` | **Owns the acquire race.** Every path ending in "this agent now holds the lock" is one read-decide-write over one lock file; `flock(2)` via `WriteGuard` is the only sound guard, and `verify_own_lease` is the assertion after it, not the defence |
+| `lease/release.rs` | `release`, `release --all`, and the sweep | A release must say what it actually did: a real release, an idempotent no-op and a lease that expired out from under its holder are all exit 0 but tell an agent different things about its own conduct |
+| `lease/store.rs` | Where a lease lives on disk: `LeaseStore`, `FileLeaseStore`, atomic write/read, the clock watermark, the lock-directory scanners | The read-only/mutating split is enforced here, not by convention: `peek` and `effective_now_readonly` leave nothing behind because a question must not mutate, while `list` sweeps because that is `lease ls`'s documented job |
+| `lease/types.rs` | The lease record, path→lock-filename, TTL parsing and bounds, and the `(lease, now)` expiry decision | One repo-relative path is exactly one lock filename, and one duration is one dialect — two spellings of a file and two dialects of a TTL are the same class of bug, and each has cost this repository a lease |
+| `lease/context_stamp.rs` | The branch/worktree/invocation triple a lock carries, the event row appended for every transition, and the OTel counters beside it | All three answer "where was the holder, and what did they do" and must not disagree: the triple is decided once, every metric sits next to its `log_event`, and an expiry carries the *holder's* context, never the sweeper's |
+
+### `src/audit/` — the event log read back as history
+
+| Path | Responsibility | Owned invariant |
+|---|---|---|
+| `audit/mod.rs` | The registry: `Check`, `Expect`, `CheckReport`, `run_check`, `render_check` | The registry stays an enum with an exhaustive `match`, not a table of trait objects — `Check::NAMES` is what clap renders `--check`'s help from, and forgetting an arm has to be a compile error |
+| `audit/model.rs` | What an event means and what the holds were: `reconstruct`, the single pass every check reads | Double-win detection lives *here*, not in `checks/double_win.rs`: an overlap is only visible while walking open hold windows, so separating them means walking the log twice with two copies of the re-entrant/takeover argument |
+| `audit/context.rs` | One pass over the log: the `--since` window, the annotations that retract lines, and the declared run context | The *order* is the correctness argument — annotations before the window, context before both — and `load` is the one place it is written down |
+| `audit/summary.rs` | `pact audit` with no `--check`: the distribution | Describes, never judges — a named check is a verdict against a stated rule; this is the description a reader forms one from. `Summary` and `render_summary` stay together because the struct is a report format |
+| `audit/export.rs` | `--export` and `--compare` | `--compare` reads a fixed list of JSON pointers (`COMPARED`) out of whatever `--export` wrote, so every pointer is a promise about `ExportReport`'s shape — split them and the next field rename breaks a comparison nobody re-runs until it matters |
+| `audit/fixtures.rs` | The event-log fixtures every check's tests are written against (test-only) | One `ev` builder for the whole tree: a second copy is a second place for the wire format to drift |
+| `audit/checks/mod.rs` | Declares one module per `--check` | Adding a check is a file here *plus* its arms in the parent — the registry deliberately did not move down with the checks |
+| `audit/checks/chain_integrity.rs` | Does each chain-tracked line's `chain_hash` match the line before it? | About the log's own physical integrity, not lease behaviour — a line with no `chain_hash` is not a finding |
+| `audit/checks/claim_lease_divergence.rs` | Did a hold's note name a bead belonging to somebody else? | Reads only the committed `interactions.jsonl` export, never a Beads database, so it needs no `bd` on `PATH`; it answers the retrospective question and is deliberately *less* sensitive than the live `bd show` version it replaced — fewer divergences, never more |
+| `audit/checks/commit_correlation.rs` | Does real git history back what the lease log claims? | The one check that reads outside `.pact/events.jsonl`; it shells out through `git_history.rs`, a deliberate narrow widening that does not touch audit's never-open-the-Beads-store rule |
+| `audit/checks/double_win.rs` | What `--check double-win` *says* about the overlaps `reconstruct` found | Holds no detection at all, by design — see `model.rs` |
+| `audit/checks/merge_divergence.rs` | Did an agent start editing from a copy the previous holder never produced? | Only *adjacent* close/open pairs, and renewals skipped: a hash that differs two holds later says nothing, because the intervening holder was entitled to change the file, and a renewal would compare an agent against itself |
+| `audit/checks/retry_storm.rs` | Which agents busy-retried instead of backing off | The only check about what the fleet wasted rather than what pact got wrong |
+| `audit/checks/silent_contention.rs` | Was a contended path ever communicated about before its holder let go? | The window is the HOLD, not a tunable cutoff — which is what unparked the check. A watch the refused agent already held counts as communication but does not net out of the contention numbers |
+| `audit/checks/stale_holds.rs` | Holds that ran past their own TTL with no renew | Judged against the TTL the opening event *recorded*, never today's compiled default — re-judging old history by a moved default rewrites its verdicts |
+| `audit/checks/topology.rs` | Did this run use the topology it was supposed to? | `Expect` and its `NAMES` stay in the parent with the registry, because clap renders `--expect` from them and the round-trip tests guarding the two lists have to sit together |
+
+### Three files over the size target, and why
+
+The split aimed at 200–800 lines per file, sized so one bead's working set is
+one file. Three land above it on purpose.
+
+- **`lease/lifecycle.rs` (1693 lines, 992 before its tests)** — the real one.
+  `acquire`, takeover, `verify_own_lease` and `renew` share a single
+  correctness argument about the acquire race, stated once in the file header:
+  read-decide-write, the double-win reproduced against the compiled binary at
+  N=2, `flock` as the only sound guard, and TLA+'s refutation of the staleness
+  heuristic that came before it. Split into four and you get four halves of one
+  argument in four places, which is how it stops being checkable. **This is a
+  structural boundary. Do not split it.**
+- **`audit/mod.rs` (1203 lines, 661 before its tests)** — the check registry,
+  `CheckReport`, and the `run_check`/`render_check` pair that construct and
+  consume it field by field. Weaker than lease's, but real: the enum, its clap
+  help and the exhaustive match are one mechanism.
+- **`cli/commands/msg.rs` (969 lines, 673 before its tests)** — `send`,
+  `inbox`, `sent` and `read` are one conversation seen from four angles.
+  **This is cohesion, not an invariant**, and the difference is the point: no
+  correctness argument breaks if it is split later, so a future bead may split
+  it on ordinary size grounds without arguing with anything. `lifecycle.rs` may
+  not.
+
+### Three files deliberately left whole
+
+`src/msg.rs` (1801 lines, 1044 before its tests), `src/doctor.rs` (1748 /
+1283) and `src/events.rs` (1525 / 1190) are all over the target too, and were
+**left alone on purpose** in the split that produced the three trees above.
+
+No invariant argues for keeping them whole — the reason is the opposite one.
+No bead needed a piece of them, so every candidate boundary would have been
+chosen by a refactorer's eye rather than by a working set, and the split's own
+rule is that a file is the lease, context and diff unit for a fleet agent.
+Splitting them now is churn with no driver, and churn in three files that every
+other module reads.
+
+That is a decision, not an omission. If you are reaching for these because the
+map above looks unfinished, it isn't; if you are reaching for them because a
+bead genuinely needs one piece of `doctor.rs` under its own lease, that is the
+driver, and the split is then worth doing.
+
 ## Where state lives
 
 All of pact's own state lives under `.pact/` at the repo root, which it finds
