@@ -1,9 +1,5 @@
-#[cfg(feature = "ui")]
-use crate::identity;
 #[cfg(feature = "mcp")]
 use crate::mcp;
-#[cfg(feature = "ui")]
-use crate::tui;
 use crate::{audit, lease, repo};
 
 use std::path::PathBuf;
@@ -14,6 +10,8 @@ use clap::{Parser, Subcommand};
 mod commands;
 mod util;
 
+#[cfg(feature = "ui")]
+use commands::run_ui;
 use commands::{
     run_agents, run_audit, run_completion, run_context_set, run_doctor, run_init, run_lease,
     run_log, run_merge, run_msg, run_plan_lint, run_watch, run_whoami, AuditArgs,
@@ -702,11 +700,7 @@ pub(crate) fn run(cli: Cli) -> Result<i32> {
             },
         ),
         #[cfg(feature = "ui")]
-        Command::Ui => {
-            let root = repo::find_repo_root(&cwd)?;
-            let agent = identity::resolve_agent(cli.agent.as_deref()).ok();
-            tui::run(root, agent).map(|()| 0)
-        }
+        Command::Ui => run_ui(&cwd, cli.agent.as_deref()),
         // No identity resolved and none needed: an observer holds nothing and
         // sends nothing, so there is no agent for it to be. The tools that need
         // one take it as a parameter, because an observer may watch several.

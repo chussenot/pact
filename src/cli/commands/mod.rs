@@ -15,6 +15,8 @@ mod log;
 mod merge;
 mod msg;
 mod plan;
+#[cfg(feature = "ui")]
+mod ui;
 mod watch;
 mod whoami;
 
@@ -29,6 +31,8 @@ pub(super) use log::run_log;
 pub(super) use merge::run_merge;
 pub(super) use msg::run_msg;
 pub(super) use plan::run_plan_lint;
+#[cfg(feature = "ui")]
+pub(super) use ui::run_ui;
 pub(super) use watch::run_watch;
 pub(super) use whoami::run_whoami;
 
