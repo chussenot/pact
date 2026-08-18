@@ -211,11 +211,11 @@ fi
 
 # And again by content, because a copy of pact's checkout is still pact's
 # sources and a fleet does not develop pact.
-if [ -f "$REPO/src/lease.rs" ] && [ -f "$REPO/Cargo.toml" ] &&
+if [ -f "$REPO/src/lease/mod.rs" ] && [ -f "$REPO/Cargo.toml" ] &&
 	grep -qE '^name *= *"pact"' "$REPO/Cargo.toml" 2>/dev/null; then
 	die "REFUSING TO RUN: --repo looks like a pact source checkout
   $REPO
-(it has src/lease.rs and a Cargo.toml naming the pact package). Point chaos at
+(it has src/lease/mod.rs and a Cargo.toml naming the pact package). Point chaos at
 the fleet's target repository, not at pact."
 fi
 

@@ -105,7 +105,7 @@ mod events;
 mod git_history;
 #[path = "../src/identity.rs"]
 mod identity;
-#[path = "../src/lease.rs"]
+#[path = "../src/lease/mod.rs"]
 mod lease;
 #[path = "../src/msg.rs"]
 mod msg;
