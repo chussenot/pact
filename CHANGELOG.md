@@ -10,6 +10,18 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.10.9 - 2026-08-18
+#### Bug Fixes
+- **(lease)** spare a swept holder that is still committing - (484427c) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- **(cli)** give every command file a header naming what it owns - (3243e45) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(beads)** close the three follow-ups from the module split - (ae7b1b1) - Clement HUSSENOT-DESENONGES
+#### Tests
+- **(chaos)** cover the content rail the path rail was masking - (2441f98) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.10.8 - 2026-08-18
 #### Bug Fixes
 - **(lease)** retarget the two literal src/lease.rs references - (a11f8a7) - Clement HUSSENOT-DESENONGES
