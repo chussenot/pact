@@ -1,5 +1,3 @@
-#[cfg(feature = "mcp")]
-use crate::mcp;
 use crate::{audit, lease, repo};
 
 use std::path::PathBuf;
@@ -10,6 +8,8 @@ use clap::{Parser, Subcommand};
 mod commands;
 mod util;
 
+#[cfg(feature = "mcp")]
+use commands::run_mcp;
 #[cfg(feature = "ui")]
 use commands::run_ui;
 use commands::{
@@ -701,13 +701,8 @@ pub(crate) fn run(cli: Cli) -> Result<i32> {
         ),
         #[cfg(feature = "ui")]
         Command::Ui => run_ui(&cwd, cli.agent.as_deref()),
-        // No identity resolved and none needed: an observer holds nothing and
-        // sends nothing, so there is no agent for it to be. The tools that need
-        // one take it as a parameter, because an observer may watch several.
         #[cfg(feature = "mcp")]
-        Command::Mcp { action } => match action {
-            McpAction::Serve => mcp::serve(repo::find_repo_root(&cwd)?),
-        },
+        Command::Mcp { action } => run_mcp(&cwd, action),
     }
 }
 

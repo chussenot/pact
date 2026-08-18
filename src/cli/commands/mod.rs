@@ -12,6 +12,8 @@ mod doctor;
 mod init;
 mod lease;
 mod log;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod merge;
 mod msg;
 mod plan;
@@ -28,6 +30,8 @@ pub(super) use doctor::run_doctor;
 pub(super) use init::run_init;
 pub(super) use lease::run_lease;
 pub(super) use log::run_log;
+#[cfg(feature = "mcp")]
+pub(super) use mcp::run_mcp;
 pub(super) use merge::run_merge;
 pub(super) use msg::run_msg;
 pub(super) use plan::run_plan_lint;
