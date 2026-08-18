@@ -10,6 +10,23 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.10.5 - 2026-08-18
+#### Bug Fixes
+- **(cli)** derive --expect's value list instead of writing it twice - (ae8c67a) - Clement HUSSENOT-DESENONGES
+- **(cli)** help that still credited bd for messaging, and six flags with none - (edc1897) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(context)** record the constraints a run operated under, in its own log - (8dda2cf) - Clement HUSSENOT-DESENONGES
+- **(doctor)** pact doctor --fix repairs what pact owns - (ece3664) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(agents)** add cli-surface-auditor, which audits help against the binary - (0ad5519) - Clement HUSSENOT-DESENONGES
+- **(pact)** coordination record for the CLI-surface work - (cc2d872) - Clement HUSSENOT-DESENONGES
+- Add events & messages - (15b48ca) - Clement HUSSENOT-DESENONGES
+- Add pact and beads files - (c46ce12) - Clement HUSSENOT-DESENONGES
+#### Tests
+- **(cli)** assert completions cover every command at every depth - (db045d3) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.10.4 - 2026-08-16
 #### Bug Fixes
 - **(audit)** --check's help named four of the nine checks that exist - (d7b67f4) - Clement HUSSENOT-DESENONGES
