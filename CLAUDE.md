@@ -112,7 +112,7 @@ check name to appear in `docs/tui.md`. After a user-visible change, use the
 `docs-curator` agent in `.claude/agents/` rather than editing docs ad hoc — it
 holds the placement rules and the reasons behind them.
 
-<!-- pact:begin hash:8546f7af -->
+<!-- pact:begin hash:6b0102d5 -->
 ## pact coordination protocol
 
 Claude Code loads this file, not `AGENTS.md`, so the protocol is imported

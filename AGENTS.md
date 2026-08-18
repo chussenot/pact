@@ -138,7 +138,7 @@ bd prime                # Refresh Beads context
 **Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
 <!-- END BEADS CODEX SETUP -->
 
-<!-- pact:begin hash:8546f7af -->
+<!-- pact:begin hash:6b0102d5 -->
 ## pact coordination protocol
 
 pact coordinates multiple coding agents working in this repository. Follow
@@ -298,6 +298,21 @@ this protocol whenever you touch shared files or hand off work to others.
   them leased by compliant peers at that moment) pass the check clean, because a
   hold existed. The better everyone else behaves, the better an unleased commit
   hides. One flag makes it visible.
+- **Three git commands take a target you did not name — do not use them in a
+  shared checkout.** A fleet shares one index and one HEAD, and each of these
+  resolves against whatever the checkout is at the instant it runs rather than
+  against the paths you own. All three were paid for here:
+  - `git commit` with no pathspec commits the whole INDEX, so it sweeps in
+    whatever a peer had staged. One run put another agent's staged deletion into
+    an unrelated commit. Always `git commit -- <explicit paths>`.
+  - `git commit --only <path>` fails SILENTLY when the path is untracked — it
+    prints `did not match any file(s)` and exits non-zero while a surrounding
+    green build reports success. `git add` the file first.
+  - `git commit --amend` amends whatever HEAD is NOW, which in a fleet is
+    routinely a peer's commit landed seconds ago. One run rewrote a peer's
+    message and folded two agents' work into one mislabelled commit. There is no
+    pathspec that protects you: the target is implicit. If you need to fix a
+    commit, add a follow-up commit instead.
 - **Everything is scriptable**: every pact command accepts `--json` for
   machine-readable output; prefer it over parsing human-formatted text.
 
