@@ -63,6 +63,14 @@ fn repo_with_worktree(branch: &str, wt_name: &str) -> (TempDir, PathBuf, PathBuf
     std::fs::create_dir(&main).unwrap();
 
     git_ok(&main, &["init", "--quiet", "--initial-branch=main"]);
+    // A LOCAL identity, in this throwaway repo only. Without it `git commit`
+    // falls back to whatever the machine can auto-detect, which works on a
+    // developer box and is refused on a CI runner — git will not accept an
+    // auto-detected `runner@host.(none)` with no domain. That is why this
+    // failed only in CI, and only once the chaos fix let cargo reach this
+    // target at all (pact-h5f).
+    git_ok(&main, &["config", "user.email", "tests@pact.invalid"]);
+    git_ok(&main, &["config", "user.name", "pact tests"]);
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/api.ts"), "export const x = 1;\n").unwrap();
     git_ok(&main, &["add", "."]);

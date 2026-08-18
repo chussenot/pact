@@ -66,6 +66,14 @@ fn stdout_of(out: &Output) -> String {
 fn repo() -> TempDir {
     let tmp = tempfile::tempdir().unwrap();
     git_ok(tmp.path(), &["init", "--quiet", "--initial-branch=main"]);
+    // A LOCAL identity, in this throwaway repo only. Without it `git commit`
+    // falls back to whatever the machine can auto-detect, which works on a
+    // developer box and is refused on a CI runner — git will not accept an
+    // auto-detected `runner@host.(none)` with no domain. That is why this
+    // failed only in CI, and only once the chaos fix let cargo reach this
+    // target at all (pact-h5f).
+    git_ok(tmp.path(), &["config", "user.email", "tests@pact.invalid"]);
+    git_ok(tmp.path(), &["config", "user.name", "pact tests"]);
     std::fs::write(tmp.path().join("README.md"), "# test\n").unwrap();
     git_ok(tmp.path(), &["add", "."]);
     git_ok(tmp.path(), &["commit", "--quiet", "-m", "initial"]);

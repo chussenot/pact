@@ -2003,7 +2003,24 @@ fn git_repo(test: &str) -> Option<TempDir> {
         .current_dir(tmp.path())
         .output()
     {
-        Ok(o) if o.status.success() => Some(tmp),
+        Ok(o) if o.status.success() => {
+            // A LOCAL identity, in this throwaway repo only. Without it `git commit`
+            // falls back to whatever the machine can auto-detect, which works on a
+            // developer box and is refused on a CI runner — git will not accept an
+            // auto-detected `runner@host.(none)` with no domain. That is why this
+            // failed only in CI, and only once the chaos fix let cargo reach this
+            // target at all (pact-h5f).
+            for cfg in [
+                ["config", "user.email", "tests@pact.invalid"],
+                ["config", "user.name", "pact tests"],
+            ] {
+                let _ = Command::new("git")
+                    .args(cfg)
+                    .current_dir(tmp.path())
+                    .status();
+            }
+            Some(tmp)
+        }
         Ok(o) => {
             eprintln!("SKIP {test}: `git init` failed ({})", o.status);
             None
@@ -6002,12 +6019,20 @@ fn a_holds_open_and_close_bracket_the_commits_made_under_it() {
     let commit = |msg: &str| {
         std::fs::write(repo.join("api.rs"), format!("// {msg}\n")).unwrap();
         for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", msg]] {
-            assert!(Command::new("git")
+            // `.output()`, not `.status()`: the first CI failure of this test
+            // printed only "assertion failed: Command::new(..)" and nothing
+            // about why git refused, which is most of a diagnosis thrown away
+            // for one word of code.
+            let out = Command::new("git")
                 .args(&args)
                 .current_dir(repo)
-                .status()
-                .unwrap()
-                .success());
+                .output()
+                .expect("failed to run git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         String::from_utf8(
             Command::new("git")

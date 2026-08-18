@@ -213,6 +213,14 @@ fn worktree_logs_to_the_main_checkout() {
         assert!(out.status.success(), "git {args:?}: {:?}", out.stderr);
     };
     git(&main, &["init", "--quiet", "--initial-branch=main"]);
+    // A LOCAL identity, in this throwaway repo only. Without it `git commit`
+    // falls back to whatever the machine can auto-detect, which works on a
+    // developer box and is refused on a CI runner — git will not accept an
+    // auto-detected `runner@host.(none)` with no domain. That is why this
+    // failed only in CI, and only once the chaos fix let cargo reach this
+    // target at all (pact-h5f).
+    git(&main, &["config", "user.email", "tests@pact.invalid"]);
+    git(&main, &["config", "user.name", "pact tests"]);
     std::fs::write(main.join("a.txt"), "x\n").unwrap();
     git(&main, &["add", "."]);
     git(&main, &["commit", "--quiet", "-m", "initial"]);
