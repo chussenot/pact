@@ -7,3 +7,4 @@
 
 pub(in crate::audit) mod claim_lease_divergence;
 pub(in crate::audit) mod merge_divergence;
+pub(in crate::audit) mod retry_storm;
