@@ -13,13 +13,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::Serialize;
 
 use crate::events;
 use crate::otel;
 use crate::output::exit_with;
-use crate::repo::pact_dir;
 use crate::watch;
 
 /// How long [`WriteGuard::acquire`] waits for the lock before giving up and
