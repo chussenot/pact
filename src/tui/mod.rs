@@ -161,11 +161,7 @@ struct App {
     fleet: fleet::State,
     messages: messages::State,
     health: health::State,
-    // Empty until the beads that own those screens fill them in; the field
-    // exists now so neither has to edit this file to add one.
-    #[allow(dead_code)]
     activity: activity::State,
-    #[allow(dead_code)]
     detail: detail::State,
 
     status: Option<String>,

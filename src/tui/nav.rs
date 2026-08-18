@@ -32,10 +32,7 @@ pub enum View {
 
     // Drill-ins. Pushed by Enter, popped by Esc.
     Path(String),
-    /// Pushed by pact-pyt.5, which makes every agent name in the UI a link.
-    /// Routed and rendered already, so that bead is a `View::Agent(name)` at
-    /// the one call site rather than a change to the spine.
-    #[allow(dead_code)]
+    /// Every agent name in the UI is a link to this (pact-pyt.5).
     Agent(String),
     Thread(String),
 }

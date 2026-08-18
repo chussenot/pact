@@ -73,12 +73,20 @@
 //!
 //! ## The API is frozen on purpose
 //!
-//! pact-aw7.2 through .7 instrument call sites against this module while it is
-//! finished. Everything public here is deliberately reachable-but-unused for
-//! now, hence the crate-wide `allow(dead_code)` below: the alternative is five
-//! agents each adding the instrument they happen to need, which is how a
-//! telemetry layer ends up with three ways to count the same thing.
-#![allow(dead_code)]
+//! pact-aw7.2 through .7 instrumented call sites against this module while it
+//! was being finished, and everything public here was deliberately
+//! reachable-but-unused for a while. That is over — every public function now
+//! has callers — so the crate-wide `allow(dead_code)` that covered it is gone.
+//!
+//! What remains suppressed is the build WITHOUT the feature, and only that
+//! build. There the no-op layer at the bottom of this file, the shared `Val`
+//! payloads and `EXIT_BUDGET_MS` all exist so the call sites still compile, and
+//! being unused is the whole point rather than a smell. With `otel` on, the real
+//! implementation is linted like anything else — which is the half that was
+//! being suppressed for no reason.
+//!
+//! Same idiom as `git_history.rs`'s `cfg_attr(not(feature = "ui"), ...)`.
+#![cfg_attr(not(feature = "otel"), allow(dead_code))]
 
 // ---------------------------------------------------------------------------
 // Types shared by both builds. These exist whether or not the feature is on,
@@ -216,10 +224,6 @@ mod imp {
         0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0,
         7500.0, 10000.0,
     ];
-
-    /// Longest attribute value we will ship. `pact.agent` and friends come
-    /// from the environment, and an environment variable is not a promise.
-    const MAX_VALUE_LEN: usize = 256;
 
     /// Per-request slice of [`EXIT_BUDGET_MS`]. Halving it means a wedged
     /// traces endpoint cannot eat the whole budget and silently starve
@@ -445,13 +449,6 @@ mod imp {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0)
-    }
-
-    fn truncate(mut s: String) -> String {
-        if s.len() > MAX_VALUE_LEN {
-            s.truncate(MAX_VALUE_LEN);
-        }
-        s
     }
 
     // -- lifecycle ----------------------------------------------------------

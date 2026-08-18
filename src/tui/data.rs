@@ -37,11 +37,6 @@
 //! needs a `pub(crate)` entry point in `audit`/`msg` that takes pre-loaded
 //! rows; worth it only if a profile says so.`
 
-// The read model lands before the five screens that project from it, so most
-// of what it returns has no caller yet. Every item here is named by a sibling
-// bead in pact-pyt; the alternative is landing this module in five pieces.
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::SystemTime;
@@ -280,14 +275,6 @@ impl Store {
         out
     }
 
-    /// Everything `agent` sent or received, oldest first.
-    pub fn messages_for(&self, agent: &str) -> Vec<&Message> {
-        self.messages
-            .iter()
-            .filter(|m| m.to == agent || m.from == agent)
-            .collect()
-    }
-
     /// The whole thread `id` belongs to, oldest first, WITHOUT marking anything
     /// read. `id` may be a thread id or any message id within it.
     pub fn thread(&self, id: &str) -> Vec<&Message> {
@@ -372,7 +359,6 @@ impl Store {
                     path: path.to_string(),
                     holder: last.holder.clone(),
                     holder_remaining_secs: last.holder_remaining_secs,
-                    since: last.at.clone(),
                     waited_secs,
                     refusals: refusals.len(),
                     // The live answer, replayed from the registry rather than
@@ -467,8 +453,6 @@ pub struct Blocked {
     pub holder: Option<String>,
     /// What the holder said it had left, at the moment of the refusal.
     pub holder_remaining_secs: Option<i64>,
-    /// RFC3339 of the most recent refusal.
-    pub since: String,
     pub waited_secs: i64,
     /// How many times this agent has been refused this path, ever.
     pub refusals: usize,
@@ -827,8 +811,10 @@ mod tests {
         let waiting = store.waiting_on(now(), DEFAULT_GRACE_SECS);
         assert_eq!(waiting.blocked.len(), 1, "one edge per (agent, path)");
         assert_eq!(waiting.blocked[0].refusals, 4);
-        // The newest refusal is the one that stands.
-        assert_eq!(waiting.blocked[0].since, "2026-08-14T14:38:30+00:00");
+        // The newest refusal is the one that stands: the test clock is 14:40:00
+        // and the newest of the four refusals is at 14:38:30, so any older one
+        // winning would show a larger wait than 90s.
+        assert_eq!(waiting.blocked[0].waited_secs, 90);
     }
 
     // ------------------------------------------------------------ projections
