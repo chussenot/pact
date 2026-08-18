@@ -45,6 +45,32 @@ the window a fleet needs to recover in. `--suspect` takes those, using the same
 silence threshold `lease ls` labels SUSPECT with; it is opt-in because a quiet
 holder may yet come back and an expired one cannot.
 
+**A holder that has committed under its path is spared.** Silence is weak
+evidence, and pact should say how weak: `suspect` means "no pact event from this
+agent for over half its TTL", and pact only ever sees an agent when it *mutates*
+something — takes a lease, sends a message, records a context row. An agent
+making one deep change to one file emits none of those between acquire and
+release, so sustained work and abandonment produce an identical signal. Measured
+over pact's own history, **23% of all 335 completed holds ran longer than half
+their TTL**, so on silence alone this sweep would reclaim roughly a quarter of
+ordinary work out from under agents still doing it.
+
+So before reclaiming a hold that is still inside its TTL, `--suspect` asks git
+whether the held path has been committed to since the lease was taken. If it
+has, the holder is working and the hold is left alone. This costs one `git log`
+per sweep, not per lease, and the default `sweep` never runs it at all — expiry
+is a statement about the clock, not about the holder, and a lapsed hold is
+nobody's by its own terms whatever anyone is doing. If git is unavailable the
+sweep behaves exactly as it did before: rescuing a live holder is an improvement,
+never a precondition.
+
+`lease ls`'s label is deliberately *not* filtered this way. It is advisory and
+destroys nothing, it shares a code path with the TUI's refresh, and buying a
+better adjective with a subprocess on that path is the trade
+[the dashboard already refused once](tui.md). Read `SUSPECT` as "pact cannot
+corroborate that anyone is behind this claim" — which is what it has always
+meant, and is true.
+
 **The gap this closes in `lease ls`.** A hold quiet but inside its TTL is loudly
 `SUSPECT: quiet 8m12s`. A hold *past* its TTL is collected as a side effect of
 the listing and leaves nothing behind — `lease ls` simply says "no active

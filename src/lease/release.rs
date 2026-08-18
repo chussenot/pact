@@ -15,6 +15,7 @@ use chrono::Utc;
 use serde::Serialize;
 
 use crate::events;
+use crate::git_history;
 use crate::otel;
 use crate::output::exit_with;
 use crate::watch;
@@ -428,6 +429,8 @@ pub fn sweep(repo_root: &Path, agent: &str, mode: Sweep, paths: &[String]) -> Re
     let wanted: Vec<String> = paths.iter().map(|p| normalize_path(repo_root, p)).collect();
 
     let mut swept = Vec::new();
+    // Populated on first use; see the working-holder rescue below.
+    let mut commits: Option<Vec<git_history::Commit>> = None;
     for (lock_path, entry) in scan(repo_root)? {
         let lease = &entry.lease;
         if !wanted.is_empty() && !wanted.contains(&lease.path) {
@@ -439,11 +442,53 @@ pub fn sweep(repo_root: &Path, agent: &str, mode: Sweep, paths: &[String]) -> Re
             continue;
         }
 
-        let eligible = entry.expired || (mode == Sweep::Suspect && entry.suspect);
+        let mut eligible = entry.expired || (mode == Sweep::Suspect && entry.suspect);
         let past_ttl = entry
             .expired
             .then(|| -entry.remaining_secs)
             .filter(|s| *s > 0);
+
+        // A holder that has COMMITTED under the path it holds is working,
+        // whatever the event log says (pact-g50).
+        //
+        // `suspect` means "no pact event from this agent for over half its
+        // TTL", and pact only ever sees an agent when it mutates something —
+        // a lease, a message, a context row. An agent doing one deep change to
+        // one file emits none of those between acquire and release, so
+        // sustained work and abandonment produce an identical signal. Measured
+        // over pact's own history: 23% of all 335 completed holds ran longer
+        // than half their TTL, so nearly a quarter of ordinary work is
+        // eligible here on silence alone.
+        //
+        // Expiry is deliberately NOT second-guessed: a lapsed hold is nobody's
+        // by its own terms, and that is a statement about the clock rather than
+        // about the holder. This only rescues holds still inside their TTL.
+        if eligible && !entry.expired {
+            if commits.is_none() {
+                // Once per sweep, not once per lease: `commits_since` is a
+                // single `git log` however many paths are asked about. Deferred
+                // to here so the default `Sweep::Expired` never spawns git at
+                // all, and so `lease ls` — which shares `scan` and runs on the
+                // TUI's refresh — is untouched.
+                commits = Some(git_history::commits_since(repo_root, None).unwrap_or_default());
+            }
+            let acquired = chrono::DateTime::parse_from_rfc3339(&lease.acquired_at)
+                .ok()
+                .map(|t| t.with_timezone(&Utc));
+            // Best-effort by signature, like every other git read here: no git,
+            // an unparsable timestamp, a bare repo — all yield no commits and
+            // the sweep proceeds exactly as it did before. Rescuing a live
+            // holder is an improvement on the old behaviour, never a
+            // precondition for sweeping at all.
+            if let (Some(acquired), Some(found)) = (acquired, commits.as_ref()) {
+                if found
+                    .iter()
+                    .any(|c| c.at > acquired && c.paths.iter().any(|p| p == &lease.path))
+                {
+                    eligible = false;
+                }
+            }
+        }
 
         if !eligible {
             swept.push(Swept {
@@ -636,6 +681,88 @@ mod tests {
         assert!(swept[0].reclaimed, "{swept:?}");
         assert_eq!(swept[0].holder, "stalled");
         assert!(swept[0].holder_silent_secs.unwrap() >= 400);
+    }
+
+    /// A holder that has committed under its path is working, and must survive
+    /// a `--suspect` sweep that reclaims its silent neighbour (pact-g50).
+    ///
+    /// Both holds in this test are identically suspect: same agent, same TTL,
+    /// same silence, same absence of any event since acquire. The ONLY
+    /// difference is that one path has a commit after the lease was taken. If
+    /// the rescue were reading anything else — git being present, the sweep
+    /// bailing out wholesale — both would survive, and the assertion that the
+    /// neighbour IS reclaimed is what rules that out.
+    ///
+    /// Why this matters at all: `suspect` fires on silence past half the TTL,
+    /// and pact only sees an agent when it mutates something. Over pact's own
+    /// history 23% of all 335 completed holds ran longer than that, so on
+    /// silence alone this sweep reclaims roughly a quarter of ordinary work
+    /// out from under agents that are still in it.
+    #[test]
+    fn sweep_suspect_spares_a_silent_holder_that_has_committed_under_its_path() {
+        let tmp = repo();
+        let root = tmp.path();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        };
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: no git");
+            return;
+        }
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "tests@pact.invalid"]);
+        git(&["config", "user.name", "pact tests"]);
+
+        let ttl = 600u64;
+        let long_ago = Utc::now() - Duration::seconds(400);
+        for path in ["printer.rs", "silent.rs"] {
+            claim_at(root, "deep-worker", path, ttl, long_ago);
+            events::append(
+                root,
+                &events::Event {
+                    at: long_ago.to_rfc3339(),
+                    agent: "deep-worker".to_string(),
+                    kind: "acquired".to_string(),
+                    path: Some(path.to_string()),
+                    ttl_secs: Some(ttl),
+                    ..blank_event()
+                },
+            );
+        }
+
+        // The commit lands AFTER both acquires, and touches only one of them.
+        std::fs::write(root.join("printer.rs"), "fn main() {}\n").unwrap();
+        git(&["add", "printer.rs"]);
+        git(&["commit", "-q", "-m", "work under the held path"]);
+
+        let swept = sweep(root, "rescuer", Sweep::Suspect, &[]).unwrap();
+        let by = |p: &str| {
+            swept
+                .iter()
+                .find(|s| s.path == p)
+                .unwrap_or_else(|| panic!("{p} missing from {swept:?}"))
+        };
+
+        assert!(
+            !by("printer.rs").reclaimed,
+            "a holder committing under its own path is working: {swept:?}"
+        );
+        assert!(
+            by("silent.rs").reclaimed,
+            "the identically-silent path with no commit must still be reclaimed, \
+             or this test proves nothing about WHY the other survived: {swept:?}"
+        );
+        assert!(root.join(".pact/leases").exists());
     }
 
     /// The whole point: a reclaim must not look like a steal in the log.
