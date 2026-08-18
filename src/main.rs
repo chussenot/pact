@@ -22,13 +22,28 @@ mod watch;
 
 use clap::Parser;
 
-use cli::{clap_outcome, repo_name, run, subcommand_name, Cli};
+use cli::{clap_outcome, run, subcommand_name, Cli};
 
 /// `tui` renders the same activity feed `pact log` does, and reaches for these
 /// two through the crate root. Re-exported here so that moving them under `cli`
 /// left the path it already used unchanged.
 #[cfg(feature = "ui")]
 pub(crate) use cli::{one_line, since};
+
+/// The repository's directory *name* for `pact.repo` — never its path.
+///
+/// A path is the wrong value twice over: it is unbounded as a dimension (the
+/// rule this whole epic is under), and it ships the operator's home-directory
+/// layout to a collector for no benefit. The basename is what a human reads
+/// on a dashboard and what joins two agents working the same checkout.
+///
+/// Read-only and best-effort: `None` outside a git repo, which is exactly the
+/// case (`exit 4`) whose trace is most worth having.
+fn repo_name() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let root = repo::find_repo_root(&cwd).ok()?;
+    Some(root.file_name()?.to_string_lossy().into_owned())
+}
 
 fn main() {
     let cli = match Cli::try_parse() {

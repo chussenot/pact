@@ -1,4 +1,4 @@
-use crate::{audit, lease, repo};
+use crate::{audit, lease};
 
 use std::path::PathBuf;
 
@@ -593,21 +593,6 @@ pub(crate) fn subcommand_name(command: &Command) -> &'static str {
             McpAction::Serve => "mcp serve",
         },
     }
-}
-
-/// The repository's directory *name* for `pact.repo` — never its path.
-///
-/// A path is the wrong value twice over: it is unbounded as a dimension (the
-/// rule this whole epic is under), and it ships the operator's home-directory
-/// layout to a collector for no benefit. The basename is what a human reads
-/// on a dashboard and what joins two agents working the same checkout.
-///
-/// Read-only and best-effort: `None` outside a git repo, which is exactly the
-/// case (`exit 4`) whose trace is most worth having.
-pub(crate) fn repo_name() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    let root = repo::find_repo_root(&cwd).ok()?;
-    Some(root.file_name()?.to_string_lossy().into_owned())
 }
 
 /// Returns the process exit code, so that no subcommand has to call

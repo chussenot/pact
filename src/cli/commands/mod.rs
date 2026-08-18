@@ -44,7 +44,7 @@ pub(super) use whoami::run_whoami;
 /// acquire`'s pending-message check and every `msg` renderer are tested against
 /// the same record, and a second copy of it is a second thing to keep in step.
 #[cfg(test)]
-pub(super) fn message(id: &str, from: &str, body: &str, read: bool) -> crate::msg::Message {
+fn message(id: &str, from: &str, body: &str, read: bool) -> crate::msg::Message {
     crate::msg::Message {
         id: id.to_string(),
         thread: id.to_string(),
