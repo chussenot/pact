@@ -4,6 +4,7 @@
 //! Re-exported from here rather than reached for by path, so that `run`'s
 //! dispatch table stays the flat list of verbs it is.
 
+mod agents;
 mod audit;
 mod completion;
 mod context;
@@ -14,6 +15,7 @@ mod plan;
 mod watch;
 mod whoami;
 
+pub(super) use agents::run_agents;
 pub(super) use audit::{run_audit, AuditArgs};
 pub(super) use completion::run_completion;
 pub(super) use context::run_context_set;
