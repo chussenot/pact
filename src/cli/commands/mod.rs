@@ -4,12 +4,14 @@
 //! Re-exported from here rather than reached for by path, so that `run`'s
 //! dispatch table stays the flat list of verbs it is.
 
+mod audit;
 mod completion;
 mod context;
 mod merge;
 mod plan;
 mod watch;
 
+pub(super) use audit::{run_audit, AuditArgs};
 pub(super) use completion::run_completion;
 pub(super) use context::run_context_set;
 pub(super) use merge::run_merge;
