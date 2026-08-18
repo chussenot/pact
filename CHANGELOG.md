@@ -10,6 +10,19 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.10.6 - 2026-08-18
+#### Bug Fixes
+- **(ci)** revive the two scheduled workflows, both dead for different reasons - (f7a3126) - Clement HUSSENOT-DESENONGES
+#### Build system
+- **(mise)** refresh shell completions on install - (b3ce72e) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- Add the events - (4a44f0e) - Clement HUSSENOT-DESENONGES
+- Add last events - (3ff74dc) - Clement HUSSENOT-DESENONGES
+#### Tests
+- give every committing fixture its own git identity - (eb0bec9) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.10.5 - 2026-08-18
 #### Bug Fixes
 - **(cli)** derive --expect's value list instead of writing it twice - (ae8c67a) - Clement HUSSENOT-DESENONGES
