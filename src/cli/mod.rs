@@ -14,6 +14,11 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use lease::human_secs;
 
+mod util;
+
+use util::{age_of, table};
+pub(crate) use util::{one_line, since};
+
 /// Build provenance for `--version`. `-V` keeps the bare `pact <semver>` that
 /// scripts grep for; the long form answers "is the binary on PATH the one I
 /// just built?", which a version number alone cannot.
@@ -1677,14 +1682,6 @@ fn prior_owners(root: &Path, paths: &[String], agent: &str) -> Vec<String> {
         .collect()
 }
 
-/// Seconds since an RFC3339 stamp, or `None` if it will not parse. Timestamps
-/// are compared as parsed instants, never as strings: `bd` writes `…Z` and pact
-/// writes `…+00:00`, which sort differently as bytes than as time.
-fn age_of(at: &str) -> Option<i64> {
-    let then = chrono::DateTime::parse_from_rfc3339(at).ok()?;
-    Some((chrono::Utc::now() - then.with_timezone(&chrono::Utc)).num_seconds())
-}
-
 /// `pact merge` — see [`crate::merge`] for why this is a command rather than
 /// five lines of protocol prose.
 fn run_merge(
@@ -3056,64 +3053,6 @@ fn render_brief(messages: &[&msg::Message]) -> String {
         .join("\n---\n")
 }
 
-/// Pad every column but the last so a listing lines up without tabs. Listings
-/// here are a handful of rows, so a two-pass width scan is plenty.
-fn table(rows: &[Vec<String>]) -> String {
-    let widths: Vec<usize> = (0..rows.iter().map(Vec::len).max().unwrap_or(0))
-        .map(|c| {
-            rows.iter()
-                .filter_map(|r| r.get(c))
-                .map(|s| s.chars().count())
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
-    rows.iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(i, cell)| {
-                    if i + 1 == row.len() {
-                        cell.clone()
-                    } else {
-                        format!("{cell:<width$}", width = widths[i])
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// "4m2s ago" answers the question `pact agents` is asked — is this identity
-/// live right now, or archaeology? An RFC3339 stamp does not.
-pub(crate) fn since(rfc3339: &str) -> String {
-    match chrono::DateTime::parse_from_rfc3339(rfc3339) {
-        Ok(t) => format!(
-            "{} ago",
-            human_secs((chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds())
-        ),
-        Err(_) => rfc3339.to_string(),
-    }
-}
-
-/// Collapse to a single line and cap at `max` chars. An inbox row must never
-/// wrap or leak a multi-paragraph body (pact-rnc.2).
-pub(crate) fn one_line(s: &str, max: usize) -> String {
-    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max {
-        flat
-    } else {
-        format!(
-            "{}…",
-            flat.chars().take(max.saturating_sub(1)).collect::<String>()
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3452,14 +3391,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn one_line_flattens_and_truncates() {
-        assert_eq!(one_line("a\n\nb  c", 40), "a b c");
-        assert_eq!(one_line("abcdef", 4), "abc…");
-        // Multi-byte input must not panic or split a char.
-        assert_eq!(one_line("héllo wörld", 6), "héllo…");
-    }
-
     fn agent_info(name: &str, leases: usize, sent: usize, received: usize) -> agents::AgentInfo {
         agents::AgentInfo {
             name: name.to_string(),
@@ -3675,14 +3606,5 @@ mod tests {
         assert_eq!(subcommand_name(&acquire), "lease acquire");
         assert_eq!(subcommand_name(&send), "msg send");
         assert_eq!(subcommand_name(&Command::Doctor { fix: false }), "doctor");
-    }
-
-    #[test]
-    fn table_pads_all_but_the_last_column() {
-        let out = table(&[
-            vec!["a".into(), "x".into()],
-            vec!["longer".into(), "y".into()],
-        ]);
-        assert_eq!(out, "a       x\nlonger  y");
     }
 }
