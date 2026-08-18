@@ -7,6 +7,7 @@
 mod audit;
 mod completion;
 mod context;
+mod doctor;
 mod merge;
 mod plan;
 mod watch;
@@ -14,6 +15,7 @@ mod watch;
 pub(super) use audit::{run_audit, AuditArgs};
 pub(super) use completion::run_completion;
 pub(super) use context::run_context_set;
+pub(super) use doctor::run_doctor;
 pub(super) use merge::run_merge;
 pub(super) use plan::run_plan_lint;
 pub(super) use watch::run_watch;
