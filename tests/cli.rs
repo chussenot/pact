@@ -39,7 +39,18 @@ fn pact(repo: &Path, agent: &str, args: &[&str]) -> Output {
 /// and the child would inherit it.
 fn pact_cmd(repo: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pact"));
-    cmd.args(args).current_dir(repo).env_remove("PACT_AGENT");
+    cmd.args(args).current_dir(repo);
+    for var in [
+        "PACT_AGENT",
+        "PACT_HARNESS",
+        "PACT_MODEL",
+        "PACT_HARNESS_SESSION",
+        "PACT_HARNESS_SUBAGENT",
+        "CLAUDECODE",
+        "CLAUDE_CODE_SESSION_ID",
+    ] {
+        cmd.env_remove(var);
+    }
     cmd
 }
 

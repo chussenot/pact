@@ -168,6 +168,26 @@ pub struct Record {
     /// to see through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_hash: Option<String>,
+    /// The SENDER's harness, when detectable — `"claude-code"`, or whatever
+    /// `PACT_HARNESS` declares (pact-c3y).
+    ///
+    /// The sender's, never the reader's: this row is written once, by the agent
+    /// sending it, and every later reader sees the same line. `read_by` is where
+    /// readers are recorded, and it is a separate mechanism for exactly that
+    /// reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// The sender's model — declared by the launcher; verified, if ever, by
+    /// joining session records (see recount). See [`crate::harness::model`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The sender's harness session id, when the harness exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_session: Option<String>,
+    /// The sender's harness subagent id — the key recount joins a transcript on.
+    /// Sparse by measurement, see [`crate::events::Event::harness_subagent`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_subagent: Option<String>,
 }
 
 /// One message as every `--json` consumer already knows it.
@@ -563,6 +583,13 @@ pub fn send(
     // to a path that is already repo-relative mangles it whenever the caller is not
     // sitting at the repo root. `about_path` normalizes its QUERY, which is the other
     // half of the same contract.
+    // Deliberately NOT an input to `message_id` (pact-c3y). The id is what makes a
+    // retried send land on the same message, and a retry is very often a DIFFERENT
+    // process — a resumed subagent, a re-spawned agent, an orchestrator finishing
+    // what a killed one started. Hashing the sender's harness session into the id
+    // would mint precisely the duplicate that key exists to prevent, in exactly the
+    // ambiguous-outcome case it was built for.
+    let who = crate::harness::Attribution::resolve();
     let id = message_id(agent, &to, thread_id.as_deref(), &title, body);
     let record = Record {
         thread: thread_id.clone().unwrap_or_else(|| id.clone()),
@@ -576,6 +603,10 @@ pub fn send(
         in_reply_to: parent.map(|r| r.id),
         about: about.to_vec(),
         chain_hash: None,
+        harness: who.harness,
+        model: who.model,
+        harness_session: who.session,
+        harness_subagent: who.subagent,
     };
     append(repo_root, &record)?;
     // Read back the PERSISTED row rather than reporting the one just built. On a

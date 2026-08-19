@@ -323,6 +323,7 @@ pub(super) fn acquire_inner(
     // `effective_now`'s doc comment.
     let now = effective_now(repo_root);
     let (branch, worktree, invoked_from) = worktree_stamp(repo_root);
+    let who = crate::harness::Attribution::resolve();
     // Hashed BEFORE the claim lands, so it describes the content the holder is
     // taking responsibility for rather than whatever a racing writer left
     // after. Best-effort: `hash_objects` yields nothing for a path that does
@@ -349,6 +350,13 @@ pub(super) fn acquire_inner(
         // `worktree_stamp`.
         invoked_from,
         content_hash,
+        // The holder's own attribution, resolved at acquire and never inherited
+        // on a takeover — a stolen lock belongs to the thief, and the two branches
+        // below copy only `extra` across for exactly that reason. Ungated by
+        // worktree topology, unlike the triple above: these say WHAT is holding
+        // the path, which is as true in one checkout as in twenty.
+        harness: who.harness,
+        model: who.model,
         extra: BTreeMap::new(),
     };
 
@@ -723,6 +731,8 @@ pub(super) fn acquire_inner(
                         holder_remaining_secs: Some(remaining),
                         holder_branch: existing.branch.clone(),
                         holder_worktree: existing.worktree.clone(),
+                        holder_harness: existing.harness.clone(),
+                        holder_model: existing.model.clone(),
                         ..Default::default()
                     },
                 );
@@ -1446,6 +1456,8 @@ mod tests {
             worktree: None,
             invoked_from: None,
             content_hash: None,
+            harness: None,
+            model: None,
             extra: BTreeMap::new(),
         };
         write_lease_atomic(&lock_path, &other).unwrap();
@@ -1602,6 +1614,8 @@ mod tests {
             worktree: None,
             invoked_from: None,
             content_hash: None,
+            harness: None,
+            model: None,
             extra: BTreeMap::new(),
         };
         write_lease_atomic(&lock_path, &thief).unwrap();
@@ -1635,6 +1649,8 @@ mod tests {
             worktree: None,
             invoked_from: None,
             content_hash: None,
+            harness: None,
+            model: None,
             extra: BTreeMap::new(),
         };
         write_lease_atomic(&lock_path2, &thief2).unwrap();
@@ -1683,11 +1699,87 @@ mod tests {
             worktree: None,
             invoked_from: None,
             content_hash: None,
+            harness: None,
+            model: None,
             extra: BTreeMap::new(),
         };
         write_lease_atomic(&lock_path, &winner).unwrap();
 
         verify_own_lease(&lock_path, "agent-a")
             .expect("same-identity race must not be reported as a lost steal");
+    }
+
+    /// pact-1gv.1's invariant, restated as a property over every field the refusal
+    /// prose mentions (pact-c3y).
+    ///
+    /// The refusal is the one message an agent reads at exit 2, and every fact in
+    /// it was once reachable only by regex. The rule since pact-1gv.1 is that each
+    /// one has a structured twin stamped from the SAME `existing` lock in the same
+    /// event literal. Adding the harness badge to the prose without a twin would
+    /// have quietly re-opened exactly that defect, so this asserts the pairing
+    /// rather than either half of it: for every fact, in the sentence iff on the
+    /// row.
+    #[test]
+    fn every_holder_fact_in_the_refusal_prose_has_a_structured_twin() {
+        let tmp = repo();
+        let root = tmp.path();
+        acquire(root, "agent-a", "f.rs", 600, false, Some("mine".into())).unwrap();
+
+        // The holder's lock, given every fact the prose can name. Written directly
+        // because a single-checkout test repo produces none of them naturally —
+        // which is precisely why this gap survived: the fields are absent in the
+        // fixture that would otherwise catch it.
+        let lock_path = lock_file_path(root, "f.rs").unwrap();
+        let mut lock = read_lease(&lock_path).unwrap();
+        lock.branch = Some("wt/w3".to_string());
+        lock.worktree = Some("w3".to_string());
+        lock.harness = Some("claude-code".to_string());
+        lock.model = Some("sonnet-4-6".to_string());
+        write_lease_atomic(&lock_path, &lock).unwrap();
+
+        let err = acquire(root, "agent-b", "f.rs", 600, false, None)
+            .expect_err("a live claim must refuse");
+        let prose = format!("{err:#}");
+
+        let refused = crate::events::recent(root, 100)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == "refused")
+            .expect("a refusal is logged");
+
+        // Each pair: the value, and the structured field that must carry it. The
+        // assertion is two-directional on purpose — a fact in the row but missing
+        // from the sentence is the same drift as the reverse, and the whole point
+        // is that neither representation can move alone.
+        for (value, structured, field) in [
+            ("agent-a", refused.holder.as_deref(), "holder"),
+            ("wt/w3", refused.holder_branch.as_deref(), "holder_branch"),
+            ("w3", refused.holder_worktree.as_deref(), "holder_worktree"),
+            (
+                "claude-code",
+                refused.holder_harness.as_deref(),
+                "holder_harness",
+            ),
+            (
+                "sonnet-4-6",
+                refused.holder_model.as_deref(),
+                "holder_model",
+            ),
+        ] {
+            assert!(
+                prose.contains(value),
+                "{field}: {value:?} is on the row but not in the refusal an agent reads: {prose}"
+            );
+            assert_eq!(
+                structured,
+                Some(value),
+                "{field}: {value:?} is in the refusal prose but reachable only by regex"
+            );
+        }
+
+        // And the number that is NOT the same as `ttl_secs`, which is the trap
+        // pact-1gv.1 was filed about: 600 was asked for, the holder has ~600 left,
+        // and the two being equal here would make the assertion vacuous.
+        assert!(refused.holder_remaining_secs.is_some());
     }
 }

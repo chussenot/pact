@@ -364,10 +364,12 @@ pub(super) fn collect_expired(repo_root: &Path, lock_path: &Path, lease: &LeaseI
             )),
             lease.ttl_secs,
             None,
-            // The holder's own recorded context, so this row says something true about
-            // the lease it closes. `None` on a lock written before pact recorded it,
-            // which correctly falls back to the sweeper's rather than inventing one.
-            lease.invoked_from.clone(),
+            // The holder's own recorded context — where they were, on what branch, in
+            // what worktree, under what harness — so this row says something true
+            // about the lease it closes. A lock written before pact recorded a given
+            // field leaves that field `None`, which correctly falls back to the
+            // sweeper's rather than inventing one.
+            Some(lease),
         );
     }
 }
@@ -523,6 +525,16 @@ pub fn sweep(repo_root: &Path, agent: &str, mode: Sweep, paths: &[String]) -> Re
         // The SWEEPER is the agent here, unlike `expired`, which describes the
         // holder because nobody chose it. A reclaim is somebody's deliberate
         // act and the log has to say whose.
+        //
+        // So `None`, and this is a CORRECTION (pact-c3y). This call used to pass
+        // the holder's `invoked_from` while naming the sweeper as `agent`, which
+        // produced a row attributing the sweeper's deliberate act to the holder's
+        // location — the same shape of falsehood pact-83r.3 fixed for `expired`,
+        // pointing the other way. Widening the parameter to the whole lock made
+        // it visible: carrying the holder's branch, worktree, harness and model
+        // onto a row whose `agent` is the sweeper would have said the sweeper was
+        // running the holder's model. Who it was reclaimed FROM is in `detail`
+        // and in nothing else that could be misread as the actor.
         log_event(
             repo_root,
             agent,
@@ -531,7 +543,7 @@ pub fn sweep(repo_root: &Path, agent: &str, mode: Sweep, paths: &[String]) -> Re
             Some(format!("reclaimed from {}: {evidence}", lease.agent)),
             lease.ttl_secs,
             None,
-            lease.invoked_from.clone(),
+            None,
         );
         swept.push(Swept {
             path: lease.path.clone(),
@@ -994,6 +1006,15 @@ mod tests {
         );
         let mut lapsed = lock.clone();
         lapsed.invoked_from = Some("wt-holder".to_string());
+        // Same sentinels for the rest of the holder's context (pact-c3y). Every
+        // one of these is a fact about the LEASE, and every one of them would
+        // otherwise be filled from whichever process happened to sweep the lock —
+        // `branch` in particular, because the sweeper is usually in the main
+        // checkout on a different branch entirely.
+        lapsed.branch = Some("holders-branch".to_string());
+        lapsed.worktree = Some("holders-worktree".to_string());
+        lapsed.harness = Some("holders-harness".to_string());
+        lapsed.model = Some("holders-model".to_string());
         collect_expired(root, &lock_file_path(root, "f.rs").unwrap(), &lapsed);
 
         let expired = crate::events::recent(root, 100)
@@ -1012,6 +1033,69 @@ mod tests {
             "the sweeper must be recorded separately, where topology ignores it: {:?}",
             expired.collected_from
         );
+        // The rest of the chain, same rule (pact-c3y). These are load-bearing in a
+        // way the assertion above is not: `invoked_from` had a hand-written
+        // holder-wins branch, while these four ride the general "a caller that
+        // already knows wins" rule in `stamp_context`. If that rule is ever
+        // simplified back to unconditional assignment, this is what notices —
+        // and it would notice quietly nowhere else, because in a single-checkout
+        // test repo the sweeper's real branch and the holder's are the same
+        // string.
+        assert_eq!(expired.branch.as_deref(), Some("holders-branch"));
+        assert_eq!(expired.worktree.as_deref(), Some("holders-worktree"));
+        assert_eq!(expired.harness.as_deref(), Some("holders-harness"));
+        assert_eq!(expired.model.as_deref(), Some("holders-model"));
+    }
+
+    /// A reclaim is the SWEEPER's act, so it carries the SWEEPER's context —
+    /// the mirror image of the test above, and a correction (pact-c3y).
+    ///
+    /// `sweep --suspect` used to pass the holder's `invoked_from` onto a row whose
+    /// `agent` is the sweeper, which is the pact-83r.3 falsehood pointing the
+    /// other way: a deliberate act attributed to somebody else's location. Adding
+    /// harness and model made it untenable rather than merely odd — that row would
+    /// have said the sweeper was running the holder's model.
+    ///
+    /// Who it was reclaimed FROM survives in `detail`, which is the one place it
+    /// cannot be mistaken for the actor.
+    #[test]
+    fn a_reclaim_carries_the_sweepers_context_not_the_holders() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim(root, "agent-a", "f.rs");
+
+        let path = lock_file_path(root, "f.rs").unwrap();
+        let mut lock = read_lease(&path).unwrap();
+        lock.invoked_from = Some("holders-worktree".to_string());
+        lock.branch = Some("holders-branch".to_string());
+        lock.harness = Some("holders-harness".to_string());
+        lock.model = Some("holders-model".to_string());
+        // Lapsed far enough that the sweep is unambiguous.
+        lock.acquired_at =
+            (Utc::now() - chrono::Duration::seconds(lock.ttl_secs as i64 * 4)).to_rfc3339();
+        write_lease_atomic(&path, &lock).unwrap();
+
+        sweep(root, "sweeper", Sweep::Expired, &[]).unwrap();
+
+        let reclaimed = crate::events::recent(root, 100)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == "reclaimed");
+        if let Some(e) = reclaimed {
+            assert_eq!(e.agent, "sweeper");
+            assert_ne!(
+                e.invoked_from.as_deref(),
+                Some("holders-worktree"),
+                "a reclaim must not claim the holder's location for the sweeper"
+            );
+            assert_ne!(e.harness.as_deref(), Some("holders-harness"));
+            assert_ne!(e.model.as_deref(), Some("holders-model"));
+            assert!(
+                e.detail.as_deref().unwrap_or_default().contains("agent-a"),
+                "who it was reclaimed from must survive, in detail: {:?}",
+                e.detail
+            );
+        }
     }
 
     #[test]

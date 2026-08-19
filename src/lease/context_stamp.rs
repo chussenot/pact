@@ -62,11 +62,31 @@ pub(super) fn worktree_stamp(repo_root: &Path) -> (Option<String>, Option<String
 /// go look at their own working copy, find it untouched, and conclude the lease
 /// is stale.
 pub(super) fn holder_location(lease: &LeaseInfo) -> String {
+    // `agent-01 [claude-code, sonnet-4-6]` — WHAT is holding it, not only who
+    // (pact-c3y). Bracketed and adjacent to the name because it qualifies the
+    // name; a peer deciding whether to wait, steal or message wants "a
+    // claude-code agent" and "a stray shell someone left a lease in" to look
+    // different at a glance, and before this they read identically.
+    //
+    // The whole clause vanishes when nothing was detected or declared, rather
+    // than rendering `[unknown]`: a fleet that declares nothing gets exactly the
+    // message it got before this existed. Every string in this module is read by
+    // an agent at exit 2, and a placeholder is a thing to reason about.
+    let badge = crate::harness::Attribution {
+        harness: lease.harness.clone(),
+        model: lease.model.clone(),
+        ..Default::default()
+    }
+    .badge();
+    let who = match badge {
+        Some(badge) => format!("{} {badge}", lease.agent),
+        None => lease.agent.clone(),
+    };
     match (&lease.branch, &lease.worktree) {
-        (Some(b), Some(w)) => format!("{} on branch {b} in worktree {w}", lease.agent),
-        (Some(b), None) => format!("{} on branch {b}", lease.agent),
-        (None, Some(w)) => format!("{} in worktree {w}", lease.agent),
-        (None, None) => lease.agent.clone(),
+        (Some(b), Some(w)) => format!("{who} on branch {b} in worktree {w}"),
+        (Some(b), None) => format!("{who} on branch {b}"),
+        (None, Some(w)) => format!("{who} in worktree {w}"),
+        (None, None) => who,
     }
 }
 
@@ -155,12 +175,19 @@ pub(super) fn log_event(
     // apart could legitimately differ, and a diff computed against a baseline
     // the log does not agree with would be unexplainable afterwards.
     content_hash: Option<String>,
-    // The HOLDER's invocation context, for a row somebody else is writing on their
+    // The HOLDER's own recorded context, for a row somebody else is writing on their
     // behalf. Only `collect_expired` passes it: an expiry is a fact about the holder's
     // lease, and `events::append` would otherwise stamp whoever swept the lock. `None`
     // everywhere else means "stamp my own", which is right for every event an agent
     // writes about itself (pact-83r.3 / finding 5).
-    holder_invoked_from: Option<String>,
+    //
+    // The whole lock rather than the one `invoked_from` string it started as
+    // (pact-c3y): `branch`, `worktree`, `harness` and `model` are the holder's
+    // facts by exactly the same argument, and threading them one parameter at a
+    // time is how four of them would end up disagreeing about whose they are.
+    // `stamp_context` fills only what is still `None`, so passing the lock here
+    // is what makes the holder win.
+    holder: Option<&LeaseInfo>,
 ) {
     events::append(
         repo_root,
@@ -185,7 +212,7 @@ pub(super) fn log_event(
             // Likewise stamped by append(), which is the only place that can
             // measure them; see Event::invoked_from (pact-ler.1) — unless the caller
             // knows better, which only the expiry sweeper does.
-            invoked_from: holder_invoked_from,
+            invoked_from: holder.and_then(|h| h.invoked_from.clone()),
             collected_from: None,
             scope: None,
             pact_version: None,
@@ -198,6 +225,16 @@ pub(super) fn log_event(
             holder_remaining_secs: None,
             holder_branch: None,
             holder_worktree: None,
+            holder_harness: None,
+            holder_model: None,
+            // The holder's own WHERE and WHAT, for a row written on their behalf.
+            // `stamp_context` fills each of these only when it is still `None`,
+            // so a normal transition (holder is `None`) still gets the writing
+            // process's own context exactly as before.
+            branch: holder.and_then(|h| h.branch.clone()),
+            worktree: holder.and_then(|h| h.worktree.clone()),
+            harness: holder.and_then(|h| h.harness.clone()),
+            model: holder.and_then(|h| h.model.clone()),
             ..Default::default()
         },
     );

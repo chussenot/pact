@@ -6,6 +6,7 @@ mod cli;
 mod doctor;
 mod events;
 mod git_history;
+mod harness;
 mod identity;
 mod lease;
 #[cfg(feature = "mcp")]

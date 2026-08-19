@@ -17,12 +17,24 @@ fn init_repo() -> TempDir {
 }
 
 fn pact(repo: &Path, agent: &str, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_pact"))
-        .args(args)
-        .current_dir(repo)
-        .env("PACT_AGENT", agent)
-        .output()
-        .expect("failed to run pact binary")
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pact"));
+    cmd.args(args).current_dir(repo).env("PACT_AGENT", agent);
+    // The refusal prose these tests read now carries the holder's harness and
+    // model when either is known (pact-c3y): `held by agent-0 [claude-code] (0s
+    // old, …)`. Cleared so the string under test is the same one a maintainer,
+    // CI and an agent running inside a harness all see — the alternative is
+    // assertions that pass or fail depending on who invoked cargo.
+    for var in [
+        "PACT_HARNESS",
+        "PACT_MODEL",
+        "PACT_HARNESS_SESSION",
+        "PACT_HARNESS_SUBAGENT",
+        "CLAUDECODE",
+        "CLAUDE_CODE_SESSION_ID",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd.output().expect("failed to run pact binary")
 }
 
 fn json_stdout(out: &Output) -> serde_json::Value {

@@ -40,6 +40,8 @@ mod testutil {
                 worktree: None,
                 invoked_from: None,
                 content_hash: None,
+                harness: None,
+                model: None,
                 extra: BTreeMap::new(),
             },
             now,
@@ -130,6 +132,8 @@ mod testutil {
             worktree: None,
             invoked_from: None,
             content_hash: None,
+            harness: None,
+            model: None,
             extra: BTreeMap::new(),
         };
         write_lease_atomic(&lock_file_path(root, path).unwrap(), &lease).unwrap();

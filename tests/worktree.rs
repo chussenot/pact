@@ -98,6 +98,28 @@ fn pact(dir: &Path, agent: &str, args: &[&str]) -> Output {
 fn pact_scoped(dir: &Path, agent: &str, args: &[&str], scope: Option<&str>) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pact"));
     cmd.args(args).current_dir(dir).env("PACT_AGENT", agent);
+    // Cleared for the same reason PACT_WORKTREE_SCOPE is below, and with the same
+    // consequence if it is not (pact-c3y). The lock-payload assertions in this
+    // file pin an exact key SET, and `harness`/`model` are `skip_serializing_if`
+    // — so an agent running the suite from inside a harness would see keys a
+    // maintainer running it from a plain shell does not. That is a test whose
+    // result depends on who ran it, which is worse than one that fails.
+    //
+    // Note what is NOT being claimed: `harness`/`model` are deliberately not
+    // gated on worktree topology, unlike `branch`/`worktree`. They say WHAT is
+    // holding the path, which is as true in one checkout as in twenty. They are
+    // absent from those assertions because nothing declared them here, not
+    // because a repo without worktrees suppresses them.
+    for var in [
+        "PACT_HARNESS",
+        "PACT_MODEL",
+        "PACT_HARNESS_SESSION",
+        "PACT_HARNESS_SUBAGENT",
+        "CLAUDECODE",
+        "CLAUDE_CODE_SESSION_ID",
+    ] {
+        cmd.env_remove(var);
+    }
     match scope {
         Some(s) => cmd.env("PACT_WORKTREE_SCOPE", s),
         // Explicitly cleared: a developer with this exported in their shell must

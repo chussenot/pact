@@ -278,6 +278,23 @@ pub struct Event {
     /// The holder's worktree, when the lock recorded one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder_worktree: Option<String>,
+    /// The holder's harness and declared model, when their lock recorded them
+    /// (pact-c3y).
+    ///
+    /// Here for the reason `holder_branch`/`holder_worktree` are: the refusal
+    /// prose now reads `held by agent-01 [claude-code, sonnet-4-6] …`, and a fact
+    /// that exists only inside an English sentence is reachable by regex and
+    /// nothing else. Stamped from the same `existing` lock that composes the
+    /// prose, in the same event literal, so the two representations cannot drift
+    /// — which is the whole of pact-1gv.1, applied to the two facts it added
+    /// after that bead closed.
+    ///
+    /// Absent, never zero, on rows written before this shipped and on holders who
+    /// declared nothing. Backfill is impossible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_model: Option<String>,
     /// `kind: "context"` only — the run-policy key this row sets.
     ///
     /// See [`CONTEXT_KIND`] for why these rows exist at all.
@@ -287,6 +304,91 @@ pub struct Event {
     /// topology expectation, or an operator's sentence about the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_value: Option<String>,
+    /// The git branch this event was written from — the ref shortname, never a
+    /// path (pact-c3y).
+    ///
+    /// Stamped by [`append`] on **every** kind, unconditionally, and that is the
+    /// difference between this field and `LeaseInfo::branch`, which looks
+    /// identical and is not. The lock file's pair is gated on
+    /// `RepoContext::has_worktrees` so that a repository which never uses
+    /// worktrees keeps byte-identical lock files — correct there, and asserted
+    /// by two worktree tests. Applying the same gate to a log field would mean a
+    /// fleet working branch-per-agent inside ONE shared checkout recorded no
+    /// branch anywhere at all, which is precisely the topology this repository's
+    /// own history is full of: across all 729 events written before this field
+    /// existed, the number carrying a branch is zero.
+    ///
+    /// The reasoning is [`Self::invoked_from`]'s, restated for the field that
+    /// should have been beside it from the start: a gated log field cannot tell
+    /// "not applicable" from "not recorded".
+    ///
+    /// `None` when `<gitdir>/HEAD` is unreadable or detached — a detached HEAD
+    /// has no branch, and inventing one would be worse than absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The worktree this event was written from, by NAME — a linked worktree's
+    /// `.git/worktrees/<name>` component, or the main worktree's directory name.
+    ///
+    /// **A name, never a path, and that is a contract rather than a preference.**
+    /// `.pact/events.jsonl` is committed and therefore travels: to a teammate's
+    /// laptop, into a CI checkout, into an archive read two years later. An
+    /// absolute path in a committed ledger is a fact about one machine's
+    /// filesystem masquerading as a fact about the run, and it is wrong on every
+    /// other machine that reads it. recount resolves a name to a live path
+    /// itself, and refuses with a stated reason when the worktree has been
+    /// pruned — which is the honest outcome, and one an embedded path could not
+    /// produce because it would look resolvable and simply not exist.
+    ///
+    /// Distinct from [`Self::invoked_from`], which normalises the main worktree
+    /// to the literal `"main"` so it is comparable across repositories. This
+    /// keeps the real name, because comparing worktrees *within* one repository
+    /// is what the TUI and the audit table do.
+    ///
+    /// `None` in a repository with no linked worktrees at all, where the pair
+    /// reads `worktree: null, invoked_from: "main"` — "there is no worktree
+    /// topology here", which is a different statement from "the topology exists
+    /// and this row is the main one", and the two are worth being able to tell
+    /// apart when reading a fleet's log afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// The model behind the agent — declared by the launcher; verified, if ever,
+    /// by joining session records (see recount).
+    ///
+    /// From `PACT_MODEL` and nowhere else. pact does not detect a model, does
+    /// not ask an API which one is in force, and does not spawn anything to find
+    /// out: see [`crate::harness::model`]. A declared field is only as good as
+    /// the declaration, which is exactly why the recount contract in
+    /// docs/audit.md compares it against what a session record says actually
+    /// ran, and treats a mismatch as orchestration drift rather than as an
+    /// error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The program driving the agent — `"claude-code"`, or whatever
+    /// `PACT_HARNESS` declares. See [`crate::harness::harness`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// The harness's identifier for the conversation this event belongs to, when
+    /// the harness exposes one. See [`crate::harness::harness_session`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_session: Option<String>,
+    /// The harness's identifier for this agent within its session — the id that
+    /// names the transcript, and the key recount joins on exactly instead of
+    /// inferring topologically.
+    ///
+    /// Expect this to be rare, by measurement rather than by pessimism: no Claude
+    /// Code subagent's environment carries its own id (verified 2026-08-19,
+    /// docs/harness-detection.md), so it arrives only where a spawner or a harness
+    /// declares `PACT_HARNESS_SUBAGENT`.
+    ///
+    /// The id does exist on disk — it names the transcript file — and pact
+    /// deliberately does not go and read it there. See
+    /// [`crate::harness::harness_subagent`]: that layout is undocumented and one
+    /// refactor from breaking, and a coordination tool reaching into its harness's
+    /// state directory to label its own log rows is a coupling nobody wants to
+    /// own. An absent field is the honest outcome, and recount's topological join
+    /// stays the load-bearing path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_subagent: Option<String>,
 }
 
 /// The kind that records **the constraints a run operated under**, as opposed to
@@ -780,6 +882,51 @@ fn stamp_context(repo_root: &Path, ev: &mut Event) {
     }
     ev.scope = Some(crate::repo::effective_scope().to_string());
     ev.pact_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    // WHERE, structurally, beside the `invoked_from` string that has carried a
+    // flattened version of it since 0.7.4 (pact-c3y). Both are decided from the
+    // one `ctx` above, in one place, so the normalised form and the real names
+    // cannot disagree — the discipline the refusal row's holder facts already
+    // follow.
+    //
+    // Ungated, unlike the lock file's identically-named pair: see
+    // `Event::branch`. `ctx.branch()` reads `<gitdir>/HEAD` and parses one line;
+    // it is not the `git rev-parse` that `head` below costs, which is why it can
+    // sit on every kind while that one cannot.
+    //
+    // `is_none()` rather than unconditional assignment, and that is the same
+    // "a caller that already knows WINS" rule `invoked_from` states above. Only
+    // `collect_expired` knows: an expiry is a fact about the holder's lease, and
+    // the row is written by whichever process happened to sweep the lock —
+    // often `pact lease ls` in the main checkout, minutes later. Stamping the
+    // sweeper's branch on it is exactly the falsehood pact-83r.3 measured for
+    // `invoked_from` (2 of 3 expiries in the quern run), one field wider.
+    if ev.branch.is_none() {
+        ev.branch = ctx.branch();
+    }
+    if ev.worktree.is_none() {
+        ev.worktree = ctx.worktree_name.clone();
+    }
+    // WHO, beyond the agent name: the harness, the declared model, and the
+    // harness's own session identifiers. Four `std::env::var` reads and nothing
+    // else — no subprocess, no filesystem, no detection. `benches/lease.rs` pins
+    // that: `stamp_context` is on the lease hot path for every event of every
+    // kind, and its by-kind pair exists to isolate the ONE subprocess already
+    // here so a second cannot be added unnoticed.
+    let who = crate::harness::Attribution::resolve();
+    if ev.harness.is_none() {
+        ev.harness = who.harness;
+    }
+    if ev.model.is_none() {
+        ev.model = who.model;
+    }
+    // The session identifiers are always this process's, never a caller's, and
+    // deliberately so: a lock file does not record them (they would be dead
+    // weight in every lock to serve one kind), so an expiry has nothing better
+    // to offer and a sweeper's own session is at least a true statement about
+    // who wrote the row. `collected_from` is what tells a reader the row was
+    // written on someone else's behalf.
+    ev.harness_session = who.session;
+    ev.harness_subagent = who.subagent;
     // The protocol the agents in this run were actually reading — the block in
     // AGENTS.md, not the one this binary would write. `pact_version` above
     // already says which binary ran; a repo that has not re-run `pact init`

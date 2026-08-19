@@ -103,6 +103,8 @@ mod beads;
 mod events;
 #[path = "../src/git_history.rs"]
 mod git_history;
+#[path = "../src/harness.rs"]
+mod harness;
 #[path = "../src/identity.rs"]
 mod identity;
 #[path = "../src/lease/mod.rs"]
@@ -374,6 +376,47 @@ fn bench_events_append(c: &mut Criterion) {
                 criterion::BatchSize::PerIteration,
             )
         });
+    }
+
+    // THE SECOND DECISIVE PAIR (pact-c3y). `stamp_context` also resolves the
+    // attribution chain — harness, declared model, harness session, subagent —
+    // on every event of every kind. Four `std::env::var` reads and nothing else:
+    // no subprocess, no filesystem, no detection.
+    //
+    // That claim is worth a benchmark for the same reason the pair above is. The
+    // obvious implementations of "which model is this" are an API call and a
+    // subprocess, both of which would sit exactly where the `git rev-parse`
+    // measured above sits, and pact already learned what a subprocess on this
+    // path costs. Set against unset, the same append at the same log size: if
+    // the gap ever resembles the `acquired`/`notified` gap, something is
+    // spawning.
+    for (label, vars) in [
+        ("attribution/absent", &[][..]),
+        (
+            "attribution/declared",
+            &[
+                ("CLAUDECODE", "1"),
+                (
+                    "CLAUDE_CODE_SESSION_ID",
+                    "0bb1638c-ef3b-454f-9ce8-c9bb6fb6d0e8",
+                ),
+                ("PACT_MODEL", "sonnet-4-6"),
+                ("PACT_HARNESS_SUBAGENT", "a99940ee56bb11045"),
+            ][..],
+        ),
+    ] {
+        let mut ev = seed_event();
+        // A non-boundary kind, so the `git rev-parse` the pair above isolates is
+        // not in this measurement at all — otherwise the subprocess would
+        // dominate both halves and hide whatever this pair is trying to show.
+        ev.kind = "notified".to_string();
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+        group.bench_function(label, |b| b.iter(|| events::append(tmp.path(), &ev)));
+        for (k, _) in vars {
+            std::env::remove_var(k);
+        }
     }
 
     // What the HEAD cache (pact-hxy) is worth, as a number rather than an

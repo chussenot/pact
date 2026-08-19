@@ -580,6 +580,8 @@ mod tests {
                 worktree: None,
                 invoked_from: None,
                 content_hash: None,
+                harness: None,
+                model: None,
                 extra: Default::default(),
             },
             age_secs: 10,

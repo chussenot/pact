@@ -196,6 +196,24 @@ pub struct LeaseInfo {
     /// to what pact wrote before this existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
+    /// The holder's harness and declared model (pact-c3y), so a peer refused at
+    /// exit 2 and a human reading `lease ls` learn WHAT is holding the path, not
+    /// only who.
+    ///
+    /// On the lock file for the reason `content_hash` and `invoked_from` are: the
+    /// readers that need it — the refusal path, `lease ls`, and through it the
+    /// TUI's refresh — already load this struct, and the alternative is scanning
+    /// the event log for the holder's `acquired` row. That scan would land on the
+    /// dashboard's refresh path, which is the one place CLAUDE.md records the
+    /// cost of and where an earlier `bd` subprocess had to be removed.
+    ///
+    /// Absent — not null — when nothing was detected or declared, so a repo whose
+    /// agents declare nothing keeps lock files byte-identical to what pact wrote
+    /// before this existed, exactly as the three fields above already do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Any field a NEWER lock file has that this compiled struct does not know
     /// about — the mirror image of `branch`/`worktree`'s `default`.
     ///
@@ -838,6 +856,8 @@ mod tests {
             worktree: None,
             invoked_from: None,
             content_hash: None,
+            harness: None,
+            model: None,
             extra: BTreeMap::new(),
         };
         assert!(
@@ -881,6 +901,8 @@ mod tests {
                 worktree: None,
                 invoked_from: None,
                 content_hash: None,
+                harness: None,
+                model: None,
                 extra: BTreeMap::new(),
             };
             assert_eq!(
@@ -944,6 +966,8 @@ mod tests {
             worktree: None,
             invoked_from: None,
             content_hash: None,
+            harness: None,
+            model: None,
             extra: BTreeMap::new(),
         };
         // Years past ttl+grace, not just minutes: a forward jump, not a slow
