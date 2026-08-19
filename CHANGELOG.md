@@ -752,6 +752,92 @@ reasoning a commit subject cannot.
 
 ## Notes — unreleased
 
+### The attribution chain (pact-c3y)
+
+Every row pact writes now carries as much of an attribution chain as was knowable
+when it was written: **identity / harness / model / harness-session / branch+worktree**.
+Two reasons, and they are different in kind.
+
+The first is that `pact ui` and `pact audit` could name *who* acted and nothing
+else. `PACT_AGENT` says which agent; nothing said which program was running it,
+which model was behind it, or which conversation the action belonged to. The
+per-agent audit table, the detail views and the refusal message now say so, and
+there is a `models by events (declared)` line for the question "was this run the
+fleet I think it was".
+
+The second is a contract with session-recall tooling. When a pact event carries
+`harness_subagent`, [recount](https://github.com/chussenot/recount) can resolve
+the harness transcript by filename — `subagents/agent-<id>.jsonl`, an exact match
+— instead of inferring it from cwd, time window and mentions. The ladder and its
+confidence tiers are written down in `docs/audit.md`; the topological join stays
+the load-bearing path and does not regress.
+
+**The model is declared, never detected, and pact marks it wherever it renders
+it** — `model X (declared)`, `models by events (declared)`. pact does not
+fingerprint a model, ask an API which one is in force, or spawn anything to find
+out. The spawner knows what it requested; that is where the declaration is cheap
+and truthful. Verification is a join against a record the harness made itself,
+which is what recount does, and a disagreement is orchestration drift worth a
+finding rather than an error.
+
+Three things worth knowing:
+
+- **`branch` was recorded nowhere before this.** Not on any event, of any kind,
+  ever: across the 729 events in this repository's own log the number carrying a
+  branch is zero. The lock file's identically-named field is gated on the repo
+  having linked worktrees — correct for a lock file, byte-compatibility, asserted
+  by two tests — and no log field ever existed. So a fleet working branch-per-agent
+  in one shared checkout left no branch attribution anywhere. The new fields are
+  stamped in `events::stamp_context`, the single funnel every kind passes through,
+  ungated.
+- **Nothing in a spawned agent's environment carries its own subagent id.**
+  Measured, not assumed: on Claude Code 2.1.235 (2026-08-19) a real subagent's
+  environment is byte-for-byte the same variable set as its parent's, and its own
+  `agentId` is nowhere in it. `PACT_HARNESS_SUBAGENT` is therefore the only way
+  the field is ever set, and the keyed join tier will be rare. The id *is* on
+  disk, in the name of the transcript file, and **pact does not go and read it
+  there** — that layout is undocumented and one refactor from breaking, and
+  nothing in pact reaches into a harness's state directory. Every function in
+  `harness.rs` is a `std::env::var` call and nothing else.
+  `docs/harness-detection.md` records the capture, dated, with the warning that
+  every one of these variables is reverse-engineered and can vanish.
+- **Absence is the value; there is no `"unknown"`.** An absent field dates a log,
+  exactly as `ttl_secs` and `chain_hash` already do. A placeholder would be
+  counted as a model by the summary line.
+
+**No check fails on attribution.** It is attribution, not judgment: a fleet is
+allowed to declare nothing, and most do.
+
+`pact doctor` gained an `attribution` check — informational, never failing — that
+prints the exact chain this process would stamp, naming each link even when absent
+and saying what would supply it. It is also how you test a fingerprint for a
+harness pact has never seen.
+
+Two corrections fell out of the work rather than being sought:
+
+- A **`reclaimed`** row used to carry the *holder's* `invoked_from` under the
+  *sweeper's* name — the same falsehood pact-83r.3 fixed for `expired`, pointing
+  the other way. Widening the parameter to the whole lock made it visible:
+  carrying the holder's harness and model onto that row would have said the
+  sweeper was running the holder's model. It now carries the sweeper's context;
+  who it was reclaimed *from* is in `detail`, where it cannot be mistaken for the
+  actor.
+- The `--json` shape assertions in `tests/cli.rs` are now run with the harness
+  variables cleared. Without that they would have passed in CI and on a
+  maintainer's shell and **failed for an agent editing this repository**, because
+  the new fields are `skip_serializing_if` and appear only when something is
+  detected. A test whose result depends on who ran it is worse than one that
+  fails.
+
+`pact ui` deliberately does **not** gain a column for this. It was tried at three
+widths and every one cost something that outranks it — a fixed 24 crushed `Path`
+to `Pa` at 120 columns; 12% was 11 characters, which cut `~sonnet-4-6` into a
+shorter, plausible, *wrong* model name. pact-rnc.10 is the incident where a
+half-read value on that table got a live agent's lease force-released. The chain
+is in the detail views instead, which have the room to write `(declared)` in
+words. `pact lease ls` does gain a `VIA` column, because its table sizes to its
+content.
+
 **Everything in this section came from the fleet, not from us.** `docs/pact-findings.md`
 in the [quern](https://github.com/chussenot/quern) repository is a field audit of pact
 written by the agents that used it, across two runs: quern (35 agents, 249 coordination

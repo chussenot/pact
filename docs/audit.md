@@ -636,6 +636,97 @@ the expiry. The sweeping process is recorded separately, as `collected_from`, wh
 this check deliberately ignores: where somebody swept a lock says nothing about
 whether the fleet ran where it was asked to.
 
+The same rule now covers the holder's `branch`, `worktree`, `harness` and `model`,
+which ride the general "a caller that already knows wins" rule in the event stamp
+rather than a hand-written branch for one field.
+
+A **`reclaimed`** row is the mirror image and was corrected in the same change: it
+is the *sweeper's* deliberate act, logged under the sweeper's name, so it carries
+the sweeper's context. It used to carry the holder's `invoked_from` under the
+sweeper's name — the same falsehood pointing the other way. Who a lease was
+reclaimed *from* is in `detail`, which is the one place it cannot be mistaken for
+the actor.
+
+## Attribution: what wrote this row
+
+Every event carries as much of an attribution chain as was knowable when it was
+written:
+
+| | |
+|---|---|
+| `agent` | `PACT_AGENT` — which agent |
+| `harness` | which program was running it |
+| `model` | which model it was **declared** to be |
+| `harness_session` / `harness_subagent` | which conversation, and which agent within it |
+| `branch` / `worktree` | which checkout, by name |
+
+`pact audit` surfaces them under each agent in the busiest-agents table, and as
+one run-wide line:
+
+```
+models by events (declared)  sonnet-4-6 412, haiku-4-5 88, undeclared 31
+```
+
+By events rather than by agent, deliberately: an agent that acquired once and one
+that ran the whole build are not equal evidence about what a run was made of. The
+`undeclared` count is the load-bearing half — without it, a run where one agent
+declared and nineteen did not reads as a single-model fleet.
+
+A named check carries the same chain as a trailer under its findings:
+
+```
+stale-holds: scanned 412 event(s)
+  agent-03 held src/api.rs for 51m0s against a 45m0s ttl, with no renew
+  …
+
+attribution (nothing here fails a check)
+  agent-03                 claude-code, model sonnet-4-6 (declared), branch wt/w3
+```
+
+On the report once, keyed by the agent name the finding already prints, rather
+than as three more fields on every finding type: the same agent appears in many
+findings, and nine finding structs would be nine chances to forget it. A clean
+check prints nothing extra — there is nothing to look up, and a verdict should
+not acquire a paragraph that reads as a caveat on it.
+
+**No check fails on attribution.** It is attribution, not judgment. A fleet is
+allowed to declare nothing, and most do; a summary that implied otherwise would
+train fleets to declare *something* rather than the right thing.
+
+Absent fields date a log, exactly as `ttl_secs` and `chain_hash` already do —
+there is no `"unknown"` value, because a field that cannot tell "not applicable"
+from "not recorded" is worse than no field. See
+[harness-detection.md](harness-detection.md) for what pact reads, and what it
+refuses to guess.
+
+### The recount join ladder
+
+`model` is a claim by whoever launched the agent. The only thing that can check it
+is a record made by the harness itself, which is what
+[`recount`](https://github.com/chussenot/recount) reads. The contract between the
+two is a ladder, tried in order:
+
+1. **Keyed.** The event carries `harness_subagent`. recount resolves the
+   transcript by filename — `<session>/subagents/agent-<id>.jsonl` — and the match
+   is exact. Reported confidence: `keyed`.
+2. **Topological.** No `harness_subagent`. recount falls back to the join it has
+   always used: cwd, worktree, time window, mentions, scored as today.
+
+Expect tier 2 to stay the load-bearing path. `harness_subagent` has no fingerprint
+on any harness pact knows about — nothing in a spawned agent's environment carries
+its own id — so it arrives only where a spawner or a harness declares
+`PACT_HARNESS_SUBAGENT` (see [fleet-patterns.md](fleet-patterns.md)). The id is on
+disk, in the name of the transcript file, and **pact does not go and read it
+there**: that layout is undocumented and one refactor from breaking, and nothing
+in pact reaches into a harness's state directory. Tier 1 is worth having anyway —
+where a spawner does know the id, it removes an inference entirely.
+
+Where a session record exposes the model it actually ran, recount reports whether
+it agrees with what pact recorded as declared. **A discrepancy is orchestration
+drift worth a finding, not an error** — it means the fleet ran something other
+than what its launcher believed it had asked for. Where either side is absent, the
+comparison degrades silently rather than manufacturing a finding out of a gap.
+
 ## `--compare`
 
 ```bash

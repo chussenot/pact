@@ -214,6 +214,36 @@ A roster name no pact process could have run under is shown as
 column — something other than pact wrote that name into the store, and it must
 not render like a peer.
 
+### The attribution chain is in the detail views, not the tables
+
+`Enter` on a path or an agent shows what is holding it, in words:
+
+```
+  orchestrator  active  held 1m30s  — pact-4xh.7: the audit table
+    via claude-code, model sonnet-4-6 (declared)
+```
+
+**`(declared)` is the point of that line.** Everything else on these screens was
+measured — pact watched the lease happen, timed it, read the lock. The model was
+*asserted*, by whoever set `PACT_MODEL` when the agent was spawned. pact does not
+detect a model and will not ([harness-detection.md](harness-detection.md) says
+why), so a reader comparing models across agents is one step from concluding pact
+verified them. It did not.
+
+**The fleet tables deliberately have no column for it.** That was tried, at three
+widths, and every one cost something that outranks it: a fixed 24 characters
+(enough for `claude-code ~sonnet-4-6`) crushed `Path` to `Pa` and `Held by` to
+`He` at 120 columns; 12% of the width was 11 characters, which cut `~sonnet-4-6`
+into a shorter, plausible, *wrong* model name; a 16-wide column on the roster
+turned `orchestrator` into `orchestrat`, and naming the agent is the one thing the
+roster exists to do. pact-rnc.10 is the incident where a half-read value on that
+table got a live agent's lease force-released. A detail view has the room to write
+the word out instead of compressing it to a marker.
+
+An undeclared fleet sees the screens it saw before this existed — no line at all,
+rather than a row of placeholders. `pact lease ls` does carry a `VIA` column,
+because its table sizes to its content.
+
 `Enter` opens the selected roster agent, or the selected path from the work
 table — whichever pane has focus (`h`/`l`). `(all leases)` is a filter and not
 an entity, so there is nothing to open on it.
@@ -382,6 +412,7 @@ named here that the CLI does not emit, fails CI:
 | `worktree` | ordinary checkout, main worktree, or linked worktree — and warns (`!`) when resolution fell back |
 | `coordination scope` | `PACT_WORKTREE_SCOPE` in effect; warns (`!`) when `local` is isolating leases from sibling worktrees |
 | `state placement` | which rule put the state directory where it is |
+| `attribution` | the full chain this process would stamp on its next event — agent, harness, declared model, harness session and subagent ids, branch, worktree — naming each link even when absent and saying what would supply it. Never fails; warns (`!`) only when a harness was detected but no session id resolved, which is what a fingerprint that has stopped working looks like. This is also how you test a fingerprint: see [harness-detection.md](harness-detection.md) |
 | `event log survives a clone` | is `.pact/events.jsonl` tracked; warns (`!`) when it is ignored, because the history dies at the next clone |
 | `message store survives a clone` | the same question for `.pact/messages.jsonl`, which became committed in 0.9.0 and had no check — so a repo could sit gitignored while carrying a `merge=union` attribute with nothing reporting it |
 | `state dir writable` | can pact actually write there — the shared directory of a linked worktree may not be yours |

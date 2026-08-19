@@ -844,6 +844,9 @@ every polite heads-up look like a failure.
   can and cannot tell a sender, and what upgrading from the bd era costs.
 - [docs/tui.md](tui.md) — `pact ui`'s four screens, the drill-in stack and its
   keybindings, and the `ui` Cargo feature it lives behind.
+- [docs/harness-detection.md](harness-detection.md) — which program is driving an
+  agent and which model it declared: what pact reads from the environment, the
+  dated captures behind each fingerprint, and why it refuses to detect a model.
 - [docs/telemetry.md](telemetry.md) — the optional `otel` feature: exactly what
   is exported, what is deliberately not, and what happens when the collector is
   missing or wedged.

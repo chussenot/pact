@@ -96,7 +96,7 @@ is, the non-goals, provenance. It holds no exit-code table; that contract lives 
 `cli.md` (the command/exit-code contract), `onboarding.md`, `leases.md`,
 `messaging.md`, `watch.md`, `architecture.md`, `mcp.md`, `tui.md`,
 `telemetry.md`, `development.md`, `testing.md`, `audit.md`,
-`fleet-patterns.md`.
+`fleet-patterns.md`, `harness-detection.md`.
 
 Every page under `docs/` opens with YAML front matter (`title`, `description`,
 `audience`); a new page needs one too. `README.md` has it as well. The three

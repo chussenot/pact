@@ -77,6 +77,66 @@ One orchestrator, agents in waves, one git worktree per agent per wave.
    the wave.
 5. **The orchestrator acts under its own `PACT_AGENT` and `BEADS_ACTOR`**, so its
    merges and checkpoints are not attributed to any worker.
+6. **The spawner declares `PACT_MODEL` and `PACT_HARNESS` beside `PACT_AGENT`**,
+   so every row the agent writes can say what wrote it. See below.
+
+## Declare what you launched
+
+```bash
+PACT_AGENT=agent-03 \
+BEADS_ACTOR=agent-03 \
+PACT_HARNESS=claude-code \
+PACT_MODEL=sonnet-4-6 \
+  claude -p "$PROMPT"
+```
+
+Two of these are new, and the argument for them is the argument for `BEADS_ACTOR`:
+**the spawner is the only party that knows, at the only moment the knowledge is
+free.** It just chose a model and a harness. The agent cannot reliably find out
+what it is running, pact will not guess, and by the time anyone wants the answer —
+reading `pact audit` after the run — the process is gone.
+
+`PACT_HARNESS` is optional where pact can fingerprint the harness
+([harness-detection.md](harness-detection.md) lists what it recognises, which
+today is Claude Code and nothing else). `PACT_MODEL` is never optional, because
+there is nothing to fingerprint: pact records a **declaration** and marks it as
+one everywhere it renders it. A wrong declaration is worse than an absent one, so
+declare what you actually requested and nothing else.
+
+What you get: a `VIA` column in `pact lease ls` and `pact ui`, `model X (declared)`
+in the per-agent audit table, a `models by events` line that shows a run meant to
+be uniform that was not, and refusals that read
+
+```
+lease on src/api.rs is held by agent-01 [claude-code, sonnet-4-6] on branch wt/w3
+```
+
+instead of naming only `agent-01`.
+
+### `PACT_HARNESS_SUBAGENT` — declare it, or leave it unset
+
+`recount` can join a pact event to the exact harness transcript that produced it,
+rather than inferring it topologically, when the event carries
+`harness_subagent`. Like every other field here it is a **declaration**: pact
+reads the environment variable and nothing else.
+
+**Set it only if your harness or spawner tells you the id.** Some do; the one
+pact can fingerprint today does not — measured on Claude Code 2.1.235
+(2026-08-19), a spawned agent's environment is identical to its parent's and its
+own id is nowhere in it, and the orchestrator does not know it at spawn time
+either.
+
+**Do not go looking for it on disk.** The id names a transcript file, so an agent
+could in principle find its own by rummaging through the harness's state
+directory — and that is exactly the sort of thing pact does not do and does not
+ask you to do. It is a reverse-engineered private layout, it is one refactor from
+breaking, and an agent reading its harness's internals to label its own log
+entries is a coupling nobody wants to own. Absence is the honest signal.
+
+Leave it unset and nothing is lost that was ever really there: `recount` uses the
+topological join it has always used, and reports the confidence tier that says
+which one it took. Never invent a value — a wrong key produces a confident join to
+the wrong transcript, which is strictly worse than an honest inference.
 
 Three files, three reasons, and all of them need committing.
 

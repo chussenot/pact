@@ -89,7 +89,20 @@ fast answer to `unrecognized subcommand`. `pact mcp serve` is documented in
 [mcp.md](mcp.md); it is read-only and speaks MCP on stdio.
 
 Every subcommand accepts a global `--agent <name>` (or `PACT_AGENT` env var)
-and `--json` flag. `--all` on `release` is mutually exclusive with both
+and `--json` flag.
+
+**Attribution comes from the environment and has no flags.** `PACT_MODEL`,
+`PACT_HARNESS`, `PACT_HARNESS_SESSION` and `PACT_HARNESS_SUBAGENT` are stamped on
+every event and every message a process writes; a spawner sets them once beside
+`PACT_AGENT` rather than every command repeating them. Each is optional and each
+is absent — never `"unknown"` — when unset. `pact doctor`'s `attribution` check
+prints what this process resolved. See
+[harness-detection.md](harness-detection.md) for what pact reads and what it
+refuses to guess, and [fleet-patterns.md](fleet-patterns.md) for the spawner side.
+
+`lease ls` grows a `VIA` column when at least one live lease carries a harness or
+a declared model, on the same rule as its existing `WHERE` column: a fleet that
+declares nothing sees byte-identical output to before. `--all` on `release` is mutually exclusive with both
 `<path>` and `--force`; `--body-file` is mutually exclusive with the positional
 body. clap rejects those combinations rather than silently ignoring one.
 
