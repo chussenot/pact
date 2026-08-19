@@ -538,6 +538,8 @@ mod tests {
             messages_sent: 0,
             messages_received: 0,
             name_valid: true,
+            harness: None,
+            model: None,
         }
     }
 

@@ -36,6 +36,21 @@ pub struct AgentInfo {
     /// the `pact agents` table flag such an entry instead of rendering it
     /// indistinguishably from a real identity.
     pub name_valid: bool,
+    /// What this agent is running, from the lock file of a lease it holds RIGHT
+    /// NOW (pact-c3y).
+    ///
+    /// Live-lease-scoped on purpose, and it pairs with `leases_held` rather than
+    /// with `lease_events`: an agent's harness and model are properties of the
+    /// process, and the process is gone once the lease is. `events::actors`
+    /// could answer historically, but "this agent WAS a claude-code agent three
+    /// days ago" is not what a dashboard column called Via would be read as.
+    ///
+    /// Absent for an agent with no live lease, which is the same statement
+    /// `leases_held: 0` already makes, and absent for one that declared nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// The operator's mailbox, reserved by the protocol block itself
@@ -104,7 +119,15 @@ pub fn list(repo_root: &Path) -> Result<Vec<AgentInfo>> {
     let mut seen: BTreeMap<String, AgentInfo> = BTreeMap::new();
 
     for entry in lease::peek(repo_root, true)? {
-        observe(&mut seen, &entry.lease.agent, &entry.lease.acquired_at).leases_held += 1;
+        let info = observe(&mut seen, &entry.lease.agent, &entry.lease.acquired_at);
+        info.leases_held += 1;
+        // Last lock wins over an agent's several live leases. They are all the
+        // same process, so the only way they disagree is a lock left by an
+        // earlier incarnation of the name — and the newest is the better guess
+        // about what is running now. `or` on the LOCK, so a lock that declared
+        // nothing does not erase one that did.
+        info.harness = entry.lease.harness.clone().or_else(|| info.harness.take());
+        info.model = entry.lease.model.clone().or_else(|| info.model.take());
     }
 
     // History, not just live locks. Releasing a lease deletes its lock file, so
@@ -240,6 +263,8 @@ fn observe<'a>(
         messages_sent: 0,
         messages_received: 0,
         name_valid,
+        harness: None,
+        model: None,
     });
     if parse_ts(at) > parse_ts(&info.last_seen) {
         info.last_seen = at.to_string();
@@ -318,6 +343,8 @@ mod tests {
             messages_sent: 0,
             messages_received: 0,
             name_valid: true,
+            harness: None,
+            model: None,
         }
     }
 
@@ -331,6 +358,8 @@ mod tests {
             messages_sent: 0,
             messages_received: 2,
             name_valid: true,
+            harness: None,
+            model: None,
         }
     }
 

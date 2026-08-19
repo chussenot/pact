@@ -477,12 +477,21 @@ fn render_leases(entries: &[lease::LeaseEntry]) -> String {
     let located = entries
         .iter()
         .any(|e| e.lease.worktree.is_some() || e.lease.branch.is_some());
+    // VIA follows the same rule as WHERE, for the same reason (pact-c3y): a fleet
+    // where nobody declares anything gets byte-identical output to before, rather
+    // than a column of blanks inviting the reader to wonder what broke.
+    let attributed = entries
+        .iter()
+        .any(|e| e.lease.harness.is_some() || e.lease.model.is_some());
     let mut header = vec![
         "PATH".to_string(),
         "AGENT".to_string(),
         "HELD".to_string(),
         "STATE".to_string(),
     ];
+    if attributed {
+        header.push("VIA".to_string());
+    }
     if located {
         header.push("WHERE".to_string());
     }
@@ -495,6 +504,9 @@ fn render_leases(entries: &[lease::LeaseEntry]) -> String {
             human_secs(e.age_secs),
             e.state_label(),
         ];
+        if attributed {
+            row.push(lease_attribution(&e.lease));
+        }
         if located {
             row.push(lease_location(&e.lease));
         }
@@ -502,6 +514,22 @@ fn render_leases(entries: &[lease::LeaseEntry]) -> String {
         row
     }));
     table(&rows)
+}
+
+/// `claude-code / sonnet-4-6` for the VIA column.
+///
+/// The model is a DECLARATION, not a measurement — pact reads `PACT_MODEL` and
+/// records what it is told (see [`crate::harness::model`]). It is rendered
+/// unadorned here and marked in the TUI, where there is room; the honest
+/// affordance in a fixed-width table is that this column is called VIA rather
+/// than MODEL, so nothing claims the model was observed.
+fn lease_attribution(lease: &lease::LeaseInfo) -> String {
+    match (lease.harness.as_deref(), lease.model.as_deref()) {
+        (Some(h), Some(m)) => format!("{h} / {m}"),
+        (Some(h), None) => h.to_string(),
+        (None, Some(m)) => format!("/ {m}"),
+        (None, None) => String::new(),
+    }
 }
 
 /// `branch @ worktree` for the WHERE column, as compactly as the pair allows.

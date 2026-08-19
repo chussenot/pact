@@ -277,6 +277,11 @@ fn path_rows(data: &Store, path: &str, now: DateTime<Utc>) -> Vec<Row> {
             line.push_str(&format!("  — {note}"));
         }
         rows.push(Row::link(line, View::Agent(entry.lease.agent.clone())));
+        if let Some(chain) =
+            attribution_line(entry.lease.harness.as_deref(), entry.lease.model.as_deref())
+        {
+            rows.push(Row::fact(chain));
+        }
     }
     // The question a lock cannot answer once it is gone, and the reason this
     // screen exists: who had this file last?
@@ -387,6 +392,13 @@ fn agent_rows(data: &Store, agent: &str, now: DateTime<Utc>) -> Vec<Row> {
                 info.messages_received
             )));
             rows.push(identity_row(info));
+            // From the agent's live lock, so it says what is running NOW rather
+            // than what once was — see `agents::AgentInfo::harness`. An agent that
+            // has released everything shows none of this, which is the same
+            // statement `held now: 0` on the line above already makes.
+            if let Some(chain) = attribution_line(info.harness.as_deref(), info.model.as_deref()) {
+                rows.push(Row::fact(chain));
+            }
         }
         None => rows.push(Row::nothing("  no trace of this name in this repo")),
     }
@@ -494,6 +506,32 @@ fn agent_rows(data: &Store, agent: &str, now: DateTime<Utc>) -> Vec<Row> {
 /// forever (pact-rnc.5). `name_valid` is the stronger flag: a name that cannot
 /// pass `identity::validate` is one no pact process could ever have run under,
 /// however much traffic the store shows for it.
+/// What an agent is running, written out (pact-c3y).
+///
+/// This is where the attribution chain lives on the dashboard, and the reason is
+/// width. The fleet screen's lease table has no column to spare — every candidate
+/// width for one cost something that outranks it, and pact-rnc.10 is the incident
+/// where a half-read value on that table got a live agent's lease force-released.
+/// A detail view has room, so the affordance can be the actual word instead of a
+/// marker.
+///
+/// **`(declared)` is the point of this line.** Everything else on these screens
+/// was measured — pact watched the lease happen, timed it, read the lock. The
+/// model was asserted by whoever set `PACT_MODEL` at spawn; pact does not detect
+/// one and will not (see [`crate::harness::model`]). A reader comparing models
+/// across agents is one step from concluding pact verified them.
+///
+/// `None` when nothing is known, so an undeclared fleet sees the screen it saw
+/// before this existed rather than a row of placeholders.
+fn attribution_line(harness: Option<&str>, model: Option<&str>) -> Option<String> {
+    match (harness, model) {
+        (Some(h), Some(m)) => Some(format!("    via {h}, model {m} (declared)")),
+        (Some(h), None) => Some(format!("    via {h}")),
+        (None, Some(m)) => Some(format!("    model {m} (declared)")),
+        (None, None) => None,
+    }
+}
+
 fn identity_row(info: &AgentInfo) -> Row {
     if !info.name_valid {
         return Row::flag("  INVALID NAME — no pact process could have run under it");
@@ -972,5 +1010,47 @@ mod tests {
             app.detail.selected.as_deref(),
             Some(app.detail.rows[3].text.as_str())
         );
+    }
+
+    /// The model must never read as a measurement (pact-c3y).
+    ///
+    /// `attribution_line` is the affordance, so it is tested directly and by the
+    /// property that matters rather than by a golden string: whenever a model is
+    /// shown, the word `(declared)` is shown with it, and whenever only the
+    /// harness is known the word is absent — because the harness IS observed, and
+    /// a marker that appears on both halves has stopped distinguishing them.
+    ///
+    /// The undeclared case returning `None` is the other half: an undeclared fleet
+    /// sees the screen it saw before this existed, not a row of placeholders.
+    #[test]
+    fn a_model_is_never_shown_without_the_word_declared() {
+        let cases = [
+            (Some("claude-code"), Some("sonnet-4-6")),
+            (None, Some("sonnet-4-6")),
+            (Some("claude-code"), None),
+            (None, None),
+        ];
+        for (harness, model) in cases {
+            let line = attribution_line(harness, model);
+            match (&line, model) {
+                (Some(text), Some(m)) => {
+                    assert!(text.contains(m), "the model must be shown: {text}");
+                    assert!(
+                        text.contains("(declared)"),
+                        "a model shown without `(declared)` reads as something pact \
+                         verified, and pact cannot verify one: {text}"
+                    );
+                }
+                (Some(text), None) => assert!(
+                    !text.contains("(declared)"),
+                    "the harness is observed; marking it declared makes the word \
+                     meaningless: {text}"
+                ),
+                (None, _) => assert!(
+                    harness.is_none() && model.is_none(),
+                    "something was known and nothing was rendered"
+                ),
+            }
+        }
     }
 }

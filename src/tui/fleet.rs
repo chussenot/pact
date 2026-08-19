@@ -529,6 +529,12 @@ fn render_roster(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(Block::default().borders(Borders::LEFT), rule);
 
     let focused = focus(app) == Focus::Roster;
+    // No VIA column here, deliberately (pact-c3y). This panel is a narrow fixed
+    // sidebar; a 16-wide column for it truncated AGENT to ten characters, which
+    // turned `orchestrator` into `orchestrat` — and naming the agent is the one
+    // thing the roster exists to do. The attribution chain lives on the lease
+    // table, which has the width, and in full on the agent detail view, which has
+    // the room to label it.
     let header = Row::new(vec!["AGENT", "HELD", "SEEN", "!"])
         .style(Style::default().add_modifier(Modifier::BOLD));
 
@@ -619,6 +625,18 @@ fn render_work(frame: &mut Frame, area: Rect, app: &mut App) {
     // to a seconds-old lease read as "this long lease" and got a live agent's
     // claim force-released. Age and state say what an operator needs; both come
     // from lease.rs, so this table and `pact lease ls` cannot disagree.
+    // No attribution column here, and that is a decision rather than an omission
+    // (pact-c3y). It was tried, at three widths, and every one of them cost
+    // something that outranks it: a fixed 24 (enough for `claude-code
+    // ~sonnet-4-6`) crushed Path to `Pa` and Held by to `He` at 120 columns; 12%
+    // was 11 characters, which cut `~sonnet-4-6` itself into a shorter, plausible,
+    // WRONG model name; 14 fixed broke three other layout tests. This table's
+    // columns are already load-bearing — pact-rnc.10 is the incident where a
+    // half-read value on this screen got a live agent's lease force-released.
+    //
+    // The chain is in the detail view instead (`Enter` on a path or an agent),
+    // which has the room to write `model sonnet-4-6 (declared)` in words rather
+    // than compressing it to a marker nobody can read at a glance.
     let header = Row::new(vec!["Path", "Held by", "Age", "State", "Note"])
         .style(Style::default().add_modifier(Modifier::BOLD));
 

@@ -711,6 +711,8 @@ mod tests {
             messages_sent: sent,
             messages_received: received,
             name_valid: true,
+            harness: None,
+            model: None,
         }
     }
 

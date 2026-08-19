@@ -86,6 +86,7 @@ pub fn checks(root: &Path) -> DoctorReport {
     });
 
     worktree_checks(&ctx, &mut checks);
+    checks.push(attribution_check(&ctx));
 
     // Warns rather than fails, and the detail carries the argument rather than
     // just the verdict: an ignored event log is not broken, it is a repository
@@ -573,6 +574,66 @@ pub fn checks(root: &Path) -> DoctorReport {
 /// question "is my peer even sharing my leases?" is asked exactly when something
 /// is already confusing, and a check that is absent unless it fires is a check
 /// nobody knows to look for.
+/// The full attribution chain THIS process would stamp on its next event, spelled
+/// out (pact-c3y).
+///
+/// Informational — `ok` is always true, and it is not a judgment. An undeclared
+/// model is not a defect; a harness pact cannot fingerprint is not a defect. What
+/// would be a defect is a fleet discovering after the run that half its rows were
+/// unattributable, and this is the command that answers that beforehand.
+///
+/// It is also, deliberately, how a user TESTS a fingerprint. The variables
+/// `crate::harness` reads are undocumented and reverse-engineered (see
+/// docs/harness-detection.md); anyone adding a fingerprint for another harness
+/// needs a way to see what pact resolved without acquiring a lease and reading
+/// the log back, and this is it.
+///
+/// The `!` fires on exactly one situation: a harness detected but no session id
+/// resolved. That is the case where a fingerprint that used to work has stopped —
+/// the harness renamed a variable, or the session was launched some way that does
+/// not export it — and it is worth saying out loud, because everything downstream
+/// degrades silently by design and would otherwise never mention it.
+fn attribution_check(ctx: &repo::RepoContext) -> DoctorCheck {
+    let who = crate::harness::Attribution::resolve();
+    // Each link named even when absent, and named as absent rather than omitted:
+    // a reader checking why recount cannot key their run needs to see WHICH link
+    // is missing, and a line that silently drops the empty ones makes the reader
+    // guess whether the field exists at all.
+    let field = |label: &str, value: Option<&String>, hint: &str| match value {
+        Some(v) => format!("{label}={v}"),
+        None => format!("{label}=<absent, {hint}>"),
+    };
+    let agent = std::env::var("PACT_AGENT").ok();
+    let chain = [
+        field("agent", agent.as_ref(), "set PACT_AGENT"),
+        field("harness", who.harness.as_ref(), "no fingerprint matched"),
+        field("model", who.model.as_ref(), "declare with PACT_MODEL"),
+        field(
+            "harness_session",
+            who.session.as_ref(),
+            "set PACT_HARNESS_SESSION",
+        ),
+        field(
+            "harness_subagent",
+            who.subagent.as_ref(),
+            "set PACT_HARNESS_SUBAGENT — no harness exposes this",
+        ),
+        field("branch", ctx.branch().as_ref(), "detached HEAD"),
+        field(
+            "worktree",
+            ctx.worktree_name.as_ref(),
+            "no linked worktrees here",
+        ),
+    ]
+    .join(", ");
+    DoctorCheck {
+        name: "attribution",
+        ok: true,
+        warn: who.harness.is_some() && who.session.is_none(),
+        detail: chain,
+    }
+}
+
 fn worktree_checks(ctx: &repo::RepoContext, checks: &mut Vec<DoctorCheck>) {
     let scope = std::env::var("PACT_WORKTREE_SCOPE").unwrap_or_else(|_| "shared".to_string());
     let scope_local = scope == "local";

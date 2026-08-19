@@ -424,7 +424,13 @@ impl Store {
     fn rebuild_roster(&mut self) {
         let mut seen: BTreeMap<String, AgentInfo> = BTreeMap::new();
         for entry in &self.leases {
-            observe(&mut seen, &entry.lease.agent, &entry.lease.acquired_at).leases_held += 1;
+            let info = observe(&mut seen, &entry.lease.agent, &entry.lease.acquired_at);
+            info.leases_held += 1;
+            // From the LIVE lock only, mirroring `agents::list` — the dashboard's
+            // Via column says what an agent is running now, and a lock is the
+            // only evidence that survives exactly as long as the process does.
+            info.harness = entry.lease.harness.clone().or_else(|| info.harness.take());
+            info.model = entry.lease.model.clone().or_else(|| info.model.take());
         }
         for (_, e) in &self.events {
             observe(&mut seen, &e.agent, &e.at).lease_events += 1;
@@ -533,6 +539,8 @@ fn observe<'a>(
         // A name that cannot pass `identity::validate` is one no pact process
         // could have run as, however much traffic the store shows for it.
         name_valid: identity::validate(name).is_ok(),
+        harness: None,
+        model: None,
     });
     if parse_at(at) > parse_at(&info.last_seen) {
         info.last_seen = at.to_string();
