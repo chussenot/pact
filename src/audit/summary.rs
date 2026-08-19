@@ -84,6 +84,26 @@ pub struct AgentActivity {
     #[serde(default)]
     pub reclaims: usize,
     pub held_secs_total: i64,
+    /// The attribution chain this agent's rows carried, last-wins (pact-c3y).
+    ///
+    /// Attribution, never judgment. Nothing here can fail a check and nothing
+    /// here is compared against an expectation: an agent that declared no model
+    /// is not doing anything wrong, and a summary that implied otherwise would
+    /// train fleets to declare something rather than the right thing.
+    ///
+    /// Last-wins rather than first, matching `events::context_at_end`: an agent
+    /// re-spawned onto a different model mid-run genuinely changed, and the
+    /// earlier rows stay in the log saying so.
+    ///
+    /// Each is `None` when no row of this agent's carried it — which, until
+    /// fleets start declaring, is most of them, and is why every consumer here
+    /// degrades to omitting the column rather than to a placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -170,6 +190,23 @@ pub struct Summary {
     pub hold_secs: Option<HoldStats>,
     pub top_contended: Vec<Contended>,
     pub per_agent: Vec<AgentActivity>,
+    /// How many EVENTS each declared model wrote, and how many declared none
+    /// (pact-c3y).
+    ///
+    /// By events rather than by agent, deliberately: an agent that acquired once
+    /// and one that ran the whole build are not equal evidence about what a run
+    /// was made of, and counting heads would say they were.
+    ///
+    /// `model_undeclared` is the load-bearing half. Without it, a run where one
+    /// agent declared and nineteen did not reads as a single-model fleet — the
+    /// exact wrong conclusion, and the one a bare histogram invites.
+    ///
+    /// Attribution, not judgment: nothing here fails a check. A fleet is allowed
+    /// to declare nothing, and most do.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub models_by_events: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub model_undeclared: usize,
     /// How many events came from each invocation point — a linked worktree's
     /// name, `main`, `outside`, or `unknown` for events written before pact
     /// recorded it at all (pact-ler.1/.2).
@@ -278,8 +315,18 @@ pub fn summary(
             steals: 0,
             reclaims: 0,
             held_secs_total: 0,
+            harness: None,
+            model: None,
+            branch: None,
         });
         a.events += 1;
+        // Last-wins, and `or` on the ROW rather than on the accumulator: a row
+        // that carries nothing must not erase what an earlier row said, because
+        // most kinds in most logs carry nothing and the first `released` after an
+        // `acquired` would otherwise blank the agent out.
+        a.harness = e.harness.clone().or_else(|| a.harness.take());
+        a.model = e.model.clone().or_else(|| a.model.take());
+        a.branch = e.branch.clone().or_else(|| a.branch.take());
         if e.kind == "stolen" {
             if takeover_of_a_lapsed_lease {
                 a.reclaims += 1;
@@ -297,6 +344,18 @@ pub fn summary(
         if let Some(a) = per.get_mut(&h.agent) {
             a.holds += 1;
             a.held_secs_total += h.held_secs.unwrap_or(0);
+        }
+    }
+
+    // Computed over EVERY event, not over `per_agent`, which is truncated to
+    // TOP_N: the models line is about the whole run, and taking it from the
+    // top-ten table would silently drop the eleventh agent's model.
+    let mut models_by_events: BTreeMap<String, usize> = BTreeMap::new();
+    let mut model_undeclared = 0usize;
+    for (_, e) in &events {
+        match e.model.as_deref() {
+            Some(m) => *models_by_events.entry(m.to_string()).or_default() += 1,
+            None => model_undeclared += 1,
         }
     }
 
@@ -416,6 +475,8 @@ pub fn summary(
         hold_secs,
         top_contended,
         per_agent,
+        models_by_events,
+        model_undeclared,
         by_invoked_from,
         by_protocol,
         protocol_unstamped,
@@ -754,7 +815,62 @@ pub fn render_summary(s: &Summary) -> String {
                 },
                 secs(a.held_secs_total)
             ));
+            // Indented under the agent rather than widened into it: the row above
+            // is four numbers a reader scans down a column, and threading three
+            // free-text fields through it would break that alignment for every
+            // fleet, including the majority that declare nothing. Omitted whole
+            // when the agent carried no attribution at all.
+            let chain = [
+                a.harness.as_deref(),
+                a.model.as_deref().map(|_| "model"),
+                a.branch.as_deref().map(|_| "branch"),
+            ];
+            if chain.iter().any(Option::is_some) {
+                let mut parts = Vec::new();
+                if let Some(h) = &a.harness {
+                    parts.push(h.clone());
+                }
+                // "declared" is not decoration. Everywhere else in this report a
+                // value was measured from the log; this one was asserted by
+                // whoever launched the agent, and a reader comparing models
+                // across a fleet has to know which kind of claim they are
+                // reading. docs/audit.md carries the same warning at length.
+                if let Some(m) = &a.model {
+                    parts.push(format!("model {m} (declared)"));
+                }
+                if let Some(b) = &a.branch {
+                    parts.push(format!("branch {b}"));
+                }
+                out.push(format!("  {:<24} {}", "", parts.join(", ")));
+            }
         }
+    }
+
+    // One line, and only when there is more than nothing to say. The question it
+    // answers is "was this run the fleet I think it was" — a run that was meant
+    // to be uniform and shows two models is orchestration drift, and a run that
+    // shows none has not started declaring yet.
+    //
+    // By EVENTS, not by agent: an agent that acquired once and one that ran the
+    // whole build are not equal evidence about what the run was made of, and
+    // counting heads would say they were.
+    if !s.models_by_events.is_empty() {
+        let mut by_events: Vec<_> = s.models_by_events.iter().collect();
+        by_events.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let mut line = by_events
+            .iter()
+            .map(|(m, n)| format!("{m} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let undeclared = s.model_undeclared;
+        // The undeclared count is the load-bearing half. Without it a run where
+        // one agent declared and nineteen did not reads as a single-model fleet,
+        // which is the exact wrong conclusion.
+        if undeclared > 0 {
+            line.push_str(&format!(", undeclared {undeclared}"));
+        }
+        out.push(String::new());
+        out.push(format!("models by events (declared)  {line}"));
     }
 
     out.join("\n")

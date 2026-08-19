@@ -61,7 +61,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::events::ChainMismatch;
+use crate::events::{ChainMismatch, Event};
 use checks::claim_lease_divergence::{claim_divergences, ClaimDivergence};
 use checks::commit_correlation::{
     ConcurrentWrite, CrossHeldCommit, UncommittedHold, UncoveredCommit,
@@ -327,9 +327,73 @@ impl Check {
 }
 
 /// The report for a named check: findings plus enough context to judge them.
+/// One agent's attribution chain, as its own rows recorded it.
+///
+/// Last-wins per field, and `or` on the ROW rather than on the accumulator: most
+/// kinds in most logs carry nothing, so a row that declares nothing must not
+/// erase what an earlier row said.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AgentChain {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// Declared by the launcher; verified, if ever, by joining session records
+    /// (see recount). Rendered with the word `declared` wherever it is shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+impl AgentChain {
+    /// Absorb one event's attribution. See the struct doc for why this is `or`.
+    fn absorb(&mut self, e: &Event) {
+        self.harness = e.harness.clone().or_else(|| self.harness.take());
+        self.model = e.model.clone().or_else(|| self.model.take());
+        self.branch = e.branch.clone().or_else(|| self.branch.take());
+    }
+
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// `claude-code, model sonnet-4-6 (declared), branch wt/w3`.
+    ///
+    /// `(declared)` is not decoration: every other value in an audit report was
+    /// measured from the log, and this one was asserted by whoever launched the
+    /// agent. A reader comparing models across a fleet has to know which kind of
+    /// claim they are reading.
+    fn render(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(h) = &self.harness {
+            parts.push(h.clone());
+        }
+        if let Some(m) = &self.model {
+            parts.push(format!("model {m} (declared)"));
+        }
+        if let Some(b) = &self.branch {
+            parts.push(format!("branch {b}"));
+        }
+        parts.join(", ")
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct CheckReport {
     pub check: &'static str,
+    /// What each agent named in this report was running (pact-c3y).
+    ///
+    /// **On the report, once, rather than on every finding type.** Every check's
+    /// findings name an agent — a `Hold`, a `DoubleWin`, a `RetryStorm` — and a
+    /// reader looking at one wants to know what that agent was. Threading three
+    /// fields into nine finding structs would put the same agent's chain in a
+    /// dozen places in one report and give nine chances to forget it; a map keyed
+    /// by the name the finding already prints answers the same question once.
+    ///
+    /// **Attribution, never judgment.** Nothing here can fail a check, and no
+    /// check reads it. A fleet that declares nothing produces an empty map and a
+    /// report byte-identical to what it printed before this existed.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub agents: std::collections::BTreeMap<String, AgentChain>,
     /// The constraints the run operated under — the same map the summary prints.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub context: std::collections::BTreeMap<String, String>,
@@ -494,6 +558,7 @@ pub fn run_check(
         // drifted apart once (pact-98u). What a report calls a check, what the
         // parser accepts and what `--help` lists are now one list.
         check: check.name(),
+        agents: agent_chains(&events),
         context: loaded.context.clone(),
         commit_policy_skipped: None,
         events_scanned: events.len(),
@@ -653,8 +718,39 @@ pub fn render_check(r: &CheckReport) -> String {
     // Last, and after every other check's findings: informational rather than a
     // finding, which is why a clean commit-correlation run still reaches it.
     checks::commit_correlation::correlation_footer(r, &mut out);
+    attribution_footer(r, &mut out);
 
     out.join("\n")
+}
+
+/// Every agent this report names, and what it was running.
+///
+/// A trailer rather than a prefix: it is context for the findings above it, and a
+/// reader who has nothing to look up should not have to scroll past it. Omitted
+/// entirely when nothing was declared, which keeps an undeclared fleet's report
+/// exactly what it was before this existed.
+fn attribution_footer(r: &CheckReport, out: &mut Vec<String>) {
+    if r.agents.is_empty() {
+        return;
+    }
+    out.push(String::new());
+    out.push("attribution (nothing here fails a check)".to_string());
+    for (agent, chain) in &r.agents {
+        out.push(format!("  {agent:<24} {}", chain.render()));
+    }
+}
+
+/// Each agent's chain, from its own rows. Skips agents that declared nothing, so
+/// the map is empty rather than full of blanks on a log written before any of
+/// this existed.
+fn agent_chains(events: &[(usize, Event)]) -> std::collections::BTreeMap<String, AgentChain> {
+    let mut by_agent: std::collections::BTreeMap<String, AgentChain> =
+        std::collections::BTreeMap::new();
+    for (_, e) in events {
+        by_agent.entry(e.agent.clone()).or_default().absorb(e);
+    }
+    by_agent.retain(|_, chain| !chain.is_empty());
+    by_agent
 }
 
 #[cfg(test)]
@@ -1199,5 +1295,75 @@ mod tests {
             unknown.contains("topology"),
             "the list must name it: {unknown}"
         );
+    }
+
+    /// pact-c3y: the attribution footer travels with FINDINGS, and never becomes
+    /// one.
+    ///
+    /// Two claims in one test, because they are the same decision seen from both
+    /// sides. A report with something to explain names what each agent was
+    /// running — a finding says `agent-a held X for 50m`, and the reader's next
+    /// question is what `agent-a` was. A clean report says nothing extra: there is
+    /// nothing to look up, and the check's verdict must not acquire a paragraph
+    /// that could be read as a caveat on it.
+    ///
+    /// The `(declared)` marker is asserted here as well as in the TUI, because
+    /// this is the surface a post-mortem is written from and it is the one place a
+    /// model most looks like a measured value — it sits under a table of measured
+    /// ones.
+    #[test]
+    fn a_report_with_findings_names_what_each_agent_was_running_and_a_clean_one_does_not() {
+        let declared = |at: &str, agent: &str, kind: &str, path: &str| {
+            format!(
+                r#"{{"at":"{at}","agent":"{agent}","kind":"{kind}","path":"{path}","ttl_secs":60,"harness":"claude-code","model":"sonnet-4-6","branch":"wt/w3"}}"#
+            )
+        };
+        // A hold that ran 50 minutes past a 60s TTL with no renew: a finding.
+        let tmp = with_log(&[
+            &declared("2026-08-11T08:00:00Z", "agent-a", "acquired", "p.rs"),
+            &declared("2026-08-11T08:50:00Z", "agent-a", "released", "p.rs"),
+        ]);
+        let report = run_check(tmp.path(), Check::StaleHolds, None, false).unwrap();
+        assert!(
+            !report.stale_holds.is_empty(),
+            "the fixture must produce a finding"
+        );
+
+        let rendered = render_check(&report);
+        assert!(
+            rendered.contains("agent-a") && rendered.contains("claude-code"),
+            "a finding's agent must be resolvable to what it was running: {rendered}"
+        );
+        assert!(
+            rendered.contains("model sonnet-4-6 (declared)"),
+            "a model sits under a table of measured values and must say it is not \
+             one of them: {rendered}"
+        );
+        assert!(
+            rendered.contains("nothing here fails a check"),
+            "attribution is not judgment, and the report has to say so where a \
+             reader of findings will see it: {rendered}"
+        );
+        // And it is not a finding: the check's own verdict is unchanged by any of
+        // it.
+        assert_eq!(report.agents.len(), 1);
+
+        // Same declarations, no finding: nothing to look up, so nothing printed.
+        let clean = with_log(&[
+            &declared("2026-08-11T08:00:00Z", "agent-a", "acquired", "p.rs"),
+            &declared("2026-08-11T08:00:30Z", "agent-a", "released", "p.rs"),
+        ]);
+        let clean = render_check(&run_check(clean.path(), Check::StaleHolds, None, false).unwrap());
+        assert!(!clean.contains("attribution"), "{clean}");
+
+        // And a log that declares nothing renders exactly what it did before this
+        // existed — an empty map, not a table of blanks.
+        let bare = with_log(&[
+            &ev("2026-08-11T08:00:00Z", "agent-a", "acquired", "p.rs"),
+            &ev_ttl("2026-08-11T08:50:00Z", "agent-a", "released", "p.rs", 60),
+        ]);
+        let bare = run_check(bare.path(), Check::StaleHolds, None, false).unwrap();
+        assert!(bare.agents.is_empty());
+        assert!(!render_check(&bare).contains("attribution"));
     }
 }
