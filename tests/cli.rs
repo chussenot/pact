@@ -34,9 +34,18 @@ fn pact(repo: &Path, agent: &str, args: &[&str]) -> Output {
         .expect("failed to run pact binary")
 }
 
-/// The binary with **no** identity in the environment. `env_remove` is not
-/// optional: these tests are run by agents who export `PACT_AGENT` themselves,
-/// and the child would inherit it.
+/// The binary with **no** identity and **no** attribution in the environment.
+/// `env_remove` is not optional: these tests are run by agents who export
+/// `PACT_AGENT` themselves, and the child would inherit it.
+///
+/// The same argument now covers the attribution chain (pact-c3y), and it bites
+/// harder there. `PACT_AGENT` is something a developer sets deliberately;
+/// `CLAUDECODE` and `CLAUDE_CODE_SESSION_ID` are set by the harness an agent
+/// happens to be running inside, so without this the `--json` shape assertions
+/// below pass in CI and on a maintainer's shell and FAIL for the agent editing
+/// this repository — the fields are `skip_serializing_if`, so they appear only
+/// when something is detected. A test whose result depends on who ran it is
+/// worse than a failing one. `attributed_cmd` is the deliberate opposite.
 fn pact_cmd(repo: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pact"));
     cmd.args(args).current_dir(repo);
@@ -6573,4 +6582,164 @@ fn topology_reads_its_expectation_from_context_when_expect_is_absent() {
     );
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["expected_topology"], "any", "{report}");
+}
+
+// ------------------------------------------- the attribution chain (pact-c3y)
+
+/// The deliberate opposite of [`pact_cmd`]: a command run with a harness and a
+/// declaration in its environment, for the tests that are about exactly that.
+fn attributed_cmd(repo: &Path, agent: &str, args: &[&str]) -> Output {
+    let mut cmd = pact_cmd(repo, args);
+    cmd.env("PACT_AGENT", agent)
+        .env("CLAUDECODE", "1")
+        .env(
+            "CLAUDE_CODE_SESSION_ID",
+            "0bb1638c-ef3b-454f-9ce8-c9bb6fb6d0e8",
+        )
+        .env("PACT_MODEL", "sonnet-4-6")
+        .env("PACT_HARNESS_SUBAGENT", "a99940ee56bb11045");
+    cmd.output().expect("failed to run pact binary")
+}
+
+/// End to end: what a launcher declares reaches BOTH committed ledgers.
+///
+/// Unit tests cover the resolution and the stamping separately, and would both
+/// pass with the two halves never wired together — which is the failure this
+/// repository has already paid for elsewhere (`tests/cli.rs` exists because a
+/// batch of bugs shipped through an untested CLI layer). The claim under test is
+/// the one a user makes: set these variables, and the log can say what wrote it.
+///
+/// `.pact/events.jsonl` and `.pact/messages.jsonl` are the two files pact commits,
+/// and they are asserted together because attribution that reaches one and not the
+/// other produces a history that can be asked who held a path but not who warned
+/// about it.
+#[test]
+fn a_declared_chain_reaches_both_committed_ledgers() {
+    let repo = init_repo();
+    std::fs::write(repo.path().join("a.rs"), "fn main() {}\n").unwrap();
+    // `init_repo` makes a bare `.git` DIRECTORY, which is all `find_repo_root`
+    // needs and is deliberately not a git repository. `branch` is read straight
+    // out of `<gitdir>/HEAD` — one file read, no `git rev-parse`, which is what
+    // lets it sit on every event of every kind — so writing that one file is
+    // exactly what this needs and is also a statement of where the value comes
+    // from.
+    std::fs::write(repo.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    assert!(
+        attributed_cmd(repo.path(), "agent-01", &["lease", "acquire", "a.rs"])
+            .status
+            .success()
+    );
+    assert!(attributed_cmd(
+        repo.path(),
+        "agent-01",
+        &["msg", "send", "--to", "agent-02", "the contract changed"]
+    )
+    .status
+    .success());
+
+    let event: serde_json::Value = events(repo.path())
+        .into_iter()
+        .find(|e| e["kind"] == "acquired")
+        .expect("an acquire was logged");
+    let message: serde_json::Value =
+        std::fs::read_to_string(repo.path().join(".pact/messages.jsonl"))
+            .expect("a message store")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .next()
+            .expect("a message was stored");
+
+    for (what, row) in [("event", &event), ("message", &message)] {
+        assert_eq!(row["harness"], "claude-code", "{what}: {row}");
+        assert_eq!(row["model"], "sonnet-4-6", "{what}: {row}");
+        assert_eq!(
+            row["harness_session"], "0bb1638c-ef3b-454f-9ce8-c9bb6fb6d0e8",
+            "{what}: {row}"
+        );
+        assert_eq!(
+            row["harness_subagent"], "a99940ee56bb11045",
+            "{what}: {row}"
+        );
+    }
+
+    // `branch` on the event only: a message is not a claim on a file, so its
+    // sender's checkout is not a fact about it. The point of asserting it here is
+    // that a plain single-worktree repo now records a branch AT ALL — across the
+    // 729 events in pact's own log before this, the number carrying one is zero,
+    // because the lock file's identically-named field is gated on the repo having
+    // linked worktrees.
+    assert_eq!(
+        event["branch"], "main",
+        "a single checkout must still record its branch: {event}"
+    );
+}
+
+/// Declaring nothing produces the ledger pact wrote before any of this existed.
+///
+/// The counterpart to the test above, and the one that keeps the convention
+/// honest: these fields are `skip_serializing_if`, so an undeclared fleet's rows
+/// carry no key at all rather than a null or an `"unknown"`. That is what lets a
+/// reader date a log by which fields are absent — the same discipline `ttl_secs`
+/// and `chain_hash` already follow — and an `"unknown"` would be counted as a
+/// model by `pact audit`'s models-by-events line.
+#[test]
+fn an_undeclared_run_writes_no_attribution_keys_at_all() {
+    let repo = init_repo();
+    std::fs::write(repo.path().join("a.rs"), "fn main() {}\n").unwrap();
+
+    assert!(pact(repo.path(), "agent-01", &["lease", "acquire", "a.rs"])
+        .status
+        .success());
+
+    let event: serde_json::Value = events(repo.path())
+        .into_iter()
+        .find(|e| e["kind"] == "acquired")
+        .expect("an acquire was logged");
+
+    for key in ["harness", "model", "harness_session", "harness_subagent"] {
+        assert!(
+            event.get(key).is_none(),
+            "{key} must be ABSENT, not null and not \"unknown\": {event}"
+        );
+    }
+}
+
+/// Reading the log for a value is only useful if a running fleet can be asked the
+/// same question, so `doctor` resolves and prints the chain THIS process would
+/// stamp — naming each link even when absent, and saying what would supply it.
+///
+/// That is also the only way to test a fingerprint on a harness pact has never
+/// seen: the alternative is acquiring a lease and reading the log back.
+#[test]
+fn doctor_prints_the_chain_this_process_would_stamp_including_what_is_missing() {
+    let repo = init_repo();
+
+    let attributed = stdout_of(&attributed_cmd(repo.path(), "agent-01", &["doctor"]));
+    let line = attributed
+        .lines()
+        .find(|l| l.contains("attribution"))
+        .unwrap_or_else(|| panic!("no attribution check: {attributed}"));
+    assert!(line.contains("harness=claude-code"), "{line}");
+    assert!(line.contains("model=sonnet-4-6"), "{line}");
+    assert!(
+        line.contains("harness_subagent=a99940ee56bb11045"),
+        "{line}"
+    );
+
+    // And with nothing set, every link is named as absent with its remedy —
+    // rather than omitted, which would leave a reader unable to tell a field that
+    // does not exist from one nobody supplied.
+    let bare = stdout_of(&pact(repo.path(), "agent-01", &["doctor"]));
+    let line = bare
+        .lines()
+        .find(|l| l.contains("attribution"))
+        .unwrap_or_else(|| panic!("no attribution check: {bare}"));
+    assert!(line.contains("model=<absent"), "{line}");
+    assert!(
+        line.contains("PACT_MODEL"),
+        "the remedy must be named: {line}"
+    );
+    assert!(!line.contains("unknown"), "{line}");
 }
