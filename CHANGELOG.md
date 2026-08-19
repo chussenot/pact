@@ -10,6 +10,20 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.11.0 - 2026-08-19
+#### Documentation
+- **(harness)** record the captures, the declaration pattern and the join ladder - (08e2f3b) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(audit)** report what each agent was running - (073968d) - Clement HUSSENOT-DESENONGES
+- **(cli)** name the harness and declared model where a holder is named - (b1d2614) - Clement HUSSENOT-DESENONGES
+- **(harness)** read the attribution chain and stamp it on every ledger row - (8818809) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(beads)** close the attribution-chain epic - (1d4893f) - Clement HUSSENOT-DESENONGES
+#### Tests
+- **(cli)** cover the attribution chain end to end - (2c51555) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.10.9 - 2026-08-18
 #### Bug Fixes
 - **(lease)** spare a swept holder that is still committing - (484427c) - Clement HUSSENOT-DESENONGES
