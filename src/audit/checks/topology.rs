@@ -19,6 +19,15 @@ pub struct TopologyMismatch {
     pub events: usize,
 }
 
+// No timestamp here, and that is the one deliberate exception to the rule
+// pact-x16.5 established — every finding that names an AGENT carries the moment
+// the named behaviour happened, so it can be joined to a transcript. This finding
+// names a LOCATION and counts a whole run's events at it; its span is the run's
+// span, and a first/last pair would say nothing a reader could act on. Every
+// other finding type was checked: Hold, DoubleWin, SilentContention,
+// MergeDivergence, ClaimDivergence, UncommittedHold and ConcurrentWrite all
+// already carried theirs, and retry-storm was the only real gap.
+
 /// Count every event by where pact was invoked from, and report the points that
 /// contradict the expectation.
 pub(in crate::audit) fn detect(

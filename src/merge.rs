@@ -71,8 +71,22 @@ pub fn mutex_key(into: &str) -> String {
 #[derive(Debug, Clone, Serialize)]
 pub struct MergeOutcome {
     pub agent: String,
-    /// The branch that was merged in.
-    pub branch: String,
+    /// The branches that were merged in, in the order given (pact-jat).
+    ///
+    /// Plural because a pair can be atomically coupled. `pact plan lint`
+    /// guarantees intra-wave FILE disjointness, and file-disjointness is not
+    /// BUILD-disjointness: one agent adding a field to a struct and another
+    /// constructing that struct as a literal in a test touch different files and
+    /// cannot land apart. Each verifies alone in its own worktree; whichever goes
+    /// first fails `--verify` and is reverted. Measured on a 26-agent run, where
+    /// the workaround was to assemble the pair on a scratch branch by hand and
+    /// merge that — which lands as one audited merge and loses both contributing
+    /// branches from the log.
+    ///
+    /// Was `branch: String`. A merge of several branches has no single one to
+    /// report, and a field naming the first would be a true-looking answer to a
+    /// question the caller did not ask.
+    pub branches: Vec<String>,
     /// The branch it was merged into.
     pub into: String,
     /// The reserved key held across the operation.
@@ -268,25 +282,37 @@ fn failing_tests(text: &str) -> BTreeSet<String> {
 }
 
 /// Redo a merge that was reverted for somebody else's breakage.
-fn reapply(repo_root: &Path, branch: &str, into: &str, agent: &str) -> Result<String> {
-    let (ok, _, stderr) = git(repo_root, &["merge", "--no-ff", "--no-commit", branch])?;
-    if !ok {
-        let _ = git(repo_root, &["merge", "--abort"]);
-        bail!("could not re-apply the merge after the baseline check: {stderr}");
-    }
-    let (ok, _, stderr) = git(
-        repo_root,
-        &[
-            "commit",
-            "-m",
-            &format!("Merge {branch} into {into}"),
-            "--trailer",
-            &format!("Pact-Agent={agent}"),
-        ],
-    )?;
-    if !ok {
-        let _ = git(repo_root, &["merge", "--abort"]);
-        bail!("could not commit the re-applied merge: {stderr}");
+fn reapply(repo_root: &Path, branches: &[String], into: &str, agent: &str) -> Result<String> {
+    // Every branch of the batch, in the order they were given, so the re-applied
+    // history is the one the baseline check reverted rather than a subset of it.
+    for branch in branches {
+        let (ok, _, stderr) = git(repo_root, &["merge", "--no-ff", "--no-commit", branch])?;
+        if !ok {
+            let _ = git(repo_root, &["merge", "--abort"]);
+            bail!("could not re-apply the merge after the baseline check: {stderr}");
+        }
+        // An already-up-to-date branch leaves no MERGE_HEAD and nothing to
+        // commit; committing anyway would fail and abort a re-apply that has
+        // otherwise gone fine.
+        let (has_merge_head, _, _) =
+            git(repo_root, &["rev-parse", "-q", "--verify", "MERGE_HEAD"])?;
+        if !has_merge_head {
+            continue;
+        }
+        let (ok, _, stderr) = git(
+            repo_root,
+            &[
+                "commit",
+                "-m",
+                &format!("Merge {branch} into {into}"),
+                "--trailer",
+                &format!("Pact-Agent={agent}"),
+            ],
+        )?;
+        if !ok {
+            let _ = git(repo_root, &["merge", "--abort"]);
+            bail!("could not commit the re-applied merge: {stderr}");
+        }
     }
     head(repo_root)
 }
@@ -365,7 +391,7 @@ fn head(repo_root: &Path) -> Result<String> {
 pub fn merge(
     repo_root: &Path,
     agent: &str,
-    branch: &str,
+    branches: &[String],
     verify: Option<&str>,
     ttl_secs: u64,
     allow_dirty: bool,
@@ -394,8 +420,16 @@ pub fn merge(
     }
 
     // Resolved before the mutex: a bad argument should cost nobody a wait, and
-    // the resolved name is what every later step and the outcome report use.
-    let branch = &resolve_branch(repo_root, branch)?;
+    // the resolved names are what every later step and the outcome report use.
+    // ALL of them, before any merge starts — a typo in the second branch must not
+    // be discovered with the first one already landed and the mutex held.
+    if branches.is_empty() {
+        bail!("no branch to merge");
+    }
+    let branches: Vec<String> = branches
+        .iter()
+        .map(|b| resolve_branch(repo_root, b))
+        .collect::<Result<_>>()?;
 
     let key = mutex_key(&into);
     let before = head(repo_root)?;
@@ -409,10 +443,10 @@ pub fn merge(
         &key,
         ttl_secs,
         false,
-        Some(format!("merging {branch} into {into}")),
+        Some(format!("merging {} into {into}", branches.join(" "))),
     )?;
 
-    match merge_while_held(repo_root, agent, branch, &into, verify, &before) {
+    match merge_while_held(repo_root, agent, &branches, &into, verify, &before) {
         Ok(outcome) => {
             let mut outcome = outcome;
             outcome.mutex = key.clone();
@@ -436,14 +470,14 @@ pub fn merge(
 fn merge_while_held(
     repo_root: &Path,
     agent: &str,
-    branch: &str,
+    branches: &[String],
     into: &str,
     verify: Option<&str>,
     before: &str,
 ) -> std::result::Result<MergeOutcome, Failure> {
     let mut outcome = MergeOutcome {
         agent: agent.to_string(),
-        branch: branch.to_string(),
+        branches: branches.to_vec(),
         into: into.to_string(),
         mutex: String::new(),
         merge_commit: None,
@@ -452,58 +486,103 @@ fn merge_while_held(
         verified: None,
     };
 
-    // `--no-commit` is not a style choice: it is the only way a trailer reaches
-    // a merge commit, because `git merge` has no `--trailer`. `--no-ff` keeps
-    // the merge commit itself, which is what carries the attribution.
-    let (ok, _, stderr) =
-        git(repo_root, &["merge", "--no-ff", "--no-commit", branch]).map_err(Failure::Clean)?;
-    if !ok {
-        // Leave no half-merged tree behind for the next agent to find.
-        let _ = git(repo_root, &["merge", "--abort"]);
-        return Err(Failure::Clean(anyhow::anyhow!(
-            "merging {branch} into {into} failed, and the merge was aborted:\n{}",
-            stderr.trim()
-        )));
+    // Every branch lands BEFORE anything is verified, and that ordering is the
+    // whole feature (pact-jat). A pair can be atomically coupled — one adds a
+    // struct field, the other constructs that struct in a test — so each verifies
+    // alone in its own worktree and neither verifies alone HERE. Verifying
+    // between merges would fail the first one for a breakage the second repairs.
+    //
+    // Each gets its own merge commit, so the log keeps both contributing
+    // branches. Assembling them on a scratch branch by hand — the workaround this
+    // replaces — lands one audited merge and loses that.
+    let mut landed_any = false;
+    for branch in branches {
+        // `--no-commit` is not a style choice: it is the only way a trailer
+        // reaches a merge commit, because `git merge` has no `--trailer`.
+        // `--no-ff` keeps the merge commit itself, which carries the attribution.
+        let (ok, _, stderr) =
+            git(repo_root, &["merge", "--no-ff", "--no-commit", branch]).map_err(Failure::Clean)?;
+        if !ok {
+            // Leave no half-merged tree behind for the next agent to find. Any
+            // EARLIER branch of this batch is already committed, so unwind to
+            // where the batch began rather than merely aborting this one —
+            // otherwise a two-branch merge that fails on the second leaves the
+            // first landed and unverified, which is the state the mutex exists to
+            // prevent.
+            let _ = git(repo_root, &["merge", "--abort"]);
+            if landed_any {
+                let saved = protect_coordination_state(repo_root);
+                let _ = git(repo_root, &["reset", "--hard", before]);
+                restore_coordination_state(saved);
+            }
+            return Err(Failure::Clean(anyhow::anyhow!(
+                "merging {branch} into {into} failed, and the merge was aborted{}:\n{}",
+                if landed_any {
+                    " along with the branches already merged in this batch"
+                } else {
+                    ""
+                },
+                stderr.trim()
+            )));
+        }
+
+        // Robust against locale: a real merge leaves MERGE_HEAD, an up-to-date
+        // one does not. Matching git's English output would break under LANG.
+        let (has_merge_head, _, _) = git(repo_root, &["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+            .map_err(Failure::Clean)?;
+        if !has_merge_head {
+            // pact-f26: "already up to date" alone cannot tell an agent whether
+            // its work is on this branch. It usually is — a retry after a merge
+            // that landed reaches exactly here — and an agent that reads this as
+            // "nothing happened" goes looking through git log to find out. Name
+            // the commit that already contains the branch, so the message answers
+            // the question the caller actually has.
+            //
+            // In a batch this is per-branch: one branch being already in is not a
+            // reason to skip the others. The outcome only reports
+            // `already_up_to_date` when EVERY branch was, which is the single-
+            // branch meaning unchanged.
+            if outcome.merge_commit.is_none() {
+                outcome.merge_commit =
+                    git(repo_root, &["rev-parse", "--verify", "--quiet", branch])
+                        .ok()
+                        .filter(|(ok, _, _)| *ok)
+                        .map(|(_, sha, _)| sha.trim().to_string());
+            }
+            continue;
+        }
+
+        let (ok, _, stderr) = git(
+            repo_root,
+            &[
+                "commit",
+                "-m",
+                &format!("Merge {branch} into {into}"),
+                "--trailer",
+                &format!("Pact-Agent={agent}"),
+            ],
+        )
+        .map_err(Failure::Clean)?;
+        if !ok {
+            let _ = git(repo_root, &["merge", "--abort"]);
+            if landed_any {
+                let saved = protect_coordination_state(repo_root);
+                let _ = git(repo_root, &["reset", "--hard", before]);
+                restore_coordination_state(saved);
+            }
+            return Err(Failure::Clean(anyhow::anyhow!(
+                "the merge staged cleanly but the commit failed:\n{}",
+                stderr.trim()
+            )));
+        }
+        landed_any = true;
+        outcome.merge_commit = head(repo_root).ok();
     }
 
-    // Robust against locale: a real merge leaves MERGE_HEAD, an up-to-date one
-    // does not. Matching git's English output would break under LANG.
-    let (has_merge_head, _, _) =
-        git(repo_root, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).map_err(Failure::Clean)?;
-    if !has_merge_head {
-        // pact-f26: "already up to date" alone cannot tell an agent whether its
-        // work is on this branch. It usually is — a retry after a merge that
-        // landed reaches exactly here — and an agent that reads this as "nothing
-        // happened" goes looking through git log to find out. Name the commit
-        // that already contains the branch, so the message answers the question
-        // the caller actually has.
+    if !landed_any {
         outcome.already_up_to_date = true;
-        outcome.merge_commit = git(repo_root, &["rev-parse", "--verify", "--quiet", branch])
-            .ok()
-            .filter(|(ok, _, _)| *ok)
-            .map(|(_, sha, _)| sha.trim().to_string());
         return Ok(outcome);
     }
-
-    let (ok, _, stderr) = git(
-        repo_root,
-        &[
-            "commit",
-            "-m",
-            &format!("Merge {branch} into {into}"),
-            "--trailer",
-            &format!("Pact-Agent={agent}"),
-        ],
-    )
-    .map_err(Failure::Clean)?;
-    if !ok {
-        let _ = git(repo_root, &["merge", "--abort"]);
-        return Err(Failure::Clean(anyhow::anyhow!(
-            "the merge staged cleanly but the commit failed:\n{}",
-            stderr.trim()
-        )));
-    }
-    outcome.merge_commit = head(repo_root).ok();
 
     let Some(verify) = verify else {
         return Ok(outcome);
@@ -559,7 +638,7 @@ fn merge_while_held(
             // Not this agent's doing. Re-apply the merge and get out of the way:
             // blocking every unrelated change behind somebody else's breakage is
             // the livelock this branch exists to prevent.
-            match reapply(repo_root, branch, into, agent) {
+            match reapply(repo_root, branches, into, agent) {
                 Ok(commit) => {
                     outcome.merge_commit = Some(commit);
                     outcome.verified = Some(false);
@@ -615,13 +694,14 @@ fn merge_while_held(
     };
 
     Err(Failure::HoldingBroken(anyhow::anyhow!(
-        "verification failed after merging {branch} into {into}, so {reverted}{added}\n\
+        "verification failed after merging {} into {into}, so {reverted}{added}\n\
          \n\
          YOU STILL HOLD THE MERGE MUTEX, deliberately: a peer merging onto a \
          branch that has just failed its own oracle would bury the cause. Fix \
          the branch, or file a bead describing what it broke, then release with:\n\
          \n\
          \x20   pact lease release {}\n",
+        branches.join(" "),
         mutex_key(into)
     )))
 }
@@ -634,10 +714,14 @@ pub fn describe(o: &MergeOutcome) -> String {
             Some(sha) => format!(
                 "{} already contains {} ({}) — nothing to merge",
                 o.into,
-                o.branch,
+                o.branches.join(" "),
                 sha.get(..12).unwrap_or(sha)
             ),
-            None => format!("{} was already up to date with {}", o.into, o.branch),
+            None => format!(
+                "{} was already up to date with {}",
+                o.into,
+                o.branches.join(" ")
+            ),
         };
     }
     let commit = o.merge_commit.as_deref().unwrap_or("(unknown)");
@@ -655,7 +739,9 @@ pub fn describe(o: &MergeOutcome) -> String {
     };
     format!(
         "merged {} into {} as {short}, signed Pact-Agent={} — {proof}",
-        o.branch, o.into, o.agent
+        o.branches.join(" "),
+        o.into,
+        o.agent
     )
 }
 
@@ -739,7 +825,15 @@ mod tests {
         let root = tmp.path();
         branch_with_change(root, "feature", "changed\n");
 
-        let out = merge(root, "wheelwright", "feature", Some("true"), 600, false).unwrap();
+        let out = merge(
+            root,
+            "wheelwright",
+            &["feature".to_string()],
+            Some("true"),
+            600,
+            false,
+        )
+        .unwrap();
         assert_eq!(out.verified, Some(true));
         assert!(!out.already_up_to_date);
 
@@ -764,7 +858,15 @@ mod tests {
         branch_with_change(root, "bad", "broken\n");
         let before = head(root).unwrap();
 
-        let err = merge(root, "sluice", "bad", Some("false"), 600, false).unwrap_err();
+        let err = merge(
+            root,
+            "sluice",
+            &["bad".to_string()],
+            Some("false"),
+            600,
+            false,
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("YOU STILL HOLD THE MERGE MUTEX"), "{msg}");
         assert!(msg.contains("pact lease release"), "{msg}");
@@ -792,7 +894,15 @@ mod tests {
         let root = tmp.path();
         git(root, &["branch", "stale"]).unwrap();
 
-        let out = merge(root, "fuller", "stale", Some("true"), 600, false).unwrap();
+        let out = merge(
+            root,
+            "fuller",
+            &["stale".to_string()],
+            Some("true"),
+            600,
+            false,
+        )
+        .unwrap();
         assert!(out.already_up_to_date);
         // Since pact-f26 this names the commit that already contains the branch
         // rather than leaving the caller to find out with `git log`.
@@ -812,7 +922,15 @@ mod tests {
         branch_with_change(root, "feature", "changed\n");
         std::fs::write(root.join("f.txt"), "local edit not committed\n").unwrap();
 
-        let err = merge(root, "millwright", "feature", Some("true"), 600, false).unwrap_err();
+        let err = merge(
+            root,
+            "millwright",
+            &["feature".to_string()],
+            Some("true"),
+            600,
+            false,
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("uncommitted tracked changes"), "{msg}");
 
@@ -833,10 +951,26 @@ mod tests {
         branch_with_change(root, "bad", "broken\n");
 
         // Leaves the mutex held, on purpose.
-        merge(root, "sluice", "bad", Some("false"), 600, false).unwrap_err();
+        merge(
+            root,
+            "sluice",
+            &["bad".to_string()],
+            Some("false"),
+            600,
+            false,
+        )
+        .unwrap_err();
 
         branch_with_change(root, "other", "other\n");
-        let err = merge(root, "fuller", "other", Some("true"), 600, false).unwrap_err();
+        let err = merge(
+            root,
+            "fuller",
+            &["other".to_string()],
+            Some("true"),
+            600,
+            false,
+        )
+        .unwrap_err();
         assert_eq!(
             output::code_for(&err),
             2,
@@ -897,7 +1031,15 @@ mod tests {
         branch_with_change(root, "feature", "changed\n");
         std::fs::write(root.join(".pact/events.jsonl"), "{}\n{\"peer\":1}\n").unwrap();
 
-        let out = merge(root, "penstock", "feature", Some("true"), 600, false).unwrap();
+        let out = merge(
+            root,
+            "penstock",
+            &["feature".to_string()],
+            Some("true"),
+            600,
+            false,
+        )
+        .unwrap();
         assert_eq!(out.verified, Some(true), "{out:?}");
     }
 
@@ -918,7 +1060,15 @@ mod tests {
         std::fs::write(root.join(".pact/events.jsonl"), appended).unwrap();
 
         // Verification fails, so the merge is reverted with reset --hard.
-        merge(root, "sluicegate", "bad", Some("false"), 600, false).unwrap_err();
+        merge(
+            root,
+            "sluicegate",
+            &["bad".to_string()],
+            Some("false"),
+            600,
+            false,
+        )
+        .unwrap_err();
 
         // Not an exact match: pact appends its OWN lease events to this file
         // while merging, so the assertion is that nothing was LOST — both the
@@ -992,10 +1142,26 @@ mod tests {
         let tmp = repo();
         let root = tmp.path();
         branch_with_change(root, "feature", "changed\n");
-        merge(root, "a", "feature", Some("true"), 600, false).unwrap();
+        merge(
+            root,
+            "a",
+            &["feature".to_string()],
+            Some("true"),
+            600,
+            false,
+        )
+        .unwrap();
 
         // Same merge again — the retry a dirty-tree refusal used to provoke.
-        let again = merge(root, "a", "feature", Some("true"), 600, false).unwrap();
+        let again = merge(
+            root,
+            "a",
+            &["feature".to_string()],
+            Some("true"),
+            600,
+            false,
+        )
+        .unwrap();
         assert!(again.already_up_to_date);
         assert!(
             again.merge_commit.is_some(),
@@ -1034,10 +1200,18 @@ mod tests {
         branch_with_change(root, "feature", "changed\n");
         std::fs::write(root.join("other.txt"), "uncommitted work\n").unwrap();
 
-        let err = merge(root, "a", "feature", Some("true"), 600, false).unwrap_err();
+        let err = merge(
+            root,
+            "a",
+            &["feature".to_string()],
+            Some("true"),
+            600,
+            false,
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("--allow-dirty"), "{err:#}");
 
-        let out = merge(root, "a", "feature", Some("true"), 600, true).unwrap();
+        let out = merge(root, "a", &["feature".to_string()], Some("true"), 600, true).unwrap();
         assert_eq!(out.verified, Some(true), "{out:?}");
     }
 
@@ -1071,7 +1245,15 @@ mod tests {
         git(root, &["commit", "-q", "-m", "unrelated"]).unwrap();
         git(root, &["checkout", "-q", "master"]).unwrap();
 
-        let out = merge(root, "penstock", "unrelated", Some(VERIFY), 600, false).unwrap();
+        let out = merge(
+            root,
+            "penstock",
+            &["unrelated".to_string()],
+            Some(VERIFY),
+            600,
+            false,
+        )
+        .unwrap();
         assert!(out.landed_on_red, "it must land: {out:?}");
         assert_eq!(out.verified, Some(false), "and must not claim to be proved");
         assert!(out.merge_commit.is_some());
@@ -1115,7 +1297,15 @@ mod tests {
         git(root, &["commit", "-q", "-m", "adds a failure"]).unwrap();
         git(root, &["checkout", "-q", "master"]).unwrap();
 
-        let err = merge(root, "pitwheel", "worse", Some(VERIFY), 600, false).unwrap_err();
+        let err = merge(
+            root,
+            "pitwheel",
+            &["worse".to_string()],
+            Some(VERIFY),
+            600,
+            false,
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("YOU STILL HOLD THE MERGE MUTEX"), "{msg}");
         assert!(
@@ -1155,7 +1345,7 @@ mod tests {
         let err = merge(
             root,
             "a",
-            "feature",
+            &["feature".to_string()],
             Some("echo opaque failure; exit 1"),
             600,
             false,
@@ -1175,8 +1365,123 @@ mod tests {
         let root = tmp.path();
         branch_with_change(root, "feature", "changed\n");
 
-        let out = merge(root, "a", "feature", None, 600, false).unwrap();
+        let out = merge(root, "a", &["feature".to_string()], None, 600, false).unwrap();
         assert_eq!(out.verified, None);
         assert!(describe(&out).contains("unverified"), "{}", describe(&out));
+    }
+
+    /// pact-jat: a file-disjoint pair that is not BUILD-disjoint lands together
+    /// or not at all.
+    ///
+    /// This is the shape a 26-agent run could not express. `pact plan lint`
+    /// guarantees that two entries in one wave do not write the same FILE, and
+    /// two agents obeyed that perfectly: one added a field to a struct, the other
+    /// wrote a test constructing that struct. Different files, both lint-clean,
+    /// each verifying alone in its own worktree — and merged one at a time in
+    /// either order, whichever went first failed `--verify` and was reverted.
+    /// Only the pair together compiles.
+    ///
+    /// Modelled here with two files and a verify command that passes only when
+    /// both are present, which is the same dependency without a compiler. The
+    /// assertions are the three things that make this an audited merge rather
+    /// than the scratch-branch workaround it replaces: both land, BOTH branches
+    /// keep their own merge commit in the log, and the verification ran once over
+    /// the combined result rather than once per branch.
+    #[test]
+    fn a_pair_that_only_compiles_together_lands_under_one_verification() {
+        let tmp = repo();
+        let root = tmp.path();
+
+        // `field` adds the declaration; `user` adds the code that needs it.
+        for (branch, file) in [("field", "field.txt"), ("user", "user.txt")] {
+            git(root, &["checkout", "-q", "-b", branch]).unwrap();
+            std::fs::write(root.join(file), "x\n").unwrap();
+            git(root, &["add", "-A"]).unwrap();
+            git(root, &["commit", "-q", "-m", branch]).unwrap();
+            git(root, &["checkout", "-q", "master"]).unwrap();
+        }
+        // Green only when BOTH are present — the coupling, without a compiler.
+        let verify = "test -f field.txt && test -f user.txt";
+
+        // Alone, either one fails and is reverted: the state the fleet hit.
+        let err = merge(
+            root,
+            "solo",
+            &["field".to_string()],
+            Some(verify),
+            600,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("YOU STILL HOLD THE MERGE MUTEX"),
+            "half a coupled pair must not land: {err:#}"
+        );
+        // Give the mutex back so the batch below is not refused by our own lock.
+        crate::lease::release(root, "solo", &mutex_key("master"), true).unwrap();
+
+        let out = merge(
+            root,
+            "pair",
+            &["field".to_string(), "user".to_string()],
+            Some(verify),
+            600,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(out.verified, Some(true), "the pair verifies together");
+        assert_eq!(out.branches, vec!["field".to_string(), "user".to_string()]);
+
+        // Both contributing branches keep their own merge commit. That is the
+        // whole difference from assembling them on a scratch branch by hand,
+        // which lands one commit and loses which branches were in it.
+        let (_, log, _) = git(root, &["log", "--format=%s", "-3"]).unwrap();
+        assert!(log.contains("Merge field into master"), "{log}");
+        assert!(log.contains("Merge user into master"), "{log}");
+
+        // And the verification ran ONCE, over the combined result — not once per
+        // branch, which is what would have failed the first of the pair.
+        assert!(std::fs::metadata(root.join("field.txt")).is_ok());
+        assert!(std::fs::metadata(root.join("user.txt")).is_ok());
+    }
+
+    /// A batch that fails partway leaves NOTHING landed.
+    ///
+    /// The gap this closes is narrow and would have been silent: the loop commits
+    /// each branch as it goes, so a conflict on the second would otherwise leave
+    /// the first merged and unverified on the shared branch — precisely the state
+    /// the mutex exists to prevent, reached while holding it.
+    #[test]
+    fn a_batch_that_conflicts_partway_leaves_nothing_landed() {
+        let tmp = repo();
+        let root = tmp.path();
+        let before = head(root).unwrap();
+
+        // Two branches that both rewrite f.txt: the second cannot merge onto the
+        // first.
+        branch_with_change(root, "one", "one\n");
+        branch_with_change(root, "two", "two\n");
+
+        let err = merge(
+            root,
+            "batcher",
+            &["one".to_string(), "two".to_string()],
+            None,
+            600,
+            false,
+        )
+        .unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already merged in this batch"),
+            "the message must say the earlier branches went back too: {msg}"
+        );
+        assert_eq!(
+            head(root).unwrap(),
+            before,
+            "a partly-applied batch is exactly what must not survive"
+        );
     }
 }

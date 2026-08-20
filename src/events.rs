@@ -300,6 +300,36 @@ pub struct Event {
     /// See [`CONTEXT_KIND`] for why these rows exist at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_key: Option<String>,
+    /// The bead this hold is for, on the kinds whose `detail` IS the lease note
+    /// (pact-6hv).
+    ///
+    /// `pact lease acquire` has no `--bead` flag, and a 26-agent run put the id
+    /// in `--note` by convention instead — 83 claims, one convention (id, colon,
+    /// purpose), held across 26 agents without enforcement. It reads well in
+    /// `pact log` and `lease ls`, and it left the id as a substring of free text
+    /// that every consumer had to go looking for.
+    ///
+    /// So the note is parsed ONCE, by the writer, at the moment it is written,
+    /// and the answer is recorded. Three things follow that reader-side parsing
+    /// cannot give:
+    ///
+    /// * A later change to [`crate::beads::bead_id_in`]'s grammar cannot
+    ///   retroactively reinterpret history. That is `ttl_secs`' argument exactly:
+    ///   a judgement recorded when it was made outranks one recomputed by
+    ///   whatever binary happens to read the log.
+    /// * Every consumer gets it — `jq`, recount, a spreadsheet — without
+    ///   reimplementing the grammar and getting its edge cases differently wrong.
+    /// * It is gated to the kinds where `detail` is the note verbatim. A
+    ///   reader-side parse cannot make that distinction from outside: a `refused`
+    ///   row's detail quotes the HOLDER's note inside a sentence of pact's own,
+    ///   and an `expired` row's detail is pact's prose with no note in it at all.
+    ///
+    /// No flag was added. `--bead` would have meant a seventh positional
+    /// parameter through `acquire`/`acquire_inner`/`acquire_many` and their two
+    /// `Store` impls — 67 call sites — to record something the note already
+    /// carries correctly in every measured run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bead: Option<String>,
     /// `kind: "context"` only — the value, verbatim. Free text: a policy name, a
     /// topology expectation, or an operator's sentence about the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -17,7 +17,7 @@ pub(in crate::cli) fn run_merge(
     cwd: &Path,
     agent_flag: Option<&str>,
     json: bool,
-    branch: &str,
+    branches: &[String],
     verify: Option<&str>,
     ttl: &str,
     allow_dirty: bool,
@@ -28,7 +28,7 @@ pub(in crate::cli) fn run_merge(
     // across the tool, so an agent that learned it once has learned it.
     let ttl = lease::parse_ttl(ttl).map_err(|e| output::exit_with(USAGE_ERROR, e.to_string()))?;
 
-    let outcome = merge::merge(&root, &agent, branch, verify, ttl, allow_dirty)?;
+    let outcome = merge::merge(&root, &agent, branches, verify, ttl, allow_dirty)?;
     output::emit(json, &outcome, merge::describe);
     merge::warn_if_unproven(&outcome);
     Ok(())

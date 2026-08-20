@@ -707,9 +707,10 @@ pub(super) fn acquire_inner(
                         kind: "refused".to_string(),
                         path: Some(relative.clone()),
                         detail: Some(format!(
-                            "held by {} ({age}s old, {remaining}s remaining), use --steal to \
+                            "held by {} ({} left on their hold, taken {age}s ago), use --steal to \
                              override{note_suffix}",
-                            holder_location(&existing)
+                            holder_location(&existing),
+                            human_secs(remaining.max(0))
                         )),
                         ttl_secs: Some(ttl_secs),
                         covers_lines: None,
@@ -744,17 +745,35 @@ pub(super) fn acquire_inner(
                 // Advisory and best-effort — an unreadable registry says nothing
                 // rather than guessing, and neither branch can change the exit
                 // code, which stays 2 as the protocol contract requires.
+                // `--wait` leads, and that ordering is a correction (pact-x16.2).
+                // This note used to say "pick up other ready work; do NOT poll",
+                // and for a subagent that is not advice, it is a trap: a
+                // subagent's process IS its turn loop, so ending the turn to wait
+                // for a watch notification is operationally identical to exiting
+                // and nothing can re-enter it. Measured on one 12-agent fleet,
+                // seven agents took that advice, four never resumed, and the
+                // three that did resumed nine hours later within fourteen seconds
+                // of each other — because a human woke the parent session, not
+                // because pact reached them. One was holding four finished fixes.
+                //
+                // `pact watch add` stays in the message and stays useful, but it
+                // must no longer read as a complete instruction on its own.
                 if watch::is_subscribed(repo_root, agent, &relative) {
                     crate::output::warn(&format!(
-                        "note: you already watch {relative} — pact will send you the diff when \
-                         {} releases it ({}s left on their lease). Pick up other ready work; do \
-                         NOT poll for this path",
-                        existing.agent, remaining
+                        "note: you already watch {relative}, so pact will send you the diff when \
+                         {} releases it — but only if you are still running then. If you are a \
+                         subagent, ending your turn to wait is the same as exiting: re-run with \
+                         `--wait {}` and this command holds the wait for you instead",
+                        existing.agent,
+                        human_secs(remaining.max(1))
                     ));
                 } else {
                     crate::output::warn(&format!(
-                        "note: `pact watch add {relative}` and pact will tell you when {} \
-                         releases it, instead of you asking again",
+                        "note: `pact lease acquire {relative} --wait {}` blocks here until {} \
+                         releases it, without ending your turn. `pact watch add {relative}` \
+                         instead if you have other work to do first AND will still be running \
+                         to receive the diff",
+                        human_secs(remaining.max(1)),
                         existing.agent
                     ));
                 }
@@ -764,9 +783,26 @@ pub(super) fn acquire_inner(
                 // find it untouched, and conclude the lease is stale.
                 Err(exit_with(
                     2,
+                    // The REMAINDER first, in a human unit, and the age demoted
+                    // (pact-x16.3). This read "(33s old, 2667s remaining)" and an
+                    // agent retried twenty seconds later saying "their hold
+                    // should be nearly done" — it acted on the age, which leads
+                    // and has the grammatical weight, while the number the
+                    // decision actually turns on came second and parenthesised.
+                    // Nobody has ever needed to know how long a holder has been
+                    // holding; only how long is left.
+                    //
+                    // `lease ls` deliberately does NOT get this treatment: it
+                    // leads with age and a state label because pact-rnc.10 is the
+                    // opposite incident, where a four-digit remaining count next
+                    // to a seconds-old lease read as "this long lease" and got a
+                    // live agent's claim force-released. A refusal is a decision
+                    // about how long to wait; a listing is a decision about
+                    // whether to intervene, and they want different numbers.
                     format!(
-                        "lease on {relative} is held by {} ({age}s old, {remaining}s remaining); use --steal to override",
-                        holder_location(&existing)
+                        "lease on {relative} is held by {} ({} left on their hold, taken {age}s ago); use --steal to override",
+                        holder_location(&existing),
+                        human_secs(remaining.max(0))
                     ),
                 ))
             }
@@ -1346,8 +1382,19 @@ mod tests {
         let detail = refused.detail.as_deref().unwrap();
         assert!(detail.contains("agent-a"), "must name the holder: {detail}");
         assert!(
-            detail.contains("remaining"),
-            "must carry the holder's remaining TTL: {detail}"
+            detail.contains("left on their hold"),
+            "must carry the holder's remaining time: {detail}"
+        );
+        // And carry it FIRST (pact-x16.3). "(33s old, 2667s remaining)" produced
+        // a retry twenty seconds later saying "their hold should be nearly done":
+        // the age led, so the age is what got acted on. The ordering is the fix,
+        // not the presence of the number, which was always there.
+        let left = detail.find("left on their hold").unwrap();
+        let age = detail.find("ago").unwrap();
+        assert!(
+            left < age,
+            "the number a reader must act on has to come before the one they \
+             must not: {detail}"
         );
         assert!(
             detail.contains("my turn"),

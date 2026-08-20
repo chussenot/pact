@@ -58,6 +58,12 @@ pub(in crate::audit) fn claim_divergences(
     events: &[(usize, Event)],
     report: &mut CheckReport,
 ) {
+    // The HISTORY, not the endpoint (pact-x16.4). A lease event is a fact about
+    // the past and a bead's assignee is present tense; joining them across time
+    // reports every peer recovery as a protocol violation by the agent that
+    // followed the protocol. On one 12-agent run that made all seven findings
+    // false — see `beads::assignee_as_of`, which carries the measurement.
+    let changes = crate::beads::assignee_changes(repo_root);
     let assignees = crate::beads::interaction_assignees(repo_root);
     if assignees.is_empty() {
         // Absent, empty, unparseable, or no assignee change ever recorded: all
@@ -74,25 +80,38 @@ pub(in crate::audit) fn claim_divergences(
         let Some(path) = e.path.as_deref() else {
             continue;
         };
-        let Some(note) = e.detail.as_deref() else {
+        // The structured field first, the note only as a fallback (pact-6hv).
+        //
+        // `Event::bead` is the same parse, done by the writer at the moment the
+        // note was written and recorded there — so rows from a pact that stamps
+        // it are read rather than re-interpreted, and a later change to
+        // `bead_id_in`'s grammar cannot silently rewrite what an old hold was
+        // for. The fallback is not optional and never will be: every row written
+        // before that field existed still has to be checkable, and this
+        // repository's own log is full of them.
+        let Some(bead) = e
+            .bead
+            .as_deref()
+            .or_else(|| e.detail.as_deref().and_then(crate::beads::bead_id_in))
+        else {
             report.holds_naming_no_bead += 1;
             continue;
         };
-        let Some(bead) = crate::beads::bead_id_in(note) else {
-            report.holds_naming_no_bead += 1;
+        // As of when the lease was TAKEN. `None` means the bead had no assignee
+        // at that moment, which is not a divergence — there was nothing to
+        // diverge from, and reporting one would accuse an agent of contradicting
+        // a decision nobody had made yet.
+        let Some(assignee) = crate::beads::assignee_as_of(&changes, bead, &e.at) else {
             continue;
         };
-        let Some(assignee) = assignees.get(bead) else {
-            continue;
-        };
-        if assignee == &e.agent {
+        if assignee == e.agent {
             continue;
         }
         report.claim_divergences.push(ClaimDivergence {
             path: path.to_string(),
             agent: e.agent.clone(),
             bead: bead.to_string(),
-            assignee: assignee.clone(),
+            assignee,
             acquired_at: e.at.clone(),
             line: *line,
         });
@@ -275,5 +294,126 @@ mod tests {
         assert!(r.claim_divergences.is_empty());
         assert_eq!(r.findings(), 0);
         assert!(r.claim_unavailable.is_some());
+    }
+}
+
+#[cfg(test)]
+mod as_of_tests {
+    use crate::audit::fixtures::*;
+    use crate::audit::{run_check, Check};
+
+    fn assign(at: &str, issue: &str, who: &str) -> String {
+        format!(
+            r#"{{"id":"1","issue_id":"{issue}","kind":"field_change","actor":"x","created_at":"{at}","extra":{{"field":"assignee","new_value":"{who}"}}}}"#
+        )
+    }
+
+    /// pact-x16.4: the peer-recovery shape, which the check used to report as a
+    /// protocol violation by the agent that followed the protocol.
+    ///
+    /// The sequence, exactly as one 12-agent run produced it four times over:
+    /// agent A claims a bead, leases a file for it 47 seconds later — the
+    /// protocol's own order — then stalls. Agent C re-claims the bead under the
+    /// peer-recovery rule and finishes it. Nothing here is wrong, and the check
+    /// reported it as A leasing for C's bead, because it read C's claim, made 45
+    /// minutes later, against A's lease.
+    ///
+    /// The fix is not a heuristic: it resolves the assignee AS OF the lease's own
+    /// timestamp, so the question becomes the one the check always meant to ask.
+    #[test]
+    fn a_peer_recovery_is_not_a_divergence() {
+        let tmp = with_log(&[&ev("2026-08-15T20:32:33Z", "bedstone", "acquired", "t.rs")]);
+        // The lease note names the bead; bedstone owned it when the lease landed.
+        std::fs::write(
+            tmp.path().join(".pact/events.jsonl"),
+            format!(
+                "{}\n",
+                ev_note(
+                    "2026-08-15T20:32:33Z",
+                    "bedstone",
+                    "t.rs",
+                    "millrace-t7k: corpus gap"
+                )
+            ),
+        )
+        .unwrap();
+        with_interactions(
+            &tmp,
+            &[
+                &assign("2026-08-15T20:31:44Z", "millrace-t7k", "bedstone"),
+                // …then bedstone stalls, and tailrace recovers it 44 minutes later.
+                &assign("2026-08-15T21:16:42Z", "millrace-t7k", "tailrace"),
+            ],
+        );
+
+        let report = run_check(tmp.path(), Check::ClaimLeaseDivergence, None, false).unwrap();
+        assert!(
+            report.claim_divergences.is_empty(),
+            "an agent that claimed correctly and was later recovered from must not \
+             be named: {:?}",
+            report.claim_divergences
+        );
+    }
+
+    /// The real thing still fires: leasing for a bead that belonged to somebody
+    /// else AT THE TIME.
+    ///
+    /// Without this the fix would be indistinguishable from deleting the check —
+    /// which, given it produced seven false findings and no true ones on the run
+    /// that motivated this, is a live risk rather than a theoretical one.
+    #[test]
+    fn leasing_for_a_bead_that_was_already_someone_elses_still_diverges() {
+        let tmp = with_log(&[&ev("2026-08-15T20:00:00Z", "x", "acquired", "t.rs")]);
+        std::fs::write(
+            tmp.path().join(".pact/events.jsonl"),
+            format!(
+                "{}\n",
+                ev_note(
+                    "2026-08-15T20:32:33Z",
+                    "interloper",
+                    "t.rs",
+                    "millrace-t7k: taking this"
+                )
+            ),
+        )
+        .unwrap();
+        with_interactions(
+            &tmp,
+            &[&assign("2026-08-15T20:31:44Z", "millrace-t7k", "bedstone")],
+        );
+
+        let report = run_check(tmp.path(), Check::ClaimLeaseDivergence, None, false).unwrap();
+        assert_eq!(report.claim_divergences.len(), 1, "{report:?}");
+        assert_eq!(report.claim_divergences[0].agent, "interloper");
+        assert_eq!(report.claim_divergences[0].assignee, "bedstone");
+    }
+
+    /// A lease taken before the bead had any assignee is not a divergence.
+    ///
+    /// There was nothing to diverge from, and a finding here would accuse an agent
+    /// of contradicting a decision nobody had made yet.
+    #[test]
+    fn a_lease_predating_every_assignment_is_not_a_divergence() {
+        let tmp = with_log(&[&ev("2026-08-15T20:00:00Z", "x", "acquired", "t.rs")]);
+        std::fs::write(
+            tmp.path().join(".pact/events.jsonl"),
+            format!(
+                "{}\n",
+                ev_note(
+                    "2026-08-15T10:00:00Z",
+                    "early",
+                    "t.rs",
+                    "millrace-t7k: starting"
+                )
+            ),
+        )
+        .unwrap();
+        with_interactions(
+            &tmp,
+            &[&assign("2026-08-15T20:31:44Z", "millrace-t7k", "bedstone")],
+        );
+
+        let report = run_check(tmp.path(), Check::ClaimLeaseDivergence, None, false).unwrap();
+        assert!(report.claim_divergences.is_empty(), "{report:?}");
     }
 }

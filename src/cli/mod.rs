@@ -95,15 +95,36 @@ pub(crate) enum Command {
     },
     /// Merge a branch under the merge mutex, prove it, and release.
     ///
-    /// The self-merge sequence a fleet with no orchestrator has to run by hand,
-    /// as one auditable command: take the reserved key, merge with `--no-ff`,
-    /// sign the merge commit with `Pact-Agent` (which `git merge` cannot do on
-    /// its own), run `--verify`, and release. A failing verification reverts the
-    /// merge and DELIBERATELY keeps the mutex, so no peer merges onto a branch
-    /// that has just failed its own oracle. See docs/fleet-patterns.md.
+    /// The sequence a fleet has to run by hand, as one auditable command: take
+    /// the reserved key, merge with `--no-ff`, sign the merge commit with
+    /// `Pact-Agent` (which `git merge` cannot do on its own), run `--verify`, and
+    /// release.
+    ///
+    /// `--verify` asks whether YOUR merge ADDED a failure, not whether the branch
+    /// is green. Arriving to a branch that is already failing for somebody else's
+    /// reason, it lands your work anyway, says so, and releases the mutex — **a
+    /// red shared branch is never a reason to hold a finished merge.** Only a
+    /// failure your merge introduced is reverted, and only then is the mutex
+    /// DELIBERATELY kept, so no peer merges onto a branch that has just failed its
+    /// own oracle.
+    ///
+    /// It merges into the branch you are CURRENTLY on, which decides who can run
+    /// it. Under the one-worktree-per-agent topology pact recommends, somebody is
+    /// sitting in the main checkout on the shared branch, and git refuses any
+    /// other worktree a checkout of it — so an agent in a worktree cannot get
+    /// onto the target branch and cannot self-merge. There, the merges are the
+    /// orchestrator's, from the main checkout. Self-merge is for fleets where
+    /// nobody holds the shared branch. See docs/fleet-patterns.md.
     Merge {
-        /// The branch to merge into the current one.
-        branch: String,
+        /// The branches to merge into the current one.
+        ///
+        /// Several are merged under ONE mutex and proved by ONE `--verify` run,
+        /// because a pair can be atomically coupled: `plan lint` guarantees
+        /// intra-wave FILE disjointness, and one agent adding a struct field
+        /// while another constructs that struct in a test is file-disjoint and
+        /// cannot land apart. On failure all of them are reverted together.
+        #[arg(required = true, num_args = 1..)]
+        branches: Vec<String>,
         /// Command that proves the merge, run from the repository root after it
         /// lands — typically the test suite. Omitted means nothing proved it,
         /// which is reported rather than assumed to pass.
@@ -331,6 +352,33 @@ pub(crate) enum LeaseAction {
         /// Why you are claiming these paths. Recorded with the lease and shown
         /// by `lease ls`, `pact log` and `agents --for` — this IS the
         /// announcement, so a message repeating it is a message nobody needed.
+        ///
+        /// The bead this hold is for. Recorded as its own field on the lease
+        /// event, and placed at the front of the note so `lease ls`, `pact log`
+        /// and `agents --for` show it exactly as a hand-written one.
+        ///
+        /// `--bead x-4xh --note "split the audit table"` is the same lease as
+        /// `--note "x-4xh: split the audit table"`, which is what every fleet
+        /// types by hand. The flag makes the convention un-misspellable.
+        #[arg(long)]
+        bead: Option<String>,
+        /// Wait up to this long for a path somebody else is holding, instead of
+        /// exiting 2 immediately. Same duration grammar as `--ttl`.
+        ///
+        /// The wait happens INSIDE this command, which is the whole point. A
+        /// subagent's process is its turn loop: ending the turn to wait for a
+        /// notification is operationally identical to exiting, and nothing can
+        /// re-enter it. Measured on one 12-agent fleet, seven agents parked on
+        /// "subscribe and pick up other work", four never resumed, and three
+        /// resumed nine hours later only because a human woke the parent session.
+        /// Blocking here keeps the turn alive.
+        #[arg(long)]
+        wait: Option<String>,
+        /// Start it with the bead id and a colon — `--note "pact-4xh.7: split
+        /// the audit table"`. There is no `--bead` flag; pact reads that id out
+        /// of the note when it writes the event and records it as its own field,
+        /// which is what `audit --check claim-lease-divergence` cross-checks
+        /// against bd. See docs/fleet-patterns.md.
         #[arg(long)]
         note: Option<String>,
     },
@@ -404,7 +452,10 @@ pub(crate) enum ContextAction {
 /// `pact plan <action>`.
 #[derive(Subcommand)]
 pub(crate) enum PlanAction {
-    /// Lint a plan manifest: intra-wave file overlap, cycles, orphans, hot files.
+    /// Lint a plan manifest: intra-wave file overlap, dependency ordering, cycles,
+    /// orphans, hot files. A wave must be a dependency-free set — every entry's
+    /// `depends_on` has to live in a STRICTLY earlier wave — and `wave` is an
+    /// integer. See docs/plan.md.
     ///
     /// The manifest is a JSON array or one JSON object per line, of
     /// `{id, wave, files[], depends_on[]}`. pact does NOT read the Beads store to
@@ -641,7 +692,7 @@ pub(crate) fn run(cli: Cli) -> Result<i32> {
             run_lease(&cwd, cli.agent.as_deref(), cli.json, action).map(|()| 0)
         }
         Command::Merge {
-            branch,
+            branches,
             verify,
             ttl,
             allow_dirty,
@@ -649,7 +700,7 @@ pub(crate) fn run(cli: Cli) -> Result<i32> {
             &cwd,
             cli.agent.as_deref(),
             cli.json,
-            &branch,
+            &branches,
             verify.as_deref(),
             &ttl,
             allow_dirty,
@@ -733,6 +784,8 @@ mod tests {
                 ttl: "900".to_string(),
                 steal: false,
                 note: Some("rewriting the auth module".to_string()),
+                bead: None,
+                wait: None,
             },
         };
         let send = Command::Msg {

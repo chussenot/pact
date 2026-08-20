@@ -150,13 +150,22 @@ this protocol whenever you touch shared files or hand off work to others.
   record of who has leased the path, so a path nobody has ever leased has no
   owner to address and the send is refused outright. You cannot pre-address work
   that has not started — for that, name the agent with `--to`.
-- **On exit 2, use the number in the refusal — do not poll.** The refusal tells you
-  how long the holder has left. Wait on THAT order of magnitude, or better, take the
-  advice pact prints with it: subscribe with `pact watch add <path>` and pick up
-  other ready work, and the next release will tell you. Measured on one fleet: an
-  agent retried every 15 seconds, 33 times, against a median 355 seconds of
-  remaining hold whose note said it would renew — and 24 refusals in that run came
-  from agents that had ALREADY subscribed and polled anyway.
+- **On exit 2, wait INSIDE the command: `pact lease acquire <path> --wait <dur>`.**
+  It blocks until the path is free and returns the moment it is, so you never end
+  your turn to wait. That matters more than it sounds: if you are a subagent, your
+  process IS your turn loop, and ending a turn to wait for a notification is the
+  same as exiting — nothing can re-enter you. Measured on one 12-agent fleet, seven
+  agents took the old advice to "subscribe and pick up other work", four never
+  resumed at all, and the three that did resumed nine hours later within fourteen
+  seconds of each other, because a human woke the parent session. One of them was
+  holding four finished, tested, committed fixes.
+  **`pact watch add <path>` is still right when you genuinely have other work
+  first** and will still be running to receive the diff. It is not a way to wait.
+  **Never poll by re-running the command yourself.** That spends a turn per
+  attempt and is what `pact audit --check retry-storm` counts: one fleet retried
+  every 15 seconds, 33 times, against a median 355 seconds of remaining hold, and
+  24 refusals in that run came from agents that had ALREADY subscribed and polled
+  anyway.
 - **A path someone else holds exits 2** — branch on that, not on the message
   text. `pact lease ls` names the holder; message them and pick up something
   else, which is what announcing early bought you. `pact lease acquire --steal`
@@ -204,6 +213,22 @@ this protocol whenever you touch shared files or hand off work to others.
   from being ignored. Across two fleet builds, three of four messages were
   never acknowledged by the agent they were addressed to — including one that
   prevented a runtime panic. `pact audit --export` lists the stragglers.
+- **A red shared branch is NEVER a reason to hold a finished merge.**
+  `pact merge --verify` asks whether YOUR merge added a failure, not whether the
+  branch is green. Arriving to a branch that is already failing for somebody
+  else's reason, it lands your work anyway, says so, and releases the mutex; only
+  a failure your merge introduced is reverted, and only then does it keep the
+  mutex. So merge when your work is done and proven, and let pact decide which of
+  those two happened.
+  This rule is here — in the block `pact init` syncs into every repository —
+  rather than in one fleet's own notes, because that is where it was and it cost
+  a run. Four agents in one 12-agent fleet independently held finished, tested,
+  committed work off a red master, each citing the mechanic correctly: *"merging
+  now would falsely go red due to their unrelated unfixed bug"*. They were not
+  defying the rule; the rule did not exist yet where they could read it. It was
+  written 38 minutes after the first of them parked, and reached the NEXT
+  cohort's spawn prompt only. One of those four was holding four finished fixes,
+  two of them repaired regressions.
 - **Orient with `pact log`**: one chronological feed of who leased what and
   who said what. Read it when you join, and when you need to know whether a
   peer is still moving.
@@ -1916,5 +1941,49 @@ bd ready
             .count();
         assert_eq!(count, 1, "a second run appended a duplicate:\n{content}");
         assert!(content.contains("target/"));
+    }
+}
+
+#[cfg(test)]
+mod x16_tests {
+    use super::*;
+
+    /// pact-x16.1 and pact-x16.2: two rules that cost a fleet because they lived
+    /// somewhere agents could not read them.
+    ///
+    /// Both are asserted against the SYNCED block rather than against any
+    /// document, because "where it lives" is the entire finding in both cases.
+    /// The red-master rule was in one repository's annex, written 38 minutes
+    /// after four agents had already parked finished work off a red master and
+    /// reaching only the next cohort's spawn prompt. The wait advice was in a
+    /// refusal payload that told a subagent to do something a subagent cannot do.
+    /// A fix that landed in docs/ would reproduce both.
+    #[test]
+    fn the_synced_block_carries_the_rules_that_cost_a_fleet() {
+        let block = managed_block();
+
+        // pact-x16.1: what --verify actually asks, and the conclusion an agent
+        // must not draw from a red branch.
+        assert!(
+            block.contains("added a failure"),
+            "an agent has to know --verify asks whether ITS merge broke something"
+        );
+        assert!(
+            block.contains("NEVER a reason to hold"),
+            "four agents reasoned their way to the opposite; the block must \
+             foreclose it"
+        );
+
+        // pact-x16.2: the wait that a subagent can actually execute, and the
+        // absence of the advice it cannot.
+        assert!(
+            block.contains("--wait"),
+            "the only form of waiting available to a subagent must be the one \
+             the block names"
+        );
+        assert!(
+            !block.contains("pick up\nother ready work") && !block.contains("do not poll."),
+            "advice with no terminator must not survive a rewrite of the advice"
+        );
     }
 }

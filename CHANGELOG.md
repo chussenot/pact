@@ -766,6 +766,143 @@ reasoning a commit subject cannot.
 
 ## Notes — unreleased
 
+### Six findings from reading the transcripts behind the ledger
+
+recount v0.2.0 was pointed at four older pact ledgers — 2,456 rows, none carrying
+an attribution chain — and then at the Claude Code transcripts behind the audit
+findings. What came back is different in kind from a bug report: each finding
+quotes the agents' own words at the moment they made the decision, so several
+long-standing assumptions about fleet behaviour turn out to be wrong.
+
+**pact told agents to do something a subagent cannot do (x16.2).** On exit 2 the
+refusal said *"subscribe with `pact watch add` and pick up other ready work; do
+NOT poll"*. That advice has no terminator for a subagent, because **a subagent's
+process IS its turn loop** — ending the turn to wait for a notification is
+operationally identical to exiting, and nothing can re-enter it. Seven of twelve
+agents on one run took the advice, in their own words:
+
+```
+"Standing by for the monitor notification."
+"I'll pause here — the notification will arrive automatically when master clears"
+```
+
+Four never resumed. The other three resumed nine hours later within fourteen
+seconds of each other, because a human woke the parent session. One was holding
+four finished, tested, committed fixes. `pact audit` later reported eight stale
+holds and nine merge divergences: not seventeen lapses, one design gap counted
+twice by two checks.
+
+  So `pact lease acquire --wait <duration>` blocks until the path is free and
+  returns the moment it is, with the waiting inside a tool call the turn is
+  already in. It is not the polling the protocol warns against — that is an agent
+  spending a *turn* per attempt, which is what `--check retry-storm` counts. The
+  advice changed in all three places it appears, including the synced protocol
+  block. A first cut sized its sleep from the holder's remaining TTL and took 30
+  seconds to notice a release at 6; it backs off 1s→15s and now takes 7.
+
+**Four agents held finished work off a red master, and were right to (x16.1).**
+They did not defy the rule; the rule did not exist where they could read it. Each
+described the mechanic correctly — *"merging now would falsely go red due to their
+unrelated unfixed bug"* — and the correction was committed **38 minutes after the
+first of them parked**, reaching only the next cohort's spawn prompt. The rule now
+lives in the block `pact init` syncs into every repository: `pact merge --verify`
+asks whether YOUR merge added a failure, and a red shared branch is never a reason
+to hold a proven one.
+
+**The refusal led with the wrong number (x16.3).** `(33s old, 2667s remaining)`
+produced a retry twenty seconds later saying the hold *"should be nearly done"* —
+the age leads and carries the grammatical weight, and the age is what got acted
+on. It now reads `(44m0s left on their hold, taken 33s ago)`. `lease ls` is
+deliberately unchanged: pact-rnc.10 is the opposite incident, where a remaining
+count next to a seconds-old lease got a live agent's claim force-released. A
+refusal decides how long to wait; a listing decides whether to intervene.
+
+**`claim-lease-divergence` was comparing across time (x16.4).** It read a bead's
+CURRENT assignee against a lease taken in the past, so every peer recovery was
+reported as a violation by the agent that had followed the protocol exactly. On
+one repository all seven findings were false — including one proven from the
+agent's own tool calls, claiming the bead and leasing 47 seconds later, named as
+leasing for somebody else's bead because a peer re-claimed it 45 minutes on. The
+assignee is now resolved as of the lease's own timestamp. Measured on that
+repository: **7 findings → 0**, with a regression case proving a genuine
+divergence still fires.
+
+**Retry-storm findings carried no timestamp (x16.5)** — the only audit finding
+with no time on it at all, on the one check that is *about* behaviour over time,
+which made it the only one nothing downstream could join to anything. They now
+carry `first_refusal_at`, `last_refusal_at` and the line numbers of their
+refusals. Every other finding type was checked and already carried its moment;
+`TopologyMismatch` is a deliberate exception, since it names a location rather
+than an agent.
+
+**`pact lease acquire --bead <id>` (x16.6),** reversing a call made earlier the
+same day. Two independent fleets put the id at the front of `--note` by hand and
+both filed for the flag; that is the argument. It places the id at the front of
+the note for you, so the flag and the convention produce the same lease — the same
+note text everywhere it is displayed, and the same structured `bead` field on the
+event.
+
+### Four findings from a 26-agent fleet
+
+All four came from one run in another repository, filed by the fleet that hit
+them. Each carries its own evidence; none was a correctness bug in what pact
+promised, and three were gaps between what pact promised and what it did.
+
+**`pact doctor` promised data the audit could not read (pact-bpp).** The `Beads
+audit sidecar` check reported *"has data to read"* whenever
+`.beads/interactions.jsonl` existed. For a whole 26-agent run it did exist — 49
+rows, every one a create/close/note, not one an assignee change, because
+`BD_AUDIT_ENABLED` was never set. `claim-lease-divergence` said *"no assignee
+history"* afterwards. Both statements were true and the reader was told the wrong
+one at the only moment it could still be acted on. That gap is worse than a wrong
+string because **this is the one thing doctor reports that cannot be repaired**:
+bd records from the moment it is switched on and never retroactively, so that run
+can never be checked for claim/lease divergence. doctor now asks
+`claim-lease-divergence`'s own question — `interaction_assignees` non-empty — so
+the two cannot disagree, and the new warning says the window closes.
+
+**`pact merge` takes several branches (pact-jat).** `plan lint` guarantees that
+two entries in one wave do not write the same *file*, and file-disjointness is not
+build-disjointness. Two agents, both lint-clean: one added a field to a struct,
+the other wrote a test constructing that struct. Each verified alone in its own
+worktree; merged one at a time, in either order, the first failed `--verify` and
+was reverted. Only the pair compiles. `pact merge A B --verify CMD` now takes the
+mutex once, merges all of them, verifies once over the combined result, and
+reverts all of them together on failure — with each branch keeping its own merge
+commit, which is what the scratch-branch workaround loses.
+
+  `MergeOutcome.branch` is now `branches`, an array. A merge of several branches
+  has no single one to report. `merge --json` had no shape assertion, which is how
+  that could have gone unnoticed; it has one now.
+
+**The self-merge the help promised is unreachable from a worktree (pact-jat).**
+`pact merge` merges into the branch you are on, and in the topology pact
+recommends somebody is in the main checkout holding it — so git refuses every
+other worktree a checkout of it and no agent can reach the target branch. Rather
+than build a temporary detached worktree for a pattern no fleet has needed, the
+docs and the help now say which shape self-merge is for: a fleet where nobody
+holds the shared branch. Worktree fleets merge orchestrator-side, which is what
+the 26-agent run did, 27 times.
+
+**The bead id in a lease note is a field now (pact-6hv).** There is no `--bead`
+flag and there is not going to be one: it would mean a seventh positional
+parameter through `acquire`/`acquire_inner`/`acquire_many` and their two `Store`
+impls — 67 call sites — to record something the note already carries correctly
+(83 of 83 claims across 26 agents, by unenforced convention). Instead pact reads
+the first bead-shaped token out of the note when it writes the row and records it
+as `Event::bead`. The parse is dated, so a later change to the grammar cannot
+reinterpret an old hold; every consumer gets the field without reimplementing the
+grammar; and it is gated to the kinds whose `detail` IS the note, which a
+reader-side parse cannot tell from outside. `claim-lease-divergence` reads the
+field and falls back to the note, permanently.
+
+**And one correction to a filed premise.** pact-vqm reported that `plan lint`
+enforces two rules its documentation does not mention. `docs/plan.md` already
+documented both at 0.10.7, the exact version the fleet ran — verified against the
+tag. The gap was in the `--help` one-liner, which is what the caller read. That is
+now widened, and `docs/plan.md` gains the longest-path-depth recipe for deriving
+waves, which is the assignment that is lint-clean by construction.
+
 ### The attribution chain (pact-c3y)
 
 Every row pact writes now carries as much of an attribution chain as was knowable

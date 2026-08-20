@@ -206,6 +206,8 @@ pub(in crate::cli) fn run_lease(
             ttl,
             steal,
             note,
+            bead,
+            wait,
         } => {
             let agent = identity::resolve_agent(agent_flag)?;
             // Parsed here rather than in a clap `value_parser` because a bare
@@ -229,7 +231,13 @@ pub(in crate::cli) fn run_lease(
             // log, 100 acquire notes named a bead, 8 resolved through the export,
             // and all 8 were acquired by the agent it names — zero warnings, for
             // a file read per acquire. See beads::interaction_assignees.
-            let mut outcomes = lease::acquire_many(&root, &agent, &paths, ttl, steal, note)?;
+            let note = with_bead(bead.as_deref(), note);
+            let wait_secs = wait
+                .as_deref()
+                .map(lease::parse_ttl)
+                .transpose()
+                .map_err(|e| output::exit_with(USAGE_ERROR, e.to_string()))?;
+            let mut outcomes = acquire_waiting(&root, &agent, &paths, ttl, steal, note, wait_secs)?;
             // One path renders and serializes exactly as it always did — a
             // script doing `lease acquire f --json | jq .lease.path` must not
             // start getting an array back because the command learned to batch.
@@ -452,6 +460,157 @@ pub(in crate::cli) fn run_lease(
 /// note comes along because "what is this agent doing" is the question an
 /// operator is actually asking before they reach for --force.
 /// Paths the event log remembers that have no lock on disk right now.
+/// `--bead <id>` folded into the note, which is where every consumer already
+/// looks (pact-x16.6).
+///
+/// **Not a seventh parameter through the lease core, and that is a measured
+/// decision rather than a shortcut.** Threading a `bead` argument through
+/// `acquire`, `acquire_inner`, `acquire_many` and their two `Store` impls is 67
+/// call sites; putting the id at the front of the note reaches the same
+/// destinations by the route fleets already use. `log_event` parses it back out
+/// into `Event::bead`, so the lease event carries it as its own structured field
+/// (pact-6hv), and `lease ls`, `pact log` and `agents --for` show it exactly as
+/// they show a hand-written one — which is what the bead asked for.
+///
+/// So `--bead x-4xh --note "split the audit table"` and
+/// `--note "x-4xh: split the audit table"` are the same lease. Two independent
+/// fleets typed the second by hand, across 83 and 26 claims, without enforcement.
+/// The flag does not replace that convention; it makes it un-misspellable.
+///
+/// If the note ALREADY begins with a bead id, the flag still wins:
+/// `bead_id_in` takes the first match, and an explicit argument outranks prose.
+fn with_bead(bead: Option<&str>, note: Option<String>) -> Option<String> {
+    // `let bead = bead?` here would return None from the FUNCTION and silently
+    // discard the note whenever `--bead` was absent — which is every lease any
+    // existing fleet takes. Caught by the equivalence test below, and worth the
+    // comment because the `?` reads correct.
+    let Some(bead) = bead.map(str::trim).filter(|b| !b.is_empty()) else {
+        return note;
+    };
+    Some(match note {
+        Some(note) if !note.trim().is_empty() => format!("{bead}: {}", note.trim()),
+        // A bare `--bead` with no note is still an announcement — it says which
+        // work this hold is for, which is more than most notes manage.
+        _ => bead.to_string(),
+    })
+}
+
+/// The lease-hot path of `--wait`: retry inside THIS process until the paths are
+/// free or the budget runs out (pact-x16.2).
+///
+/// **Waiting has to happen inside a tool call, because a subagent's process is
+/// its turn loop.** pact's advice on exit 2 was "subscribe with `pact watch add`
+/// and pick up other ready work"; for an agent that is a Claude Code Task — which
+/// most fleet agents are — ending the turn to wait for that notification is
+/// operationally identical to exiting, and neither `pact watch` nor any
+/// harness-level monitor can re-enter a subagent that has stopped producing
+/// turns. Measured on one 12-agent run: seven agents parked on that advice, four
+/// never resumed at all, and the three that did resumed within fourteen seconds
+/// of each other nine hours later, when a human woke the parent session. One of
+/// them was holding four finished, tested, committed fixes.
+///
+/// So this is not the polling the protocol warns against — that is an AGENT
+/// spending a turn per attempt, which is what produced `--check retry-storm`.
+/// This spends no turns at all: one tool call that returns when the path is
+/// free.
+///
+/// The sleep is sized from the holder's OWN remaining time, read with
+/// `lease::peek` (which does not garbage-collect, so asking cannot change the
+/// answer), and capped so a holder who releases early is not waited out. A lock
+/// that cannot be read falls back to the cap rather than to a tight loop.
+fn acquire_waiting(
+    root: &Path,
+    agent: &str,
+    paths: &[String],
+    ttl: u64,
+    steal: bool,
+    note: Option<String>,
+    wait_secs: Option<u64>,
+) -> Result<Vec<lease::AcquireOutcome>> {
+    let Some(budget) = wait_secs else {
+        return lease::acquire_many(root, agent, paths, ttl, steal, note);
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(budget);
+    let mut announced = false;
+    let mut attempt = 0u32;
+    loop {
+        let err = match lease::acquire_many(root, agent, paths, ttl, steal, note.clone()) {
+            Ok(outcomes) => return Ok(outcomes),
+            // Only a HELD path is worth waiting through. Every other failure —
+            // a usage error, an unreadable lock, no git repo — is not going to
+            // become true by waiting, and retrying it would turn a clear error
+            // into a slow one.
+            Err(e) if output::code_for(&e) == 2 => e,
+            Err(e) => return Err(e),
+        };
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            // The refusal the last attempt produced, unchanged: the exit code
+            // stays 2 and the message still names the holder, so a caller that
+            // branched on either before `--wait` existed still works.
+            return Err(err);
+        }
+        if !announced {
+            output::warn(&format!(
+                "note: waiting up to {} for {}; this command is holding the wait so your \
+                 turn does not have to end — it returns as soon as the path is free",
+                lease::human_secs(budget as i64),
+                paths.join(", ")
+            ));
+            announced = true;
+        }
+        std::thread::sleep(next_poll(root, paths, attempt).min(left));
+        attempt += 1;
+    }
+}
+
+/// How long to sleep before attempt `attempt`: gentle backoff, never past the
+/// point where the hold being waited on could legally be reclaimed.
+///
+/// **Backoff rather than "sleep until their TTL expires", and the difference is
+/// the whole responsiveness of `--wait`.** A holder's remaining TTL is its worst
+/// case, not its expected one: pact's own history puts the median file hold at
+/// 14 minutes against a 45-minute default and the median merge hold at 37
+/// seconds against 30 minutes. A first cut here slept for the holder's remaining
+/// time and took 30 seconds to notice a release that happened at 6 — correct,
+/// and useless, because releasing early is the common case rather than the
+/// exception.
+///
+/// So: start short, grow, and cap. The floor stops a lock that lapsed a moment
+/// ago from spinning; the ceiling bounds how long a release can go unnoticed.
+/// The holder's own remaining time is an upper bound on top of that, so the last
+/// sleep before a lease becomes reclaimable lands on it rather than overshooting.
+///
+/// Read with `lease::peek`, which does not garbage-collect — asking who holds a
+/// path must not change the answer. An unreadable lock yields the ceiling rather
+/// than a tight loop.
+fn next_poll(root: &Path, paths: &[String], attempt: u32) -> std::time::Duration {
+    const FLOOR_SECS: u64 = 1;
+    const CEILING_SECS: u64 = 15;
+    let backoff = FLOOR_SECS
+        .saturating_mul(1u64 << attempt.min(6))
+        .min(CEILING_SECS);
+    let soonest = lease::peek(root, true)
+        .unwrap_or_default()
+        .into_iter()
+        // Normalized on both sides, because the caller spells a path however it
+        // is standing — `./src/a.rs` from a subdirectory is the lock the holder
+        // took as `src/a.rs`, and matching the raw strings would wait on nothing
+        // and poll at the floor.
+        .filter(|e| {
+            paths
+                .iter()
+                .any(|p| lease::normalize_path(root, p) == e.lease.path)
+        })
+        // Plus the grace period, because that is when the lease actually becomes
+        // reclaimable — waking exactly at the TTL would find it still held and
+        // spend an attempt learning that.
+        .map(|e| (e.remaining_secs + lease::GRACE_SECS).max(0) as u64)
+        .min()
+        .unwrap_or(CEILING_SECS);
+    std::time::Duration::from_secs(backoff.min(soonest.max(FLOOR_SECS)))
+}
+
 fn released_paths(root: &Path, held: &[lease::LeaseEntry]) -> Vec<String> {
     events::owners(root)
         .unwrap_or_default()

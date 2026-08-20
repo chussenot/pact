@@ -13,6 +13,36 @@ nothing stops you from `git push --force` over a coworker's branch. The point
 isn't to make that impossible; it's to make coordinating cheap enough that
 agents actually do it.
 
+## Waiting for a held path: `--wait`
+
+```bash
+pact lease acquire src/api.rs --wait 20m
+```
+
+Blocks until the path is free and acquires it, or exits 2 with the usual refusal
+when the budget runs out. The exit code and the message are unchanged, so a caller
+that branched on either before this existed still works.
+
+**The wait happens inside the command, and that is the point.** pact used to
+answer a refusal with "subscribe with `pact watch add` and pick up other ready
+work". For a subagent that is a trap rather than advice: its process is its turn
+loop, so ending the turn to wait for the notification is the same as exiting, and
+nothing can re-enter it. On one 12-agent fleet seven agents took that advice, four
+never resumed, and the three that did resumed nine hours later within fourteen
+seconds of each other, when a human woke the parent session. See
+[watch.md](watch.md#watch-is-not-a-way-to-wait).
+
+This is not the polling the protocol warns against. Polling is an *agent* spending
+a turn per attempt — the behaviour `pact audit --check retry-storm` counts. `--wait`
+spends no turns: one tool call that returns when the path is free.
+
+Internally it retries with a short backoff, capped at 15 seconds and never
+sleeping past the point where the hold it is waiting on becomes reclaimable. A
+first cut slept for the holder's remaining TTL instead and took 30 seconds to
+notice a release that happened at 6 — correct, and useless, because holds
+routinely end long before their TTL: pact's own median file hold is 14 minutes
+against a 45-minute default.
+
 ## Reclaiming a hold whose holder is gone
 
 `--steal` overrides a live claim on your assertion that the holder is gone. It

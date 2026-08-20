@@ -410,8 +410,25 @@ never a false one. Three limits, all verified rather than assumed:
    — `bd update --assignee` appends the `field_change` row this check replays. Take
    the warning as cosmetic, not as a failed remediation.
 
-   `pact doctor`'s **Beads audit sidecar** check warns when the file is absent, and
-   names both levers along with that warning. It deliberately does *not* claim
+   The hold's side of the join is `Event::bead`, a field the writer fills by
+   reading the first bead-shaped token out of the lease note (pact-6hv). Rows
+   written before that field existed are still checked, by parsing the note at
+   read time exactly as this check always did — the fallback is permanent, since
+   this repository's own log is full of such rows. See
+   [fleet-patterns.md](fleet-patterns.md) for the note convention it reads.
+
+   `pact doctor`'s **Beads audit sidecar** check warns when the file is absent
+   **and when it is present but carries no assignee change**, asking the same
+   `interaction_assignees` predicate this check uses so the two cannot disagree
+   (pact-bpp). That second state is the one that costs something: a 26-agent run
+   spent its whole life in it — 49 rows on disk, every one a create/close/note,
+   `BD_AUDIT_ENABLED` never set — with doctor reporting "has data to read"
+   throughout, and the truth arriving from this check after the run had ended. bd
+   records from the moment it is switched on and never backwards, so that run can
+   never be checked for claim/lease divergence. It is the one gap doctor reports
+   that cannot be repaired and re-run, which is why it is worth a pre-flight
+   warning rather than a footnote. The check names both levers along with that
+   warning. It deliberately does *not* claim
    recording is currently on: `BD_AUDIT_ENABLED=1` lives in someone else's
    environment and leaves nothing pact can read, while `bd config get audit.enabled`
    answers for keys nobody set — so a config-derived verdict is wrong in both

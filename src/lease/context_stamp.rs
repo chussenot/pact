@@ -189,6 +189,11 @@ pub(super) fn log_event(
     // is what makes the holder win.
     holder: Option<&LeaseInfo>,
 ) {
+    // Before `detail` is moved into the event. See `Event::bead`.
+    let bead = matches!(kind, "acquired" | "stolen" | "renewed" | "released")
+        .then(|| detail.as_deref().and_then(crate::beads::bead_id_in))
+        .flatten()
+        .map(str::to_string);
     events::append(
         repo_root,
         &events::Event {
@@ -217,6 +222,13 @@ pub(super) fn log_event(
             scope: None,
             pact_version: None,
             content_hash,
+            // Parsed once, from the note this row already carries, and gated to
+            // the kinds where `detail` IS that note (pact-6hv). A `refused` row
+            // quotes the holder's note inside a sentence of pact's own and an
+            // `expired` row carries no note at all, so a blanket parse of
+            // `detail` would attribute a bead to rows that never named one. See
+            // `Event::bead` for why this is recorded rather than recomputed.
+            bead,
             subscriber: None,
             message_id: None,
             protocol_hash: None,
@@ -689,5 +701,83 @@ mod tests {
         assert!(acquire(root, "agent-a", "f.rs", 900, false, None).is_ok());
         assert_eq!(held_by(root, "agent-a"), vec!["f.rs".to_string()]);
         assert!(release(root, "agent-a", "f.rs", false).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod bead_tests {
+    use crate::lease::testutil::*;
+
+    /// pact-6hv: the bead id becomes a field, and only on the rows whose note it
+    /// actually is.
+    ///
+    /// The gating is the half worth testing. A blanket parse of `detail` would
+    /// look right on an `acquired` row and then attribute a bead to rows that
+    /// never named one: a `refused` row's detail quotes the HOLDER's note inside
+    /// a sentence pact composed, and an `expired` row's detail is pact's own
+    /// prose about a lapse. Both would have produced a `bead` field standing for
+    /// a claim nobody made, which is worse than the free-text substring this
+    /// replaces — a wrong structured field is trusted, and a wrong substring is
+    /// at least visibly prose.
+    #[test]
+    fn the_bead_is_stamped_from_the_note_and_only_where_detail_is_the_note() {
+        let tmp = repo();
+        let root = tmp.path();
+        let note = Some("recount-hwk.31: the scoring join and its evidence".to_string());
+
+        crate::lease::acquire(root, "agent-a", "f.rs", 600, false, note).unwrap();
+        // A second agent is refused: its detail names the holder in pact's prose.
+        let _ = crate::lease::acquire(root, "agent-b", "f.rs", 600, false, None);
+        crate::lease::release(root, "agent-a", "f.rs", false).unwrap();
+
+        let rows = crate::events::recent(root, 100).unwrap();
+        let bead_on = |kind: &str| {
+            rows.iter()
+                .find(|e| e.kind == kind)
+                .unwrap_or_else(|| panic!("no {kind} row"))
+                .bead
+                .clone()
+        };
+
+        assert_eq!(bead_on("acquired").as_deref(), Some("recount-hwk.31"));
+        assert_eq!(
+            bead_on("released").as_deref(),
+            Some("recount-hwk.31"),
+            "a release carries the same note, so it carries the same bead"
+        );
+        assert_eq!(
+            bead_on("refused"),
+            None,
+            "a refusal's detail is pact's sentence about somebody else's hold, \
+             not a note this agent wrote"
+        );
+    }
+
+    /// A note with no bead in it stays absent rather than becoming a guess — the
+    /// same discipline every other optional field on the row follows.
+    #[test]
+    fn a_note_naming_no_bead_leaves_the_field_absent() {
+        let tmp = repo();
+        let root = tmp.path();
+        crate::lease::acquire(
+            root,
+            "agent-a",
+            "f.rs",
+            600,
+            false,
+            Some("tidying up the printer module".to_string()),
+        )
+        .unwrap();
+
+        let acquired = crate::events::recent(root, 10)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == "acquired")
+            .unwrap();
+        assert_eq!(acquired.bead, None);
+        // And the serialized row carries no key at all, so a reader can tell
+        // "named no bead" from "written before pact recorded one".
+        let json = serde_json::to_string(&acquired).unwrap();
+        assert!(!json.contains("bead"), "{json}");
     }
 }

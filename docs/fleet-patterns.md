@@ -80,6 +80,45 @@ One orchestrator, agents in waves, one git worktree per agent per wave.
 6. **The spawner declares `PACT_MODEL` and `PACT_HARNESS` beside `PACT_AGENT`**,
    so every row the agent writes can say what wrote it. See below.
 
+## Put the bead id at the front of the lease note
+
+```bash
+pact lease acquire src/join.rs --ttl 90m --bead recount-hwk.31 \
+  --note "the scoring join and its evidence"
+
+# identical, and what two fleets typed by hand before the flag existed:
+pact lease acquire src/join.rs --ttl 90m \
+  --note "recount-hwk.31: the scoring join and its evidence"
+```
+
+**Id, colon, purpose.** `--bead` puts the id at the front of the note for you, so
+the two forms above produce the same lease — the same note text in `lease ls`,
+`pact log` and `agents --for`, and the same structured `bead` field on the event.
+Use the flag; it is the same convention with no way to misspell it. There is no `--bead` flag, and the convention is not a
+habit pact merely tolerates: when it writes the lease event, pact reads the first
+bead-shaped token out of the note and records it as its own `bead` field on the
+row. `pact audit --check claim-lease-divergence` reads that field to ask whether
+the agent holding a path is the agent bd assigned the bead to.
+
+The grammar it looks for is `<prefix>-<exactly three alnum>` with optional `.N`
+suffixes — `pact-mqw`, `pact-mqw.4`, `recount-hwk.31` — which is what both bd and
+br generate. Ordinary hyphenated prose does not match, because its second
+component is almost never exactly three characters. It takes the FIRST match, so
+put the id first and the sentence after it.
+
+A note without an id still works and still reads well; the hold is simply counted
+under "named no bead in their note, so there was nothing to cross-check". One
+26-agent run put ids in notes this way across 83 claims with no enforcement at
+all, which is the evidence that the convention is the natural one rather than an
+imposition.
+
+Why not a flag: `--bead` would mean a seventh positional parameter threaded
+through `acquire`, `acquire_inner`, `acquire_many` and their two `Store` impls —
+67 call sites — to record something the note already carries correctly. Parsing
+it once at write time gets the structured field without any of that, and gets one
+thing a flag would not: the parse is dated. A later change to the id grammar
+cannot retroactively reinterpret what an old hold was for.
+
 ## Declare what you launched
 
 ```bash
@@ -248,16 +287,102 @@ own log cannot be reclassified after the fact**. New runs using the reserved pre
 get clean statistics; a legacy bare-directory lease keeps appearing as an ordinary
 path.
 
-## The self-merge mutex: `pact merge`
+## The merge mutex: `pact merge`
 
 The reserved-key pattern above has one use common enough to have earned its own
-command. A fleet with **no orchestrator** has nobody to merge for it, so every agent
-merges its own worktree into the shared branch — and the shared branch has to be
-serialized.
+command. Somebody has to merge each worktree into the shared branch, and the shared
+branch has to be serialized.
 
 ```bash
 pact merge wt/wheelwright-millrace-ulk --verify 'cargo test --release'
 ```
+
+### Who can run it, which is not everybody
+
+**`pact merge` merges into the branch you are currently on**, and that one fact
+decides who can run it.
+
+In the one-worktree-per-agent topology above, somebody is sitting in the main
+checkout on `master` — pact's own docs say so, and `audit --check topology` has
+`--allow-main` precisely because of it. git then refuses every other worktree a
+checkout of that branch:
+
+```console
+$ cd wt/probe && git checkout master
+fatal: 'master' is already used by worktree at '/home/you/project'
+```
+
+So **an agent in a worktree cannot self-merge**: it cannot get onto the target
+branch to merge into it. This was reproduced on a probe worktree before wave 0 of
+a 26-agent run, which is why that run used orchestrator-side merges throughout —
+27 of them, all through `pact merge --verify`, and the pattern held.
+
+That is the answer for a worktree fleet: **the merges are the orchestrator's**, run
+from the main checkout, one per worktree per wave. Self-merge is for the other
+shape — a fleet where nobody holds the shared branch, so each agent can check it
+out to merge into it.
+
+pact could have grown a temporary detached worktree to merge in from anywhere. It
+has not, because no fleet has needed it: the topology that makes self-merge
+impossible is the same topology that has an orchestrator to do the merging.
+
+### A red shared branch is not a reason to hold your merge
+
+`pact merge --verify` asks **whether your merge added a failure**, not whether the
+branch is green. If the branch was already failing for somebody else's reason and
+your merge adds nothing new, pact lands it, says so on stderr, and releases the
+mutex. Only a failure you introduced is reverted, and only then is the mutex kept.
+
+That is worth stating out loud because agents reliably reason their way to the
+opposite. Four agents in one 12-agent fleet independently parked finished, tested,
+committed work rather than merge onto a red master, each describing the mechanic
+correctly:
+
+```
+"Holding off on pact merge for both until master goes green, since merging onto a
+ master that's already red for a different reason would get reverted and muddy the
+ audit trail."
+
+"merging now would falsely go red due to their unrelated unfixed bug"
+```
+
+They were not ignoring the rule. **The rule did not exist yet where they could
+read it** — it was written 38 minutes after the first of them parked, and reached
+only the next cohort's spawn prompt. One of the four was holding four finished
+fixes, two of them repaired regressions.
+
+It now lives in the protocol block `pact init` syncs into every repository, so it
+reaches fleets rather than the one that learned it.
+
+### File-disjoint is not build-disjoint
+
+`pact plan lint` guarantees that two entries in one wave do not write the same
+**file**. That is not the same as their being able to land apart.
+
+Two agents in one wave, both lint-clean and file-disjoint: one added a field to a
+struct in `src/model.rs`, the other wrote a test constructing that struct as a
+literal. Each branch verifies alone in its own worktree. Merged one at a time, in
+either order, the first one fails `--verify` and is reverted:
+
+```
+error[E0063]: missing field `declined` in initializer of `model::SessionMeta`
+```
+
+Only the pair together compiles. So merge them together:
+
+```bash
+pact merge wt/honesty wt/cmdat --verify 'cargo test'
+```
+
+Several branches are merged under **one** mutex and proved by **one** verification
+run over the combined result. Each keeps its own merge commit, so the log still
+says which branches were in it — which is what assembling them on a scratch branch
+by hand loses. On failure all of them are reverted together, and a conflict partway
+through unwinds the ones already merged rather than leaving half a batch on the
+shared branch.
+
+A wave barrier is where this surfaces, and no manifest can predict it: pact cannot
+see from a list of paths that one entry's struct is the other entry's literal.
 
 That takes `.pact/internal/merge-to-<branch>` (derived from the branch you are on, so
 on `master` it is exactly the key fleets were already spelling by hand), merges with

@@ -3485,28 +3485,57 @@ fn a_refusal_records_the_holders_facts_structurally_and_says_what_to_do_next() {
         "and must be the HOLDER's remaining, not the requester's ttl: {row}"
     );
     // The two representations must agree — that is the whole reason they are
-    // stamped from one place.
+    // stamped from one place. Compared at minute granularity because the prose
+    // now renders a human unit ("10m0s left on their hold") rather than raw
+    // seconds: an agent read "(33s old, 2667s remaining)" and retried twenty
+    // seconds later saying the hold "should be nearly done", so the seconds went
+    // (pact-x16.3). Minutes still catch any drift worth catching — the structured
+    // field is what a machine reads, and it is asserted exactly above.
     let detail = row["detail"].as_str().unwrap_or_default();
     assert!(
-        detail.contains(&format!("{remaining}s remaining")),
+        detail.contains(&format!("{}m", remaining / 60)),
         "the structured number and the prose must not drift: {detail}"
+    );
+    // And the remainder leads. This is the finding: the age used to come first,
+    // so the age is what agents acted on.
+    assert!(
+        detail.find("left on their hold") < detail.find("ago"),
+        "the number to act on must precede the one to ignore: {detail}"
     );
 
     // .2: with no subscription, the refusal offers the channel.
     let err = stderr_of(&refused);
     assert!(
+        err.contains("--wait"),
+        "a refused agent must first be offered the wait that keeps its turn \
+         alive: {err}"
+    );
+    assert!(
         err.contains("pact watch add src/eval.rs"),
-        "a refused agent must be offered the channel that works: {err}"
+        "and still be offered the channel, which works when it has other work \
+         first and will be running to receive the diff: {err}"
     );
 
-    // And once subscribed, it is told to stop polling rather than to keep asking.
+    // And once subscribed, it is told how to WAIT rather than how to park
+    // (pact-x16.2). "Pick up other ready work; do NOT poll" was the old wording,
+    // and for a subagent it is a trap rather than advice: a subagent's process is
+    // its turn loop, so ending the turn to wait for the notification is the same
+    // as exiting. Seven of twelve agents on one fleet did exactly that and four
+    // never came back. The channel must still be offered — it works when the
+    // agent genuinely has other work and will still be running — but it must not
+    // read as a complete instruction on its own.
     assert_ok(&pact(repo, "waiter", &["watch", "add", "src/eval.rs"]));
     let again = pact(repo, "waiter", &["lease", "acquire", "src/eval.rs"]);
     assert_eq!(again.status.code(), Some(2));
     let err = stderr_of(&again);
     assert!(
-        err.contains("you already watch src/eval.rs") && err.contains("do NOT poll"),
-        "an already-subscribed agent must be told to stop polling: {err}"
+        err.contains("you already watch src/eval.rs") && err.contains("--wait"),
+        "an already-subscribed agent must be offered the wait that cannot strand \
+         it, not only the notification that can: {err}"
+    );
+    assert!(
+        !err.contains("do NOT poll"),
+        "advice pact cannot make safe must not survive in the payload: {err}"
     );
     assert!(
         err.contains("holder"),
@@ -6582,6 +6611,186 @@ fn topology_reads_its_expectation_from_context_when_expect_is_absent() {
     );
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["expected_topology"], "any", "{report}");
+}
+
+/// pact-x16.2: `--wait` returns when the path frees, and it waits INSIDE the
+/// command.
+///
+/// The second half is the whole feature. pact's advice on exit 2 was to
+/// subscribe and pick up other work, which assumes the agent that subscribes is
+/// still running when the notification fires — false for a subagent, whose
+/// process IS its turn loop. Measured on one 12-agent fleet: seven agents parked
+/// on that advice, four never resumed, three resumed nine hours later only
+/// because a human woke the parent session, and one of them was holding four
+/// finished, tested, committed fixes.
+///
+/// So this asserts what a parked agent could not get: the command blocks and
+/// then SUCCEEDS on its own, with no second invocation and no notification.
+#[test]
+fn wait_blocks_until_the_holder_releases_and_then_acquires() {
+    let repo = init_repo();
+    assert_ok(&pact(repo.path(), "holder", &["lease", "acquire", "a.rs"]));
+
+    // Release from another process while the waiter is blocked, which is the
+    // real shape: nothing tells the waiter, it finds out by asking.
+    let path = repo.path().to_path_buf();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        pact(&path, "holder", &["lease", "release", "a.rs"]);
+    });
+
+    let started = std::time::Instant::now();
+    let out = pact(
+        repo.path(),
+        "waiter",
+        &["lease", "acquire", "a.rs", "--wait", "60s"],
+    );
+    let waited = started.elapsed();
+    releaser.join().unwrap();
+
+    assert!(
+        out.status.success(),
+        "the wait must end in the lease, not in advice: {}",
+        stderr_of(&out)
+    );
+    assert!(
+        waited.as_secs() >= 2,
+        "it must actually have waited, not raced the holder: {waited:?}"
+    );
+    // Responsiveness is the difference between this being usable and being
+    // technically correct: an early cut slept for the holder's remaining TTL and
+    // took 30s to notice a release at 6s. The backoff is capped at 15s.
+    assert!(
+        waited.as_secs() < 25,
+        "a release must be noticed promptly, not at the holder's TTL: {waited:?}"
+    );
+}
+
+/// A wait that runs out still exits 2 with the refusal it always gave.
+///
+/// `--wait` must not become a new failure mode for a caller that branches on the
+/// exit code — which every agent is told to do, and which is the documented
+/// contract for a held path.
+#[test]
+fn a_wait_that_times_out_still_exits_2_and_names_the_holder() {
+    let repo = init_repo();
+    assert_ok(&pact(repo.path(), "holder", &["lease", "acquire", "a.rs"]));
+
+    let out = pact(
+        repo.path(),
+        "waiter",
+        &["lease", "acquire", "a.rs", "--wait", "2s"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a held path is exit 2 whether or not the caller waited"
+    );
+    let err = stderr_of(&out);
+    assert!(err.contains("held by holder"), "{err}");
+}
+
+/// pact-x16.6 / pact-6hv: `--bead` makes the convention un-misspellable without
+/// changing where anything reads it from.
+///
+/// Two independent fleets put the bead id at the front of `--note` by hand — 83
+/// claims in one, 26 agents in another, neither enforced — and both filed for the
+/// flag. So `--bead X --note "Y"` produces exactly the lease `--note "X: Y"`
+/// produces: the same note text that `lease ls`, `pact log` and `agents --for`
+/// already show, and the same structured `Event::bead` that
+/// `--check claim-lease-divergence` reads.
+#[test]
+fn bead_is_folded_into_the_note_and_lands_as_a_structured_field() {
+    let repo = init_repo();
+    assert_ok(&pact(
+        repo.path(),
+        "bedstone",
+        &[
+            "lease",
+            "acquire",
+            "a.rs",
+            "--bead",
+            "m-t7k",
+            "--note",
+            "corpus gap",
+        ],
+    ));
+    // Equivalence with the hand-typed form, which is the claim being made.
+    assert_ok(&pact(
+        repo.path(),
+        "bedstone",
+        &["lease", "acquire", "b.rs", "--note", "m-t7k: corpus gap"],
+    ));
+
+    let rows: Vec<serde_json::Value> = events(repo.path())
+        .into_iter()
+        .filter(|e| e["kind"] == "acquired")
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["bead"], "m-t7k", "{:?}", rows[0]);
+    assert_eq!(
+        rows[0]["detail"], rows[1]["detail"],
+        "the flag and the convention must produce the same lease, or a fleet \
+         that adopts the flag stops matching one that has not"
+    );
+
+    // A bare --bead with no note is still an announcement: it says which work
+    // this hold is for, which is more than many notes manage.
+    assert_ok(&pact(
+        repo.path(),
+        "bedstone",
+        &["lease", "acquire", "c.rs", "--bead", "m-ymj"],
+    ));
+    let listed = stdout_of(&pact(repo.path(), "bedstone", &["lease", "ls"]));
+    assert!(listed.contains("m-ymj"), "{listed}");
+}
+
+/// `pact merge --json` has a shape too, and it did not have a test — which is how
+/// `branch` became `branches` (pact-jat) with nothing in the tree contradicting
+/// it. pact-er0's whole mechanism is that changing a shape edits this file.
+#[test]
+fn json_shape_of_merge() {
+    let repo = init_repo();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo.path())
+            .output()
+            .expect("git");
+    };
+    std::fs::remove_dir_all(repo.path().join(".git")).unwrap();
+    git(&["init", "-q", "-b", "master"]);
+    git(&["config", "user.email", "a@b.c"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    git(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(repo.path().join("b.txt"), "b\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "feature"]);
+    git(&["checkout", "-q", "master"]);
+
+    let out = pact(repo.path(), "merger", &["merge", "feature", "--json"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_object_keys(
+        "merge",
+        &v,
+        &[
+            "agent",
+            "branches",
+            "into",
+            "mutex",
+            "merge_commit",
+            "already_up_to_date",
+            "verified",
+        ],
+    );
+    // `branches` is an ARRAY even for one branch — invisible in a key comparison,
+    // and precisely what a `jq -r .branch` consumer would trip over.
+    assert!(v["branches"].is_array(), "{v}");
+    assert_eq!(v["branches"][0], "feature");
 }
 
 // ------------------------------------------- the attribution chain (pact-c3y)

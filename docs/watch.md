@@ -191,6 +191,45 @@ rather than issuing an instruction that is wrong for everybody but the fastest r
 The file path is unchanged: a real file with no recorded baseline still notifies
 nobody, because "I cannot tell what changed" is not worth a message.
 
+## `watch` is not a way to wait
+
+**A notification only reaches an agent that is still running.** That sounds
+obvious and it is the single most expensive thing this page has to say, because
+for a subagent it is not obvious at all: **a subagent's process IS its turn loop.**
+Ending a turn to wait for a notification is operationally identical to exiting.
+Nothing — not `pact watch`, not a harness-level background monitor — can re-enter
+a subagent that has stopped producing turns.
+
+Measured on one 12-agent fleet. Seven agents ended a turn on the advice pact
+printed at them, in their own words:
+
+```
+"Standing by for the monitor notification."
+"I'll pause here — the notification will arrive automatically when master clears"
+```
+
+Four never resumed. The other three resumed **nine hours later, within fourteen
+seconds of each other** — because a human woke the parent session the next
+morning and every parked child flushed at once, not because anything reached
+them. One of the four was holding four finished, tested, committed fixes; another
+had parked holding a lease that lapsed forty-five minutes later with nobody home.
+`pact audit` reported those as eight stale holds and nine merge divergences: not
+seventeen lapses, one design gap counted twice.
+
+**To wait for a path, block inside the command:**
+
+```bash
+pact lease acquire src/api.rs --wait 20m
+```
+
+That returns the moment the path is free, and your turn never ends. It is not the
+polling the protocol warns against — that is an agent spending a *turn* per
+attempt, which is what `pact audit --check retry-storm` counts. This spends none.
+
+`pact watch add` is right when you genuinely have other work to do first **and**
+will still be running to receive the diff — a long-lived orchestrator, a human at
+a terminal, an agent with a full queue. It is not a mechanism for going to sleep.
+
 ## Subscriptions
 
 Exact paths or directory prefixes. **No globs in v1.**

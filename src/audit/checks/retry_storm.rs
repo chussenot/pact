@@ -35,6 +35,33 @@ pub struct RetryStorm {
     pub median_holder_remaining_secs: Option<i64>,
     /// Did this agent ever end up holding the path?
     pub ever_claimed: bool,
+    /// When the storm started and when it ended, RFC3339, and the lines its
+    /// refusals sit on in `.pact/events.jsonl` (pact-x16.5).
+    ///
+    /// **A storm is a span, and this was the only audit finding with no time on
+    /// it at all** — which made it the only one nothing downstream could join to
+    /// anything. That is a sharp irony rather than a small gap: this is the one
+    /// check that is ABOUT agent behaviour over time. `recount testify` classifies
+    /// these as passed-through and exits 0, which is right behaviour on wrong
+    /// data. Answering "why did tailrace's storm spin?" meant finding the refusal
+    /// events by hand in the log and then the transcript by hand after that.
+    ///
+    /// Named `first_refusal_at`/`last_refusal_at` rather than `at`/`ended_at`
+    /// because consumers find the moment inside a finding BY NAME, matching the
+    /// `*_at` convention every other finding in this document already uses.
+    ///
+    /// `None` only when no refusal in the storm carried a parsable timestamp,
+    /// which no pact has ever written — absent rather than defaulted, like every
+    /// other optional field here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_refusal_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refusal_at: Option<String>,
+    /// The 1-based lines of this storm's refusals in `.pact/events.jsonl`, so a
+    /// reader can go straight to them instead of grepping for an (agent, path)
+    /// pair across a log where the same pair may contend more than once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<usize>,
 }
 
 /// How many refusals of one path by one agent stop being contention and start being
@@ -73,13 +100,19 @@ const RETRY_IMPATIENCE_RATIO: i64 = 4;
 /// be reported as a badly-behaved peer — the fault injector's deliberate skip
 /// counted against the fleet.
 pub(in crate::audit) fn retry_storms(events: &[(usize, Event)], report: &mut CheckReport) {
-    let mut by_pair: BTreeMap<(&str, &str), Vec<&Event>> = BTreeMap::new();
-    for (_, e) in events {
+    // The line number rides along with the event: a storm's whole value to a
+    // reader is being able to go and look at it, and an (agent, path) pair is not
+    // a unique key over a log where the same pair may contend more than once.
+    let mut by_pair: BTreeMap<(&str, &str), Vec<(usize, &Event)>> = BTreeMap::new();
+    for (line, e) in events {
         if e.kind != "refused" || is_injector(&e.agent) {
             continue;
         }
         if let Some(path) = e.path.as_deref() {
-            by_pair.entry((e.agent.as_str(), path)).or_default().push(e);
+            by_pair
+                .entry((e.agent.as_str(), path))
+                .or_default()
+                .push((*line, e));
         }
         if e.kind == "refused" && e.holder_remaining_secs.is_none() {
             report.refusals_without_remaining += 1;
@@ -95,14 +128,14 @@ pub(in crate::audit) fn retry_storms(events: &[(usize, Event)], report: &mut Che
         let mut gaps: Vec<i64> = rows
             .windows(2)
             .filter_map(|w| {
-                let (a, b) = (parse_at(&w[0].at)?, parse_at(&w[1].at)?);
+                let (a, b) = (parse_at(&w[0].1.at)?, parse_at(&w[1].1.at)?);
                 Some((b - a).num_seconds())
             })
             .collect();
         gaps.sort_unstable();
         let mut remaining: Vec<i64> = rows
             .iter()
-            .filter_map(|e| e.holder_remaining_secs)
+            .filter_map(|(_, e)| e.holder_remaining_secs)
             .collect();
         remaining.sort_unstable();
         let median = |v: &[i64]| v.get(v.len() / 2).copied();
@@ -127,6 +160,11 @@ pub(in crate::audit) fn retry_storms(events: &[(usize, Event)], report: &mut Che
             median_gap_secs: median_gap,
             median_holder_remaining_secs: median_remaining,
             ever_claimed: claimed.contains(&(agent, path)),
+            // Both ends, because a storm is a span. The rows arrive in log order,
+            // which is append order, so first and last are the ends of it.
+            first_refusal_at: rows.first().map(|(_, e)| e.at.clone()),
+            last_refusal_at: rows.last().map(|(_, e)| e.at.clone()),
+            lines: rows.iter().map(|(line, _)| *line).collect(),
         });
     }
     // Worst first: the loudest offender is what a reader wants at the top.
@@ -337,6 +375,66 @@ mod tests {
             render_check(&r).contains("7 refusal(s) carry no holder-remaining"),
             "{}",
             render_check(&r)
+        );
+    }
+}
+
+#[cfg(test)]
+mod span_tests {
+    use crate::audit::fixtures::*;
+    use crate::audit::{run_check, Check};
+
+    /// pact-x16.5: a storm is a span, and it must be findable.
+    ///
+    /// This was the only audit finding carrying no time at all — which made it the
+    /// only one nothing downstream could join to anything, on the one check that
+    /// is ABOUT behaviour over time. `recount testify` classified these as
+    /// passed-through: right behaviour on wrong data. Answering "why did this
+    /// storm spin?" meant locating the refusals by hand in the log and the
+    /// transcript by hand after that.
+    ///
+    /// Asserted on the SERIALIZED shape, because the consumer is `--json` and a
+    /// by-name lookup for `*_at` is how recount finds the moment inside a finding.
+    #[test]
+    fn a_storm_carries_both_ends_and_the_lines_to_look_at() {
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..6 {
+            lines.push(ev_refused(
+                &format!("2026-08-15T21:{:02}:00Z", 5 + i),
+                "tailrace",
+                "m.rs",
+                "spillway",
+                2600,
+            ));
+        }
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let tmp = with_log(&refs);
+
+        let report = run_check(tmp.path(), Check::RetryStorm, None, false).unwrap();
+        let storm = report
+            .retry_storms
+            .first()
+            .expect("six refusals is a storm");
+
+        assert_eq!(
+            storm.first_refusal_at.as_deref(),
+            Some("2026-08-15T21:05:00Z")
+        );
+        assert_eq!(
+            storm.last_refusal_at.as_deref(),
+            Some("2026-08-15T21:10:00Z")
+        );
+        assert_eq!(
+            storm.lines.len(),
+            6,
+            "every refusal's line, because an (agent, path) pair is not a unique \
+             key over a log where the same pair may contend twice"
+        );
+
+        let json = serde_json::to_value(storm).unwrap();
+        assert!(
+            json.as_object().unwrap().keys().any(|k| k.ends_with("_at")),
+            "recount finds the moment inside a finding BY NAME: {json}"
         );
     }
 }

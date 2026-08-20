@@ -159,6 +159,52 @@ Map your own `group:` names to wave numbers however your run is staged; pact onl
 cares that entries sharing a wave do not share a file. Keep the manifest as a
 build artifact, not a committed file — it is a snapshot of one run's plan.
 
+### Derive waves from the dependency graph, not by hand
+
+**A wave must be a dependency-free set.** Every entry's `depends_on` has to live in a
+strictly earlier wave, and `dependency-not-earlier` is an error rather than a warning
+because a plan that says one thing and schedules another will deadlock or race.
+
+Hand-drawn waves fail this constantly, and understandably: the natural instinct is to
+group by *phase of work* — "wave 1 is the parsing work" — which puts a bead and the
+bead it depends on side by side. One 25-bead plan produced 14 `dependency-not-earlier`
+errors that way and had to be re-planned.
+
+There is one wave assignment that is lint-clean by construction, and it is worth
+computing rather than guessing: **each entry's wave is its longest path from a root in
+the dependency graph.** A dependency is then always at a strictly lower depth, because
+its own longest path is at least one shorter.
+
+```bash
+jq -c -s '
+  # depth(id) = 0 for an entry with no dependencies,
+  #             1 + max(depth of its dependencies) otherwise.
+  # Iterated to a fixpoint, which needs at most (number of entries) rounds —
+  # cheap at plan sizes, and it terminates on a cycle instead of recursing
+  # forever. `pact plan lint` is what tells you the cycle is there.
+  ( map({ (.id): .depends_on }) | add ) as $deps
+  | reduce range(0; length) as $_ (
+      ( map({ (.id): 0 }) | add );
+      . as $d
+      | reduce ($deps | keys[]) as $id (
+          $d;
+          .[$id] = ( [ 0, ( $deps[$id][] | ($d[.] // 0) + 1 ) ] | max )
+        )
+    ) as $depth
+  | .[] | . + { wave: $depth[.id] }
+' plan.jsonl > waved.jsonl
+
+pact plan lint waved.jsonl
+```
+
+This only fixes ORDERING. Two entries at the same depth can still claim the same file,
+which is `intra-wave-overlap` and a separate question — move one of them later, which
+is free precisely because nothing depends on where in the order it sits.
+
+And file-disjointness is not build-disjointness: two entries that write different files
+can still be un-mergeable apart, if one adds a struct field the other constructs. pact
+cannot see that from a manifest.
+
 ## What it checks
 
 **Errors** — exit 1, fix before spawning:

@@ -41,7 +41,7 @@ made. That is also why the MCP server is read-only — see
 
 ```
 # ─── agents run these, while they work ───────────────────────────────────────
-pact lease acquire <path>... [--ttl <duration>] [--steal] [--note <text>]
+pact lease acquire <path>... [--ttl <duration>] [--steal] [--note <text>] [--bead <id>] [--wait <duration>]
 pact lease renew <path>
 pact lease release <path>... [--force]
 pact lease release --all
@@ -102,7 +102,13 @@ refuses to guess, and [fleet-patterns.md](fleet-patterns.md) for the spawner sid
 
 `lease ls` grows a `VIA` column when at least one live lease carries a harness or
 a declared model, on the same rule as its existing `WHERE` column: a fleet that
-declares nothing sees byte-identical output to before. `--all` on `release` is mutually exclusive with both
+declares nothing sees byte-identical output to before.
+
+`acquire --wait <duration>` blocks until a held path is free rather than exiting 2
+immediately, and still exits 2 with the same refusal if the budget runs out. It
+exists because a subagent cannot wait any other way — its process is its turn
+loop, so ending the turn to wait for a `pact watch` notification is the same as
+exiting. See [leases.md](leases.md#waiting-for-a-held-path---wait). `--all` on `release` is mutually exclusive with both
 `<path>` and `--force`; `--body-file` is mutually exclusive with the positional
 body. clap rejects those combinations rather than silently ignoring one.
 

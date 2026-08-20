@@ -444,6 +444,11 @@ pub fn checks(root: &Path) -> DoctorReport {
     checks.push(sidecar_check(
         beads_dir.is_dir(),
         beads_dir.join("interactions.jsonl").is_file(),
+        // The SAME call `claim-lease-divergence` makes, and calling it rather than
+        // asking a cheaper question of our own is the fix (pact-bpp). doctor and
+        // the check now answer from one predicate, so doctor cannot promise data
+        // the check will not find.
+        !beads::interaction_assignees(root).is_empty(),
     ));
 
     // peek, not list: a diagnostic that mutates is not a diagnostic — running
@@ -1052,6 +1057,27 @@ fn clone_reach_check(
 /// not want it is not broken; what is worth a warning is believing a check runs when
 /// it cannot.
 ///
+/// **A present file is not the same as a readable one, which is pact-bpp.** The
+/// sidecar's presence used to be the whole verdict, and a 26-agent run found the
+/// gap that leaves: 49 rows of `interactions.jsonl` were on disk, every one of
+/// them a create/close/note, not one carrying an assignee change, because
+/// `BD_AUDIT_ENABLED` was never set. doctor said *"has data to read"* for the
+/// whole run; `claim-lease-divergence` said *"no assignee history"* afterwards.
+/// Both statements were true, and the reader was told the wrong one at the only
+/// moment it could still be acted on.
+///
+/// That gap is worse than a wrong string, because **this is the one check whose
+/// failure cannot be repaired.** bd records from the moment it is switched on and
+/// never retroactively, so a run that finishes without assignee history can never
+/// be checked for claim/lease divergence — the evidence window is gone. Every
+/// other thing doctor reports can be fixed and the run repeated. doctor exists to
+/// say so *before* 26 agents are spawned, which is precisely what it failed to do.
+///
+/// So the third fact is the one `claim-lease-divergence` itself uses:
+/// [`beads::interaction_assignees`] is non-empty. Not a cheaper proxy of doctor's
+/// own — the two must answer from one predicate, or this reopens the first time
+/// either one's idea of "readable" moves.
+///
 /// **It reports the file, not the switch, and that is the whole of pact-83r.6.** The
 /// question a reader wants answered is "is recording on", and pact cannot answer it:
 /// `BD_AUDIT_ENABLED=1` enables the sidecar from the environment of whoever runs bd,
@@ -1074,7 +1100,7 @@ fn clone_reach_check(
 /// (verified end to end — see [`beads::interaction_assignees`]). A reader who sees
 /// that and concludes the fix failed will go looking for a different one that does
 /// not exist.
-fn sidecar_check(beads_dir: bool, sidecar: bool) -> DoctorCheck {
+fn sidecar_check(beads_dir: bool, sidecar: bool, assignees: bool) -> DoctorCheck {
     let name = "Beads audit sidecar";
     if !beads_dir {
         return DoctorCheck {
@@ -1084,13 +1110,32 @@ fn sidecar_check(beads_dir: bool, sidecar: bool) -> DoctorCheck {
             detail: "no .beads/ — not applicable".to_string(),
         };
     }
-    let (warn, detail) = if sidecar {
+    let (warn, detail) = if sidecar && assignees {
         (
             false,
-            ".beads/interactions.jsonl is present — `pact audit --check \
+            ".beads/interactions.jsonl carries assignee history — `pact audit --check \
              claim-lease-divergence` has data to read. Whether bd is still recording is \
              not something pact can see (`BD_AUDIT_ENABLED=1` leaves no trace in bd's \
              config), so check the newest row's date if this repo has been quiet"
+                .to_string(),
+        )
+    } else if sidecar {
+        // The state that used to pass silently. The file is there, so the previous
+        // verdict said "has data to read" — and the rows are the wrong KIND, which
+        // only the audit found out, after the run.
+        (
+            true,
+            ".beads/interactions.jsonl is present but records no assignee change, so \
+             `pact audit --check claim-lease-divergence` cannot run — bd is writing \
+             create/close/note rows without the audit sidecar's assignee history. This \
+             is the one gap that CANNOT be fixed afterwards: bd records from the moment \
+             it is switched on, never retroactively, so a run that finishes like this \
+             can never be checked for claim/lease divergence. Turn it on before you \
+             spawn agents: `BD_AUDIT_ENABLED=1` in the environment your agents run bd \
+             in, or `bd config set audit.enabled true` to persist it — bd 1.2.1 answers \
+             that one with `\"audit.enabled\" is not a recognized config key` and then \
+             honours it anyway, so the warning is bd's allowlist being wrong, not the \
+             switch failing"
                 .to_string(),
         )
     } else {
@@ -1649,15 +1694,32 @@ mod tests {
     #[test]
     fn the_sidecar_verdict_warns_exactly_when_a_check_would_silently_not_run() {
         // Nothing to say about a repo with no issue tracker.
-        let none = sidecar_check(false, false);
+        let none = sidecar_check(false, false, false);
         assert!(none.ok && !none.warn, "{}", none.detail);
         assert!(none.detail.contains("not applicable"));
 
-        for (sidecar, should_warn, why) in [
-            (true, false, "the export exists: the check has data to read"),
-            (false, true, "absent: the check passes in silence forever"),
+        for (sidecar, assignees, should_warn, why) in [
+            (
+                true,
+                true,
+                false,
+                "assignee history recorded: the check has data to read",
+            ),
+            (
+                true,
+                false,
+                true,
+                "present but no assignee row: the check CANNOT run, and this state \
+                 used to pass (pact-bpp)",
+            ),
+            (
+                false,
+                false,
+                true,
+                "absent: the check passes in silence forever",
+            ),
         ] {
-            let c = sidecar_check(true, sidecar);
+            let c = sidecar_check(true, sidecar, assignees);
             assert!(c.ok, "an optional sidecar must never FAIL doctor: {why}");
             assert_eq!(c.warn, should_warn, "{why}: {}", c.detail);
             assert!(
@@ -1666,6 +1728,59 @@ mod tests {
                 c.detail
             );
         }
+    }
+
+    /// pact-bpp: the state a 26-agent run spent its whole life in, and the reason
+    /// this warning had to become louder than the others rather than merely exist.
+    ///
+    /// `interactions.jsonl` was present with 49 rows and doctor said "has data to
+    /// read" for the duration. Every row was a create/close/note; not one carried an
+    /// assignee change, because `BD_AUDIT_ENABLED` was never set. The audit found
+    /// out afterwards, which is too late by construction: bd records from the moment
+    /// it is switched on and never backwards, so that run can never be checked for
+    /// claim/lease divergence. Every other gap doctor reports can be fixed and the
+    /// run repeated; this one cannot.
+    ///
+    /// So the message has to say the two things a reader acts on — that the check
+    /// cannot run, and that waiting costs the evidence outright — and it must not
+    /// read like the absent case, because the absent case is the one a reader has
+    /// already learned to expect.
+    #[test]
+    fn a_sidecar_with_no_assignee_rows_warns_that_the_window_closes() {
+        let hollow = sidecar_check(true, true, false);
+
+        assert!(
+            hollow.warn,
+            "this is the state that used to pass silently: {}",
+            hollow.detail
+        );
+        assert!(
+            hollow.detail.contains("no assignee change"),
+            "it must name what is actually missing, not just that something is: {}",
+            hollow.detail
+        );
+        assert!(
+            hollow.detail.contains("never retroactively"),
+            "a reader who does not know the window closes will fix it later, which \
+             is exactly too late: {}",
+            hollow.detail
+        );
+        assert!(
+            hollow.detail.contains("BD_AUDIT_ENABLED=1")
+                && hollow.detail.contains("not a recognized config key"),
+            "the remediation must be as complete here as in the absent case: {}",
+            hollow.detail
+        );
+
+        // And it must not be mistakable for the state a reader already knows.
+        let absent = sidecar_check(true, false, false);
+        assert_ne!(hollow.detail, absent.detail);
+        assert!(
+            hollow.detail.contains("is present"),
+            "the file IS there, and a message implying otherwise sends the reader \
+             looking for a file they already have: {}",
+            hollow.detail
+        );
     }
 
     /// pact-83r.6, and why it is worth its own test: the remediation must stay TRUE
@@ -1684,7 +1799,7 @@ mod tests {
     /// had re-measured. These assertions exist so that claim cannot come back.
     #[test]
     fn the_sidecar_remediation_names_both_levers_and_pre_empts_bds_spurious_warning() {
-        let absent = sidecar_check(true, false);
+        let absent = sidecar_check(true, false, false);
 
         assert!(
             absent.detail.contains("bd config set audit.enabled true"),
@@ -1709,7 +1824,7 @@ mod tests {
 
         // The present case must not claim recording is still ON: pact cannot see the
         // env lever, so that is precisely the assertion it is not entitled to make.
-        let present = sidecar_check(true, true);
+        let present = sidecar_check(true, true, true);
         assert!(
             present.detail.contains("not something pact can see"),
             "a check must not imply it verified what it cannot: {}",

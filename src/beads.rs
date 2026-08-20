@@ -686,8 +686,27 @@ pub fn interaction_actors(repo_root: &Path) -> Option<Vec<String>> {
 /// question is asked now, offline, where a stale answer costs nothing.
 pub fn interaction_assignees(repo_root: &Path) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
+    for (_, issue, who) in assignee_changes(repo_root) {
+        if who.trim().is_empty() {
+            out.remove(&issue);
+        } else {
+            out.insert(issue, who);
+        }
+    }
+    out
+}
+
+/// Every recorded assignment, oldest first, as `(created_at, issue, new_value)`.
+///
+/// The history rather than the endpoint, because "who owns this bead" and "who
+/// owned this bead THEN" are different questions and only the second one can be
+/// asked of a lease taken in the past (pact-x16.4). An empty `new_value` is an
+/// unassignment and is kept in the list rather than folded away — a bead that was
+/// unassigned before a lease was taken is not the same as one that was never
+/// assigned, and [`assignee_as_of`] needs to be able to tell them apart.
+pub fn assignee_changes(repo_root: &Path) -> Vec<(String, String, String)> {
     let Ok(contents) = std::fs::read_to_string(repo_root.join(".beads/interactions.jsonl")) else {
-        return out;
+        return Vec::new();
     };
     let mut rows: Vec<(String, String, String)> = contents
         .lines()
@@ -707,14 +726,41 @@ pub fn interaction_assignees(repo_root: &Path) -> std::collections::BTreeMap<Str
     // The export is append-ordered already; sorting costs one line and survives a
     // merge of two branches' logs, which append-order does not.
     rows.sort();
-    for (_, issue, who) in rows {
-        if who.trim().is_empty() {
-            out.remove(&issue);
-        } else {
-            out.insert(issue, who);
-        }
-    }
-    out
+    rows
+}
+
+/// Who owned `issue` at `at` — the last assignment recorded at or before that
+/// moment, or `None` if it had none yet.
+///
+/// **The whole point is that this is not the CURRENT assignee.** A lease event is
+/// history; a bead's assignee is present tense. Joining them across time reports
+/// the difference as a violation, and on one 12-agent run that made every finding
+/// false: all seven were an agent that claimed a bead correctly, leased for it,
+/// then stalled or died, whose bead a peer later re-claimed under the
+/// peer-recovery rule. Four of the seven are proven from the agents' own tool
+/// calls — bedstone ran `bd update millrace-t7k --claim` at 20:31:44 and leased 47
+/// seconds later, the protocol's exact order — and the check named it as leasing
+/// for somebody else's bead because tailrace re-claimed the bead 45 minutes later.
+///
+/// Timestamps are PARSED, never compared as strings: pact writes `+00:00` and bd
+/// writes `Z` for the same instant, so string ordering would call one older than
+/// the other. An unparsable stamp on either side yields `None` — "cannot tell"
+/// must not read as "diverged".
+pub fn assignee_as_of(
+    changes: &[(String, String, String)],
+    issue: &str,
+    at: &str,
+) -> Option<String> {
+    let when = chrono::DateTime::parse_from_rfc3339(at).ok()?;
+    changes
+        .iter()
+        // `rfind`, so the LAST assignment at or before `when` wins — the rows are
+        // sorted oldest-first, so scanning from the end finds it on the first hit.
+        .rfind(|(stamp, id, _)| {
+            id == issue && chrono::DateTime::parse_from_rfc3339(stamp).is_ok_and(|s| s <= when)
+        })
+        .map(|(_, _, who)| who.clone())
+        .filter(|who| !who.trim().is_empty())
 }
 
 fn sqlite_db(beads_dir: &Path) -> Option<PathBuf> {
