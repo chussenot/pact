@@ -374,6 +374,38 @@ pub(super) fn collect_expired(repo_root: &Path, lock_path: &Path, lease: &LeaseI
     }
 }
 
+/// Has this holder COMMITTED under the path it holds, since it took it?
+///
+/// The one signal pact has that distinguishes a working agent from an absent one,
+/// and it exists because every other signal pact has is a mutation of pact's own
+/// state. An agent doing one deep change to one file emits no lease, message or
+/// context row between acquire and release, so sustained work and abandonment
+/// produce an identical silence — measured over this repository's history, 23% of
+/// all 335 completed holds ran longer than half their TTL, which is nearly a
+/// quarter of ordinary work looking abandoned (pact-g50).
+///
+/// Shared rather than duplicated, so `lease sweep --suspect` and `pact doctor`
+/// cannot disagree about whether a quiet holder is working (pact-x16.7). They
+/// used to: the sweep spared such a holder while every read-only surface still
+/// called it SUSPECT. `lease ls` and the TUI still do, and deliberately — this
+/// question costs a `git log`, and those two run on the dashboard's refresh path.
+/// An operator command can afford it; a listing cannot.
+///
+/// Best-effort by signature, like every other git read on this path: no git, an
+/// unparsable timestamp, a bare repo — all yield no commits and every caller
+/// proceeds exactly as it did before this existed.
+pub(crate) fn has_committed_under(commits: &[git_history::Commit], lease: &LeaseInfo) -> bool {
+    let Some(acquired) = chrono::DateTime::parse_from_rfc3339(&lease.acquired_at)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+    else {
+        return false;
+    };
+    commits
+        .iter()
+        .any(|c| c.at > acquired && c.paths.iter().any(|p| p == &lease.path))
+}
+
 /// What a sweep did to one hold.
 #[derive(Debug, Clone, Serialize)]
 pub struct Swept {
@@ -474,21 +506,8 @@ pub fn sweep(repo_root: &Path, agent: &str, mode: Sweep, paths: &[String]) -> Re
                 // TUI's refresh — is untouched.
                 commits = Some(git_history::commits_since(repo_root, None).unwrap_or_default());
             }
-            let acquired = chrono::DateTime::parse_from_rfc3339(&lease.acquired_at)
-                .ok()
-                .map(|t| t.with_timezone(&Utc));
-            // Best-effort by signature, like every other git read here: no git,
-            // an unparsable timestamp, a bare repo — all yield no commits and
-            // the sweep proceeds exactly as it did before. Rescuing a live
-            // holder is an improvement on the old behaviour, never a
-            // precondition for sweeping at all.
-            if let (Some(acquired), Some(found)) = (acquired, commits.as_ref()) {
-                if found
-                    .iter()
-                    .any(|c| c.at > acquired && c.paths.iter().any(|p| p == &lease.path))
-                {
-                    eligible = false;
-                }
+            if has_committed_under(commits.as_deref().unwrap_or_default(), lease) {
+                eligible = false;
             }
         }
 

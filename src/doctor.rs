@@ -87,6 +87,7 @@ pub fn checks(root: &Path) -> DoctorReport {
 
     worktree_checks(&ctx, &mut checks);
     checks.push(attribution_check(&ctx));
+    checks.push(fleet_liveness_check(root));
 
     // Warns rather than fails, and the detail carries the argument rather than
     // just the verdict: an ignored event log is not broken, it is a repository
@@ -579,6 +580,107 @@ pub fn checks(root: &Path) -> DoctorReport {
 /// question "is my peer even sharing my leases?" is asked exactly when something
 /// is already confusing, and a check that is absent unless it fires is a check
 /// nobody knows to look for.
+/// Is the fleet still moving, or has it stopped without saying so (pact-x16.7)?
+///
+/// **The gap this fills is narrower than it was filed as, and the correction is
+/// worth keeping.** A parked agent is NOT invisible: `lease ls` and `pact ui`
+/// have labelled a quiet holder `SUSPECT: quiet 8m12s` since pact-mqw.6. What was
+/// missing is that `doctor` — the surface an operator runs BEFORE spawning
+/// twenty-six agents and again when something feels wrong — said nothing about
+/// them at all, so the answer was only available to somebody who already
+/// suspected the question.
+///
+/// And it corrects a real disagreement between two surfaces. `lease sweep
+/// --suspect` spares a quiet holder that has COMMITTED under its path (pact-g50);
+/// `lease ls` still calls that holder SUSPECT, because the question costs a `git
+/// log` and that listing runs on the TUI's refresh. So pact's own two answers
+/// differed, and the cheaper one was the one an operator read. This check asks
+/// the expensive question — [`lease::has_committed_under`], the identical
+/// predicate the sweep uses — because a diagnostic can afford what a dashboard
+/// cannot.
+///
+/// **Never fails, and warns only on the one shape that is actually evidence.** On
+/// the measured evidence quiet is not misconduct: 23% of this repository's 335
+/// completed holds ran longer than half their TTL, so a bare quiet-holder alarm
+/// would accuse a quarter of ordinary work. Quiet AND nothing committed under the
+/// path is a much smaller set, and it is the shape a parked agent leaves.
+///
+/// It reports the distribution either way, because "3 holders, all quiet, all
+/// committing" is a fleet working hard and an operator needs to be able to see
+/// that rather than infer it from an absent warning.
+fn fleet_liveness_check(root: &Path) -> DoctorCheck {
+    let name = "fleet liveness";
+    // `peek`, never `list`: a diagnostic that reclaims the locks it is reporting
+    // is not a diagnostic (pact-rnc.19).
+    let held = lease::peek(root, true).unwrap_or_default();
+    let live: Vec<_> = held.iter().filter(|e| !e.expired).collect();
+    if live.is_empty() {
+        return DoctorCheck {
+            name,
+            ok: true,
+            warn: false,
+            detail: "no live leases — nothing is being held here".to_string(),
+        };
+    }
+    let quiet: Vec<_> = live.iter().filter(|e| e.suspect).collect();
+    let agents: std::collections::BTreeSet<&str> =
+        live.iter().map(|e| e.lease.agent.as_str()).collect();
+    if quiet.is_empty() {
+        return DoctorCheck {
+            name,
+            ok: true,
+            warn: false,
+            detail: format!(
+                "{} agent(s) holding {} lease(s); none has gone quiet past half its TTL",
+                agents.len(),
+                live.len()
+            ),
+        };
+    }
+    // One `git log` for the whole check, and only once something is quiet — so a
+    // healthy fleet, which is the common case, spawns nothing.
+    let commits = crate::git_history::commits_since(root, None).unwrap_or_default();
+    let (working, absent): (Vec<&&&lease::LeaseEntry>, Vec<&&&lease::LeaseEntry>) = quiet
+        .iter()
+        .partition(|e| lease::has_committed_under(&commits, &e.lease));
+    let longest = absent
+        .iter()
+        .filter_map(|e| e.holder_silent_secs)
+        .max()
+        .unwrap_or(0);
+    let names: std::collections::BTreeSet<&str> =
+        absent.iter().map(|e| e.lease.agent.as_str()).collect();
+    DoctorCheck {
+        name,
+        ok: true,
+        warn: !absent.is_empty(),
+        detail: format!(
+            "{} agent(s) holding {} lease(s); {} quiet past half their TTL, {} of those \
+             committing under the path they hold. {}",
+            agents.len(),
+            live.len(),
+            quiet.len(),
+            working.len(),
+            if absent.is_empty() {
+                "Every quiet holder is still committing, so the fleet is working, \
+                 not stopped."
+                    .to_string()
+            } else {
+                format!(
+                    "{} quiet with NO commit under their path — longest {}: {}. That is the \
+                     shape a parked or dead agent leaves, and it stays invisible to \
+                     `--check stale-holds` until the TTL runs out. Check whether they \
+                     are alive before their leases lapse; `pact lease sweep --suspect` \
+                     reclaims the ones that are not, and spares any that commits.",
+                    absent.len(),
+                    lease::human_secs(longest),
+                    names.into_iter().collect::<Vec<_>>().join(", ")
+                )
+            }
+        ),
+    }
+}
+
 /// The full attribution chain THIS process would stamp on its next event, spelled
 /// out (pact-c3y).
 ///
@@ -1830,6 +1932,83 @@ mod tests {
             "a check must not imply it verified what it cannot: {}",
             present.detail
         );
+    }
+
+    /// pact-x16.7: the distinction that makes this reportable at all.
+    ///
+    /// A bare "quiet holder" alarm is useless and worse than nothing: 23% of this
+    /// repository's 335 completed holds ran longer than half their TTL, so it
+    /// would accuse a quarter of ordinary work — which is precisely the false
+    /// positive pact-g50 had to teach `sweep --suspect` to avoid. The only thing
+    /// that separates a working agent from an absent one is whether it has
+    /// COMMITTED under the path it holds, and this check asks the identical
+    /// predicate the sweep asks, so the two cannot drift apart again.
+    ///
+    /// It never fails. Quiet is not misconduct, and the warning fires only on the
+    /// smaller set: quiet AND nothing committed.
+    #[test]
+    fn fleet_liveness_separates_a_quiet_worker_from_a_parked_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q", "."]);
+        git(&["config", "user.email", "a@b.c"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(root.join("busy.rs"), "x\n").unwrap();
+        std::fs::write(root.join("parked.rs"), "x\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+
+        // Both hold, both go quiet: identical to pact until git is consulted.
+        lease::acquire(root, "busy", "busy.rs", 4, false, None).unwrap();
+        lease::acquire(root, "parked", "parked.rs", 4, false, None).unwrap();
+        // Only one of them is actually working. The sleep is git's, not pact's:
+        // commit timestamps are second-granular, so a commit in the same second
+        // as the acquire can sort before it.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::fs::write(root.join("busy.rs"), "y\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "busy: real work"]);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let check = fleet_liveness_check(root);
+
+        assert!(
+            check.ok,
+            "quiet is not misconduct and must never fail doctor"
+        );
+        assert!(
+            check.warn,
+            "one holder is quiet with nothing committed, which is the shape worth \
+             saying out loud: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("parked"),
+            "the agent to go and check on must be named: {}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("busy"),
+            "a quiet holder that is COMMITTING is working, and naming it is the \
+             false positive this check exists to avoid: {}",
+            check.detail
+        );
+    }
+
+    /// Nothing held, nothing to say — and no `git log` spawned to say it.
+    #[test]
+    fn fleet_liveness_is_quiet_when_nothing_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let check = fleet_liveness_check(tmp.path());
+        assert!(check.ok && !check.warn);
+        assert!(check.detail.contains("no live leases"), "{}", check.detail);
     }
 
     /// A solo session legitimately collapses to one identity everywhere —

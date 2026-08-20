@@ -119,6 +119,39 @@ it once at write time gets the structured field without any of that, and gets on
 thing a flag would not: the parse is dated. A later change to the id grammar
 cannot retroactively reinterpret what an old hold was for.
 
+## Is the fleet still moving?
+
+```console
+$ pact doctor | grep 'fleet liveness'
+! fleet liveness: 12 agent(s) holding 14 lease(s); 7 quiet past half their TTL,
+  1 of those committing under the path they hold. 6 quiet with NO commit under
+  their path — longest 41m0s: bedstone, damsel, gudgeon, headrace, hopper,
+  penstock. …
+```
+
+**A stopped fleet and a working one look identical in the ledger, and that is
+structural rather than an oversight.** Every signal pact has is a mutation of its
+own state: an agent doing one deep change to one file emits no lease, no message
+and no context row between acquire and release. So silence means both things, and
+`--check stale-holds` cannot tell you which until the TTLs run out — 45 minutes
+after the fleet effectively stopped, on the default.
+
+The one signal that separates them is whether a quiet holder has **committed under
+the path it holds** since taking it. That is why the warning above fires on the
+combination and not on quiet alone: 23% of this repository's completed holds ran
+past half their TTL, so a bare quiet-holder alarm accuses a quarter of ordinary
+work.
+
+`lease ls` and `pact ui` label a quiet holder `SUSPECT: quiet 8m12s` without
+consulting git, because that costs a `git log` and they run on the dashboard's
+refresh path. `pact doctor` can afford it, and asks the same question
+`pact lease sweep --suspect` asks before reclaiming — so the two never disagree
+about whether a quiet agent is working.
+
+Run it when a wave has gone unusually silent. If agents really have stopped,
+`pact lease sweep --suspect` reclaims their paths and spares any that is still
+committing.
+
 ## Declare what you launched
 
 ```bash

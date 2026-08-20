@@ -772,6 +772,30 @@ reasoning a commit subject cannot.
 
 ## Notes — unreleased
 
+### `pact doctor` can tell a stopped fleet from a working one
+
+**With a correction to the premise it was filed under.** A parked agent is not
+invisible: `lease ls` and `pact ui` have labelled a quiet holder
+`SUSPECT: quiet 8m12s` since pact-mqw.6. What was missing is that `doctor` — the
+surface an operator runs before spawning twenty-six agents, and again when a wave
+goes silent — said nothing about them, so the answer was only available to someone
+who already suspected the question.
+
+The new `fleet liveness` check reports the distribution: how many agents hold how
+many leases, how many have gone quiet past half their TTL, and how many of those
+have **committed under the path they hold** since taking it. It warns on the last
+combination only — quiet AND nothing committed — because quiet alone is not
+evidence: 23% of this repository's 335 completed holds ran past half their TTL, so
+a bare quiet-holder alarm accuses a quarter of ordinary work. It never fails.
+
+It also closes a disagreement between two of pact's own surfaces.
+`lease sweep --suspect` has spared a quiet holder that is still committing since
+pact-g50; `lease ls` still calls that holder SUSPECT, because the question costs a
+`git log` and that listing runs on the TUI's refresh path. So pact gave two
+answers and an operator read the cheaper one. `has_committed_under` is now one
+shared predicate, and doctor — which can afford the cost a dashboard cannot —
+asks it.
+
 ### Six findings from reading the transcripts behind the ledger
 
 recount v0.2.0 was pointed at four older pact ledgers — 2,456 rows, none carrying
