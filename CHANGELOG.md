@@ -10,6 +10,12 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.11.1 - 2026-08-20
+#### Bug Fixes
+- **(fleet)** ten findings from two fleets reading their own transcripts - (951a1f6) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.11.0 - 2026-08-19
 #### Documentation
 - **(harness)** record the captures, the declaration pattern and the join ladder - (08e2f3b) - Clement HUSSENOT-DESENONGES
