@@ -10,6 +10,12 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.12.0 - 2026-08-20
+#### Features
+- **(doctor)** tell a stopped fleet from a working one - (54c988a) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.11.1 - 2026-08-20
 #### Bug Fixes
 - **(fleet)** ten findings from two fleets reading their own transcripts - (951a1f6) - Clement HUSSENOT-DESENONGES
