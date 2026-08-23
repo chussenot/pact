@@ -81,20 +81,58 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          git fetch --quiet origin master
-          if git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
-            echo "$TAG ($GITHUB_SHA) is on master"
-            exit 0
+          # Retried, because pushing a branch and pushing a tag are two
+          # operations and the tag can win. `git push origin <tag>` starts this
+          # workflow within seconds; if master has not landed yet the check sees
+          # a tag that is genuinely not on master — for about as long as it takes
+          # the second push to arrive. 0.11.1 and 0.12.0 both failed this way on
+          # the same minute, and both were perfectly good tags.
+          for attempt in 1 2 3 4 5 6; do
+            git fetch --quiet origin master
+            if git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+              echo "$TAG ($GITHUB_SHA) is on master"
+              exit 0
+            fi
+            if [ "$attempt" -lt 6 ]; then
+              echo "master has not caught up yet (attempt $attempt/6); waiting 10s"
+              sleep 10
+            fi
+          done
+
+          # TWO DIFFERENT FAILURES WEAR THIS SHAPE, and their remedies are
+          # opposite — one is "push the branch you forgot", the other is "destroy
+          # this tag and cut it again". Telling them apart is the whole reason
+          # this branch exists: the message used to assume the second, so the
+          # first time the first one happened it advised deleting a tag that was
+          # correct, on a release that only needed `git push origin master`.
+          if git merge-base --is-ancestor origin/master "$GITHUB_SHA"; then
+            cat >&2 <<EOF
+          ::error::Tag $TAG ($GITHUB_SHA) is AHEAD of origin/master — master has not been pushed.
+
+          Nothing is wrong with the tag. Its commit is a descendant of
+          origin/master, so master is simply behind: the tag was pushed and the
+          branch was not, or not yet. Waited 60s for it to arrive.
+
+          Fix by pushing the branch, then re-running this job:
+
+              git push origin master
+
+          Do NOT delete and re-create the tag. It is correct, and re-cutting it
+          would change nothing except the timestamps.
+          EOF
+            exit 1
           fi
+
           cat >&2 <<EOF
           ::error::Tag $TAG points at $GITHUB_SHA, which is NOT an ancestor of origin/master.
 
-          This is the orphaned-tag failure mode. It happens when a branch is
-          rebased or amended after a tag was cut: the tag keeps pointing at the
-          pre-rebase commit, which is then reachable from no branch at all. The
-          tag still resolves, \`git show\` still works, and a release built from
-          it can quietly differ from what master says shipped — or be garbage
-          collected.
+          This is the orphaned-tag failure mode, and it is the serious one: the
+          tag's commit is not a descendant of master either, so the two have
+          genuinely diverged. It happens when a branch is rebased or amended
+          after a tag was cut: the tag keeps pointing at the pre-rebase commit,
+          which is then reachable from no branch at all. The tag still resolves,
+          \`git show\` still works, and a release built from it can quietly
+          differ from what master says shipped — or be garbage collected.
 
           To fix, once you have confirmed the content really is on master
           (\`git diff $TAG origin/master\` should be empty):
