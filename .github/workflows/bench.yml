@@ -34,7 +34,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch tip — pins the ACTION, not the toolchain
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
       # The runner pact is measured on, recorded in the log so a number in
       # docs/performance.md can be compared against the hardware that produced it
