@@ -209,6 +209,33 @@ The only durable evidence of consumption is an agent saying so where it travels:
 a bead close reason that references the handoff, a commit message that cites it.
 If you want consumption to be auditable, that is where to put it.
 
+### The orchestrator inherits too
+
+Handoffs are addressed to a bead, so they route to whoever picks that bead up.
+The orchestrator picks up no bead — and then writes the shared skeleton the next
+wave builds on, which is precisely the code a previous wave's findings were about.
+
+That gap has a cost on the record. On the modmill proving-ground run the
+orchestrator pre-wired shared code without reading the findings the prior wave
+had handed to the beads that code serves, and shipped a bug a worker had already
+found and written down.
+
+**`pact msg inbox` will not show them**, and that is by construction rather than
+an oversight: a handoff is posted with no recipient, because the agent who will
+inherit the bead may not exist yet. The thread key is the only route to one.
+
+So before writing anything the next wave depends on, read the thread for each
+bead your skeleton serves:
+
+```bash
+pact msg thread bead:<id>
+```
+
+The rule is the same one the workers follow — read before you write, not after —
+but the orchestrator has to go and fetch it by bead, because there is no inbox
+that will hand it over. If the skeleton spans several beads, that is several
+`msg thread` calls, and it is still cheaper than the bug.
+
 ## Declare what you launched
 
 ```bash
@@ -311,9 +338,9 @@ luck — the file layout was chosen so concurrent agents would mostly own differ
 files. It is worth doing deliberately, and `pact audit`'s most-contended-paths
 output tells you afterwards whether it worked.
 
-## The two rules that make the record trustworthy
+## The three rules that make the record trustworthy
 
-Both were learned by getting them wrong, and neither is enforced.
+Each was learned by getting it wrong, and none is enforced.
 
 ### Commit before you release
 
@@ -335,6 +362,40 @@ but the lease/edit binding then rests on convention rather than record.
 `invoked_from` on every event is what makes it checkable, and
 [`--check topology --expect worktrees`](audit.md#--check-topology---expect-worktreesmainany)
 turns it into a gate.
+
+### The orchestrator holds leases too
+
+The protocol block `pact init` writes addresses *agents*. The orchestrator reads
+the same file, but it has no bead, no wave and no claim, and nothing in that
+block is written to it — so "lease anything you WRITE" reads as somebody else's
+rule, and scaffolding reads as exempt.
+
+It is not exempt, and the orchestrator is the worst participant to have exempt.
+It is the one with the broadest write access: shared skeletons, pre-wiring,
+merges, checkpoints, README. Its commits are the ones most likely to land
+underneath somebody's in-flight work.
+
+Measured on the modmill proving-ground run:
+[`--check commit-correlation`](audit.md#--check-commit-correlation) found 12
+commits no hold covered, and **every one was the orchestrator's**, writing shared
+code with no lease held — a real violation of the rule that same orchestrator had
+written into all 16 of its workers' prompts, and which all 16 followed.
+
+So: lease the skeleton before you write it, release it when the wave starts.
+Being the participant who merges does not make you the participant who cannot
+collide.
+
+Two things make this easy to miss, and neither is a licence:
+
+- **`--allow-main` excuses the orchestrator from `--check topology`**, because
+  acting from the main checkout is correct for merges and checkpoints. That is an
+  exemption from one check about *where you run pact*, not from holding leases.
+- **A green `commit-correlation` does not mean your commits were covered.** The
+  check asks whether *anyone* held a path when a commit landed, not whether the
+  commit's author did — so an unleased commit hides behind compliant peers, and
+  hides better the better they behave. `git commit --trailer
+  Pact-Agent=$PACT_AGENT` is what closes that gap, for the orchestrator exactly as
+  for everyone else.
 
 ## Reserved keys: leasing something that is not a file
 
