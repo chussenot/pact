@@ -10,6 +10,14 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.15.0 - 2026-08-25
+#### Features
+- **(audit)** gate declarations, verified and never enforced - (e118417) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(beads)** close the gate epic, file the check-docs gap it exposed - (8765194) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.14.0 - 2026-08-25
 #### Features
 - **(handoff)** knowledge that outlives the agent that had it - (11d1300) - Clement HUSSENOT-DESENONGES
