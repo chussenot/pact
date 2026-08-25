@@ -1,0 +1,109 @@
+# Does every version tag have a release?
+#
+# This exists because the answer was NO for five days and nothing said so.
+#
+# Tags 0.13.0, 0.14.0, 0.15.0 and 0.15.1 were pushed to origin and `release.yml`
+# never ran for any of them. `git tag` moved, CI moved, `gh release list` stayed
+# pinned at 0.12.0, and the install path stayed pinned with it — a downstream
+# project proving out 0.15 was running a 0.12.0 binary and had no way to tell.
+# Every individual signal was green. The only thing that would have caught it is
+# diffing two lists nobody diffs, which is what this job does.
+#
+# ## The cause, and why a retry would not have helped
+#
+# **GitHub does not create tag push events when more than three tags arrive in
+# one push.** Not an error, not a skipped run — no event at all, so there is
+# nothing in the Actions tab to notice the absence of.
+#
+# The evidence is clean, because this repository ran the experiment by accident:
+#
+# | pushed together | runs fired |
+# |---|---|
+# | 0.11.1, 0.12.0 | 2 |
+# | 0.13.0, 0.14.0, 0.15.0, 0.15.1 | 0 |
+#
+# Master was pushed each time a version landed — CI fired on all four — and the
+# tags accumulated locally and went up in one `git push --tags` afterwards.
+#
+# **So: push version tags ONE AT A TIME.** `git push origin <tag>`, per tag. This
+# job is the backstop for when somebody forgets, which is the right shape for a
+# rule no tooling here enforces.
+#
+# ## Why it only reports
+#
+# It opens no release. Republishing a tag is a decision with a blast radius —
+# `release.yml`'s own `workflow_dispatch` publishes nothing for the same reason —
+# and the failure mode this catches is "nobody looked", which a red scheduled job
+# fixes. The remedy is one command, and the job prints it.
+name: Release drift
+
+on:
+  schedule:
+    # After the nightly bench, so a failure here is not competing for attention
+    # with a run that takes minutes.
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tags-without-releases:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Tags are the entire subject of this job, and a shallow clone has none.
+          fetch-depth: 0
+
+      - name: Every version tag must have a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # The same shape release.yml triggers on, so this cannot drift into
+          # asking about tags that were never meant to release.
+          tags="$(git tag --list '[0-9]*.[0-9]*.[0-9]*' | sort -V)"
+          releases="$(gh release list --limit 200 --json tagName -q '.[].tagName' | sort -V)"
+
+          # The floor: the OLDEST tag that has a release. Everything before it
+          # predates this repository having a release pipeline at all — 0.1.0
+          # through 0.7.5 were never published and never will be — and a job that
+          # is red about history is a job nobody reads.
+          floor="$(head -1 <<<"$releases")"
+          echo "checking tags from $floor onward"
+
+          missing=""
+          for tag in $tags; do
+            # Older than the floor: not drift, just history.
+            if [ "$tag" != "$floor" ] \
+               && [ "$(printf '%s\n%s\n' "$tag" "$floor" | sort -V | head -1)" = "$tag" ]; then
+              continue
+            fi
+            # On master only. A tag on an abandoned branch is not a missed
+            # release, and release.yml's integrity job would have refused it.
+            if ! git merge-base --is-ancestor "$tag" origin/master 2>/dev/null; then
+              continue
+            fi
+            if ! grep -qxF "$tag" <<<"$releases"; then
+              missing="$missing $tag"
+            fi
+          done
+
+          if [ -z "$missing" ]; then
+            echo "every version tag on master has a release"
+            exit 0
+          fi
+
+          echo "::error::tags on master with no GitHub release:$missing"
+          echo
+          echo "Most likely cause: more than three tags were pushed in one push, so"
+          echo "GitHub created no tag push events and release.yml never ran. Push"
+          echo "version tags one at a time."
+          echo
+          echo "To release a missed tag, re-push it on its own:"
+          for tag in $missing; do
+            echo "  git push origin :refs/tags/$tag && git push origin $tag"
+          done
+          exit 1

@@ -207,3 +207,32 @@ A failure opens an issue labelled `canary` with the leg, the `bd` version and a
 link to the run — or comments on the open one, so a persistent break is one
 thread rather than a weekly pile. Run it locally with `scripts/canary.sh`; it
 needs `bd`, `jq` and `git`.
+
+## Releasing: push version tags one at a time
+
+`release.yml` triggers on a version tag push. **GitHub creates no tag push events
+at all when more than three tags arrive in one push** — no error, no skipped run,
+nothing in the Actions tab to notice the absence of.
+
+This repository ran the experiment by accident:
+
+| pushed together | Release runs fired |
+|---|---|
+| 0.11.1, 0.12.0 | 2 |
+| 0.13.0, 0.14.0, 0.15.0, 0.15.1 | 0 |
+
+Master was pushed each time a version landed, so CI fired on all four and every
+individual signal stayed green. The tags accumulated locally and went up together
+afterwards, and four versions sat on master with no release for five days. A
+downstream project proving out 0.15 was running a 0.12.0 binary the whole time,
+because `mise install` and `gh release list` both agreed 0.12.0 was the newest
+thing there was.
+
+So: `git push origin <tag>`, one per tag.
+
+[`.github/workflows/release-drift.yml`](../.github/workflows/release-drift.yml)
+is the backstop — a nightly job that diffs the version tags on master against
+`gh release list` and goes red on any tag with no release. It reports and does
+not publish: republishing a tag has a blast radius, and the failure this catches
+is "nobody looked", which a red job fixes. Re-push a missed tag on its own and
+`release.yml` picks it up.

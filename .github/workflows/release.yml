@@ -35,6 +35,18 @@ name: Release
 #
 # Runs on the tag push, so a bad tag is red within a minute of being created
 # rather than at release time.
+#
+# ## PUSH VERSION TAGS ONE AT A TIME
+#
+# GitHub creates no tag push events at all when more than three tags arrive in a
+# single push — no error, no skipped run, nothing in the Actions tab to notice.
+# This repository ran the experiment by accident: 0.11.1 and 0.12.0 went up
+# together and both fired; 0.13.0, 0.14.0, 0.15.0 and 0.15.1 went up together and
+# none did, leaving four tags on master with no release for five days while every
+# other signal stayed green. `git push origin <tag>`, per tag.
+#
+# `release-drift.yml` is the backstop, and it is the only thing that catches this
+# — the failure has no artifact of its own to look at.
 
 on:
   push:
