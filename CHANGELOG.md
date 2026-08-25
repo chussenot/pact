@@ -798,6 +798,59 @@ reasoning a commit subject cannot.
 
 ## Notes — unreleased
 
+### Gates: declared in the plan, verified by audit, never enforced
+
+A manifest entry may carry `gate: true` — a verification bead (tests, an oracle
+run, a contract check, a review) that the plan declares must **close** before any
+bead of a later wave **starts**. Its dependents are every entry in every later
+wave, implied by the wave numbers rather than listed, because a declaration that
+must be edited each time a bead is added behind it is one nobody maintains.
+
+`plan lint` checks the two shapes that make the declaration meaningless — a gate
+with no wave (error: it orders nothing, and silently disables what the entry was
+added to say) and a gate with nothing behind it (warning: a plan under
+construction legitimately has one). It checks nothing about conduct.
+
+`pact audit --check gate-order` does that afterwards, joining three sources it
+already reads: `.pact/plan.json` for waves and gates, the event log for lease
+acquires carrying `Event::bead`, and the interactions export for bd claims and
+closes. No store, no subprocess.
+
+```
+m-imp (wave 1) started by eager via lease at 2026-08-25T09:00:00+00:00
+  — gate g-tst (wave 0) 1h0m before it closed (line 227)
+```
+
+**It reports and exits 0.** `--strict` is for CI, where somebody has decided this
+fleet's gates *are* a rule — which is their call and not pact's default.
+
+Runtime pact never declines an acquire on gate grounds, and that is the whole
+design rather than an unimplemented half. Enforcement would make pact a
+*scheduler*, something that decides what may run, and pact's shape is the
+opposite: advisory leases, honoured because they are visible. The field record is
+the argument — **agents route around enforcement and respect what is measured.**
+They skipped renewal (one in 153 events) and messaging (four messages between 28
+agents) because neither was measured; they honoured leases they could trivially
+have stolen because every steal is recorded with their name on it. A gate that
+refuses an acquire gets a `--steal`, a lease on a path it does not cover, or an
+edited manifest. A gate that is audited gets honoured or gets explained.
+
+**A violation is a finding about the PLAN as much as the agent**, which is why the
+output names the whole chain rather than a culprit. Work that ran early and turned
+out fine means the gate was declared over something that did not depend on it, and
+the manifest asked for a wait that bought nothing; work that ran early and broke
+means the gate was right and nobody could see it. The check cannot tell those
+apart and says so in as many words.
+
+Two notes on the plumbing. The snapshot `pact plan lint` writes now carries waves
+and gates beside the edges — **correcting a doc comment written a day earlier**
+which said `files` and `wave` were "the linter's business, answered before any
+agent runs". That was true when `handoff` was the only consumer; gates made it
+false, and waves are now a fact that outlives the run. And a snapshot written
+before this carries neither key, parses fine, and reads as "no gates declared" —
+which the check reports rather than passing, because "no gates were violated" and
+"nothing was checked" are different statements.
+
 ### `pact handoff` — knowledge that outlives the agent that had it
 
 In an orchestratorless run nobody holds the shape of the work. An agent finishes a

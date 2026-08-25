@@ -729,6 +729,51 @@ pub fn assignee_changes(repo_root: &Path) -> Vec<(String, String, String)> {
     rows
 }
 
+/// When each issue was last CLOSED, from the committed export.
+///
+/// bd records a close as a `field_change` on `status` with `new_value = "closed"`
+/// — there is no `close` kind — so this reads the same rows
+/// [`assignee_changes`] does, filtered on a different field. Verified against this
+/// repository's own export, where 343 of 343 interaction rows are `field_change`.
+///
+/// LAST close, not first: a bead can be reopened and closed again, and the
+/// question every caller asks is when it was finally done. An issue closed then
+/// reopened and still open has its old close time here, which is the honest answer
+/// to "when was this last closed" and the wrong answer to "is it closed" — no
+/// caller asks the second, and one that did would need the status timeline rather
+/// than this.
+///
+/// Empty where the export is absent, unreadable, or has no status history — the
+/// same best-effort contract every other reader of this file follows, because a
+/// missing sidecar means "cannot tell" and never "did not happen".
+pub fn closed_at(repo_root: &Path) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(contents) = std::fs::read_to_string(repo_root.join(".beads/interactions.jsonl")) else {
+        return out;
+    };
+    let mut rows: Vec<(String, String)> = contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|v| {
+            v["extra"]["field"].as_str() == Some("status")
+                && v["extra"]["new_value"].as_str() == Some("closed")
+        })
+        .filter_map(|v| {
+            Some((
+                v["created_at"].as_str().unwrap_or_default().to_string(),
+                v["issue_id"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    // Sorted so the last write wins deterministically even if the export was
+    // assembled from two branches' logs, which append-order does not survive.
+    rows.sort();
+    for (at, issue) in rows {
+        out.insert(issue, at);
+    }
+    out
+}
+
 /// Who owned `issue` at `at` — the last assignment recorded at or before that
 /// moment, or `None` if it had none yet.
 ///

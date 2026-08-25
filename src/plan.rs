@@ -64,6 +64,20 @@ pub struct Entry {
     pub files: Vec<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// This entry is a GATE: the plan declares it must close before any bead of a
+    /// later wave starts (pact-gyn).
+    ///
+    /// A verification bead — the test suite, an oracle run, a contract check, a
+    /// review. Not a dependency: a gate's dependents are every entry in every
+    /// later wave, implied by the wave numbers rather than listed, because listing
+    /// them means editing the gate every time a bead is added behind it and a
+    /// declaration nobody maintains is worse than none.
+    ///
+    /// **Declared, never enforced.** pact will not refuse an acquire because a
+    /// gate has not closed — see `--check gate-order`, which is where a
+    /// declaration becomes a question somebody can answer afterwards.
+    #[serde(default)]
+    pub gate: bool,
 }
 
 /// What the lint found. `error` decides the exit code; everything else is reported.
@@ -310,6 +324,48 @@ pub fn lint(repo_root: &Path, entries: &[Entry]) -> Report {
         });
     }
 
+    // Gate shape (pact-gyn). A gate is a DECLARATION about ordering, so the only
+    // things worth checking here are the two that make the declaration
+    // meaningless — and both are about the gate itself, never about whether the
+    // fleet obeyed it. That question is `pact audit --check gate-order`'s, asked
+    // afterwards against what actually happened.
+    for e in entries.iter().filter(|e| e.gate) {
+        match e.wave {
+            // A gate with no wave orders nothing: "must close before a later wave"
+            // has no meaning when there is no wave it is later THAN. An error
+            // rather than a warning, because unlike a missing wave on an ordinary
+            // entry — a normal intermediate state — this one silently disables the
+            // very thing the entry was added to declare.
+            None => findings.push(Finding {
+                kind: "gate-without-wave".into(),
+                error: true,
+                detail: format!(
+                    "{} is a gate but declares no wave — a gate orders the waves \
+                     AFTER it, so without one it guards nothing and `--check \
+                     gate-order` has nothing to check",
+                    e.id
+                ),
+            }),
+            Some(w) => {
+                // Declared ceremony guarding nothing. A warning, not an error: a
+                // plan under construction legitimately has a gate before the waves
+                // it will eventually guard, and failing that would make the
+                // manifest harder to write in the order people write them.
+                if !entries.iter().any(|o| o.wave.is_some_and(|ow| ow > w)) {
+                    findings.push(Finding {
+                        kind: "gate-guards-nothing".into(),
+                        error: false,
+                        detail: format!(
+                            "{} is a gate in wave {w}, but no entry runs in a \
+                             later wave — nothing is ordered behind it",
+                            e.id
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
     Report {
         entries: entries.len(),
         waves: per_wave.len(),
@@ -462,19 +518,32 @@ fn coalesce(warns: &[&Finding]) -> Vec<String> {
 /// Where `plan lint` leaves the graph for runtime commands to read.
 pub const SNAPSHOT_PATH: &str = ".pact/plan.json";
 
-/// The dependency graph, as `pact plan lint` last accepted it.
+/// The parts of a plan that stay interesting after the plan has been executed.
 ///
-/// **Only the edges, and deliberately not the manifest.** `files` and `wave` are
-/// the linter's business — they decide contention and ordering, and both are
-/// answered before any agent runs. What a runtime command needs is who depends on
-/// whom, which is the one part of a plan that stays interesting after the plan has
-/// been executed.
+/// **This started as edges alone**, on the reasoning that `files` and `wave` were
+/// the linter's business and answered before any agent ran. That was true while
+/// `pact handoff` was the only consumer, and gates made it false: `--check
+/// gate-order` asks whether a bead in wave N+1 started before wave N's gates
+/// closed, which is a question about waves, asked long afterwards, from a clone.
+///
+/// `files` is still absent and still the linter's business — contention is decided
+/// before the run and nothing downstream re-asks it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     /// RFC3339, when the lint that wrote this ran.
     pub at: String,
     /// `id -> depends_on`, every entry the manifest declared.
     pub edges: BTreeMap<String, Vec<String>>,
+    /// `id -> wave`, for the entries that declared one.
+    ///
+    /// `#[serde(default)]` so a snapshot written before gates existed still
+    /// parses, and reads as a plan with no waves — which `gate-order` reports as
+    /// "no gates declared" rather than as a plan that violated them all.
+    #[serde(default)]
+    pub waves: BTreeMap<String, i64>,
+    /// The entries the plan declared as gates, sorted.
+    #[serde(default)]
+    pub gates: Vec<String>,
 }
 
 impl Snapshot {
@@ -525,12 +594,23 @@ pub fn write_snapshot(repo_root: &Path, entries: &[Entry], report: &Report) {
     let Ok(dir) = crate::repo::pact_dir(repo_root) else {
         return;
     };
+    let mut gates: Vec<String> = entries
+        .iter()
+        .filter(|e| e.gate)
+        .map(|e| e.id.clone())
+        .collect();
+    gates.sort();
     let snap = Snapshot {
         at: chrono::Utc::now().to_rfc3339(),
         edges: entries
             .iter()
             .map(|e| (e.id.clone(), e.depends_on.clone()))
             .collect(),
+        waves: entries
+            .iter()
+            .filter_map(|e| e.wave.map(|w| (e.id.clone(), w)))
+            .collect(),
+        gates,
     };
     if let Ok(json) = serde_json::to_string_pretty(&snap) {
         let _ = std::fs::write(dir.join("plan.json"), json + "\n");
@@ -564,11 +644,114 @@ mod tests {
             wave,
             files: files.iter().map(|s| (*s).into()).collect(),
             depends_on: deps.iter().map(|s| (*s).into()).collect(),
+            gate: false,
         }
     }
 
     fn kinds(r: &Report) -> Vec<&str> {
         r.findings.iter().map(|f| f.kind.as_str()).collect()
+    }
+
+    /// pact-gyn: the two ways a gate declaration is meaningless, and neither is
+    /// about whether anyone obeyed it.
+    ///
+    /// A gate with no wave is an ERROR because, unlike a missing wave on an
+    /// ordinary entry — a normal intermediate state — it silently disables the one
+    /// thing the entry was added to declare. A gate with nothing behind it is a
+    /// WARNING because a plan under construction legitimately has the gate before
+    /// the waves it will eventually guard.
+    #[test]
+    fn gate_shape_is_checked_and_conduct_is_not() {
+        let tmp = root();
+
+        let no_wave = lint(
+            tmp.path(),
+            &[Entry {
+                id: "g-tst".into(),
+                wave: None,
+                files: vec!["t.rs".into()],
+                depends_on: vec![],
+                gate: true,
+            }],
+        );
+        assert!(kinds(&no_wave).contains(&"gate-without-wave"));
+        assert_eq!(no_wave.errors(), 1, "it disables the declaration silently");
+
+        let lonely = lint(
+            tmp.path(),
+            &[Entry {
+                id: "g-tst".into(),
+                wave: Some(9),
+                files: vec!["t.rs".into()],
+                depends_on: vec![],
+                gate: true,
+            }],
+        );
+        assert!(kinds(&lonely).contains(&"gate-guards-nothing"));
+        assert_eq!(
+            lonely.errors(),
+            0,
+            "a plan under construction is not broken"
+        );
+
+        // A gate with a later wave behind it is clean — and note nothing here
+        // checks whether the fleet obeyed it. That is `--check gate-order`'s
+        // question, asked afterwards against what actually happened.
+        let ok = lint(
+            tmp.path(),
+            &[
+                Entry {
+                    id: "g-tst".into(),
+                    wave: Some(0),
+                    files: vec!["t.rs".into()],
+                    depends_on: vec![],
+                    gate: true,
+                },
+                Entry {
+                    id: "m-imp".into(),
+                    wave: Some(1),
+                    files: vec!["i.rs".into()],
+                    depends_on: vec![],
+                    gate: false,
+                },
+            ],
+        );
+        assert!(!kinds(&ok).iter().any(|k| k.starts_with("gate-")), "{ok:?}");
+    }
+
+    /// The snapshot carries what `--check gate-order` needs, and only that.
+    #[test]
+    fn the_snapshot_records_waves_and_gates_but_not_files() {
+        let tmp = root();
+        let entries = [
+            Entry {
+                id: "g-tst".into(),
+                wave: Some(0),
+                files: vec!["t.rs".into()],
+                depends_on: vec![],
+                gate: true,
+            },
+            Entry {
+                id: "m-imp".into(),
+                wave: Some(1),
+                files: vec!["i.rs".into()],
+                depends_on: vec!["g-tst".into()],
+                gate: false,
+            },
+        ];
+        let report = lint(tmp.path(), &entries);
+        write_snapshot(tmp.path(), &entries, &report);
+
+        let snap = snapshot(tmp.path()).expect("a clean lint writes one");
+        assert_eq!(snap.gates, vec!["g-tst".to_string()]);
+        assert_eq!(snap.waves.get("m-imp"), Some(&1));
+        assert_eq!(snap.dependents("g-tst"), vec!["m-imp"]);
+        // `files` is the linter's business and is answered before any agent runs.
+        let raw = std::fs::read_to_string(tmp.path().join(".pact/plan.json")).unwrap();
+        assert!(
+            !raw.contains("t.rs"),
+            "the snapshot is not the manifest: {raw}"
+        );
     }
 
     #[test]
@@ -736,6 +919,7 @@ mod tests {
                 wave: None,
                 files: vec![format!("f{i}.rs")],
                 depends_on: ids.get(i + 1).cloned().into_iter().collect(),
+                gate: false,
             })
             .collect();
         let r = lint(tmp.path(), &entries);

@@ -468,6 +468,63 @@ This is the second place audit reaches outside `.pact/`, after
 obeys it more strictly than its predecessor did: it never opens the Beads DB, and
 now never even runs its CLI.
 
+### `--check gate-order`
+
+```
+gate-order: scanned 412 event(s)
+
+  m-imp (wave 1) started by eager via lease at 2026-08-25T09:00:00+00:00
+    — gate g-tst (wave 0) 1h0m before it closed (line 227)
+```
+
+Did anything start in wave N+1 before wave N's declared
+[gates](plan.md#gate-work-the-plan-says-must-finish-first) closed? Joins three
+sources it already reads: `.pact/plan.json` for the waves and gates, the event log
+for lease acquires carrying `Event::bead`, and the committed interactions export
+for bd claims and closes. No store, no subprocess.
+
+**The only check whose subject is a declaration.** Every other one measures
+behaviour against a rule pact holds; this measures a fleet's own stated ordering
+against what it then did. pact has no opinion about the ordering.
+
+#### It reports and exits 0 — `--strict` is somebody else's decision
+
+Runtime pact never declines an acquire because a gate has not closed, and that is
+load-bearing rather than unimplemented. Enforcement would make pact a *scheduler*,
+something that decides what may run, and pact's whole shape is the opposite:
+advisory leases, honoured because they are visible.
+
+The field record is the argument. **Agents route around enforcement and respect
+what is measured.** They skipped renewal — one in 153 events — and messaging —
+four messages between 28 agents — because neither was measured; they honoured
+leases they could trivially have stolen because every steal is recorded with their
+name on it. A gate that refuses an acquire gets a `--steal`, a lease on a path the
+gate does not cover, or an edited manifest. A gate that is *audited* gets honoured
+or gets explained, and both are outcomes worth having.
+
+So violations do not count toward the exit code unless `--strict`, which exists
+for CI where somebody has decided this fleet's gates **are** a rule. Failing by
+default would teach fleets to stop declaring gates — paying the measurement to buy
+an enforcement pact is deliberately not doing.
+
+#### A violation is a finding about the PLAN as much as the agent
+
+Which is why the output names the whole chain rather than a culprit: who, via
+what, for which bead, how long before which gate. An agent that started wave 2
+before the wave-1 test gate closed may have been wrong — or the gate may have been
+declared over work that never depended on it, in which case the plan asked for a
+wait that bought nothing and the agent's judgement beat the manifest's. **The
+check cannot tell those apart and does not try.**
+
+A gate that never closed is the loud case and sorts first: everything behind it
+ran with nothing verified, and there is no interval to report because there is no
+close.
+
+Degrades rather than passing: no linted plan, or a plan declaring no gates, says
+so and stops. "No gates were violated" and "nothing was checked" are different
+statements, and a snapshot written before gates existed carries neither `waves`
+nor `gates` and reads as the second.
+
 ### `--check retry-storm`
 
 **The only check about what the fleet wasted, rather than what pact got wrong.**

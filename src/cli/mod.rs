@@ -343,6 +343,16 @@ pub(crate) enum Command {
         /// output a human — or another agent session — can read directly.
         #[arg(long)]
         export: Option<PathBuf>,
+        /// Count `--check gate-order` violations toward the exit code.
+        ///
+        /// For CI, where somebody has decided this fleet's declared gates ARE a
+        /// rule. pact does not decide that on their behalf: a gate is a
+        /// declaration a plan made about itself, and a violated one is as often a
+        /// finding about the plan as about the agent — work that ran early and
+        /// turned out fine means the gate was declared over something that did not
+        /// depend on it. So by default it reports and exits 0.
+        #[arg(long)]
+        strict: bool,
     },
     /// Interactive terminal dashboard over leases, messages, and doctor status.
     #[cfg(feature = "ui")]
@@ -802,6 +812,7 @@ pub(crate) fn run(cli: Cli) -> Result<i32> {
             allow_main,
             compare,
             export,
+            strict,
         } => run_audit(
             &cwd,
             cli.json,
@@ -813,6 +824,7 @@ pub(crate) fn run(cli: Cli) -> Result<i32> {
                 allow_main,
                 compare,
                 export,
+                strict,
             },
         ),
         #[cfg(feature = "ui")]

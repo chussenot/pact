@@ -66,6 +66,7 @@ use checks::claim_lease_divergence::{claim_divergences, ClaimDivergence};
 use checks::commit_correlation::{
     ConcurrentWrite, CrossHeldCommit, UncommittedHold, UncoveredCommit,
 };
+use checks::gate_order::GateViolation;
 use checks::merge_divergence::{merge_divergences, MergeDivergence};
 use checks::retry_storm::retry_storms;
 use checks::silent_contention::{silent_contentions, SilentContention};
@@ -124,6 +125,15 @@ pub enum Check {
     /// anybody, before its holder let go? Named for what it reports rather than for
     /// its subject, because `Contention` is already the summary's stats struct.
     SilentContention,
+    /// pact-gyn: did anything start in wave N+1 before wave N's declared gates
+    /// closed?
+    ///
+    /// The only check whose subject is a DECLARATION rather than a behaviour.
+    /// Every other one measures what pact itself recorded against a rule pact
+    /// holds; this measures a fleet's own stated ordering against what it then
+    /// did, and pact has no opinion about the ordering — it only reports whether
+    /// the plan and the ledger agree.
+    GateOrder,
 }
 
 /// What `--expect` declares a run's topology should have been.
@@ -259,7 +269,7 @@ impl Check {
     ///
     /// clap renders this list itself now, so the help cannot say something the
     /// parser does not accept.
-    pub const NAMES: [&'static str; 9] = [
+    pub const NAMES: [&'static str; 10] = [
         "double-win",
         "stale-holds",
         "chain-integrity",
@@ -269,6 +279,7 @@ impl Check {
         "retry-storm",
         "silent-contention",
         "topology",
+        "gate-order",
     ];
 
     /// The name this check is spelled with on the command line.
@@ -288,6 +299,7 @@ impl Check {
             Check::RetryStorm => "retry-storm",
             Check::SilentContention => "silent-contention",
             Check::Topology(_) => "topology",
+            Check::GateOrder => "gate-order",
         }
     }
 
@@ -304,6 +316,7 @@ impl Check {
             "claim-lease-divergence" => Ok(Check::ClaimLeaseDivergence),
             "retry-storm" => Ok(Check::RetryStorm),
             "silent-contention" => Ok(Check::SilentContention),
+            "gate-order" => Ok(Check::GateOrder),
             "topology" => Ok(Check::Topology(match expect {
                 Some(e) => Expect::parse(e, allow_main)?,
                 // Not `Any` directly: the run may have declared its own
@@ -522,6 +535,24 @@ pub struct CheckReport {
     pub refusals_without_remaining: usize,
     /// `Check::Contention` only.
     pub silent_contentions: Vec<SilentContention>,
+    /// `Check::GateOrder` only: beads that started before a gate their wave was
+    /// declared to wait for (pact-gyn).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gate_violations: Vec<GateViolation>,
+    /// Why `gate-order` could not run: no linted plan, or a plan that declares no
+    /// gates.
+    ///
+    /// Its own field rather than an empty finding list, because "no gates were
+    /// violated" and "nothing was checked" are different statements and only the
+    /// first is a pass. Same discipline as `claim_unavailable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gates_unavailable: Option<String>,
+    /// `--strict`: count gate violations toward the exit code.
+    ///
+    /// Off by default, and serialized so a `--json` consumer can tell a report
+    /// that WOULD have failed from one that did.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict: bool,
     /// `Check::Contention` only: refusals where the refused agent already held a
     /// covering watch, so the channel WAS in place. Not a finding, and not netted
     /// out of the count either — see [`SilentContention`].
@@ -553,6 +584,17 @@ impl CheckReport {
             + self.claim_divergences.len()
             + self.retry_storms.len()
             + self.silent_contentions.len()
+            // Gate violations are NOT here, deliberately (pact-gyn). A gate is a
+            // declaration a fleet made about itself, not a rule pact holds, and a
+            // violated one is as often a finding about the plan as about the agent
+            // — work that ran early and turned out fine means the gate was
+            // declared over something that did not depend on it. Failing a build
+            // on that would teach fleets to stop declaring gates, which costs the
+            // measurement to gain the enforcement pact is deliberately not doing.
+            //
+            // `--strict` is for CI, where somebody has decided this fleet's gates
+            // ARE a rule. That is their call to make and not pact's default.
+            + if self.strict { self.gate_violations.len() } else { 0 }
     }
 }
 
@@ -561,6 +603,17 @@ pub fn run_check(
     check: Check,
     since: Option<DateTime<Utc>>,
     include_annotated: bool,
+) -> Result<CheckReport> {
+    run_check_strict(repo_root, check, since, include_annotated, false)
+}
+
+/// [`run_check`], with `--strict`'s effect on the exit code.
+pub fn run_check_strict(
+    repo_root: &std::path::Path,
+    check: Check,
+    since: Option<DateTime<Utc>>,
+    include_annotated: bool,
+    strict: bool,
 ) -> Result<CheckReport> {
     let loaded = load(repo_root, since, include_annotated)?;
     let unparseable = loaded.unparseable;
@@ -608,6 +661,9 @@ pub fn run_check(
         retry_storms: Vec::new(),
         refusals_without_remaining: 0,
         silent_contentions: Vec::new(),
+        gate_violations: Vec::new(),
+        gates_unavailable: None,
+        strict,
         refusals_with_a_channel: 0,
     };
 
@@ -660,6 +716,7 @@ pub fn run_check(
         Check::ClaimLeaseDivergence => claim_divergences(repo_root, &events, &mut report),
         Check::RetryStorm => retry_storms(&events, &mut report),
         Check::SilentContention => silent_contentions(repo_root, &events, &holds, &mut report),
+        Check::GateOrder => checks::gate_order::detect(repo_root, &events, &mut report),
         Check::Topology(ref expect) => {
             checks::topology::detect(&loaded.context, &events, expect, &mut report)
         }
@@ -710,6 +767,10 @@ pub fn render_check(r: &CheckReport) -> String {
         checks::chain_integrity::scope(r, &mut out);
     }
 
+    if r.check == "gate-order" && checks::gate_order::scope(r, &mut out) {
+        return out.join("\n");
+    }
+
     if r.check == "merge-divergence" {
         checks::merge_divergence::scope(r, &mut out);
     }
@@ -740,6 +801,9 @@ pub fn render_check(r: &CheckReport) -> String {
             "retry-storm" => checks::retry_storm::clean(),
             "claim-lease-divergence" => checks::claim_lease_divergence::clean(),
             "merge-divergence" => checks::merge_divergence::clean(),
+            // Only when there is genuinely nothing — see the exception below.
+            "gate-order" if r.gate_violations.is_empty() => checks::gate_order::clean(),
+            "gate-order" => String::new(),
             // `stale-holds` named explicitly rather than left to the catch-all it
             // used to own: a new check landing on that arm inherited the wrong
             // clean message, which is how this comment got written.
@@ -747,7 +811,14 @@ pub fn render_check(r: &CheckReport) -> String {
         });
         // commit-correlation still has informational rows to print (holds
         // with no commit at all) even with zero fail-worthy findings.
-        if r.check != "commit-correlation" {
+        //
+        // gate-order is here for a sharper reason (pact-gyn): its violations are
+        // deliberately absent from `findings()` unless `--strict`, so without this
+        // exception a report with real violations would take the clean branch and
+        // print "every bead started after its gates" over the top of them. The
+        // exit code and the OUTPUT answer different questions here, and only the
+        // first one is what `--strict` moves.
+        if !matches!(r.check, "commit-correlation" | "gate-order") {
             return out.join("\n");
         }
     }
@@ -761,6 +832,7 @@ pub fn render_check(r: &CheckReport) -> String {
     checks::retry_storm::findings(r, &mut out);
     checks::claim_lease_divergence::findings(r, &mut out);
     checks::merge_divergence::findings(r, &mut out);
+    checks::gate_order::findings(r, &mut out);
     // Last, and after every other check's findings: informational rather than a
     // finding, which is why a clean commit-correlation run still reaches it.
     checks::commit_correlation::correlation_footer(r, &mut out);

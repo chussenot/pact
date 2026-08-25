@@ -159,10 +159,34 @@ Map your own `group:` names to wave numbers however your run is staged; pact onl
 cares that entries sharing a wave do not share a file. Keep the manifest as a
 build artifact, not a committed file — it is a snapshot of one run's plan.
 
+### `gate`: work the plan says must finish first
+
+```json
+{"id": "g-tst", "wave": 1, "gate": true, "files": ["tests/"]}
+```
+
+A **gate** is a verification bead — the test suite, an oracle run, a contract
+check, a review — that the plan declares must **close** before any bead of a
+**later wave starts**. Its dependents are every entry in every later wave, implied
+by the wave numbers rather than listed: listing them would mean editing the gate
+each time a bead is added behind it, and a declaration nobody maintains is worse
+than none.
+
+Two shape rules, and both are about the gate rather than about anyone's conduct:
+
+| finding | why |
+|---|---|
+| `gate-without-wave` (error) | a gate orders the waves *after* it; with no wave there is nothing it is later than, so it guards nothing and silently disables what the entry was added to declare |
+| `gate-guards-nothing` (warning) | a gate in the last wave has nothing behind it. A warning, because a plan under construction legitimately has a gate before the waves it will eventually guard |
+
+**pact never enforces a gate.** No acquire is refused on gate grounds and none
+will be — see [audit.md](audit.md#--check-gate-order) for what happens instead,
+and why measuring beats enforcing here.
+
 ### pact keeps its own copy of the edges
 
-A lint that finds **no errors** writes `.pact/plan.json`: the dependency graph and
-nothing else — no files, no waves, no timestamps of yours. Those are the linter's
+A lint that finds **no errors** writes `.pact/plan.json`: the dependency edges, the
+waves, and which entries are gates — no files, and none of your timestamps. Those are the linter's
 business and are answered before any agent runs; the edges are the part that stays
 interesting after the plan has been executed.
 

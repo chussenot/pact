@@ -12,6 +12,7 @@ pub(in crate::audit) mod chain_integrity;
 pub(in crate::audit) mod claim_lease_divergence;
 pub(in crate::audit) mod commit_correlation;
 pub(in crate::audit) mod double_win;
+pub(in crate::audit) mod gate_order;
 pub(in crate::audit) mod merge_divergence;
 pub(in crate::audit) mod retry_storm;
 pub(in crate::audit) mod silent_contention;

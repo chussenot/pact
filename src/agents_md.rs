@@ -229,6 +229,11 @@ this protocol whenever you touch shared files or hand off work to others.
   written 38 minutes after the first of them parked, and reached the NEXT
   cohort's spawn prompt only. One of those four was holding four finished fixes,
   two of them repaired regressions.
+- **Gates are beads, and they are visible in `bd` like any other.** Before you
+  claim into a new wave, check that the prior wave's gates have closed. pact will
+  not stop you — no acquire is ever refused on gate grounds — but `pact audit
+  --check gate-order` reads the ledger either way, and a start it finds ahead of a
+  gate is a question somebody will ask afterwards.
 - **Read your inheritance before you start a claimed bead**: `pact msg thread
   bead:<id>`. Whoever finished what yours depends on may have left findings there
   — addressed to the bead rather than to you, because when they wrote it you did

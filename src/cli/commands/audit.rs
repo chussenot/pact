@@ -30,6 +30,7 @@ pub(in crate::cli) struct AuditArgs {
     pub(in crate::cli) allow_main: Vec<String>,
     pub(in crate::cli) compare: Option<PathBuf>,
     pub(in crate::cli) export: Option<PathBuf>,
+    pub(in crate::cli) strict: bool,
 }
 
 pub(in crate::cli) fn run_audit(cwd: &Path, json: bool, args: AuditArgs) -> Result<i32> {
@@ -41,6 +42,7 @@ pub(in crate::cli) fn run_audit(cwd: &Path, json: bool, args: AuditArgs) -> Resu
         allow_main,
         compare,
         export,
+        strict,
     } = args;
     let root = repo::find_repo_root(cwd)?;
     let since = match since {
@@ -83,7 +85,7 @@ pub(in crate::cli) fn run_audit(cwd: &Path, json: bool, args: AuditArgs) -> Resu
         }
         Some(name) => {
             let check = audit::Check::parse(&name, expect.as_deref(), &allow_main)?;
-            let report = audit::run_check(&root, check, since, include_annotated)?;
+            let report = audit::run_check_strict(&root, check, since, include_annotated, strict)?;
             output::emit(json, &report, audit::render_check);
             // The whole point of a named check: a machine can branch on it.
             Ok(if report.findings() == 0 { 0 } else { 1 })
