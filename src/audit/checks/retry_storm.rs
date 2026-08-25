@@ -108,6 +108,7 @@ pub(in crate::audit) fn retry_storms(events: &[(usize, Event)], report: &mut Che
         if e.kind != "refused" || is_injector(&e.agent) {
             continue;
         }
+        report.refusals_seen += 1;
         if let Some(path) = e.path.as_deref() {
             by_pair
                 .entry((e.agent.as_str(), path))
@@ -175,6 +176,12 @@ pub(in crate::audit) fn retry_storms(events: &[(usize, Event)], report: &mut Che
 
 /// The scope line, stated even when clean.
 pub(in crate::audit) fn scope(r: &CheckReport, out: &mut Vec<String>) {
+    // Nothing to scope when the check could not run: a "0 refusal(s) …" line
+    // above a "could not run" line is two ways of saying the same absence, and the
+    // first one looks like a measurement.
+    if r.refusals_seen == 0 {
+        return;
+    }
     // Scope before verdict, clean or not: the impatience half of this check
     // cannot speak to a refusal whose holder-remaining was never recorded.
     out.push(format!(
@@ -185,7 +192,16 @@ pub(in crate::audit) fn scope(r: &CheckReport, out: &mut Vec<String>) {
 }
 
 /// What this check prints when it found nothing.
-pub(in crate::audit) fn clean() -> String {
+pub(in crate::audit) fn clean(r: &CheckReport) -> String {
+    // Vacuous is not clean. A storm is a pattern in refusals; with no refusals
+    // there was nothing to hammer, and "no agent hammered a lease it was refused"
+    // reads as a fleet that behaved well under contention rather than as a fleet
+    // that never met any.
+    if r.refusals_seen == 0 {
+        return "could not run: no refusals in this log, so no retry behaviour to \
+                measure. This check reads what an agent does after it is told no."
+            .to_string();
+    }
     "no agent hammered a lease it was refused — every retry was either rare or \
      spaced against what the holder advertised"
         .to_string()
@@ -376,6 +392,72 @@ mod tests {
             "{}",
             render_check(&r)
         );
+    }
+    /// A log with no refusals in it must say the check COULD NOT RUN, not that no
+    /// agent hammered anything (pact-k1n.4).
+    ///
+    /// The modmill proving-ground run read this line as a pass on a log with 0
+    /// refusals end to end. It is not a pass — a fleet that never contended for a
+    /// path has not demonstrated good behaviour under contention, it has just not
+    /// been asked. `claim-lease-divergence` and `gate-order` already say "could not
+    /// run" in their own vacuous cases; this makes the third one consistent.
+    #[test]
+    fn no_refusals_reads_as_could_not_run_rather_than_clean() {
+        let tmp = with_log(&[
+            &ev(
+                "2026-08-11T08:00:00Z",
+                "agent-06",
+                "acquired",
+                "src/eval.rs",
+            ),
+            &ev(
+                "2026-08-11T08:10:00Z",
+                "agent-06",
+                "released",
+                "src/eval.rs",
+            ),
+        ]);
+        let r = run_check(tmp.path(), Check::RetryStorm, None, false).unwrap();
+        assert_eq!(r.findings(), 0);
+        assert_eq!(r.refusals_seen, 0, "the fixture has no refusals");
+
+        let text = render_check(&r);
+        assert!(text.contains("could not run"), "{text}");
+        assert!(
+            !text.contains("no agent hammered"),
+            "a vacuous scan must not claim the fleet behaved well: {text}"
+        );
+        // And no "0 refusal(s) carry no holder-remaining" line either — a zero
+        // rendered as a measurement is the same lie in smaller type.
+        assert!(!text.contains("0 refusal(s)"), "{text}");
+    }
+
+    /// The other half: with refusals present and none stormy, the clean sentence is
+    /// still the right answer. The fix must not turn every quiet run into "could
+    /// not run".
+    #[test]
+    fn refusals_present_and_well_spaced_still_read_as_clean() {
+        let tmp = with_log(&[
+            &ev(
+                "2026-08-11T08:00:00Z",
+                "agent-06",
+                "acquired",
+                "src/eval.rs",
+            ),
+            &ev_refused(
+                "2026-08-11T08:01:00Z",
+                "agent-02",
+                "src/eval.rs",
+                "agent-06",
+                355,
+            ),
+        ]);
+        let r = run_check(tmp.path(), Check::RetryStorm, None, false).unwrap();
+        assert_eq!(r.findings(), 0);
+        assert_eq!(r.refusals_seen, 1);
+        let text = render_check(&r);
+        assert!(text.contains("no agent hammered"), "{text}");
+        assert!(!text.contains("could not run"), "{text}");
     }
 }
 

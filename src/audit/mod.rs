@@ -407,19 +407,39 @@ pub struct CheckReport {
     /// report byte-identical to what it printed before this existed.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub agents: std::collections::BTreeMap<String, AgentChain>,
-    /// Whether each agent named by a STILL-OPEN stale hold is alive right now,
+    /// What the activity record says about each agent named by a stale hold,
     /// from `.pact/activity/` (pact-88z).
     ///
-    /// **Only for open holds, and the limit is the point.** "Held past its TTL"
-    /// is one finding today and two smells: a worker overrunning a TTL it should
-    /// have renewed, and a lock nobody is behind. Those want opposite responses,
-    /// and the activity record separates them — for a hold that is still open.
+    /// "Held past its TTL" is one finding and two smells — a worker overrunning a
+    /// TTL it should have renewed, and a lock nobody is behind — which want
+    /// opposite responses. The activity record separates them, and it answers a
+    /// **different question for each kind of hold**:
     ///
-    /// It cannot separate them for a CLOSED one. The record carries when an agent
-    /// was last seen, not a history, so asking it about a hold that ended last
-    /// Tuesday gets an answer about today. Audit is offline analysis of history
-    /// and this is present-tense state; where the two do not meet, the finding
-    /// stays exactly as unqualified as it was.
+    /// - **Still open**: is this agent fresh right now? A present-tense
+    ///   `Liveness` label. There is a live lock, so "is anybody behind it" is
+    ///   exactly what a reader needs.
+    /// - **Ended by expiry**: was this agent seen *after* the lease lapsed? There
+    ///   is no lock left to be behind; what matters is whether the agent survived
+    ///   its own lapse — overran the TTL and kept working, or died holding the
+    ///   path.
+    ///
+    /// Ended by `released` or `stolen`: nothing, and deliberately. The first is an
+    /// agent that acted, the second a peer that took over; neither leaves the
+    /// question open.
+    ///
+    /// **Why the closed case is sound, given that the record is one timestamp.**
+    /// This map used to cover open holds only, on the reasoning that a single
+    /// "last seen" stamp cannot speak to a hold that ended last Tuesday — asking
+    /// it gets an answer about today. That objection holds against *classifying*
+    /// a closed hold present-tense, and pact-k1n.3 does not do that. "Seen since
+    /// `closed_at`" is a comparison, and an ordering between two timestamps is
+    /// precisely what one stored timestamp can support. What it still cannot do is
+    /// say what the agent was doing *during* the hold, and nothing here claims to.
+    ///
+    /// The gap was not theoretical: the modmill proving-ground run's one real
+    /// stale hold had been reclaimed by its TTL, so the qualifier skipped exactly
+    /// the hold it existed to explain. The only shape that occurred in the field
+    /// was the one shape not covered.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub liveness: std::collections::BTreeMap<String, String>,
     /// The constraints the run operated under — the same map the summary prints.
@@ -557,6 +577,19 @@ pub struct CheckReport {
     /// covering watch, so the channel WAS in place. Not a finding, and not netted
     /// out of the count either — see [`SilentContention`].
     pub refusals_with_a_channel: usize,
+    /// Refusals this check actually looked at, after its own exclusions.
+    ///
+    /// **Zero means the check could not run, not that it passed.** `retry-storm`
+    /// and `silent-contention` both reason exclusively about refusals: with none
+    /// in the log there is nothing either could have found, and printing "no
+    /// agent retried a refused lease" over an empty scan states as an achievement
+    /// what is really an absence of evidence. The modmill proving-ground run read
+    /// two clean lines that way and had 0 refusals end to end (pact-k1n.4).
+    ///
+    /// `claim_unavailable` and `gates_unavailable` already draw this line for
+    /// their own checks; this is the same distinction for the two that were still
+    /// conflating it.
+    pub refusals_seen: usize,
     /// `Check::Topology` only: events carrying no `invoked_from` at all.
     /// Reported, never a finding — every log written before pact 0.7.0 is
     /// entirely in this state, and flagging it would fail every existing
@@ -665,6 +698,7 @@ pub fn run_check_strict(
         gates_unavailable: None,
         strict,
         refusals_with_a_channel: 0,
+        refusals_seen: 0,
     };
 
     match check {
@@ -676,6 +710,61 @@ pub fn run_check_strict(
             // no such qualifier. One small file read per distinct agent.
             let state = crate::repo::pact_dir_path(repo_root);
             let now = Utc::now();
+            // Holds the TTL reclaimed, and the LATEST moment each agent let one
+            // lapse. Qualified with "seen since?" rather than a present-tense
+            // label — see below (pact-k1n.3).
+            let mut lapsed: std::collections::BTreeMap<&str, &str> =
+                std::collections::BTreeMap::new();
+            for h in &report.stale_holds {
+                if h.closed_by.as_deref() != Some("expired") {
+                    continue;
+                }
+                let Some(at) = h.closed_at.as_deref() else {
+                    continue;
+                };
+                // String comparison is correct here and cheap: these are RFC3339
+                // stamps written by pact, in UTC, so lexical order IS chronological
+                // order. The same reason `pact log` sorts them as strings.
+                lapsed
+                    .entry(h.agent.as_str())
+                    .and_modify(|prev| {
+                        if at > *prev {
+                            *prev = at;
+                        }
+                    })
+                    .or_insert(at);
+            }
+            for (agent, closed_at) in lapsed {
+                // **The comparison, not a classification.** `Liveness::of` asks
+                // "is this agent fresh right now", which says nothing useful about
+                // a hold that ended long ago — that was the standing objection to
+                // qualifying closed holds at all, and it was right. "Was this agent
+                // seen after `closed_at`" is a different question, and it is the
+                // one a single stored timestamp answers exactly: it needs an
+                // ordering, not a history.
+                let seen = crate::activity::last_active(&state, agent);
+                let reading = match (seen, chrono::DateTime::parse_from_rfc3339(closed_at)) {
+                    (Some(seen), Ok(end)) if seen > end.with_timezone(&Utc) => format!(
+                        "seen {} after letting a path lapse — it outlived its own lease and \
+                         kept working",
+                        secs((seen - end.with_timezone(&Utc)).num_seconds())
+                    ),
+                    (Some(_), Ok(_)) => {
+                        "not seen since its lease lapsed — it never came back to release this"
+                            .to_string()
+                    }
+                    // No record, or a timestamp that will not parse. NOT evidence
+                    // of death: every repository has no records until an agent runs
+                    // a pact new enough to write them, and reporting that as "never
+                    // came back" would turn every older log into a massacre.
+                    _ => continue,
+                };
+                report.liveness.insert(agent.to_string(), reading);
+            }
+            // Present-tense state, for the agents whose holds are STILL OPEN. A
+            // different question from the one above and a different answer shape,
+            // so it is computed separately — and it wins on an agent that has both,
+            // because a lock still standing is the more urgent of the two.
             let open_holders: std::collections::BTreeSet<&str> = report
                 .stale_holds
                 .iter()
@@ -797,8 +886,8 @@ pub fn render_check(r: &CheckReport) -> String {
             "chain-integrity" => checks::chain_integrity::clean(),
             "commit-correlation" => checks::commit_correlation::clean(),
             "topology" => checks::topology::clean(r),
-            "silent-contention" => checks::silent_contention::clean(),
-            "retry-storm" => checks::retry_storm::clean(),
+            "silent-contention" => checks::silent_contention::clean(r),
+            "retry-storm" => checks::retry_storm::clean(r),
             "claim-lease-divergence" => checks::claim_lease_divergence::clean(),
             "merge-divergence" => checks::merge_divergence::clean(),
             // Only when there is genuinely nothing — see the exception below.

@@ -62,17 +62,40 @@ pub(in crate::audit) fn findings(r: &CheckReport, out: &mut Vec<String>) {
             ended,
             h.opened_line
         ));
-        // A still-open hold past its TTL is two different smells, and this is the
-        // only thing that separates them (pact-88z): a worker overrunning a TTL it
+        // A hold that outran its TTL is two different smells, and this is the only
+        // thing that separates them (pact-88z): a worker overrunning a TTL it
         // should have renewed, versus a lock nobody is behind. Appended rather
         // than folded into the row, because it is present-tense state beside a
         // historical finding and the reader has to be able to tell which is which.
-        if let Some(state) = h
-            .closed_by
-            .is_none()
-            .then(|| r.liveness.get(&h.agent))
-            .flatten()
-        {
+        //
+        // **Expired holds are qualified too, and that is pact-k1n.3.** This used to
+        // fire only on `closed_by == None`, on the reasoning that an expired hold
+        // is already over so there is nothing live to say about it. The modmill
+        // proving-ground run is the counter-example: its one real stale hold had
+        // been reclaimed by the TTL, so `closed_by` was `expired`, so the qualifier
+        // skipped precisely the hold the check existed to explain. The only shape
+        // that occurred in the field was the one shape not covered.
+        //
+        // For an ended hold the question is a DIFFERENT one, not the same one asked
+        // later: not "is somebody behind this lock" — there is no lock — but **was
+        // this agent seen after the lease lapsed**. An agent seen since overran a
+        // TTL and kept working, which is a protocol lapse by a healthy agent; an
+        // agent not seen since died holding the path, which is an incident. Same
+        // record, opposite readings, and `run_check` computes which by comparing
+        // the activity stamp against the hold's own `closed_at`.
+        //
+        // That comparison is what makes this safe, and it is worth being explicit
+        // because the objection to qualifying closed holds was a good one: the
+        // activity record is a single timestamp, not a history, so classifying it
+        // present-tense says something about today rather than about a hold that
+        // ended last Tuesday. "Seen since X" is the one question a single timestamp
+        // answers exactly — it needs an ordering, not a history.
+        //
+        // `released` and `stolen` are still skipped, and deliberately: the first is
+        // an agent that acted, the second is a peer that took over. Neither leaves
+        // the "is anybody there" question open.
+        let qualify = matches!(h.closed_by.as_deref(), None | Some("expired"));
+        if let Some(state) = qualify.then(|| r.liveness.get(&h.agent)).flatten() {
             out.push(format!("  {:<40} holder is {}", "", state));
         }
     }
@@ -270,5 +293,69 @@ mod tests {
         let r = run_check(tmp.path(), Check::StaleHolds, None, false).unwrap();
         assert_eq!(r.findings(), 1);
         assert_eq!(r.stale_holds[0].closed_by.as_deref(), Some("expired"));
+    }
+
+    /// A hold the TTL reclaimed is qualified by whether its agent was seen SINCE
+    /// (pact-k1n.3) — the shape the modmill proving-ground run actually produced,
+    /// and the one this check used to skip.
+    ///
+    /// Both directions, because they are opposite verdicts on identical rows: an
+    /// agent seen after the lapse overran a TTL and kept working; an agent not seen
+    /// since died holding the path.
+    #[test]
+    fn an_expired_hold_says_whether_its_agent_was_seen_since() {
+        for (label, active_at, expected) in [
+            (
+                "came back",
+                "2026-08-01T12:00:00Z",
+                "it outlived its own lease",
+            ),
+            ("never did", "2026-08-01T09:00:00Z", "never came back"),
+        ] {
+            let tmp = with_log(&[
+                &ev_ttl("2026-08-01T10:00:00Z", "w3", "acquired", "a.rs", 600),
+                &ev_ttl("2026-08-01T11:00:00Z", "w3", "expired", "a.rs", 600),
+            ]);
+            // The activity record the fleet would have written by simply running
+            // pact commands — before the lapse in one case, after it in the other.
+            let dir = tmp.path().join(".pact/activity");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("w3"), active_at).unwrap();
+
+            let r = run_check(tmp.path(), Check::StaleHolds, None, false).unwrap();
+            assert_eq!(
+                r.findings(),
+                1,
+                "{label}: the hold itself is still the finding"
+            );
+            assert_eq!(r.stale_holds[0].closed_by.as_deref(), Some("expired"));
+
+            let text = render_check(&r);
+            assert!(
+                text.contains(expected),
+                "{label}: expected {expected:?} in:\n{text}"
+            );
+        }
+    }
+
+    /// No activity record is NOT evidence of death. Every repository is in that
+    /// state until an agent runs a pact new enough to write one, and a fleet that
+    /// ran on an older pact must not be reported as a fleet of corpses.
+    #[test]
+    fn an_expired_hold_with_no_activity_record_is_left_unqualified() {
+        let tmp = with_log(&[
+            &ev_ttl("2026-08-01T10:00:00Z", "w3", "acquired", "a.rs", 600),
+            &ev_ttl("2026-08-01T11:00:00Z", "w3", "expired", "a.rs", 600),
+        ]);
+        let r = run_check(tmp.path(), Check::StaleHolds, None, false).unwrap();
+        assert_eq!(r.findings(), 1);
+        assert!(
+            r.liveness.is_empty(),
+            "no record means no claim: {:?}",
+            r.liveness
+        );
+        let text = render_check(&r);
+        assert!(!text.contains("never came back"), "{text}");
+        assert!(!text.contains("outlived"), "{text}");
     }
 }

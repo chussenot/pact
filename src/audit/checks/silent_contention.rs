@@ -68,6 +68,7 @@ pub(in crate::audit) fn silent_contentions(
         if is_injector(&e.agent) {
             continue;
         }
+        report.refusals_seen += 1;
         let had_channel = crate::watch::was_subscribed_at(&watch_records, &e.agent, path, &e.at);
         if had_channel {
             report.refusals_with_a_channel += 1;
@@ -117,6 +118,12 @@ pub(in crate::audit) fn silent_contentions(
 
 /// The scope line, stated even when clean.
 pub(in crate::audit) fn scope(r: &CheckReport, out: &mut Vec<String>) {
+    // Nothing to scope when the check could not run: a "0 refusal(s) …" line
+    // above a "could not run" line is two ways of saying the same absence, and the
+    // first one looks like a measurement.
+    if r.refusals_seen == 0 {
+        return;
+    }
     // Stated clean or not. A run where every refused agent was already
     // subscribed has NO findings here, and that fact is the interesting one —
     // silence would read as "nothing to see" rather than "the channel was used".
@@ -128,7 +135,16 @@ pub(in crate::audit) fn scope(r: &CheckReport, out: &mut Vec<String>) {
 }
 
 /// What this check prints when it found nothing.
-pub(in crate::audit) fn clean() -> String {
+pub(in crate::audit) fn clean(r: &CheckReport) -> String {
+    // Vacuous is not clean. This check reasons only about refusals; with none in
+    // the log it examined nothing, and the clean sentence below would be claiming
+    // a fleet communicated well about contention that never happened.
+    if r.refusals_seen == 0 {
+        return "could not run: no refusals in this log, so no contention to be \
+                silent about. This check reads a fleet's behaviour when a path was \
+                actually wanted by two agents at once."
+            .to_string();
+    }
     "every contended path was communicated about before its holder let go — by a \
      watch delivery, a message, or the refused agent's own subscription"
         .to_string()
@@ -340,5 +356,37 @@ mod tests {
         ]);
         let r = run_check(tmp.path(), Check::SilentContention, None, false).unwrap();
         assert_eq!(r.findings(), 0, "{:?}", r.silent_contentions);
+    }
+
+    /// No refusals means no contention to have been silent about, and the check
+    /// must say so rather than crediting the fleet with communicating well
+    /// (pact-k1n.4).
+    #[test]
+    fn no_refusals_reads_as_could_not_run_rather_than_clean() {
+        let tmp = with_log(&[
+            &ev(
+                "2026-08-11T08:00:00Z",
+                "agent-06",
+                "acquired",
+                "src/eval.rs",
+            ),
+            &ev(
+                "2026-08-11T08:10:00Z",
+                "agent-06",
+                "released",
+                "src/eval.rs",
+            ),
+        ]);
+        let r = run_check(tmp.path(), Check::SilentContention, None, false).unwrap();
+        assert_eq!(r.findings(), 0);
+        assert_eq!(r.refusals_seen, 0);
+
+        let text = render_check(&r);
+        assert!(text.contains("could not run"), "{text}");
+        assert!(
+            !text.contains("every contended path was communicated about"),
+            "a run with no contention has not communicated well about it: {text}"
+        );
+        assert!(!text.contains("0 refusal(s)"), "{text}");
     }
 }
