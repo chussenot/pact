@@ -637,39 +637,22 @@ fn fleet_liveness_check(root: &Path) -> DoctorCheck {
             ),
         };
     }
-    // Activity first, because it is both cheaper and stronger than the commit
-    // rung — one small file read per agent against one `git log` — and because it
-    // is the only rung that sees a holder whose participation is read-only
-    // (pact-88z). This is the same ladder `lease sweep --suspect` walks, in the
-    // same order, so doctor and the sweep cannot disagree about who is alive.
-    let state = crate::repo::pact_dir_path(root);
-    let now = chrono::Utc::now();
-    let seen: Vec<_> = quiet
-        .iter()
-        .filter(|e| {
-            crate::activity::idle_secs(&state, &e.lease.agent, now)
-                .is_some_and(|i| i * 2 <= lease::ttl_as_i64(e.lease.ttl_secs))
-        })
-        .collect();
-    // One `git log` for the whole check, and only for what activity did not
-    // already vouch for — so a healthy fleet, which is the common case, spawns
-    // nothing at all.
-    let unvouched: Vec<_> = quiet
-        .iter()
-        .filter(|e| {
-            crate::activity::idle_secs(&state, &e.lease.agent, now)
-                .is_none_or(|i| i * 2 > lease::ttl_as_i64(e.lease.ttl_secs))
-        })
-        .collect();
-    let commits = if unvouched.is_empty() {
-        Vec::new()
-    } else {
-        crate::git_history::commits_since(root, None).unwrap_or_default()
-    };
-    let (committing, absent): (Vec<&&&&lease::LeaseEntry>, Vec<&&&&lease::LeaseEntry>) = unvouched
+    // The activity rung is already inside `quiet` (pact-88z): `scan` folds pact
+    // activity into `holder_silent_secs` alongside the event log, so a holder that
+    // has run ANY pact command inside half its TTL is not `suspect` and is not in
+    // this list. Re-checking it here would be dead code wearing the shape of a
+    // safety net, and the two copies would drift the first time either threshold
+    // moved.
+    //
+    // What is left is the commit rung, which `scan` cannot afford: it costs a
+    // `git log`, and `scan` backs `lease ls` and the TUI refresh. A diagnostic
+    // can pay for it; a listing cannot. One `git log` for the whole check, and
+    // only when something is quiet — so a healthy fleet spawns nothing.
+    let commits = crate::git_history::commits_since(root, None).unwrap_or_default();
+    let (working, absent): (Vec<&&&lease::LeaseEntry>, Vec<&&&lease::LeaseEntry>) = quiet
         .iter()
         .partition(|e| lease::has_committed_under(&commits, &e.lease));
-    let working = seen.len() + committing.len();
+    let working = working.len();
     let longest = absent
         .iter()
         .filter_map(|e| e.holder_silent_secs)

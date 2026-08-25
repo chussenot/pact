@@ -86,6 +86,13 @@ pub struct State {
     /// `None` is the `(all leases)` row — every lease, nobody filtered out.
     pub agent: Option<String>,
     pub focus: Focus,
+    /// Sort the roster worst-first instead of most-recent-first (pact-88z).
+    ///
+    /// Off by default, because the default answer to "who is here" is a fleet in
+    /// the order it acted. On is the answer to "who is stuck", which is the
+    /// question that makes somebody open this panel in the middle of a run — and
+    /// the dead sort to the top because they are why it was opened.
+    pub dead_first: bool,
 
     /// Unread mail per recipient, counted in one pass over the message store per
     /// tick rather than one `inbox()` scan per roster row per frame.
@@ -190,6 +197,14 @@ pub fn handle_key(app: &mut App, code: KeyCode) -> bool {
         KeyCode::Left | KeyCode::Char('h') => app.fleet.focus = Focus::Roster,
         KeyCode::Right | KeyCode::Char('l') => app.fleet.focus = Focus::Work,
         KeyCode::Char('x') => release_selected(app),
+        // Toggling re-sorts under the cursor, so the selection is re-pinned to
+        // the AGENT it was on rather than the row index — the same reason
+        // `reselect_roster` exists at all, since the roster already re-sorts by
+        // recency every tick.
+        KeyCode::Char('d') => {
+            app.fleet.dead_first = !app.fleet.dead_first;
+            reselect_roster(app);
+        }
         _ => return false,
     }
     true
@@ -230,7 +245,7 @@ pub fn select(app: &mut App, index: usize) {
 
 /// Release leads, because it is the only key here that changes anything.
 pub fn help() -> &'static str {
-    "x: release  j/k: move  h/l: pane  enter: open agent/path"
+    "x: release  d: dead first  j/k: move  h/l: pane  enter: open agent/path"
 }
 
 // ----------------------------------------------------------------- selection
@@ -255,13 +270,26 @@ fn roster_len(app: &App) -> usize {
 /// the whole right-hand pane, so hiding it would silently re-scope the screen
 /// to `(all leases)` while the operator was typing a path.
 fn roster_rows(app: &App) -> Vec<&AgentInfo> {
-    app.data
+    let mut rows: Vec<&AgentInfo> = app
+        .data
         .roster()
         .iter()
         .filter(|a| {
             app.filter.matches(&[&a.name]) || app.fleet.agent.as_deref() == Some(a.name.as_str())
         })
-        .collect()
+        .collect();
+    if app.fleet.dead_first {
+        // `Liveness`' own ordering is the severity ordering, so this is a plain
+        // sort rather than a hand-written comparator that could disagree with the
+        // labels beside it. Name breaks ties so the list is stable between ticks
+        // — an operator reading a row must not have it move under them because
+        // two agents share a state.
+        rows.sort_by(|a, b| {
+            let key = |i: &AgentInfo| activity::Liveness::of(i.idle_secs, i.leases_held, false);
+            key(a).cmp(&key(b)).then(a.name.cmp(&b.name))
+        });
+    }
+    rows
 }
 
 /// Where the keyboard actually is. With no roster there is only one list, so a
@@ -1071,6 +1099,66 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    /// pact-88z: `d` puts the worst first, because the worst are why the panel
+    /// was opened.
+    ///
+    /// Default order is recency, which answers "who is here". This answers "who
+    /// is stuck", and the two are different questions — an operator mid-run wants
+    /// the second and should not have to read the whole roster to get it.
+    ///
+    /// The selection is asserted to survive the re-sort. That is not incidental:
+    /// the roster already re-sorts by recency every tick, which is why
+    /// `reselect_roster` keys on the AGENT and not the row, and a toggle that
+    /// moved the cursor to a different agent would be a worse bug than no toggle.
+    #[test]
+    fn d_sorts_the_worst_first_and_keeps_the_operator_on_their_agent() {
+        let tmp = fixture();
+        let dir = crate::repo::pact_dir_path(tmp.path()).join("activity");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ago = |s: i64| (Utc::now() - chrono::Duration::seconds(s)).to_rfc3339();
+        // poller is ACTIVE, docs-story is IDLE. Recency puts poller first.
+        std::fs::write(dir.join("poller"), ago(5)).unwrap();
+        std::fs::write(
+            dir.join("docs-story"),
+            ago(crate::activity::FRESH_SECS + 60),
+        )
+        .unwrap();
+
+        let mut app = app(tmp.path(), Some("operator"), vec![]);
+        app.fleet.agent = Some("poller".to_string());
+        reselect_roster(&mut app);
+        let before = app.fleet.roster.selected();
+
+        let order = |app: &App| -> Vec<String> {
+            roster_rows(app).iter().map(|a| a.name.clone()).collect()
+        };
+        let recency = order(&app);
+
+        assert!(handle_key(&mut app, KeyCode::Char('d')), "d is handled");
+        let worst_first = order(&app);
+
+        assert_ne!(recency, worst_first, "the toggle must actually reorder");
+        let idle_at = worst_first.iter().position(|n| n == "docs-story").unwrap();
+        let active_at = worst_first.iter().position(|n| n == "poller").unwrap();
+        assert!(
+            idle_at < active_at,
+            "IDLE outranks ACTIVE when sorting by what is wrong: {worst_first:?}"
+        );
+
+        // And the cursor is still on the operator's agent, not on whatever row
+        // that index now holds.
+        assert_eq!(app.fleet.agent.as_deref(), Some("poller"));
+        let after = app.fleet.roster.selected();
+        assert!(
+            before != after || recency == worst_first,
+            "a re-sort that moved the agent must have moved the cursor with it"
+        );
+
+        // Toggling back restores the default order.
+        assert!(handle_key(&mut app, KeyCode::Char('d')));
+        assert_eq!(order(&app), recency);
     }
 
     /// pact-88z: the four states an operator scans for, plus the non-state.

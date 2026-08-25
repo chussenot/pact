@@ -25,6 +25,14 @@ whether a quiet holder is working — the exit-2 refusal, `lease sweep --suspect
 | **commit** | the holder has committed under this path since taking it | one `git log` |
 | **pact activity** | the holder ran *any* pact command recently, including read-only ones | one small file read |
 
+`SUSPECT` itself walks the first and third rungs: since pact-88z the silence
+behind it counts **every channel pact can see**, not only the event log. That is
+why `lease ls`, the `pact ui` lease table and the exit-2 refusal all improved at
+once — one change in the scan, rather than three surfaces each learning the same
+thing. `sweep --suspect` and `pact doctor` deliberately do NOT re-check it: a
+holder that has run a pact command inside half its TTL is not suspect in the first
+place and never reaches them.
+
 Silence alone is weak, and measurably so: pact only sees an agent when it
 **mutates** something, so a worker making one deep change to one file emits
 nothing at all between acquire and release. Over pact's own history, 23% of 335

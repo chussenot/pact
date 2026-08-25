@@ -778,6 +778,31 @@ reasoning a commit subject cannot.
 
 ## Notes — unreleased
 
+### `SUSPECT` now means silent in every channel
+
+A follow-up that turned out to delete more than it added. `LeaseEntry::suspect`
+asked "has this agent written no EVENT for over half its TTL" — and pact writes
+events only for mutations, so an agent reading its inbox was as suspect as one
+that had stopped existing. The scan now folds pact activity in beside the event
+log and takes the more recent of the two, which is what the word was always
+trying to mean.
+
+Three surfaces improved from that one change rather than from three of their own:
+`lease ls`'s `STATE`, the `pact ui` lease table, and the exit-2 refusal. A
+contended path now shows whether waiting is rational without any new column.
+
+And two rungs came back out. `sweep --suspect` and `pact doctor` had each grown
+their own activity check; both are now gone, because a holder that has run a pact
+command inside half its TTL is no longer `suspect` and never reaches either. One
+source of truth — the duplicates would have drifted the first time either
+threshold moved.
+
+`pact ui` gains `d`: sort the roster worst-first (DEAD, STALE, IDLE, ACTIVE)
+instead of by recency. The default answers "who is here"; this answers "who is
+stuck", which is the question that makes somebody open the panel mid-run. The
+selection follows the agent through the re-sort rather than the row index, for the
+same reason it already does under the recency sort.
+
 ### Liveness, as a by-product of participation
 
 Every pact invocation now records that its agent is alive. Not a heartbeat, not a

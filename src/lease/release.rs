@@ -510,21 +510,16 @@ pub fn sweep(repo_root: &Path, agent: &str, mode: Sweep, paths: &[String]) -> Re
         // process can stat is frequently not the one the holder is editing, and a
         // rung that is silently wrong under the topology pact recommends is worse
         // than a rung that is missing.
-        if eligible && !entry.expired {
-            let idle = crate::activity::idle_secs(
-                &crate::repo::pact_dir_path(repo_root),
-                &lease.agent,
-                crate::lease::effective_now(repo_root),
-            );
-            // Judged against this lease's OWN ttl, exactly as `suspect` is: a
-            // 10-minute lease and a 45-minute one deserve different patience, and
-            // the same halving that made the holder suspect un-makes it here.
-            // Anything else would let the two disagree about the same threshold.
-            if idle.is_some_and(|i| i * 2 <= ttl_as_i64(lease.ttl_secs)) {
-                eligible = false;
-            }
-        }
-
+        // The activity rung is not applied HERE, and its absence is the design
+        // rather than an omission: `entry.suspect` already accounts for it.
+        // `scan` folds pact activity into `holder_silent_secs` alongside the
+        // event log, so a holder that has run any pact command inside half its
+        // TTL is not suspect in the first place and never reaches this loop.
+        //
+        // One source of truth, deliberately. Checking it again here would be
+        // dead code that reads as a safety net, and the two copies would drift
+        // the first time either threshold moved.
+        //
         // A holder that has COMMITTED under the path it holds is working,
         // whatever the event log says (pact-g50).
         //

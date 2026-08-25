@@ -243,8 +243,21 @@ the one thing this panel exists to do. Nothing is lost by the swap: `SEEN` showe
 the age of the newest *event*, and this shows the age of the newest pact command,
 which is that signal plus the read-only half that used to be invisible.
 
+`d` toggles the roster to **worst-first** — DEAD, then STALE, then IDLE, then
+ACTIVE — because the worst are why the panel was opened mid-run. The default stays
+recency, which answers "who is here"; this answers "who is stuck". The selection
+follows the agent through the re-sort, not the row index, for the same reason it
+already does under the recency sort.
+
 The refresh reads one directory of small per-agent files — no log scan, no
 subprocess, which is the rule this surface has always been held to.
+
+The **lease** table needs no column of its own: its `STATE` already reads
+`SUSPECT: quiet 8m12s`, and since pact-88z the silence behind that word counts
+every channel pact can see rather than only the event log. So a contended path
+shows whether waiting is rational without anything new on the row — a holder
+running pact commands reads `active`, and one that has genuinely stopped reads
+`SUSPECT`.
 
 ### The attribution chain is in the detail views, not the tables
 

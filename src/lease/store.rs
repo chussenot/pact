@@ -267,6 +267,21 @@ pub(super) fn scan(repo_root: &Path) -> Result<Vec<(PathBuf, LeaseEntry)>> {
     // a failed listing — `lease ls` must keep working in a repo whose log was
     // never committed.
     let last_seen: Vec<(String, String, usize)> = events::actors(repo_root).unwrap_or_default();
+    // And ONE directory read for the activity records, for the same reason
+    // (pact-88z). `actors` answers "when did this agent last MUTATE something";
+    // this answers "when did it last run anything at all", which is a strictly
+    // wider question and the one `suspect` was always trying to ask.
+    //
+    // Affordable here where the commit rung is not: this is a `read_dir` of a
+    // directory holding one small file per agent — measured at 14.7 µs to WRITE
+    // one, less to read — against the `git log` that made `has_committed_under`
+    // sweep-only. `scan` backs `lease ls` and the TUI's refresh, so the
+    // distinction between a file read and a subprocess is the whole difference
+    // between a signal this surface can carry and one it cannot.
+    let last_active: std::collections::BTreeMap<String, chrono::DateTime<Utc>> =
+        crate::activity::all(&crate::repo::pact_dir_path(repo_root))
+            .into_iter()
+            .collect();
     let mut entries = Vec::new();
 
     let dir = match std::fs::read_dir(&leases_dir) {
@@ -293,11 +308,28 @@ pub(super) fn scan(repo_root: &Path) -> Result<Vec<(PathBuf, LeaseEntry)>> {
 
         let (age_secs, remaining_secs) = age_and_remaining(&lease, now);
         let expired = is_expired(&lease, now);
-        let holder_silent_secs = last_seen
+        // "Silent" now means silent in EVERY channel pact can see, which is what
+        // the word was always meant to mean (pact-88z). Before this it meant
+        // "wrote no event", and pact only writes events for mutations — so an
+        // agent reading its inbox, listing leases or reading the log was as
+        // silent as one that had stopped existing. That is the pact-g50 residual,
+        // and it made SUSPECT fire on roughly a quarter of ordinary work.
+        //
+        // The MORE RECENT of the two wins, never the average and never the event
+        // alone: each is evidence the agent was alive at that moment, and the
+        // question is how long ago the last such moment was.
+        let event_silence = last_seen
             .iter()
             .find(|(agent, _, _)| *agent == lease.agent)
             .and_then(|(_, at, _)| chrono::DateTime::parse_from_rfc3339(at).ok())
             .map(|at| (now - at.with_timezone(&Utc)).num_seconds().max(0));
+        let activity_silence = last_active
+            .get(&lease.agent)
+            .map(|at| (now - *at).num_seconds().max(0));
+        let holder_silent_secs = match (event_silence, activity_silence) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (only, None) | (None, only) => only,
+        };
         // Half the lease's OWN ttl, not a global constant: a 10-minute lease and a
         // 45-minute one deserve different patience, and the lease already carries
         // the number. An already-expired lease is not flagged — it has a louder
