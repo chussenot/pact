@@ -125,9 +125,19 @@ pub fn harness_session() -> Option<String> {
 /// docs/fleet-patterns.md tells fleets the same thing rather than suggesting they
 /// scrape it themselves.
 ///
-/// The consequence for recount is written down rather than discovered later: the
-/// keyed join tier will be rare, and the topological join stays the load-bearing
-/// path.
+/// **What that leaves is a statement about the contract, not a forecast about a
+/// consumer.** A join keyed on this field needs it present on both sides; under
+/// Claude Code it is present on neither, so a keyed answer is not available and a
+/// consumer must reach it some other way or say it could not.
+///
+/// An earlier version of this comment went further and predicted the shape of
+/// recount's join — that its keyed tier would be rare and its topological ladder
+/// would stay load-bearing. The modmill run measured the opposite: keyed fired on
+/// 3 of 3 findings and the topological ladder ran 0 times. The measurement behind
+/// the prediction was right — the field really is absent on every row — but the
+/// prediction was not pact's to make, because what a consumer keys on is the
+/// consumer's design and not a property of this field. Sentences like that read as
+/// established fact to the next person (pact-k1n.5).
 pub fn harness_subagent() -> Option<String> {
     fingerprinted("PACT_HARNESS_SUBAGENT", "")
 }

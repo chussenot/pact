@@ -136,8 +136,11 @@ own. Every function in `harness.rs` is a `std::env::var` call and nothing else �
 no filesystem, no subprocess — and that is a property of the module, not an
 accident of what was convenient.
 
-Absence is the honest signal, and it costs less than it looks: `recount` falls
-back to the topological join it has always used and says which tier it took. See
+Absence is the honest signal. What it costs is stated as a contract rather than
+as a forecast: a join keyed on `harness_subagent` needs the field on both sides,
+and under Claude Code it is on neither — so a consumer either reaches the same
+answer another way or reports that it could not. Which route a given consumer
+takes is that consumer's design, not a property of this field. See
 [audit.md](audit.md#the-recount-join-ladder).
 
 ### Observed and deliberately unused
