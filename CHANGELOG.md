@@ -10,6 +10,14 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.15.1 - 2026-08-25
+#### Continuous Integration
+- **(docs)** guard the enumerated flag values in cli.md - (1a82eb3) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(beads)** close the check-docs enum-value gap - (8a3587f) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.15.0 - 2026-08-25
 #### Features
 - **(audit)** gate declarations, verified and never enforced - (e118417) - Clement HUSSENOT-DESENONGES
