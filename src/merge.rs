@@ -842,7 +842,7 @@ mod tests {
         assert_eq!(line, "Merge feature into master|wheelwright", "{line}");
 
         // The mutex is not held any more.
-        let held = lease::list(root, true).unwrap();
+        let held = lease::list_reclaiming(root, true).unwrap().0;
         assert!(
             !held.iter().any(|l| l.lease.path == mutex_key("master")),
             "a green merge must release: {held:?}"
@@ -879,7 +879,7 @@ mod tests {
         );
 
         // And the lock is still held, so no peer merges onto a broken branch.
-        let held = lease::list(root, true).unwrap();
+        let held = lease::list_reclaiming(root, true).unwrap().0;
         assert!(
             held.iter().any(|l| l.lease.path == mutex_key("master")),
             "a red merge must KEEP the mutex: {held:?}"
@@ -909,7 +909,7 @@ mod tests {
         assert!(out.merge_commit.is_some(), "{out:?}");
         assert!(describe(&out).contains("already contains stale"), "{out:?}");
 
-        let held = lease::list(root, true).unwrap();
+        let held = lease::list_reclaiming(root, true).unwrap().0;
         assert!(!held.iter().any(|l| l.lease.path == mutex_key("master")));
     }
 
@@ -939,7 +939,7 @@ mod tests {
             std::fs::read_to_string(root.join("f.txt")).unwrap(),
             "local edit not committed\n"
         );
-        assert!(lease::list(root, true).unwrap().is_empty());
+        assert!(lease::list_reclaiming(root, true).unwrap().0.is_empty());
     }
 
     /// A second agent cannot merge while the first holds the key — the property
@@ -1268,7 +1268,7 @@ mod tests {
 
         // And the mutex is released — holding it would block the fleet behind
         // a breakage this agent did not cause.
-        let held = lease::list(root, true).unwrap();
+        let held = lease::list_reclaiming(root, true).unwrap().0;
         assert!(
             !held.iter().any(|l| l.lease.path == mutex_key("master")),
             "must not hold the mutex for somebody else's breakage: {held:?}"
@@ -1313,8 +1313,9 @@ mod tests {
             "it must name what this merge broke: {msg}"
         );
         assert_eq!(head(root).unwrap(), before, "the merge must be undone");
-        assert!(lease::list(root, true)
+        assert!(lease::list_reclaiming(root, true)
             .unwrap()
+            .0
             .iter()
             .any(|l| l.lease.path == mutex_key("master")));
     }

@@ -48,7 +48,11 @@ pub trait LeaseStore {
     ) -> Result<ReleaseOutcome>;
     fn release_all(&self, repo_root: &Path, agent: &str) -> Result<Vec<String>>;
     fn renew(&self, repo_root: &Path, agent: &str, path: &str) -> Result<LeaseInfo>;
-    fn list(&self, repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>>;
+    fn list_reclaiming(
+        &self,
+        repo_root: &Path,
+        all: bool,
+    ) -> Result<(Vec<LeaseEntry>, Vec<LeaseEntry>)>;
     fn peek(&self, repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>>;
 }
 
@@ -98,8 +102,12 @@ impl LeaseStore for FileLeaseStore {
         renew_fs(repo_root, agent, path)
     }
 
-    fn list(&self, repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>> {
-        list_fs(repo_root, all)
+    fn list_reclaiming(
+        &self,
+        repo_root: &Path,
+        all: bool,
+    ) -> Result<(Vec<LeaseEntry>, Vec<LeaseEntry>)> {
+        list_reclaiming_fs(repo_root, all)
     }
 
     fn peek(&self, repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>> {
@@ -367,22 +375,53 @@ pub(super) fn scan(repo_root: &Path) -> Result<Vec<(PathBuf, LeaseEntry)>> {
 /// The sweep is documented behaviour for `pact lease ls` (docs/leases.md), so
 /// it stays. Anything merely *asking* who holds what — `pact agents`, the TUI,
 /// `msg send`'s recipient check — must use [`peek`] instead (pact-rnc.19).
-pub fn list(repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>> {
-    current_store().list(repo_root, all)
-}
-
-fn list_fs(repo_root: &Path, all: bool) -> Result<Vec<LeaseEntry>> {
+/// Every lease on disk, plus the holds this call just reclaimed.
+///
+/// **`list` IS the garbage collector**, and until now it collected in silence: an
+/// expired lock was unlinked and its row simply did not appear. From the CLI a
+/// released hold and a dead one therefore looked identical — both are absent from
+/// the next table — so a fleet losing agents reads as a fleet finishing work.
+///
+/// Measured in the modmill proving-ground run (pact-k1n.1), on a lease whose
+/// holder had been killed mid-edit and which was then left alone for its full
+/// 45-minute TTL: at the moment it lapsed, `pact lease ls` went straight from
+/// showing the hold as `active` to "no active leases", with nothing in between
+/// naming what had just happened. The operator had to know to reach for `--all`,
+/// and by then this call had already collected the lock.
+///
+/// So the reclaimed set is returned rather than dropped. `list`'s own shape is
+/// untouched — `lease ls --json` is a pinned array of `LeaseEntry` (pact-er0), and
+/// a reclaimed hold no longer has a lock to describe — and the reporting is the
+/// caller's to render.
+fn list_reclaiming_fs(repo_root: &Path, all: bool) -> Result<(Vec<LeaseEntry>, Vec<LeaseEntry>)> {
     let mut entries = Vec::new();
+    let mut reclaimed = Vec::new();
     for (lock_path, entry) in scan(repo_root)? {
         if entry.expired {
             collect_expired(repo_root, &lock_path, &entry.lease);
+            // Recorded from the SAME scan that collected it, so there is no window
+            // in which a lease could lapse between observing and reclaiming and go
+            // unreported. A second pass with `peek` would have had exactly that
+            // race, and would have under-reported precisely when the fleet was
+            // busiest.
+            reclaimed.push(entry.clone());
             if !all {
                 continue;
             }
         }
         entries.push(entry);
     }
-    Ok(entries)
+    Ok((entries, reclaimed))
+}
+
+/// Every lease, and the expired holds this call reclaimed on its way there.
+///
+/// **The GC and the listing are one call, and the reclaimed set is returned
+/// rather than dropped.** There is no `list` that discards it: a second entry
+/// point would let a caller collect in silence again, which is exactly the shape
+/// pact-k1n.1 came back from the field to fix.
+pub fn list_reclaiming(repo_root: &Path, all: bool) -> Result<(Vec<LeaseEntry>, Vec<LeaseEntry>)> {
+    current_store().list_reclaiming(repo_root, all)
 }
 
 /// The non-mutating twin of [`list`]: same view, nothing deleted (pact-rnc.19).
@@ -769,7 +808,7 @@ mod tests {
         let tmp = repo();
         let root = tmp.path();
         assert!(peek(root, true).unwrap().is_empty());
-        assert!(list(root, true).unwrap().is_empty());
+        assert!(list_reclaiming(root, true).unwrap().0.is_empty());
         assert!(
             !root.join(".pact").exists(),
             "listing leases created .pact/ on a repo that never used pact"
@@ -807,7 +846,7 @@ mod tests {
         assert!(lock_exists(root, "dead.rs"));
 
         // list() keeps sweeping: documented behaviour for `pact lease ls`.
-        let listed = list(root, true).unwrap();
+        let listed = list_reclaiming(root, true).unwrap().0;
         assert_eq!(listed.len(), 2, "--all still shows the swept lease once");
         assert!(!lock_exists(root, "dead.rs"), "list must GC");
         assert!(lock_exists(root, "live.rs"));

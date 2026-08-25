@@ -389,7 +389,22 @@ pub(in crate::cli) fn run_lease(
             output::emit(json, &swept, |s: &Vec<lease::Swept>| {
                 let (taken, left): (Vec<_>, Vec<_>) = s.iter().partition(|e| e.reclaimed);
                 if taken.is_empty() && left.is_empty() {
-                    return "nothing to sweep — no lease here is held by an absent agent".into();
+                    // Say WHY there was nothing, because the two modes are empty for
+                    // opposite reasons and only one of them is interesting.
+                    //
+                    // The default mode reclaims expired locks — and on the ordinary
+                    // expiry path there are never any, because `lease ls` and `lease
+                    // acquire` both collect an expired lock as they pass. So an
+                    // operator who watched a hold lapse and reached for `sweep` gets
+                    // "nothing to sweep" and no hint that the work was already done
+                    // for them somewhere else; the modmill run read that as sweep
+                    // being broken (pact-k1n.2). It is not — it has no customer here.
+                    return match mode {
+                        lease::Sweep::Expired =>
+                            "nothing to sweep — no expired lock here.\n\n                             On the ordinary path there rarely is one: `lease ls` and                              `lease acquire` each collect an expired lock as they pass,                              and `lease ls` names what it reclaimed. This mode is for                              locks nothing has walked past yet.\n                             For a lease whose holder has gone quiet but whose TTL has                              NOT lapsed, use `lease sweep --suspect`.".into(),
+                        lease::Sweep::Suspect =>
+                            "nothing to sweep — no lease here is held by an absent agent".into(),
+                    };
                 }
                 let mut out = Vec::new();
                 for e in &taken {
@@ -424,7 +439,7 @@ pub(in crate::cli) fn run_lease(
             Ok(())
         }
         LeaseAction::Ls { all } => {
-            let entries = lease::list(&root, all)?;
+            let (entries, reclaimed) = lease::list_reclaiming(&root, all)?;
             // `--all` means "show me everything pact knows about paths", and
             // until now a released path vanished completely: `src/doctor.rs`
             // blocked two agents in sequence because nothing distinguished it
@@ -440,8 +455,32 @@ pub(in crate::cli) fn run_lease(
             } else {
                 Vec::new()
             };
+            // Say what this call just reclaimed.
+            //
+            // `lease ls` IS the garbage collector, and it used to collect in
+            // silence: the expired lock was unlinked and the row simply stopped
+            // appearing. So from the CLI a hold that was RELEASED and a hold whose
+            // agent DIED are the same observation — both are absent from the next
+            // table — and a fleet losing agents reads exactly like a fleet
+            // finishing work.
+            //
+            // Measured (pact-k1n.1), on a hold whose agent was killed mid-edit and
+            // then left alone for its full 45-minute TTL: at the moment it lapsed,
+            // `lease ls` went from showing it `active` to "no active leases", with
+            // nothing in between naming what had happened. The operator had to
+            // already suspect something to reach for `--all`, and by then this call
+            // had done the collecting.
+            //
+            // Human output only, for the same reason as `released` above: `lease ls
+            // --json` is a pinned array of LeaseEntry (pact-er0), and these entries
+            // are no longer leases. `pact log` carries the `expired` events for
+            // scripts.
+            let expiries = render_reclaimed(&reclaimed);
             output::emit(json, &entries, |entries: &Vec<lease::LeaseEntry>| {
                 let mut out = render_leases(entries);
+                if !expiries.is_empty() {
+                    out.push_str(&expiries);
+                }
                 if !released.is_empty() {
                     out.push_str("\n\nrecently released (no lease held, last owner known):\n");
                     out.push_str(&released.join("\n"));
@@ -623,6 +662,58 @@ fn released_paths(root: &Path, held: &[lease::LeaseEntry]) -> Vec<String> {
             format!("  {path}  {} by {} ({ago})", owner.kind, owner.agent)
         })
         .collect()
+}
+
+/// The holds this `lease ls` reclaimed on its way to answering.
+///
+/// Deliberately not folded into the main table. A reclaimed hold is not a lease
+/// any more — printing it as a row would put a `remaining` and a state next to
+/// something that no longer exists — and the point is not to keep it in the
+/// listing, it is to name the transition ONCE, in the call that performed it.
+/// Its holder is the fact worth reading: an agent whose hold pact just took back
+/// did not release it, which means it either finished without saying so or it is
+/// gone.
+fn render_reclaimed(reclaimed: &[lease::LeaseEntry]) -> String {
+    if reclaimed.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "\n\n{} hold(s) expired and were reclaimed by this listing:\n",
+        reclaimed.len()
+    );
+    for e in reclaimed {
+        // `remaining_secs` is negative once past the ttl, so its magnitude is how
+        // long the hold has been over. Reported alongside the holder's own silence
+        // because the two answer different questions — the first is "how long has
+        // this path been free", the second is "is that agent still anywhere".
+        out.push_str(&format!(
+            "  {} — held by {}, ttl lapsed {} ago",
+            e.lease.path,
+            e.lease.agent,
+            human_secs(-e.remaining_secs)
+        ));
+        if let Some(silent) = e.holder_silent_secs {
+            out.push_str(&format!(", last seen {} ago", human_secs(silent)));
+        }
+        if let Some(note) = e
+            .lease
+            .note
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            out.push_str(&format!("\n      was: {note}"));
+        }
+        out.push('\n');
+    }
+    // The actionable half. An expired hold is not automatically an incident — the
+    // agent may simply have finished and exited — so this points at the two
+    // commands that tell them apart rather than asserting which happened.
+    out.push_str(
+        "  `pact agents` says whether those agents are still active; \
+         `pact log` has the full history for each path.",
+    );
+    out
 }
 
 fn render_leases(entries: &[lease::LeaseEntry]) -> String {

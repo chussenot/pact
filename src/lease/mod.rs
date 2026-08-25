@@ -57,8 +57,9 @@ mod testutil {
     }
 
     pub(super) fn held_by(root: &Path, agent: &str) -> Vec<String> {
-        let mut paths: Vec<String> = list(root, true)
+        let mut paths: Vec<String> = list_reclaiming(root, true)
             .unwrap()
+            .0
             .into_iter()
             .filter(|e| e.lease.agent == agent)
             .map(|e| e.lease.path)

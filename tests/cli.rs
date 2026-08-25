@@ -1079,16 +1079,30 @@ fn lease_ls_shows_age_and_a_state_label_per_lease() {
     assert!(dead[2].starts_with("1h"), "{dead:?}");
     assert_eq!(dead[3], "expired", "{dead:?}");
 
-    // `--all` is what shows an expired lease; the default listing GCs it and
-    // hides it. (`dead.txt` is already gone — the listing above swept it — so
-    // expire a fresh one to check the default view.)
+    // `--all` is what keeps an expired lease as a ROW; the default listing GCs it
+    // and reports the reclaim instead. (`dead.txt` is already gone — the listing
+    // above swept it — so expire a fresh one to check the default view.)
+    //
+    // This assertion used to be a flat `!contains("fresh.txt")`, i.e. the default
+    // view must not mention an expired hold at all. That was the bug pact-k1n.1
+    // came back with from the field: silence makes a hold that was released and a
+    // hold whose agent died the same observation. The table half of the contract
+    // is unchanged — an expired hold is not a lease and gets no row — but the call
+    // that collects it now says so.
     backdate(tmp.path(), "fresh.txt", 5000);
     let plain = pact(tmp.path(), "agent-a", &["lease", "ls"]);
     assert_ok(&plain);
+    let text = stdout_of(&plain);
+    let (table, reclaimed) = text
+        .split_once("hold(s) expired and were reclaimed")
+        .expect("the reclaim must be reported: {text}");
     assert!(
-        !stdout_of(&plain).contains("fresh.txt"),
-        "default listing should hide expired leases: {}",
-        stdout_of(&plain)
+        !table.contains("fresh.txt"),
+        "an expired hold gets no row in the table: {text}"
+    );
+    assert!(
+        reclaimed.contains("fresh.txt"),
+        "...but the call that reclaimed it names it: {text}"
     );
     assert!(!lock_path(tmp.path(), "fresh.txt").exists(), "not GC'd");
 }
@@ -7185,4 +7199,138 @@ fn doctor_prints_the_chain_this_process_would_stamp_including_what_is_missing() 
         "the remedy must be named: {line}"
     );
     assert!(!line.contains("unknown"), "{line}");
+}
+
+/// `lease ls` NAMES the holds it reclaims instead of collecting them in silence
+/// (pact-k1n.1).
+///
+/// `lease ls` is the garbage collector, and it used to unlink an expired lock and
+/// simply stop printing the row. That makes a hold that was RELEASED and a hold
+/// whose agent DIED the same observation — both absent from the next table — so a
+/// fleet losing agents reads exactly like a fleet finishing work.
+///
+/// The modmill proving-ground run hit this on a hold whose agent was killed
+/// mid-edit and then left alone for its full TTL: `lease ls` went straight from
+/// `active` to "no active leases". Only `--all` said "expired by w3-arpeggio",
+/// and by then the plain call had already done the collecting.
+///
+/// End-to-end on purpose. The reclaim happens in `lease::list`, but the silence
+/// was in the CLI's rendering of it, which is only reachable through a process.
+#[test]
+fn lease_ls_names_the_expired_hold_it_just_reclaimed() {
+    let tmp = init_repo();
+
+    // Fabricated rather than slept for — same shortcut as tests/lease.rs, and the
+    // 2000s age clears ttl + GRACE_SECS by a wide margin.
+    let lock = tmp.path().join(".pact/leases/sequencer.rs.lock");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    let stale = chrono::Utc::now() - chrono::Duration::seconds(2000);
+    std::fs::write(
+        &lock,
+        serde_json::json!({
+            "agent": "w3-arpeggio",
+            "path": "sequencer.rs",
+            "acquired_at": stale.to_rfc3339(),
+            "ttl_secs": 900,
+            "note": "porting the sequencer to the new clock"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = pact(tmp.path(), "observer", &["lease", "ls"]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    // The three things that were missing: that it happened, to what, and to whom.
+    assert!(
+        text.contains("reclaimed by this listing"),
+        "the reclaim must be reported, not silent; got:\n{text}"
+    );
+    assert!(
+        text.contains("sequencer.rs") && text.contains("w3-arpeggio"),
+        "a reclaim names the path and its holder; got:\n{text}"
+    );
+    // The note is the only record of what the dead agent was doing.
+    assert!(
+        text.contains("porting the sequencer"),
+        "the hold's note is what says what was lost; got:\n{text}"
+    );
+
+    // The lock is really gone: this is the GC reporting itself, not a new listing
+    // mode that leaves expired locks lying around for the next reader to trip on.
+    assert!(
+        !lock.exists(),
+        "lease ls must still collect the expired lock"
+    );
+
+    // And it says it exactly once. A second call has nothing left to reclaim, so
+    // the fleet does not read as losing the same agent over and over.
+    let again = pact(tmp.path(), "observer", &["lease", "ls"]);
+    let text = String::from_utf8_lossy(&again.stdout);
+    assert!(
+        !text.contains("reclaimed by this listing"),
+        "the reclaim is reported by the call that performs it, once; got:\n{text}"
+    );
+}
+
+/// `lease ls --json` keeps the shape pact-er0 pinned: an array of LeaseEntry, and
+/// a reclaimed hold is not one.
+///
+/// The human view gained a section; the machine view must not gain a field, a
+/// wrapper object, or a synthesized entry with an invented ttl. `pact log` is
+/// where a script reads expiries.
+#[test]
+fn lease_ls_json_is_unchanged_by_a_reclaim() {
+    let tmp = init_repo();
+    let lock = tmp.path().join(".pact/leases/gone.rs.lock");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    let stale = chrono::Utc::now() - chrono::Duration::seconds(2000);
+    std::fs::write(
+        &lock,
+        serde_json::json!({
+            "agent": "w3-arpeggio", "path": "gone.rs",
+            "acquired_at": stale.to_rfc3339(), "ttl_secs": 900, "note": null
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = pact(tmp.path(), "observer", &["lease", "ls", "--json"]);
+    assert!(out.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+    assert_eq!(
+        parsed,
+        serde_json::json!([]),
+        "a reclaimed hold has no lock to describe, so it is not a LeaseEntry"
+    );
+}
+
+/// `lease sweep` with nothing to do says WHY, and the two modes say different
+/// things (pact-k1n.2).
+///
+/// On the ordinary expiry path the default mode never has a customer: `lease ls`
+/// and `lease acquire` each collect an expired lock as they pass. An operator who
+/// watched a hold lapse and reached for `sweep` used to get a flat "no lease here
+/// is held by an absent agent", which reads as sweep being broken rather than as
+/// the work already having been done elsewhere.
+#[test]
+fn sweep_with_nothing_to_do_says_which_nothing_it_means() {
+    let tmp = init_repo();
+    let out = pact(tmp.path(), "observer", &["lease", "sweep"]);
+    assert_ok(&out);
+    let text = stdout_of(&out);
+    assert!(text.contains("no expired lock here"), "{text}");
+    // The pointer that was missing: where expired locks actually go.
+    assert!(text.contains("lease ls"), "{text}");
+    // And the other mode, for the case the operator may have actually meant.
+    assert!(text.contains("--suspect"), "{text}");
+
+    let suspect = pact(tmp.path(), "observer", &["lease", "sweep", "--suspect"]);
+    assert_ok(&suspect);
+    assert!(
+        stdout_of(&suspect).contains("absent agent"),
+        "--suspect keeps its own reason: {}",
+        stdout_of(&suspect)
+    );
 }

@@ -1050,7 +1050,7 @@ mod tests {
             Utc::now() - Duration::seconds(ttl as i64 + GRACE_SECS + 90),
         );
         // The sweep: this is what leaves no lock file behind.
-        let _ = list(root, false).unwrap();
+        let _ = list_reclaiming(root, false).unwrap();
 
         let outcome = release(root, "agent-08", "tests/corpus.rs", false).unwrap();
         let ReleaseOutcome::AlreadyExpired { at, since_secs, .. } = &outcome else {
@@ -1249,7 +1249,7 @@ mod tests {
         claim_aged(root, "agent-a", "gone.rs", 60, 60 + GRACE_SECS + 1);
 
         // Whoever happens to run the command that collects it.
-        assert!(list(root, false).unwrap().is_empty());
+        assert!(list_reclaiming(root, false).unwrap().0.is_empty());
         assert!(!lock_exists(root, "gone.rs"), "list must still GC");
 
         let events = crate::events::recent(root, 10).unwrap();
@@ -1263,7 +1263,7 @@ mod tests {
 
         // The lock is gone, so a second listing has nothing left to report: one
         // lapse, one event, however many agents run `lease ls`.
-        assert!(list(root, true).unwrap().is_empty());
+        assert!(list_reclaiming(root, true).unwrap().0.is_empty());
         assert_eq!(crate::events::recent(root, 10).unwrap().len(), 1);
     }
 
