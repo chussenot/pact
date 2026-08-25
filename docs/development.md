@@ -27,9 +27,16 @@ mise run install    # cargo install with every feature (the binary that ends up 
 
 `check-docs` walks the built binary's `--help` output rather than a hardcoded
 list, and fails if [cli.md](cli.md)'s `Commands` block is missing a subcommand or a
-long flag *or* documents one the CLI no longer has, if any relative link in `README.md` or `docs/` doesn't resolve, or if a `pact doctor` check isn't named
+long flag *or* documents one the CLI no longer has, if a flag taking an enum has a
+different set of values there than clap accepts, if any relative link in
+`README.md` or `docs/` doesn't resolve, or if a `pact doctor` check isn't named
 in [docs/tui.md](tui.md)'s Doctor section. It exists because a README link pointed at a doc that had been deleted, and
 nothing noticed.
+
+The enum-value check reads **both** of clap's layouts — the compact
+`[possible values: a, b, c]` and the expanded `Possible values:` list it switches
+to the moment a variant carries a doc comment. Reading only one covered two flags
+out of three, which is the same defect the check exists to catch.
 
 Or run the underlying `cargo` commands directly if you don't use mise.
 

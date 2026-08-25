@@ -12,6 +12,9 @@
 #   1. every subcommand and flag the real CLI exposes is in docs/cli.md's Commands block
 #      (built with every optional feature on, so `ui` and `mcp` count)
 #      (and, in reverse, nothing in that block has stopped existing)
+#      (1b: and for a flag taking an enum, the VALUES match clap's own list —
+#       pact-zr4, added after `gate-order` went into the parser while cli.md's
+#       hand-written list stayed one short and nothing said so)
 #   2. every relative markdown link in README.md and docs/ resolves to a real file
 #   3. every `pact doctor` check name is named in docs/tui.md's Doctor section
 #
@@ -59,11 +62,19 @@ is_global() { case "$1" in --agent | --json | --help | --version) return 0 ;; *)
 commands=()   # "lease acquire", "msg send", …
 flags=()      # "--ttl", "--body-file", … deduped
 shortflags=() # same index as flags: "-n" for --limit, "" when there is no short form
+# --flag -> "a b c" for the flags clap renders a `[possible values: …]` list for
+# (pact-zr4). cli.md spells those out by hand inside the Commands block, and
+# nothing compared the two: `gate-order` was added to the parser and the list in
+# cli.md stayed one short until somebody noticed by eye. That is pact-98u's defect
+# — help enumerating a subset of what the parser accepts — one file over. It was
+# fixed there by making clap render from `Check::NAMES`, which is why `--help`
+# cannot drift; this makes the docs unable to either.
+declare -A flag_values
 
 seen_flag() { local f; for f in "${flags[@]}"; do [ "$f" = "$1" ] && return 0; done; return 1; }
 
 walk() {
-	local path="$1" help section line
+	local path="$1" help section line last_long="" in_values=0
 	# shellcheck disable=SC2086 # word splitting is how we turn "lease acquire" into argv
 	help=$(pact $path --help 2>&1) || { problem "\`pact $path --help\` failed"; return; }
 
@@ -92,11 +103,56 @@ walk() {
 			commands+=("${path:+$path }$sub")
 			walk "${path:+$path }$sub"
 		else
+			# clap has TWO layouts for an enum's values and renders whichever fits,
+			# so both are read here. It picks the expanded one the moment a
+			# variant carries a doc comment — which is how `--confidence` sat
+			# unguarded when this check first worked: `--check` and `--expect`
+			# were compact, `--confidence`'s variants are documented, and a
+			# checker that silently covers two flags out of three is the same
+			# defect it exists to catch.
+			#
+			# Compact:  [possible values: a, b, c]
+			# Expanded: Possible values:
+			#           - a: what a means
+			#
+			# Both attach to the last flag seen, since clap prints them below it.
+			local head=${line#"${line%%[![:space:]]*}"}
+			if [[ $line =~ \[possible\ values:\ (.*)\] ]] && [ -n "$last_long" ]; then
+				flag_values[$last_long]="${BASH_REMATCH[1]//,/}"
+				continue
+			fi
+			if [ "$head" = "Possible values:" ]; then
+				in_values=1
+				continue
+			fi
+			if [ "$in_values" = 1 ]; then
+				if [[ $head =~ ^-[[:space:]]+([a-z][a-z0-9-]*):? ]] && [ -n "$last_long" ]; then
+					# `${x-}` because the script runs under `set -u` and this is
+					# the first value seen for the flag: the array entry does not
+					# exist yet, and an unguarded read aborts the whole check.
+					flag_values[$last_long]="${flag_values[$last_long]-} ${BASH_REMATCH[1]}"
+					continue
+				fi
+				in_values=0
+			fi
 			# "  -n, --limit <LIMIT>  How many…" or "      --ttl <TTL>  …"
+			# Anchored at the start of the line, and that anchor is load-bearing.
+			# clap's expanded layout puts a flag's DESCRIPTION on its own lines,
+			# and those descriptions routinely name other flags — `--check`'s
+			# mentions `--expect` and `--allow-main`, `--expect`'s mentions
+			# `--check`. An unanchored match walked those, so `last_long` was
+			# whatever flag the prose last referred to and the `[possible values]`
+			# line below attached to the wrong one: every `--expect` value was
+			# reported as one the CLI does not accept, which is a false DRIFT and
+			# the worst kind, since the fix for it is to break the docs.
 			local short="" long=""
-			[[ $line =~ (^|[[:space:]])(-[a-zA-Z]),[[:space:]] ]] && short="${BASH_REMATCH[2]}"
-			[[ $line =~ (--[a-z][a-z0-9-]*) ]] && long="${BASH_REMATCH[1]}"
+			case "$head" in -*) ;; *) continue ;; esac
+			[[ $head =~ ^(-[a-zA-Z]),[[:space:]] ]] && short="${BASH_REMATCH[1]}"
+			[[ $head =~ ^-{1,2}[a-zA-Z],?[[:space:]]*(--[a-z][a-z0-9-]*) ]] && long="${BASH_REMATCH[1]}"
+			[[ -z $long && $head =~ ^(--[a-z][a-z0-9-]*) ]] && long="${BASH_REMATCH[1]}"
 			[ -n "$long" ] || continue
+			last_long="$long"
+			in_values=0
 			is_global "$long" && continue
 			seen_flag "$long" || { flags+=("$long"); shortflags+=("$short"); }
 		fi
@@ -151,6 +207,37 @@ for f in $(grep -oE -- '--[a-z][a-z0-9-]*' <<<"$block" | sort -u); do
 	is_global "$f" && continue
 	seen_flag "$f" ||
 		problem "docs/cli.md's Commands block documents $f, which the CLI does not have"
+done
+
+# ------------------------------- 1b. enumerated flag values in that block
+
+# `--check <double-win|stale-holds|…>` in cli.md against clap's own
+# `[possible values: …]` (pact-zr4).
+#
+# Both directions, like the command and flag checks above, and for the same
+# reason: a value the parser accepts but the docs omit sends a reader looking for
+# a feature they were told does not exist, and a value the docs claim but the
+# parser rejects sends them to an error. `gate-order` was the first — added to
+# `Check::NAMES`, where clap renders it into `--help` automatically, while
+# cli.md's hand-written list stayed one short and nothing said so.
+#
+# Only flags cli.md actually spells out with a `<a|b|c>` group are compared. A
+# flag documented as `<SINCE>` or `<path>` is describing a shape rather than
+# enumerating a set, and demanding the enum there would be demanding noise.
+for f in "${!flag_values[@]}"; do
+	# The angle-bracket group immediately after this flag, anywhere in the block.
+	documented=$(grep -oE -- "$f <[a-z0-9|-]+>" <<<"$block" | head -1 |
+		sed -E "s/^$f <//; s/>$//" | tr '|' ' ')
+	[ -n "$documented" ] || continue
+
+	for v in ${flag_values[$f]}; do
+		printf '%s\n' $documented | grep -qxF "$v" ||
+			problem "docs/cli.md lists $f values but omits \`$v\`, which the CLI accepts"
+	done
+	for v in $documented; do
+		printf '%s\n' ${flag_values[$f]} | grep -qxF "$v" ||
+			problem "docs/cli.md lists \`$v\` for $f, which the CLI does not accept"
+	done
 done
 
 # ----------------------------------------------------- 2. relative md links
@@ -234,7 +321,13 @@ done <<<"$documented"
 # ---------------------------------------------------------------------------
 
 if [ $fail -eq 0 ]; then
-	printf 'docs ok: %d commands, %d flags, %d doctor checks, all links resolve\n' \
-		"${#commands[@]}" "${#flags[@]}" "$(wc -l <<<"$doctor_names")"
+	# The enumerated-flag count is here for the reason every other number is: a
+	# checker that silently stops finding what it checks is worse than one that
+	# fails. If this drops to 0 because clap changed how it renders
+	# `[possible values]`, the line says so before anybody has to notice that a
+	# whole class of drift stopped being caught.
+	printf 'docs ok: %d commands, %d flags (%d enumerated), %d doctor checks, all links resolve\n' \
+		"${#commands[@]}" "${#flags[@]}" "${#flag_values[@]}" \
+		"$(wc -l <<<"$doctor_names")"
 fi
 exit $fail

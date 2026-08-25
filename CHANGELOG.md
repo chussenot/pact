@@ -806,6 +806,39 @@ reasoning a commit subject cannot.
 
 ## Notes — unreleased
 
+### `check-docs` now guards enumerated flag values too
+
+`docs/cli.md` spells out every value an enum flag accepts —
+`--check <double-win|…|gate-order>`, `--expect <worktrees|main|any>`,
+`--confidence <high|medium|low>` — and nothing compared those lists to the parser.
+`gate-order` went into `Check::NAMES` a day earlier, where clap renders it into
+`--help` automatically, while the hand-written list in `cli.md` stayed one short.
+It was noticed by eye. Nothing would have told the next person.
+
+That is **pact-98u's defect one file over**: help text enumerating a subset of what
+the parser accepts. That one was fixed by making clap render from `Check::NAMES`,
+which is why `--help` cannot drift; `cli.md` still could.
+
+Both directions, like the command and flag checks beside it — a value the parser
+takes but the docs omit sends a reader looking for a feature they were told does
+not exist; a value the docs claim but the parser rejects sends them to an error.
+
+**Two findings from building it**, and the second is the better one:
+
+- The first cut matched flag names anywhere on a line, and clap's expanded layout
+  puts descriptions on their own lines — descriptions that name other flags.
+  `--check`'s mentions `--expect`; `--expect`'s mentions `--check`. So values
+  attached to whichever flag the prose last referred to, and every `--expect` value
+  was reported as one the CLI does not accept. A false DRIFT is the worst kind:
+  the obvious fix for it is to break the docs.
+- **clap has two layouts for possible values**, and switches to the expanded one
+  the moment an enum variant carries a doc comment. Reading only the compact form
+  covered `--check` and `--expect` and silently missed `--confidence` — a checker
+  guarding two flags out of three, which is precisely the defect it exists to
+  catch. Both layouts are read now, and the summary line reports how many flags are
+  enumerated so a future clap change that breaks the parse says so rather than
+  quietly covering nothing.
+
 ### Gates: declared in the plan, verified by audit, never enforced
 
 A manifest entry may carry `gate: true` — a verification bead (tests, an oracle
