@@ -68,8 +68,20 @@ pub(in crate::audit) fn claim_divergences(
     if assignees.is_empty() {
         // Absent, empty, unparseable, or no assignee change ever recorded: all
         // one answer, "nothing to check against", and all of them PASS.
-        report.claim_unavailable =
-            Some("no assignee history in .beads/interactions.jsonl".to_string());
+        //
+        // But NOT all one cause, and the difference decides whether the
+        // remediation this check prints is worth following (pact-k1n.6). A
+        // readable sidecar with no assignee rows in it is a sidecar that is
+        // working — the switch is already on, and telling the reader to turn it on
+        // sends them to fix something that is not broken.
+        report.claim_unavailable = Some(
+            if crate::beads::interaction_actors(repo_root).is_some_and(|a| !a.is_empty()) {
+                "the sidecar is recording, but no assignee change appears in                  .beads/interactions.jsonl"
+            } else {
+                "no .beads/interactions.jsonl to read"
+            }
+            .to_string(),
+        );
         return;
     }
     // Walked over the OPENING EVENTS rather than over reconstructed `Hold`s,
@@ -133,6 +145,28 @@ pub(in crate::audit) fn scope(r: &CheckReport, out: &mut Vec<String>) -> bool {
         // for one that does not exist, which is how this check stayed unrun in the
         // field. So the fix is named here, warning and all — `pact audit` never
         // spawns bd, so it cannot check the outcome, only state it accurately.
+        // Two causes, two remediations, and the wrong one costs a reader real time.
+        //
+        // Measured on the modmill proving-ground run: BD_AUDIT_ENABLED=1 was set for
+        // the entire run, the sidecar recorded every one of the 16 status changes in
+        // full, and this check still could not run — because `bd update <id> --claim`
+        // writes no assignee row, only a bare `--assignee=` does (pact-6wb). The
+        // advice below is correct for a sidecar that is off and useless for that,
+        // and a reader who follows it turns on something already on and sees nothing
+        // change.
+        if reason.starts_with("the sidecar is recording") {
+            out.push(format!(
+                "  {reason} — claim-lease-divergence could not run. The switch is not \
+                 the problem: the sidecar is writing other rows fine. The likely cause \
+                 is the claim form. On bd 1.2.2 (measured 2026-08-25) `bd update <id> \
+                 --claim` writes NO interaction at all — not an assignee change, not \
+                 even the in_progress status — so a fleet that claims that way leaves \
+                 this check nothing to read. `bd update <id> --assignee=<name>` records \
+                 one explicitly. bd writes from that point, not retroactively, so work \
+                 already done stays unreadable here"
+            ));
+            return true;
+        }
         out.push(format!(
             "  no beads data ({reason}) — claim-lease-divergence could not run. bd's \
              audit sidecar is not recording: turn it on with `BD_AUDIT_ENABLED=1` in \
@@ -294,6 +328,50 @@ mod tests {
         assert!(r.claim_divergences.is_empty());
         assert_eq!(r.findings(), 0);
         assert!(r.claim_unavailable.is_some());
+    }
+    /// A sidecar that IS recording, with no assignee row in it, must not be
+    /// diagnosed as a sidecar that is off (pact-k1n.6).
+    ///
+    /// Measured on the modmill proving-ground run: BD_AUDIT_ENABLED=1 was set for
+    /// the whole run, every one of the 16 status changes was logged in full, and
+    /// this check still could not run — because `bd update <id> --claim` writes no
+    /// assignee row (pact-6wb). A reader told to turn the switch on turns on
+    /// something already on and watches nothing change.
+    #[test]
+    fn a_recording_sidecar_with_no_assignees_is_not_diagnosed_as_switched_off() {
+        let tmp = with_log(&[&ev("2026-08-11T08:00:00Z", "agent-a", "acquired", "a.rs")]);
+        // Status rows only — exactly the shape `--claim` leaves behind.
+        with_interactions(
+            &tmp,
+            &[
+                &status_row("2026-08-11T08:01:00Z", "pact-abc", "in_progress"),
+                &status_row("2026-08-11T08:09:00Z", "pact-abc", "closed"),
+            ],
+        );
+        let r = run_check(tmp.path(), Check::ClaimLeaseDivergence, None, false).unwrap();
+        assert_eq!(r.findings(), 0, "still a pass — there is nothing to check");
+
+        let text = render_check(&r);
+        assert!(text.contains("could not run"), "{text}");
+        assert!(
+            text.contains("--assignee"),
+            "the reader needs the claim form that actually records: {text}"
+        );
+        assert!(
+            !text.contains("BD_AUDIT_ENABLED"),
+            "the switch is already on; sending the reader there is the wrong fix: {text}"
+        );
+    }
+
+    /// The other cause keeps the other remediation. No file at all really is a
+    /// sidecar that is not recording, and the switch really is the fix.
+    #[test]
+    fn a_missing_sidecar_still_points_at_the_switch() {
+        let tmp = with_log(&[&ev("2026-08-11T08:00:00Z", "agent-a", "acquired", "a.rs")]);
+        let r = run_check(tmp.path(), Check::ClaimLeaseDivergence, None, false).unwrap();
+        assert_eq!(r.findings(), 0);
+        let text = render_check(&r);
+        assert!(text.contains("BD_AUDIT_ENABLED"), "{text}");
     }
 }
 

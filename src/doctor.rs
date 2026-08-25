@@ -1239,16 +1239,22 @@ fn sidecar_check(beads_dir: bool, sidecar: bool, assignees: bool) -> DoctorCheck
         (
             true,
             ".beads/interactions.jsonl is present but records no assignee change, so \
-             `pact audit --check claim-lease-divergence` cannot run — bd is writing \
-             create/close/note rows without the audit sidecar's assignee history. This \
-             is the one gap that CANNOT be fixed afterwards: bd records from the moment \
-             it is switched on, never retroactively, so a run that finishes like this \
-             can never be checked for claim/lease divergence. Turn it on before you \
-             spawn agents: `BD_AUDIT_ENABLED=1` in the environment your agents run bd \
-             in, or `bd config set audit.enabled true` to persist it — bd 1.2.1 answers \
-             that one with `\"audit.enabled\" is not a recognized config key` and then \
-             honours it anyway, so the warning is bd's allowlist being wrong, not the \
-             switch failing"
+             `pact audit --check claim-lease-divergence` cannot run. This is the one gap \
+             that CANNOT be fixed afterwards: bd records from the moment it is switched \
+             on, never retroactively, so a run that finishes like this can never be \
+             checked for claim/lease divergence. TWO different causes produce this state \
+             and pact cannot tell them apart from the file, so check both. (1) The audit \
+             sidecar is off, and bd is writing create/close/note rows without it: turn it \
+             on before you spawn agents with `BD_AUDIT_ENABLED=1` in the environment your \
+             agents run bd in, or `bd config set audit.enabled true` to persist it — bd \
+             1.2.1 answers that one with `\"audit.enabled\" is not a recognized config \
+             key` and then honours it anyway, so the warning is bd's allowlist being \
+             wrong, not the switch failing. (2) The sidecar is on and working, and your \
+             fleet claims with `bd update <id> --claim`, which on bd 1.2.2 (measured \
+             2026-08-25) writes no interaction at all — claim with `bd update <id> \
+             --assignee=<name>` instead, which records one explicitly. A 16-agent run \
+             had the switch set correctly for its whole life, logged every status change \
+             in full, and still left this check nothing to read for exactly that reason"
                 .to_string(),
         )
     } else {

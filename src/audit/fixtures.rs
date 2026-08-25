@@ -78,6 +78,15 @@ pub(in crate::audit) fn assignee_row(at: &str, issue: &str, new_value: &str) -> 
     )
 }
 
+/// A `field=status` row — what `bd close` and `bd update <id> --claim` leave in
+/// the sidecar. The shape that proves recording is ON while carrying nothing
+/// `claim-lease-divergence` can read (pact-k1n.6).
+pub(in crate::audit) fn status_row(at: &str, issue: &str, new_value: &str) -> String {
+    format!(
+        r#"{{"id":"int-1","kind":"field_change","created_at":"{at}","actor":"someone","issue_id":"{issue}","extra":{{"field":"status","new_value":"{new_value}","old_value":""}}}}"#
+    )
+}
+
 /// Plant watch records beside an existing log, so a fixture can say what an agent
 /// was subscribed to and WHEN.
 pub(in crate::audit) fn with_watches(tmp: &tempfile::TempDir, lines: &[&str]) {

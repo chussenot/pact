@@ -1205,6 +1205,23 @@ back: a metric that returns the same answer regardless of behaviour is worse
 than no metric — and so is concluding a thing cannot be measured because the
 first field you looked at did not move.
 
+**And it moved again.** On **bd 1.2.2, measured 2026-08-25**, `bd update <id>
+--claim` writes **no interaction at all** — not an assignee change, and not even
+the `in_progress` status it sets. Measured in this repository's own sidecar: a
+bead claimed with `--claim` and closed later has exactly one row, the close.
+Every assignee row in the file is from 2026-08-11/12 and none has appeared
+since.
+
+That does not retract the paragraph above; both observations are real, dated,
+and about different bd builds. It is the reason this page dates them. The
+consequence for a fleet today is concrete: **claiming with `--claim` leaves
+`--check claim-lease-divergence` nothing to read.** The whole check goes quiet —
+not a pass, an absence — and the modmill proving-ground run lost it exactly that
+way with `BD_AUDIT_ENABLED=1` set correctly for its entire life and all 16
+status changes recorded in full. `bd update <id> --assignee=<name>` records the
+row explicitly; `pact doctor`'s `Beads audit sidecar` check names both causes
+before a run rather than after it.
+
 Whether pact should *report* claim adherence is a separate question and
 deliberately still open: this data is Beads-side, and
 [audit reads `.pact/` and never the Beads store](#what-audit-deliberately-cannot-see).
