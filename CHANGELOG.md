@@ -10,6 +10,14 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.14.0 - 2026-08-25
+#### Features
+- **(handoff)** knowledge that outlives the agent that had it - (11d1300) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(beads)** close the handoff epic - (0464e76) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.13.0 - 2026-08-25
 #### Continuous Integration
 - **(release)** tell an unpushed branch apart from an orphaned tag - (8220f1b) - Clement HUSSENOT-DESENONGES
