@@ -18,6 +18,25 @@ cargo install --path . --force --features mcp     # or: ui,otel,mcp
 pact --version | grep features                    # confirm `mcp` is in there
 ```
 
+## It records nothing, including liveness
+
+`pact mcp serve` leaves the repository byte-identical, and `tests/mcp.rs` asserts
+exactly that after every tool call.
+
+That guarantee is why the liveness records `pact` writes for every other
+invocation are **not** written here. Since pact-88z every CLI command records that
+its agent is alive, as a by-product of resolving an identity — but an MCP client
+is an **observer, not a participant**. It cannot acquire a lease, send a message
+or mark one read; every mutation it might want goes through the CLI. Recording it
+as alive would say the wrong thing (an inbox polled by a dashboard is not an agent
+still working) and would say it by breaking the guarantee somebody chose this
+interface for.
+
+So an agent that works exclusively through MCP has no liveness record, and
+`pact doctor`, `pact ui` and `lease sweep --suspect` will report it as `no data`
+rather than as alive. That is the honest answer: pact has not seen it do
+anything it could not have done by reading.
+
 ## What it is for
 
 Every pact command assumes the asker can run a shell command. Not every observer

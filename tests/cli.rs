@@ -2648,6 +2648,18 @@ fn json_shapes_of_every_command_that_needs_no_beads_backend() {
             // `--to` check) is distinguishable from a real identity by callers
             // parsing this JSON, not just by the table's own footnote.
             "name_valid",
+            // Added by pact-88z: seconds since this agent last ran ANY pact
+            // command, from `.pact/activity/`. Distinct from `last_seen`, which is
+            // the newest MUTATION — a lease event, a message, a lock. This counts
+            // the read-only half too, so an agent that checked its inbox is
+            // visibly alive where before it was indistinguishable from one that
+            // had stopped.
+            //
+            // Machine-local, so it is ABSENT rather than zero for an agent this
+            // machine has never seen — including every agent in a repository whose
+            // fleet ran on a pact older than this. A consumer must read absence as
+            // "no data", never as "dead".
+            "idle_secs",
         ],
     );
 
@@ -6743,6 +6755,58 @@ fn bead_is_folded_into_the_note_and_lands_as_a_structured_field() {
     ));
     let listed = stdout_of(&pact(repo.path(), "bedstone", &["lease", "ls"]));
     assert!(listed.contains("m-ymj"), "{listed}");
+}
+
+/// pact-88z: liveness is a by-product of participation, so a READ-ONLY command
+/// records it.
+///
+/// This is the whole feature in one assertion. `holder_silent_secs` has always
+/// been event-shaped — every mutation feeds it — so the half that was invisible
+/// is the half that writes nothing: reading an inbox, listing leases, reading the
+/// log. An agent doing those is doing the most ordinary thing a working agent
+/// does, and it looked exactly like an agent that had stopped.
+///
+/// `msg inbox` is chosen deliberately: it writes no event, no lock and no
+/// message, so a record after it can have come from nothing but the invocation.
+#[test]
+fn any_command_records_liveness_including_a_read_only_one() {
+    let repo = init_repo();
+    // Something has to create `.pact/` first — see the carve-out below.
+    assert_ok(&pact(repo.path(), "holder", &["lease", "acquire", "a.rs"]));
+
+    let record = repo.path().join(".pact/activity/reader");
+    assert!(!record.exists(), "reader has not run anything yet");
+
+    assert_ok(&pact(repo.path(), "reader", &["msg", "inbox"]));
+
+    let raw = std::fs::read_to_string(&record).expect("a read-only command must count");
+    let at = chrono::DateTime::parse_from_rfc3339(raw.trim())
+        .expect("the record is a timestamp, readable without pact");
+    assert!(
+        (chrono::Utc::now() - at.with_timezone(&chrono::Utc))
+            .num_seconds()
+            .abs()
+            < 30,
+        "the record must be this invocation, not an epoch: {raw}"
+    );
+}
+
+/// And the carve-out that keeps "a question must not mutate" true.
+///
+/// Every read-only command reaches the touch, so if it created the state
+/// directory then `pact lease ls` in a repository that never ran `pact init`
+/// would leave `.pact/` behind — which is exactly what `repo::pact_dir_path`
+/// refuses to do, and the reason `lease::peek` exists beside `lease::list`.
+#[test]
+fn a_read_only_command_records_nothing_where_pact_has_never_run() {
+    let repo = init_repo();
+
+    assert_ok(&pact(repo.path(), "reader", &["lease", "ls"]));
+
+    assert!(
+        !repo.path().join(".pact").exists(),
+        "a question created the state directory"
+    );
 }
 
 /// `pact merge --json` has a shape too, and it did not have a test — which is how

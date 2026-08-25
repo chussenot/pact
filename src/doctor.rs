@@ -637,12 +637,39 @@ fn fleet_liveness_check(root: &Path) -> DoctorCheck {
             ),
         };
     }
-    // One `git log` for the whole check, and only once something is quiet — so a
-    // healthy fleet, which is the common case, spawns nothing.
-    let commits = crate::git_history::commits_since(root, None).unwrap_or_default();
-    let (working, absent): (Vec<&&&lease::LeaseEntry>, Vec<&&&lease::LeaseEntry>) = quiet
+    // Activity first, because it is both cheaper and stronger than the commit
+    // rung — one small file read per agent against one `git log` — and because it
+    // is the only rung that sees a holder whose participation is read-only
+    // (pact-88z). This is the same ladder `lease sweep --suspect` walks, in the
+    // same order, so doctor and the sweep cannot disagree about who is alive.
+    let state = crate::repo::pact_dir_path(root);
+    let now = chrono::Utc::now();
+    let seen: Vec<_> = quiet
+        .iter()
+        .filter(|e| {
+            crate::activity::idle_secs(&state, &e.lease.agent, now)
+                .is_some_and(|i| i * 2 <= lease::ttl_as_i64(e.lease.ttl_secs))
+        })
+        .collect();
+    // One `git log` for the whole check, and only for what activity did not
+    // already vouch for — so a healthy fleet, which is the common case, spawns
+    // nothing at all.
+    let unvouched: Vec<_> = quiet
+        .iter()
+        .filter(|e| {
+            crate::activity::idle_secs(&state, &e.lease.agent, now)
+                .is_none_or(|i| i * 2 > lease::ttl_as_i64(e.lease.ttl_secs))
+        })
+        .collect();
+    let commits = if unvouched.is_empty() {
+        Vec::new()
+    } else {
+        crate::git_history::commits_since(root, None).unwrap_or_default()
+    };
+    let (committing, absent): (Vec<&&&&lease::LeaseEntry>, Vec<&&&&lease::LeaseEntry>) = unvouched
         .iter()
         .partition(|e| lease::has_committed_under(&commits, &e.lease));
+    let working = seen.len() + committing.len();
     let longest = absent
         .iter()
         .filter_map(|e| e.holder_silent_secs)
@@ -656,18 +683,19 @@ fn fleet_liveness_check(root: &Path) -> DoctorCheck {
         warn: !absent.is_empty(),
         detail: format!(
             "{} agent(s) holding {} lease(s); {} quiet past half their TTL, {} of those \
-             committing under the path they hold. {}",
+             still alive on pact activity or a commit under the path they hold. {}",
             agents.len(),
             live.len(),
             quiet.len(),
-            working.len(),
+            working,
             if absent.is_empty() {
-                "Every quiet holder is still committing, so the fleet is working, \
+                "Every quiet holder is still participating, so the fleet is working, \
                  not stopped."
                     .to_string()
             } else {
                 format!(
-                    "{} quiet with NO commit under their path — longest {}: {}. That is the \
+                    "{} quiet with no pact activity and no commit under their path — longest \
+                     {}: {}. That is the \
                      shape a parked or dead agent leaves, and it stays invisible to \
                      `--check stale-holds` until the TTL runs out. Check whether they \
                      are alive before their leases lapse; `pact lease sweep --suspect` \

@@ -261,6 +261,34 @@ pub fn acquire(
     current_store().acquire(repo_root, agent, path, ttl_secs, steal, note)
 }
 
+/// `, last active 4m ago` — the clause that turns a wait-or-pivot decision from a
+/// guess into a decision (pact-88z).
+///
+/// A refused agent already learns how long the holder has LEFT. That is the
+/// ceiling, not the estimate: it says when the lease lapses, not whether anybody
+/// is still behind it. Two situations produce an identical refusal today — a peer
+/// deep in a change with 40 minutes left, and a peer that stopped existing 40
+/// minutes ago — and they call for opposite responses. `--wait` is right for the
+/// first and a waste of the whole TTL for the second.
+///
+/// Rendered as a clause rather than a verdict. pact says when the holder last ran
+/// a pact command and lets the reader decide, because an activity record is
+/// evidence of USAGE and not of progress: an agent busy-retrying a lease it will
+/// never get looks maximally alive here. That is `--check retry-storm`'s
+/// question, not this one.
+///
+/// Empty when there is no record — which is every holder on a machine that has
+/// not run a pact new enough to write them, and the holder whose own `acquire`
+/// created `.pact/`. A refusal that said "last active: unknown" would invite the
+/// reader to treat absence as absence-of-life, and the honest rendering of no
+/// data is no clause.
+fn holder_liveness(repo_root: &Path, agent: &str, now: chrono::DateTime<Utc>) -> String {
+    match crate::activity::idle_secs(&crate::repo::pact_dir_path(repo_root), agent, now) {
+        Some(idle) => format!(", last active {} ago", human_secs(idle)),
+        None => String::new(),
+    }
+}
+
 /// Telemetry wrapper around [`acquire_inner`]. Separate so the span covers the
 /// whole operation — including the post-rename verify — and so the four
 /// success branches inside do not each have to remember to close the wait
@@ -707,10 +735,11 @@ pub(super) fn acquire_inner(
                         kind: "refused".to_string(),
                         path: Some(relative.clone()),
                         detail: Some(format!(
-                            "held by {} ({} left on their hold, taken {age}s ago), use --steal to \
-                             override{note_suffix}",
+                            "held by {} ({} left on their hold{}, taken {age}s ago), use --steal \
+                             to override{note_suffix}",
                             holder_location(&existing),
-                            human_secs(remaining.max(0))
+                            human_secs(remaining.max(0)),
+                            holder_liveness(repo_root, &existing.agent, now)
                         )),
                         ttl_secs: Some(ttl_secs),
                         covers_lines: None,
@@ -800,9 +829,10 @@ pub(super) fn acquire_inner(
                     // about how long to wait; a listing is a decision about
                     // whether to intervene, and they want different numbers.
                     format!(
-                        "lease on {relative} is held by {} ({} left on their hold, taken {age}s ago); use --steal to override",
+                        "lease on {relative} is held by {} ({} left on their hold{}, taken {age}s ago); use --steal to override",
                         holder_location(&existing),
-                        human_secs(remaining.max(0))
+                        human_secs(remaining.max(0)),
+                        holder_liveness(repo_root, &existing.agent, now)
                     ),
                 ))
             }

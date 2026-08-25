@@ -394,6 +394,21 @@ pub struct CheckReport {
     /// report byte-identical to what it printed before this existed.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub agents: std::collections::BTreeMap<String, AgentChain>,
+    /// Whether each agent named by a STILL-OPEN stale hold is alive right now,
+    /// from `.pact/activity/` (pact-88z).
+    ///
+    /// **Only for open holds, and the limit is the point.** "Held past its TTL"
+    /// is one finding today and two smells: a worker overrunning a TTL it should
+    /// have renewed, and a lock nobody is behind. Those want opposite responses,
+    /// and the activity record separates them — for a hold that is still open.
+    ///
+    /// It cannot separate them for a CLOSED one. The record carries when an agent
+    /// was last seen, not a history, so asking it about a hold that ended last
+    /// Tuesday gets an answer about today. Audit is offline analysis of history
+    /// and this is present-tense state; where the two do not meet, the finding
+    /// stays exactly as unqualified as it was.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub liveness: std::collections::BTreeMap<String, String>,
     /// The constraints the run operated under — the same map the summary prints.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub context: std::collections::BTreeMap<String, String>,
@@ -559,6 +574,7 @@ pub fn run_check(
         // parser accepts and what `--help` lists are now one list.
         check: check.name(),
         agents: agent_chains(&events),
+        liveness: std::collections::BTreeMap::new(),
         context: loaded.context.clone(),
         commit_policy_skipped: None,
         events_scanned: events.len(),
@@ -597,7 +613,37 @@ pub fn run_check(
 
     match check {
         Check::DoubleWin => report.double_wins = doubles,
-        Check::StaleHolds => checks::stale_holds::detect(holds, &mut report),
+        Check::StaleHolds => {
+            checks::stale_holds::detect(holds, &mut report);
+            // Present-tense state, asked only about the agents whose holds are
+            // STILL OPEN — see `CheckReport::liveness` for why a closed hold gets
+            // no such qualifier. One small file read per distinct agent.
+            let state = crate::repo::pact_dir_path(repo_root);
+            let now = Utc::now();
+            let open_holders: std::collections::BTreeSet<&str> = report
+                .stale_holds
+                .iter()
+                .filter(|h| h.closed_by.is_none())
+                .map(|h| h.agent.as_str())
+                .collect();
+            for agent in open_holders {
+                let idle = crate::activity::idle_secs(&state, agent, now);
+                // Classified against the agent-level window rather than any one
+                // lease's ttl, because this is a statement about the agent. `holds
+                // = 1` and `all_expired = false`: these holds are open and past
+                // their TTL, but "expired" here would claim the lock is
+                // reclaimable, which is a lease-state question the log cannot
+                // answer about right now.
+                let l = crate::activity::Liveness::of(idle, 1, false);
+                report.liveness.insert(
+                    agent.to_string(),
+                    match idle {
+                        Some(i) => format!("{} ({} idle)", l.label(), secs(i)),
+                        None => l.label().to_string(),
+                    },
+                );
+            }
+        }
         Check::ChainIntegrity => checks::chain_integrity::detect(repo_root, &mut report)?,
         Check::CommitCorrelation => checks::commit_correlation::detect(
             repo_root,

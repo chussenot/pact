@@ -51,6 +51,22 @@ pub struct AgentInfo {
     pub harness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Seconds since this agent last ran ANY pact command, from
+    /// `.pact/activity/` (pact-88z).
+    ///
+    /// Distinct from `last_seen`, and strictly wider. `last_seen` is the newest
+    /// timestamp across this agent's lease events, messages and locks — every one
+    /// of which is a MUTATION. This counts the read-only half too: an agent that
+    /// checked its inbox two minutes ago wrote nothing anywhere and is
+    /// nonetheless plainly alive.
+    ///
+    /// `None` where this machine has no record: an agent seen only in a committed
+    /// log written elsewhere, or any agent at all before a pact new enough to
+    /// write records ran here. Machine-local by construction — it says who ran a
+    /// command HERE, which is why it is absent rather than zero for a peer whose
+    /// events travelled in over git.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<i64>,
 }
 
 /// The operator's mailbox, reserved by the protocol block itself
@@ -143,6 +159,24 @@ pub fn list(repo_root: &Path) -> Result<Vec<AgentInfo>> {
         }
         // Same rule as the message half below: the lease answer is still true.
         Err(e) => crate::output::warn(&format!("warning: lease history unavailable: {e:#}")),
+    }
+
+    // One small file read per agent, after the roster is built rather than during
+    // it: `observe` is called from four places and this belongs to the finished
+    // agent, not to any one sighting of it.
+    // One `read_dir` for the whole roster, which is also how `pact ui` builds it —
+    // the two answer the same question about the same agents and must not do it
+    // by different routes, or `agents --json` and the dashboard start disagreeing
+    // about who is alive.
+    let recent: BTreeMap<String, DateTime<Utc>> =
+        crate::activity::all(&crate::repo::pact_dir_path(repo_root))
+            .into_iter()
+            .collect();
+    let now = Utc::now();
+    for info in seen.values_mut() {
+        info.idle_secs = recent
+            .get(&info.name)
+            .map(|at| (now - *at).num_seconds().max(0));
     }
 
     match msg::all_messages(repo_root) {
@@ -265,6 +299,7 @@ fn observe<'a>(
         name_valid,
         harness: None,
         model: None,
+        idle_secs: None,
     });
     if parse_ts(at) > parse_ts(&info.last_seen) {
         info.last_seen = at.to_string();
@@ -345,6 +380,7 @@ mod tests {
             name_valid: true,
             harness: None,
             model: None,
+            idle_secs: None,
         }
     }
 
@@ -360,6 +396,7 @@ mod tests {
             name_valid: true,
             harness: None,
             model: None,
+            idle_secs: None,
         }
     }
 

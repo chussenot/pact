@@ -623,3 +623,53 @@ fn a_hung_beads_call_does_not_delay_other_in_flight_requests() {
     assert_eq!(id_2_response["result"]["isError"], false);
     assert!(id_2_response["result"]["structuredContent"]["leases"].is_array());
 }
+
+/// pact-88z: the read-only promise covers liveness too.
+///
+/// Every CLI invocation records that its agent is alive, as a by-product of
+/// resolving an identity. `mcp serve` is the one exception, and this pins it. The
+/// byte-identical assertions above already catch a record appearing — they did,
+/// which is how the exception got written — but they cannot say WHY it must not,
+/// and a future reader looking at that carve-out in `main` deserves a test that
+/// names the reason rather than a diff that shows a filename.
+///
+/// An MCP client is an observer, not a participant. It cannot acquire a lease,
+/// send a message or mark one read. Recording it as alive would report an inbox
+/// polled by a dashboard as an agent still working — and would do it by breaking
+/// the one guarantee somebody chose this interface for.
+#[test]
+fn serving_records_no_liveness_for_its_own_agent() {
+    let repo = init_repo();
+    assert!(
+        pact(repo.path(), "worker-a", &["lease", "acquire", "src/api.rs"])
+            .status
+            .success()
+    );
+    // A SECOND command, and the reason is itself worth pinning: the acquire above
+    // is the invocation that CREATED `.pact/`, and the liveness touch runs before
+    // the subcommand does — so that one command cannot record itself. One missed
+    // record per repository, ever, documented at the call site in `main`.
+    //
+    // This second command is the control. It makes the directory populated, so an
+    // absent `observer` below is the server declining to write rather than the
+    // mechanism being switched off.
+    assert!(pact(repo.path(), "worker-a", &["lease", "ls"])
+        .status
+        .success());
+    assert!(repo.path().join(".pact/activity/worker-a").exists());
+
+    let (_, code, _) = serve(
+        repo.path(),
+        &[("PACT_AGENT", "observer")],
+        &[
+            initialize(),
+            call(1, "pact_lease_list", serde_json::json!({})),
+        ],
+    );
+    assert_eq!(code, 0);
+
+    assert!(
+        !repo.path().join(".pact/activity/observer").exists(),
+        "mcp serve wrote a liveness record; it must observe and nothing else"
+    );
+}

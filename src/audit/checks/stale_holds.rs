@@ -62,6 +62,19 @@ pub(in crate::audit) fn findings(r: &CheckReport, out: &mut Vec<String>) {
             ended,
             h.opened_line
         ));
+        // A still-open hold past its TTL is two different smells, and this is the
+        // only thing that separates them (pact-88z): a worker overrunning a TTL it
+        // should have renewed, versus a lock nobody is behind. Appended rather
+        // than folded into the row, because it is present-tense state beside a
+        // historical finding and the reader has to be able to tell which is which.
+        if let Some(state) = h
+            .closed_by
+            .is_none()
+            .then(|| r.liveness.get(&h.agent))
+            .flatten()
+        {
+            out.push(format!("  {:<40} holder is {}", "", state));
+        }
     }
     if !r.stale_holds.is_empty() {
         out.push(String::new());

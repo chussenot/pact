@@ -482,6 +482,49 @@ pub fn sweep(repo_root: &Path, agent: &str, mode: Sweep, paths: &[String]) -> Re
             .then(|| -entry.remaining_secs)
             .filter(|s| *s > 0);
 
+        // THE SIGNAL LADDER, cheapest and strongest first (pact-88z / pact-g50).
+        //
+        //   silence          the holder wrote no EVENT for over half its TTL.
+        //                    This is what `suspect` means, and on its own it is
+        //                    weak: pact only sees an agent when it MUTATES
+        //                    something, so a worker making one deep change emits
+        //                    nothing between acquire and release.
+        //   commit           the holder has committed under this path since
+        //                    taking it. Strong, and expensive: one `git log`.
+        //   pact activity    the holder has run ANY pact command recently —
+        //                    including the read-only ones that write no event.
+        //
+        // Activity is checked FIRST, and it is both the strongest rung and the
+        // cheapest: one small file read against a `git log`. It also closes what
+        // the commit rung could not. An agent that ran `pact msg inbox` two
+        // minutes ago is alive whether or not it has committed anything — and
+        // reading the inbox is exactly what a deep-change worker does most, while
+        // being the one thing that used to leave no trace at all.
+        //
+        // NOT IMPLEMENTED, and named rather than quietly skipped: a working-tree
+        // mtime rung between commit and activity — "has this path changed on
+        // disk since the hold opened". It would catch the worker who has neither
+        // committed nor run a pact command, which activity mostly subsumes. It is
+        // absent because a `stat` per swept path is affordable but the semantics
+        // are not: a worktree fleet edits its own checkout, so the path this
+        // process can stat is frequently not the one the holder is editing, and a
+        // rung that is silently wrong under the topology pact recommends is worse
+        // than a rung that is missing.
+        if eligible && !entry.expired {
+            let idle = crate::activity::idle_secs(
+                &crate::repo::pact_dir_path(repo_root),
+                &lease.agent,
+                crate::lease::effective_now(repo_root),
+            );
+            // Judged against this lease's OWN ttl, exactly as `suspect` is: a
+            // 10-minute lease and a 45-minute one deserve different patience, and
+            // the same halving that made the holder suspect un-makes it here.
+            // Anything else would let the two disagree about the same threshold.
+            if idle.is_some_and(|i| i * 2 <= ttl_as_i64(lease.ttl_secs)) {
+                eligible = false;
+            }
+        }
+
         // A holder that has COMMITTED under the path it holds is working,
         // whatever the event log says (pact-g50).
         //
@@ -712,6 +755,67 @@ mod tests {
         assert!(swept[0].reclaimed, "{swept:?}");
         assert_eq!(swept[0].holder, "stalled");
         assert!(swept[0].holder_silent_secs.unwrap() >= 400);
+    }
+
+    /// pact-88z: activity outranks the commit rung, and closes what it could not.
+    ///
+    /// The shape the commit rescue cannot see: an agent holding a lease, silent
+    /// in the EVENT log past half its TTL, with nothing committed — but running
+    /// pact commands. Reading an inbox writes no event, so before this it was
+    /// indistinguishable from an agent that had stopped, and `--suspect` deleted
+    /// its lock.
+    ///
+    /// Two holders, identical in every respect the sweep could previously see.
+    /// Only one has participated.
+    #[test]
+    fn sweep_suspect_spares_a_holder_that_has_run_a_pact_command() {
+        let tmp = repo();
+        let root = tmp.path();
+        // Quiet in the log past half their TTL: both are `suspect`.
+        claim_aged(root, "reader", "reads.rs", 600, 400);
+        claim_aged(root, "gone", "abandoned.rs", 600, 400);
+        assert!(!lock_exists(root, "nothing"), "fixture sanity");
+
+        // `reader` participated — read-only, so it wrote no event and the log
+        // still shows it silent. That is the entire point.
+        crate::activity::touch(&crate::repo::pact_dir_path(root), "reader");
+
+        sweep(root, "sweeper", Sweep::Suspect, &[]).unwrap();
+
+        assert!(
+            lock_exists(root, "reads.rs"),
+            "an agent that ran a pact command is alive, commits or not"
+        );
+        assert!(
+            !lock_exists(root, "abandoned.rs"),
+            "and a genuinely silent holder is still reclaimed — a rescue that \
+             spares everyone is a disabled check"
+        );
+    }
+
+    /// Stale activity does not rescue: the record is a timestamp, not a flag.
+    ///
+    /// Judged against the lease's OWN ttl, the same halving that made the holder
+    /// suspect in the first place — so the two cannot disagree about where the
+    /// line is.
+    #[test]
+    fn activity_older_than_half_the_ttl_does_not_rescue() {
+        let tmp = repo();
+        let root = tmp.path();
+        claim_aged(root, "parked", "f.rs", 600, 400);
+
+        // Seen, but longer ago than half of its 600s ttl.
+        let stale = (Utc::now() - chrono::Duration::seconds(400)).to_rfc3339();
+        let dir = crate::repo::pact_dir_path(root).join("activity");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("parked"), stale).unwrap();
+
+        sweep(root, "sweeper", Sweep::Suspect, &[]).unwrap();
+
+        assert!(
+            !lock_exists(root, "f.rs"),
+            "an agent last seen 400s into a 600s lease is as silent as one never seen"
+        );
     }
 
     /// A holder that has committed under its path is working, and must survive

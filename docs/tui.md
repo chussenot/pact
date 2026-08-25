@@ -214,6 +214,38 @@ A roster name no pact process could have run under is shown as
 column — something other than pact wrote that name into the store, and it must
 not render like a peer.
 
+### `LIVE` — is anybody home
+
+The roster's `LIVE` column answers the question an orchestratorless run is
+actually asking: is anyone stuck?
+
+| | |
+|---|---|
+| `ACTIVE` | ran a pact command inside the freshness window |
+| `IDLE` | quiet past the window, holding nothing — blocking nobody |
+| `STALE` | quiet past the window and **still holding**. The one to act on |
+| `DEAD` | past TTL on everything it holds; its locks are reclaimable |
+| `no data` | this machine has no record. **Not a verdict** |
+
+The window is half the default lease TTL, derived from the same constant
+`SUSPECT` uses so the roster and `lease ls` cannot draw the line in different
+places.
+
+**`LIVE` says the agent used pact, not that it is progressing.** An agent
+busy-retrying a lease it will never get renders `ACTIVE`, in green, and is exactly
+the pathology [`--check retry-storm`](audit.md) exists to catch. The legend under
+the roster says so, because a green cell is where that limit gets forgotten.
+
+It **replaced** the old `SEEN` column rather than joining it, and that was a
+measurement: added alongside, it turned `orchestrator` into `orchestrat` — the
+same crushing a 16-wide column produced here in pact-c3y, and naming the agent is
+the one thing this panel exists to do. Nothing is lost by the swap: `SEEN` showed
+the age of the newest *event*, and this shows the age of the newest pact command,
+which is that signal plus the read-only half that used to be invisible.
+
+The refresh reads one directory of small per-agent files — no log scan, no
+subprocess, which is the rule this surface has always been held to.
+
 ### The attribution chain is in the detail views, not the tables
 
 `Enter` on a path or an agent shows what is holding it, in words:

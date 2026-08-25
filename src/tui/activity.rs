@@ -540,6 +540,7 @@ mod tests {
             name_valid: true,
             harness: None,
             model: None,
+            idle_secs: None,
         }
     }
 

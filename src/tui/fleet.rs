@@ -34,6 +34,7 @@ use super::data::{Blocked, WaitingOn, DEFAULT_GRACE_SECS};
 use super::nav::View;
 use super::widgets;
 use super::App;
+use crate::activity;
 use crate::agents::AgentInfo;
 use crate::lease::{self, LeaseEntry};
 
@@ -535,10 +536,9 @@ fn render_roster(frame: &mut Frame, area: Rect, app: &mut App) {
     // thing the roster exists to do. The attribution chain lives on the lease
     // table, which has the width, and in full on the agent detail view, which has
     // the room to label it.
-    let header = Row::new(vec!["AGENT", "HELD", "SEEN", "!"])
+    let header = Row::new(vec!["AGENT", "HELD", "LIVE", "!"])
         .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let now = Utc::now();
     let mut rows: Vec<Row<'static>> = roster_rows(app)
         .into_iter()
         .enumerate()
@@ -565,7 +565,7 @@ fn render_roster(frame: &mut Frame, area: Rect, app: &mut App) {
                     0 => "-".to_string(),
                     n => n.to_string(),
                 }),
-                Cell::from(since(&info.last_seen, now)),
+                liveness_cell(info),
                 Cell::from(match unread {
                     0 => String::new(),
                     n => n.to_string(),
@@ -597,9 +597,52 @@ fn render_roster(frame: &mut Frame, area: Rect, app: &mut App) {
     let widths = [
         Constraint::Min(10),
         Constraint::Length(4),
-        Constraint::Length(6),
+        // 7 is exactly "no data", the longest thing this cell holds and the one a
+        // reader must not meet as "no dat".
+        //
+        // It REPLACES the old SEEN column rather than joining it, and that is a
+        // measurement, not a preference: added alongside, at this width, it
+        // turned `orchestrator` into `orchestrat` — the same crushing a 16-wide
+        // column produced on this table in pact-c3y, and naming the agent is the
+        // one thing this panel exists to do. Nothing is lost by the swap. SEEN
+        // showed the age of the newest EVENT; this shows the age of the newest
+        // pact command, which is the same signal plus the read-only half that
+        // used to be invisible. The precise elapsed time is in the agent's detail
+        // view, where there is room to write it out.
+        Constraint::Length(7),
         Constraint::Length(2),
     ];
+    // The legend, and it is not decoration (pact-88z). LIVE says an agent RAN a
+    // pact command, not that it is getting anywhere: an agent busy-retrying a
+    // lease it will never get renders ACTIVE, in green, and is exactly the
+    // pathology `--check retry-storm` exists to catch. A green cell is precisely
+    // where that limit gets forgotten, so the caption sits under the column that
+    // invites the mistake.
+    //
+    // Only when the roster is tall enough to spare the room — an operator's
+    // answer must never be pushed off-screen by the footnote to it.
+    let area = if area.height > 5 {
+        frame.render_widget(
+            Paragraph::new(vec![Line::from(Span::styled(
+                "LIVE = ran a pact command, not that it is progressing. \
+                 STALE/DEAD still hold. \"no data\" = no record on this machine.",
+                Style::default().fg(Color::DarkGray),
+            ))])
+            .wrap(Wrap { trim: true }),
+            Rect {
+                y: area.y + area.height - 2,
+                height: 2,
+                ..area
+            },
+        );
+        Rect {
+            height: area.height - 2,
+            ..area
+        }
+    } else {
+        area
+    };
+
     let table = Table::new(rows, widths)
         .header(header)
         .row_highlight_style(selection_style(focused))
@@ -819,6 +862,41 @@ fn lease_row(
     hovered(app, row, index, offset, app.fleet.table.selected(), focused)
 }
 
+/// The LIVE cell: is anybody home (pact-88z)?
+///
+/// Four states and a non-state. `ACTIVE` means this agent ran SOME pact command
+/// inside the freshness window — including the read-only ones that write no
+/// event, which is the whole reason this exists. `STALE` is the one worth acting
+/// on: quiet past the window and still holding, so work is parked behind a lease
+/// nobody is behind. `IDLE` is quiet and holding nothing, which blocks nobody.
+/// `DEAD` is past TTL on everything it holds.
+///
+/// `no data` is not a verdict and is styled as absence rather than as alarm. A
+/// repository whose fleet ran on a pact older than this has no records at all,
+/// and rendering that as DEAD would report every historical agent as a corpse.
+///
+/// **This says the agent used pact, not that it is making progress.** An agent
+/// busy-retrying a lease it will never get is maximally ACTIVE here and is
+/// exactly what `pact audit --check retry-storm` exists to catch. The legend
+/// under the roster says so, because a colour that reads as "fine" is the one
+/// place that limit will be forgotten.
+fn liveness_cell(info: &AgentInfo) -> Cell<'static> {
+    // `all_expired` is false here: the roster counts leases held, and whether
+    // each is past TTL is the lease table's question, asked with the lease in
+    // hand. Overclaiming DEAD from a count alone would be the worse error.
+    let state = activity::Liveness::of(info.idle_secs, info.leases_held, false);
+    let style = match state {
+        // STALE and DEAD are the reasons an operator opened this panel, so they
+        // are the two that must be findable without reading.
+        activity::Liveness::Dead => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        activity::Liveness::Stale => Style::default().fg(Color::Yellow),
+        activity::Liveness::Active => Style::default().fg(Color::Green),
+        activity::Liveness::Idle => Style::default(),
+        activity::Liveness::NoData => Style::default().fg(Color::DarkGray),
+    };
+    Cell::from(state.label()).style(style)
+}
+
 /// Selection's own reversed style is already a strong indicator; hover only
 /// adds anything on rows that aren't already selected, and only in the pane the
 /// keyboard is actually driving.
@@ -851,14 +929,6 @@ fn selection_style(focused: bool) -> Style {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
         Style::default().add_modifier(Modifier::DIM | Modifier::REVERSED)
-    }
-}
-
-/// How long ago an RFC3339 stamp was, in the same units the lease table uses.
-fn since(at: &str, now: chrono::DateTime<Utc>) -> String {
-    match chrono::DateTime::parse_from_rfc3339(at) {
-        Ok(t) => human((now - t.with_timezone(&Utc)).num_seconds()),
-        Err(_) => "-".to_string(),
     }
 }
 
@@ -1001,6 +1071,89 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    /// pact-88z: the four states an operator scans for, plus the non-state.
+    ///
+    /// Rendered from fixture activity records, because the classification is only
+    /// worth anything if it survives the panel — a helper returning the right
+    /// word while the column that shows it is truncated, dropped or reordered is
+    /// the failure this repository has already had twice on this exact table
+    /// (pact-rnc.10, pact-c3y).
+    ///
+    /// `no data` is asserted as loudly as the rest. A repository whose fleet ran
+    /// on a pact older than this has no records at all, and rendering that as
+    /// DEAD would report every historical agent as a corpse.
+    #[test]
+    fn the_roster_shows_each_liveness_state_and_names_the_absent_one() {
+        let tmp = fixture();
+        let state = crate::repo::pact_dir_path(tmp.path());
+        let dir = state.join("activity");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ago = |secs: i64| (Utc::now() - chrono::Duration::seconds(secs)).to_rfc3339();
+
+        // orchestrator holds a REAL lock — written through `lease::acquire`, so the
+        // store's own `peek` finds it — and is quiet past the window: STALE. The
+        // lock has to be real because `leases_held` is rebuilt from the store, not
+        // from the fixture handed to the view, and STALE is precisely the state
+        // that distinguishes "quiet" from "quiet AND holding".
+        crate::lease::acquire(tmp.path(), "orchestrator", "docs/tui.md", 2700, false, None)
+            .unwrap();
+        std::fs::write(
+            dir.join("orchestrator"),
+            ago(crate::activity::FRESH_SECS + 60),
+        )
+        .unwrap();
+        // docs-story holds nothing and is quiet -> IDLE.
+        std::fs::write(
+            dir.join("docs-story"),
+            ago(crate::activity::FRESH_SECS + 60),
+        )
+        .unwrap();
+        // poller ran something a moment ago -> ACTIVE.
+        std::fs::write(dir.join("poller"), ago(5)).unwrap();
+        // and the fixture's fourth agent gets no record at all.
+
+        let held = entry("orchestrator", "docs/tui.md", 90);
+        let mut app = app(tmp.path(), Some("operator"), vec![held]);
+        let screen = drawn(&mut app, 160, 24);
+
+        for want in ["STALE", "IDLE", "ACTIVE", "no data"] {
+            assert!(
+                screen.contains(want),
+                "the roster must show {want}: {screen}"
+            );
+        }
+        // The honesty rail, on screen rather than only in a doc comment: a green
+        // cell is where "alive" gets read as "progressing", and an agent spinning
+        // on a refused lease is maximally ACTIVE here.
+        // Asserted in pieces, because the caption wraps in a narrow pane and a
+        // whole-sentence match would pass or fail on the pane width rather than
+        // on the words being there.
+        for want in ["ran a pact command", "progressing"] {
+            assert!(
+                screen.contains(want),
+                "the legend must say what LIVE does not mean ({want}): {screen}"
+            );
+        }
+    }
+
+    /// An agent whose every hold is past TTL is DEAD, and that outranks how
+    /// recently it ran something — a lock anyone may reclaim is the louder fact.
+    #[test]
+    fn every_hold_past_ttl_reads_as_dead() {
+        use crate::activity::Liveness;
+        assert_eq!(Liveness::of(Some(5), 1, true), Liveness::Dead);
+        assert_eq!(Liveness::of(Some(5), 1, false), Liveness::Active);
+        assert_eq!(
+            Liveness::of(Some(crate::activity::FRESH_SECS), 1, false),
+            Liveness::Stale
+        );
+        assert_eq!(
+            Liveness::of(Some(crate::activity::FRESH_SECS), 0, false),
+            Liveness::Idle
+        );
+        assert_eq!(Liveness::of(None, 3, true), Liveness::NoData);
     }
 
     /// The landing screen shows every agent seen in this repo — live holders

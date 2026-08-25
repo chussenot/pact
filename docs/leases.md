@@ -13,6 +13,60 @@ nothing stops you from `git push --force` over a coworker's branch. The point
 isn't to make that impossible; it's to make coordinating cheap enough that
 agents actually do it.
 
+## The signal ladder: is this holder alive?
+
+Four rungs, cheapest and strongest first. Every consumer that has to decide
+whether a quiet holder is working — the exit-2 refusal, `lease sweep --suspect`,
+`pact doctor`'s fleet check — walks the same one, so they cannot disagree.
+
+| rung | what it sees | cost |
+|---|---|---|
+| **silence** | the holder wrote no *event* for over half its TTL. This is what `SUSPECT` means | free, already loaded |
+| **commit** | the holder has committed under this path since taking it | one `git log` |
+| **pact activity** | the holder ran *any* pact command recently, including read-only ones | one small file read |
+
+Silence alone is weak, and measurably so: pact only sees an agent when it
+**mutates** something, so a worker making one deep change to one file emits
+nothing at all between acquire and release. Over pact's own history, 23% of 335
+completed holds ran past half their TTL — nearly a quarter of ordinary work looks
+abandoned on silence alone.
+
+The commit rung (pact-g50) closed most of that. **pact activity closes the rest**:
+an agent that ran `pact msg inbox` two minutes ago is alive whether or not it has
+committed, and reading the inbox is exactly what a deep-change worker does most
+while being the one thing that used to leave no trace.
+
+### It is a by-product, never a step
+
+The record is written by the identity resolution every invocation already
+performs. There is no heartbeat command and there will not be one, because the
+measurement that shaped this says agents would not run it: **one renewal in 153
+events** across the field runs. A liveness protocol gets renewal's compliance.
+
+### An mtime is evidence of USAGE, not of progress
+
+The honest limit, and every consumer inherits it. This says an agent ran a pact
+command. **A spinning agent is alive AND stuck** — one retrying a refused lease
+every fifteen seconds looks maximally healthy here, and is precisely what
+[`--check retry-storm`](audit.md) exists to catch. The two answer different
+questions and neither substitutes for the other.
+
+### A rung that is not there
+
+Working-tree mtime — "has this path changed on disk since the hold opened" —
+would sit between commit and activity. It is **not implemented**, and named here
+rather than silently omitted: under the one-worktree-per-agent topology pact
+recommends, the path this process can `stat` is frequently not the copy the holder
+is editing. A rung that is quietly wrong under the recommended topology is worse
+than a rung that is missing.
+
+### Machine-local, and absent is not dead
+
+`.pact/activity/` is gitignored with `.pact/leases/`: a record of who ran a
+command on *this* machine. Every consumer degrades to "no data" rather than to a
+verdict — a repository whose fleet ran on an older pact has no records at all,
+and reporting that as a fleet of corpses would be the worst available answer.
+
 ## Waiting for a held path: `--wait`
 
 ```bash

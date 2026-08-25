@@ -778,6 +778,99 @@ reasoning a commit subject cannot.
 
 ## Notes — unreleased
 
+### Liveness, as a by-product of participation
+
+Every pact invocation now records that its agent is alive. Not a heartbeat, not a
+command anyone runs on purpose — a file written by the identity resolution `main`
+already performs, from one call site, before the subcommand runs.
+
+**The measurement that shaped it: agents skip ceremony.** One renewal in 153
+events across the field runs. A protocol asking an agent to announce it is still
+alive would get renewal's compliance, which is none — and the agents would be
+right, because a heartbeat produces nothing they were asked for. So the signal
+had to cost zero extra commands or not exist.
+
+**A correction to how this was framed.** Liveness was not missing.
+`holder_silent_secs` — the input to `SUSPECT`, to `sweep --suspect` and to
+doctor's fleet check — comes from `events::actors`, so every *mutation* already
+counted: acquire, renew, release, steal, a refusal, a watch delivery. What left no
+trace was the **read-only half**: `msg inbox`, `lease ls`, `log`, `agents`,
+`audit`. An agent reading its inbox mid-hold was indistinguishable from one that
+had stopped — and reading is the most common thing the deep-change worker does,
+the exact residual `sweep --suspect` had to be taught not to reclaim in pact-g50.
+
+The signal ladder is now three rungs, and every consumer walks the same one so
+they cannot disagree:
+
+```
+silence         no EVENT for over half the TTL          free, already loaded
+commit          committed under this path since acquire one `git log`
+pact activity   ran ANY pact command recently           one small file read
+```
+
+Activity is checked first: cheapest *and* strongest. `docs/leases.md` carries the
+ladder, including a rung that is **not** implemented — working-tree mtime — named
+rather than silently omitted, because under the worktree topology pact recommends
+the path this process can `stat` is frequently not the copy the holder is editing.
+
+Consumers: the exit-2 refusal gains `last active 4m ago`, which is what turns a
+wait-or-pivot decision from a guess into a decision; `sweep --suspect` spares a
+holder that has run anything; `doctor` reads it instead of inferring; and
+`stale-holds` splits "held past TTL, active" from "held past TTL, silent".
+
+`pact ui`'s roster gains a `LIVE` column — ACTIVE / IDLE / STALE / DEAD, plus
+`no data`. It **replaced** `SEEN` rather than joining it, measured: added
+alongside it turned `orchestrator` into `orchestrat`, the same crushing a 16-wide
+column produced in pact-c3y. Nothing is lost — `SEEN` was event-age, `LIVE` is
+command-age, which is that plus the half that used to be invisible.
+
+**What it costs, measured against the bench that guards this path:**
+
+| | |
+|---|---|
+| the write | **14.7 µs** |
+| no `.pact/` — the read-only-command path | **2.5 µs** |
+| the cheapest append pact already does per event | 549 µs |
+| an append that spawns `git rev-parse` | 3.19 ms |
+
+2.7% of the cheapest thing pact already does per event. That is what makes "every
+invocation" affordable, and it decided the mechanism: touching the agent's own
+*lock files* instead would need a `read_dir` of `.pact/leases/` plus a parse per
+lock to find which are its own — a scan on the path every invocation takes, to
+record the same fact. Both numbers are in `benches/lease.rs` so the trade cannot
+be quietly reversed.
+
+**Three honesty rails, each of which cost something to get right:**
+
+- **`pact mcp serve` records nothing**, and its own tests are what established
+  that. That surface promises the repository is byte-identical after every tool
+  call — in the server's advertised instructions, in `docs/mcp.md`, in the
+  protocol block — and the touch broke it. The promise won: an MCP client is an
+  *observer*, not a participant. It cannot acquire a lease, send a message or mark
+  one read. Recording it as alive would report an inbox polled by a dashboard as
+  an agent still working, and would do it by breaking the guarantee somebody chose
+  that interface for. An MCP-only agent reads as `no data`.
+- **A question still creates nothing.** Every read-only command reaches the touch,
+  so it is skipped entirely when `.pact/` is absent — `pact lease ls` in a
+  repository that never ran `pact init` leaves nothing behind, which is what
+  `repo::pact_dir_path` and `lease::peek` exist to guarantee. Tested from the CLI.
+- **An mtime is evidence of USAGE, not of progress.** A spinning agent is alive
+  AND stuck: one retrying a refused lease every fifteen seconds renders `ACTIVE`,
+  in green, and is exactly what `--check retry-storm` exists to catch. Stated on
+  the module, in `docs/leases.md`, and in the legend under the roster — because a
+  green cell is where that limit gets forgotten.
+
+Two smaller facts worth knowing. The one command in a repository's life that
+*creates* `.pact/` cannot record itself, because the touch runs before the
+subcommand does; that is one missed record ever, it self-heals, and it reads as
+`no data` rather than as dead. And `pact audit` qualifies only **open** holds —
+the record is present-tense state, so asking it about a hold that closed last
+Tuesday returns an answer about today.
+
+API: `pact agents --json` gains `idle_secs`. Absent, never zero, for an agent this
+machine has no record of — including every agent in a repository whose fleet ran
+on an older pact. `pact ui`'s roster drops the `SEEN` column for `LIVE`.
+
 ### `pact doctor` can tell a stopped fleet from a working one
 
 **With a correction to the premise it was filed under.** A parked agent is not

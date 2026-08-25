@@ -174,7 +174,7 @@ impl Store {
             }
         }
 
-        self.rebuild_roster();
+        self.rebuild_roster(repo_root);
     }
 
     /// What the status line should say about this read, in place of the
@@ -421,7 +421,7 @@ impl Store {
     /// The same three sources `agents::list` reads — live locks, lease history,
     /// message traffic — but off the already-parsed stores, and returning its
     /// diagnostics instead of printing them. See the module doc.
-    fn rebuild_roster(&mut self) {
+    fn rebuild_roster(&mut self, repo_root: &Path) {
         let mut seen: BTreeMap<String, AgentInfo> = BTreeMap::new();
         for entry in &self.leases {
             let info = observe(&mut seen, &entry.lease.agent, &entry.lease.acquired_at);
@@ -438,6 +438,22 @@ impl Store {
         for m in &self.messages {
             observe(&mut seen, &m.from, &m.created_at).messages_sent += 1;
             observe(&mut seen, &m.to, &m.created_at).messages_received += 1;
+        }
+        // Liveness for the whole roster in ONE `read_dir` of a directory holding
+        // one small file per agent (pact-88z). That is the budget this surface
+        // has: the refresh comment above is explicit that a naive re-read here
+        // re-parses the entire event and message store ~10x/second. A fleet is
+        // tens of agents, so this is tens of tiny files against thousands of JSON
+        // lines — and no subprocess, which is the other half of that rule.
+        let recent: std::collections::BTreeMap<String, chrono::DateTime<Utc>> =
+            crate::activity::all(&crate::repo::pact_dir_path(repo_root))
+                .into_iter()
+                .collect();
+        let now = Utc::now();
+        for info in seen.values_mut() {
+            info.idle_secs = recent
+                .get(&info.name)
+                .map(|at| (now - *at).num_seconds().max(0));
         }
         let mut roster: Vec<AgentInfo> = seen.into_values().collect();
         // Most recently active first; name breaks ties so the list is stable.
@@ -541,6 +557,7 @@ fn observe<'a>(
         name_valid: identity::validate(name).is_ok(),
         harness: None,
         model: None,
+        idle_secs: None,
     });
     if parse_at(at) > parse_at(&info.last_seen) {
         info.last_seen = at.to_string();

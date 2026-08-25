@@ -95,6 +95,8 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 // `crate::attrs` is NOT in this list and is not missing: it is a
 // `#[macro_export]` macro defined in otel.rs, so including that module puts the
 // macro at this crate's root the same way it lands at pact's.
+#[path = "../src/activity.rs"]
+mod activity;
 #[path = "../src/agents_md.rs"]
 mod agents_md;
 #[path = "../src/beads.rs"]
@@ -418,6 +420,28 @@ fn bench_events_append(c: &mut Criterion) {
             std::env::remove_var(k);
         }
     }
+
+    // THE THIRD DECISIVE PAIR (pact-88z). Liveness is recorded by every pact
+    // invocation, which makes it the one thing on this path that runs even when
+    // nothing else does — a `pact msg inbox` writes no event and still pays this.
+    //
+    // The budget it has to fit inside is the env-read budget the attribution pair
+    // above measures, not the subprocess budget: one `O_CREAT|O_TRUNC` open of a
+    // ~30-byte file. The pair below is that write against nothing, so the cost of
+    // the whole feature is a number rather than an assurance — and so that the
+    // obvious "improvement" of scanning `.pact/leases/` to touch each of an
+    // agent's locks, which is what a per-lease record would need, shows up here
+    // as the regression it would be.
+    let tmp = seedless_repo();
+    std::fs::create_dir_all(tmp.path().join(".pact")).expect(".pact");
+    group.bench_function("activity/touch", |b| {
+        b.iter(|| activity::touch(&tmp.path().join(".pact"), "bench-a"))
+    });
+    group.bench_function("activity/absent", |b| {
+        // The read-only-command path in a repo that never ran `pact init`: one
+        // `is_dir` and out, which is what keeps "a question must not mutate" free.
+        b.iter(|| activity::touch(&tmp.path().join("nope"), "bench-a"))
+    });
 
     // What the HEAD cache (pact-hxy) is worth, as a number rather than an
     // inference: the same boundary-kind append cold — a fresh command's first
