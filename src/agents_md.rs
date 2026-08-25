@@ -115,6 +115,16 @@ this protocol whenever you touch shared files or hand off work to others.
   still corrupted the shared Beads store, because it read the protocol as being
   about editing files and a CLI wrote a second database behind it at exit 0.
   pact itself never writes to `.beads/`; the commands you run directly do.
+- **If you are the ORCHESTRATOR, this file is addressed to you too.** You have no
+  bead, no wave and no claim, so every rule here reads as somebody else's — and
+  you are the participant with the broadest write access: shared skeletons,
+  pre-wiring, merges, checkpoints. Lease the skeleton before you write it. On one
+  20-agent run `pact audit --check commit-correlation` found 12 commits no hold
+  covered and every one was the orchestrator's, breaking the rule it had written
+  into all 16 workers' prompts — which all 16 followed. `--allow-main` excuses you
+  from `--check topology`, not from holding leases. And read the handoffs for the
+  beads your skeleton serves (`pact msg thread bead:<id>`) before you write it:
+  they are addressed to a bead, not to you, so no inbox will hand them over.
 - **Ownership, and its one carve-out, stated together**: lease every file you
   edit that another agent might also touch, and release it when done. The
   single exception is a file that is yours alone by assignment (your own
