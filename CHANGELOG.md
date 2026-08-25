@@ -790,6 +790,70 @@ reasoning a commit subject cannot.
 
 ## Notes — unreleased
 
+### `pact handoff` — knowledge that outlives the agent that had it
+
+In an orchestratorless run nobody holds the shape of the work. An agent finishes a
+bead, closes it, exits — and everything it learned exits with it. Whoever picks up
+the dependent bead an hour later starts from the description, the diff, and
+inference. In the runs so far that knowledge moved through prose in a commit
+message, or through luck.
+
+Messaging could not fix it, for a structural reason rather than a gap: **`msg send`
+needs a recipient and the recipient does not exist yet.** So a handoff is addressed
+to the *work* — the thread `bead:<dependent-id>` — which outlives everyone, the way
+`--to-owner-of` addresses a path that outlives its holder.
+
+```bash
+pact handoff m-aaa --confidence high --findings "the arena is owned by the parser"
+#   → one message per dependent, on that dependent's own thread
+
+pact msg thread bead:m-bbb     # what the next agent runs before starting
+```
+
+`--confidence` is the same three tiers `recount` reports for testimony, so a fleet
+reads one scale rather than converting between two.
+
+**It is inheritance, not ceremony.** It never blocks, never gates a close, and a
+bead with nothing worth saying sends nothing. That restraint is why it might
+survive: pact's history is a list of ceremonies agents did not perform — one
+renewal in 153 events, four messages between 28 agents across three runs — and
+anything costing a turn while producing nothing the agent was asked for does not
+get done.
+
+`pact plan lint` now snapshots the accepted graph to `.pact/plan.json`, and
+`handoff` routes along those edges or **refuses**. With no snapshot it will not
+guess: a handoff delivered to the wrong bead is worse than one never sent, because
+it arrives carrying a confidence tier. A lint that found errors writes nothing —
+a graph the linter refused is not one to route messages along.
+
+`pact audit` gains a coverage line: how many beads with dependents left findings,
+and which did not. A count, never a verdict.
+
+**Three corrections the brief needed**, all verified before building:
+
+- **`pact msg thread` did not exist.** The subcommands were send/inbox/sent/read,
+  and `read` resolves by message id or prefix — never by thread key. It had to be
+  built, and it reads *records* rather than the fanned-out messages every other
+  command uses, because a handoff has no recipients and the fan-out drops it
+  entirely.
+- **Committing `.pact/plan.json` contradicted `docs/plan.md`, twice.** Resolved by
+  distinguishing the artifacts rather than stepping over it: your input manifest
+  stays a build artifact, and pact's linted copy of the edges joins the two ledgers
+  as history — because coverage has to be answerable from a clone. `.gitignore`
+  gains its third negation, and it is the first that is not append-only.
+- **Coverage cannot count "closed" beads.** The brief asked for closed beads with
+  dependents that sent nothing, computed from `plan.json` and `messages.jsonl`
+  alone — and those two cannot say what is closed; that lives in bd. It counts
+  every bead the plan gives dependents instead, which those sources *can* answer,
+  and the field says so.
+
+**And what it refuses to claim: whether anyone read it.** Read state is
+machine-local, so audit reports what was *sent* and nothing about consumption. The
+only durable evidence is an agent citing a handoff where it travels — a close
+reason, a commit message — which is a convention a fleet can adopt and not
+something pact can measure. Said in `docs/audit.md` and `docs/fleet-patterns.md`
+rather than left for someone to assume.
+
 ### `SUSPECT` now means silent in every channel
 
 A follow-up that turned out to delete more than it added. `LeaseEntry::suspect`

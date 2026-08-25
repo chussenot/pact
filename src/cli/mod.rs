@@ -3,7 +3,7 @@ use crate::{audit, lease};
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 mod commands;
 mod util;
@@ -13,8 +13,8 @@ use commands::run_mcp;
 #[cfg(feature = "ui")]
 use commands::run_ui;
 use commands::{
-    run_agents, run_audit, run_completion, run_context_set, run_doctor, run_init, run_lease,
-    run_log, run_merge, run_msg, run_plan_lint, run_watch, run_whoami, AuditArgs,
+    run_agents, run_audit, run_completion, run_context_set, run_doctor, run_handoff, run_init,
+    run_lease, run_log, run_merge, run_msg, run_plan_lint, run_watch, run_whoami, AuditArgs,
 };
 
 /// `tui` renders the same activity feed `pact log` does and reaches for these
@@ -57,6 +57,36 @@ pub(crate) struct Cli {
 
     #[command(subcommand)]
     pub(crate) command: Command,
+}
+
+/// How much weight the next agent should give a handoff.
+///
+/// **The same three tiers `recount` reports for testimony**, and that is a
+/// contract rather than a coincidence. A fleet that reads `confidence: medium` on
+/// an inherited finding and `confidence: medium` on a joined transcript should be
+/// reading one scale, not two it has to convert between in its head. If recount's
+/// vocabulary moves, this moves with it.
+///
+/// Rendered in words wherever it is shown. A number would invite arithmetic on
+/// something nobody measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum Confidence {
+    /// Verified: tested, reproduced, or read directly from the source.
+    High,
+    /// Consistent with what was seen, not independently confirmed.
+    Medium,
+    /// A lead worth checking, and worth doubting.
+    Low,
+}
+
+impl Confidence {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -148,6 +178,32 @@ pub(crate) enum Command {
         /// lose to the hard reset that revert performs.
         #[arg(long)]
         allow_dirty: bool,
+    },
+    /// Leave findings for whoever picks up the beads that depend on this one.
+    ///
+    /// Resolves `<bead>`'s dependents from the graph `pact plan lint` snapshotted
+    /// and posts one message per dependent onto that dependent's own thread —
+    /// addressed to the WORK, because the agent who inherits it frequently does
+    /// not exist yet. They read it with `pact msg thread bead:<their-id>`.
+    ///
+    /// Never blocks and never gates a close: this is inheritance, not ceremony. A
+    /// bead with nothing to say sends nothing, and `pact audit --check
+    /// handoff-coverage` is where that shows up.
+    Handoff {
+        /// The bead you are finishing.
+        bead: String,
+        /// How much weight the next agent should give this.
+        ///
+        /// The same three tiers `recount` reports for testimony, deliberately, so
+        /// a fleet's evidence and its inheritance are graded on one scale rather
+        /// than two that have to be mentally converted.
+        #[arg(long, value_enum)]
+        confidence: Confidence,
+        /// What you found. `@path` reads a file — quotes, backslashes and aligned
+        /// tables do not survive a shell, and a handoff is exactly that kind of
+        /// content.
+        #[arg(long)]
+        findings: String,
     },
     /// Threaded messages between agents, in pact's own append-only store.
     Msg {
@@ -523,6 +579,15 @@ pub(crate) enum MsgAction {
     },
     /// List messages you sent, newest first, and whether they were read.
     Sent,
+    /// Read a whole thread by its key, including messages addressed to nobody.
+    ///
+    /// The route to an inheritance. `pact handoff` posts onto `bead:<id>` with no
+    /// recipient, because the agent who will pick that bead up may not exist yet —
+    /// so `inbox` cannot show it and only the thread key reaches it.
+    Thread {
+        /// `bead:<id>`, or any thread key.
+        key: String,
+    },
     /// Read a message (or its thread) by id.
     Read {
         /// Message id, as `msg inbox` prints it. Reading marks it read for you
@@ -590,11 +655,13 @@ pub(crate) fn subcommand_name(command: &Command) -> &'static str {
             LeaseAction::Ls { .. } => "lease ls",
         },
         Command::Merge { .. } => "merge",
+        Command::Handoff { .. } => "handoff",
         Command::Msg { action } => match action {
             MsgAction::Send { .. } => "msg send",
             MsgAction::Inbox { .. } => "msg inbox",
             MsgAction::Sent => "msg sent",
             MsgAction::Read { .. } => "msg read",
+            MsgAction::Thread { .. } => "msg thread",
         },
         Command::Log { .. } => "log",
         Command::Context { action } => match action {
@@ -672,6 +739,19 @@ pub(crate) fn run(cli: Cli) -> Result<i32> {
         Command::Plan { action } => match action {
             PlanAction::Lint { manifest } => run_plan_lint(&cwd, cli.json, &manifest),
         },
+        Command::Handoff {
+            bead,
+            confidence,
+            findings,
+        } => run_handoff(
+            &cwd,
+            cli.agent.as_deref(),
+            cli.json,
+            &bead,
+            confidence,
+            &findings,
+        )
+        .map(|()| 0),
         Command::Doctor { fix } => run_doctor(&cwd, cli.json, fix, cli.agent.as_deref()),
         Command::Init {
             print,

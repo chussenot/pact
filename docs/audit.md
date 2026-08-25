@@ -664,6 +664,35 @@ sweeper's name — the same falsehood pointing the other way. Who a lease was
 reclaimed *from* is in `detail`, which is the one place it cannot be mistaken for
 the actor.
 
+## Handoff coverage
+
+```
+handoff coverage  7 of 11 bead(s) with dependents left findings
+  silent: m-bbb, m-ddd, m-jjj, m-kkk
+  (a smell, not a failure — a bead with nothing worth saying should send nothing)
+```
+
+From `.pact/plan.json` and `.pact/messages.jsonl` only: no bd, no subprocess, no
+guess at edges. Absent entirely where no plan has been linted, because coverage
+against a graph nobody declared is not a low score — it is an unanswerable
+question.
+
+It counts **beads the plan gives dependents**, not closed ones. Those two sources
+cannot say which beads are closed; that lives in bd, which audit reads only
+through the committed interactions export. An open bead with no handoff is counted
+the same as a closed one, and should be — it has not sent yet, and this is a
+coverage figure rather than an accusation.
+
+### It does not know whether anyone read it
+
+**And it will not pretend to.** Read state is machine-local, so a repository's
+committed history carries what was *sent* and nothing about what was consumed. A
+coverage line that implied otherwise would be inventing the more interesting half.
+
+The only durable evidence of consumption is an agent citing a handoff somewhere
+that travels — a bead close reason that references it, a commit message that
+quotes it. That is a convention a fleet can adopt, not something pact can measure.
+
 ## Attribution: what wrote this row
 
 Every event carries as much of an attribution chain as was knowable when it was

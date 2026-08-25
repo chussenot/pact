@@ -6809,6 +6809,176 @@ fn a_read_only_command_records_nothing_where_pact_has_never_run() {
     );
 }
 
+// -------------------------------------------------- pact handoff (pact-e7d)
+
+/// A three-bead plan: `root` has two dependents, `leaf` has none.
+fn handoff_repo() -> TempDir {
+    let repo = init_repo();
+    std::fs::write(
+        repo.path().join("plan.jsonl"),
+        "{\"id\":\"m-aaa\",\"wave\":0,\"files\":[\"a.rs\"],\"depends_on\":[]}\n\
+         {\"id\":\"m-bbb\",\"wave\":1,\"files\":[\"b.rs\"],\"depends_on\":[\"m-aaa\"]}\n\
+         {\"id\":\"m-ccc\",\"wave\":1,\"files\":[\"c.rs\"],\"depends_on\":[\"m-aaa\"]}\n",
+    )
+    .unwrap();
+    assert_ok(&pact(
+        repo.path(),
+        "planner",
+        &["plan", "lint", "plan.jsonl"],
+    ));
+    repo
+}
+
+/// pact-e7d: one handoff per dependent, and a later claimer finds it by the
+/// thread key rather than by knowing who sent it.
+///
+/// The fan-out and the keying are one test because they are one claim: findings
+/// reach EVERY bead that depends on this one, and each arrives somewhere an agent
+/// who does not yet exist will know to look.
+#[test]
+fn a_handoff_reaches_every_dependent_on_its_own_thread() {
+    let repo = handoff_repo();
+
+    assert_ok(&pact(
+        repo.path(),
+        "finisher",
+        &[
+            "handoff",
+            "m-aaa",
+            "--confidence",
+            "high",
+            "--findings",
+            "the arena is owned by the parser",
+        ],
+    ));
+
+    // Both dependents, each on its own thread — not one message with two
+    // recipients, because they are two different inheritances.
+    for dependent in ["m-bbb", "m-ccc"] {
+        let out = stdout_of(&pact(
+            repo.path(),
+            "later",
+            &["msg", "thread", &format!("bead:{dependent}")],
+        ));
+        assert!(
+            out.contains("the arena is owned by the parser"),
+            "{dependent} must inherit the findings: {out}"
+        );
+        assert!(
+            out.contains("high"),
+            "and the tier, because a finding without one gets acted on at full \
+             weight: {out}"
+        );
+    }
+
+    // And it is invisible to the inbox, which is the point: it was addressed to
+    // the work, not to a person. An agent polling its inbox must not be shown
+    // somebody else's inheritance.
+    let inbox = stdout_of(&pact(repo.path(), "later", &["msg", "inbox"]));
+    assert!(
+        !inbox.contains("the arena is owned by the parser"),
+        "a handoff has no recipient and must not surface as mail: {inbox}"
+    );
+}
+
+/// A bead nothing depends on sends nothing, and says so at exit 0.
+///
+/// The exit code is the assertion that matters. A non-zero code here would teach
+/// a fleet that `handoff` is a step that can fail, and an optional step that can
+/// fail is one agents learn to skip.
+#[test]
+fn a_leaf_bead_sends_nothing_and_does_not_fail() {
+    let repo = handoff_repo();
+    let out = pact(
+        repo.path(),
+        "finisher",
+        &["handoff", "m-ccc", "--confidence", "low", "--findings", "x"],
+    );
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("nothing in the plan depends on m-ccc"));
+}
+
+/// With no linted graph, it REFUSES rather than guessing edges.
+///
+/// The alternative is inferring dependents from bead ids in lease notes or from
+/// names that look related, and a handoff delivered to the wrong bead is worse
+/// than one never sent: the second is a gap, the first is misinformation carrying
+/// a confidence tier.
+#[test]
+fn no_plan_snapshot_refuses_and_names_the_command_that_makes_one() {
+    let repo = init_repo();
+    let out = pact(
+        repo.path(),
+        "finisher",
+        &[
+            "handoff",
+            "m-aaa",
+            "--confidence",
+            "high",
+            "--findings",
+            "x",
+        ],
+    );
+    assert!(!out.status.success());
+    let err = stderr_of(&out);
+    assert!(err.contains("pact plan lint"), "{err}");
+    assert!(
+        err.contains("will not guess"),
+        "the refusal must say why, or it reads as a missing feature: {err}"
+    );
+}
+
+/// A lint that found ERRORS leaves no graph to route along.
+///
+/// A manifest with a cycle or an unknown dependency describes edges the linter has
+/// already refused, and routing somebody's findings down them would be worse than
+/// not routing at all.
+#[test]
+fn a_failing_lint_writes_no_graph() {
+    let repo = init_repo();
+    std::fs::write(
+        repo.path().join("bad.jsonl"),
+        "{\"id\":\"m-aaa\",\"wave\":1,\"depends_on\":[\"m-bbb\"]}\n\
+         {\"id\":\"m-bbb\",\"wave\":1,\"depends_on\":[]}\n",
+    )
+    .unwrap();
+    // Same-wave dependency: an error, so the lint exits 1 and writes nothing.
+    let _ = pact(repo.path(), "planner", &["plan", "lint", "bad.jsonl"]);
+    assert!(
+        !repo.path().join(".pact/plan.json").exists(),
+        "a graph the linter refused must not become one handoff routes along"
+    );
+}
+
+/// Coverage counts beads with dependents that left findings, and names the rest.
+#[test]
+fn audit_reports_handoff_coverage_from_the_plan_and_the_store() {
+    let repo = handoff_repo();
+    assert_ok(&pact(
+        repo.path(),
+        "finisher",
+        &[
+            "handoff",
+            "m-aaa",
+            "--confidence",
+            "medium",
+            "--findings",
+            "y",
+        ],
+    ));
+
+    let v: serde_json::Value =
+        serde_json::from_slice(&pact(repo.path(), "auditor", &["audit", "--json"]).stdout).unwrap();
+    let c = &v["handoff_coverage"];
+    // m-aaa is the only bead with dependents here, and it sent.
+    assert_eq!(c["with_dependents"], 1, "{v}");
+    assert_eq!(c["handed_off"], 1, "{v}");
+    assert!(
+        c["silent"].as_array().is_none_or(|a| a.is_empty()),
+        "nothing is silent: {c}"
+    );
+}
+
 /// `pact merge --json` has a shape too, and it did not have a test — which is how
 /// `branch` became `branches` (pact-jat) with nothing in the tree contradicting
 /// it. pact-er0's whole mechanism is that changing a shape edits this file.

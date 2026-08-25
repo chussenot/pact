@@ -188,6 +188,18 @@ pub struct Record {
     /// Sparse by measurement, see [`crate::events::Event::harness_subagent`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_subagent: Option<String>,
+    /// `kind: "handoff"` only — the bead whose findings these are (pact-e7d).
+    ///
+    /// A field rather than a substring of the subject, and the reason is the one
+    /// this repository keeps relearning: `pact audit`'s coverage line has to ask
+    /// "which beads with dependents left findings", and answering that by
+    /// regexing `handoff from <id>` out of prose would make the answer depend on
+    /// a sentence anybody could reword. The thread says who it is FOR; this says
+    /// who it is FROM.
+    ///
+    /// Absent on every other kind, and on handoffs written before this existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_from: Option<String>,
 }
 
 /// One message as every `--json` consumer already knows it.
@@ -468,6 +480,135 @@ fn message_id(
     format!("pact-msg-{hash:016x}")
 }
 
+/// `kind` for a handoff: findings left for whoever picks up a dependent bead
+/// (pact-e7d).
+///
+/// A third kind beside [`MAIL`] and [`NOTICE`], additive by the same rule they
+/// were: a pact that predates it reads the row, does not recognise the kind, and
+/// treats it as ordinary correspondence. Nothing breaks and nothing is hidden.
+pub const HANDOFF: &str = "handoff";
+
+/// The thread a bead's inheritance lives on.
+///
+/// **The address is the WORK, not a person**, and that is the whole reason this
+/// feature can exist. A handoff is written when a bead closes, for whoever picks
+/// up what depended on it — and that agent frequently has not been spawned yet,
+/// so there is no name to send to. A path already outlives its holder in
+/// `--to-owner-of`; a bead outlives everyone.
+pub fn bead_thread(bead: &str) -> String {
+    format!("bead:{bead}")
+}
+
+/// How much of a handoff is kept.
+///
+/// The same bound `watch`'s release diffs carry, for the same measured reason:
+/// past a point a wall of text is not a message but a pointer to one, and the
+/// reader stops reading. Handoffs are written by an agent that has just finished
+/// something and has everything in its context, which is exactly the condition
+/// that produces a wall.
+const MAX_HANDOFF_LINES: usize = 200;
+
+/// Post `body` to a bead's thread, addressed to nobody.
+///
+/// `to` is empty, and that is not a degenerate case — it is the shape. Putting the
+/// dependent's agent there is impossible (it may not exist), and putting the bead
+/// id there would be worse: `to` is an agent field, and `agents::observe` would
+/// enrol every bead id as an identity in the roster and in recipient validation.
+///
+/// The consequence, stated because it decides how a handoff is read: [`fan_out`]
+/// produces one [`Message`] per recipient, so a record with none fans out to
+/// nothing and is invisible to `inbox` and to [`all_messages`]. A handoff is
+/// reached through its THREAD — `pact msg thread bead:<id>` — and nowhere else.
+pub fn post_to_thread(
+    repo_root: &Path,
+    agent: &str,
+    thread: &str,
+    from_bead: &str,
+    subject: &str,
+    body: &str,
+) -> Result<Record> {
+    let body = cap_handoff(body);
+    let id = message_id(agent, &[], Some(thread), subject, &body);
+    let record = Record {
+        thread: thread.to_string(),
+        id,
+        at: Utc::now().to_rfc3339(),
+        from: agent.to_string(),
+        to: Vec::new(),
+        subject: Some(subject.to_string()),
+        body,
+        kind: HANDOFF.to_string(),
+        in_reply_to: None,
+        about: Vec::new(),
+        chain_hash: None,
+        handoff_from: Some(from_bead.to_string()),
+        ..attribution_of()
+    };
+    append(repo_root, &record)?;
+    Ok(record)
+}
+
+/// Every stored record, oldest first.
+///
+/// Records rather than [`Message`]s, for the reason [`thread_records`] gives: a
+/// handoff has no recipients and fans out to nothing.
+pub fn all_records(repo_root: &Path) -> Result<Vec<Record>> {
+    Ok(records(repo_root)?.0)
+}
+
+/// Every record on `thread`, oldest first.
+///
+/// Reads RECORDS rather than [`Message`]s on purpose: a handoff has no recipients,
+/// so the fan-out that produces `Message` drops it entirely. This is the only
+/// route to one.
+pub fn thread_records(repo_root: &Path, thread: &str) -> Result<Vec<Record>> {
+    let (records, _) = records(repo_root)?;
+    Ok(records.into_iter().filter(|r| r.thread == thread).collect())
+}
+
+/// Trim a handoff to [`MAX_HANDOFF_LINES`], saying where the rest went.
+///
+/// Names the cap in the text rather than trailing off, so a reader can tell a
+/// truncated handoff from a terse one — the same distinction `watch`'s diff
+/// truncation draws, and for the same reason: silence and brevity look identical
+/// at the bottom of a message.
+fn cap_handoff(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.len() <= MAX_HANDOFF_LINES {
+        return body.to_string();
+    }
+    let kept = lines[..MAX_HANDOFF_LINES].join("\n");
+    format!(
+        "{kept}\n\n[handoff truncated at {MAX_HANDOFF_LINES} lines of {}. A handoff is a \
+         summary for somebody who has not read your work; if the rest matters, put it in the \
+         repository and name the path here.]",
+        lines.len()
+    )
+}
+
+/// The sender's attribution, as every stored record carries it.
+fn attribution_of() -> Record {
+    let who = crate::harness::Attribution::resolve();
+    Record {
+        id: String::new(),
+        at: String::new(),
+        from: String::new(),
+        to: Vec::new(),
+        subject: None,
+        body: String::new(),
+        thread: String::new(),
+        kind: String::new(),
+        in_reply_to: None,
+        about: Vec::new(),
+        chain_hash: None,
+        handoff_from: None,
+        harness: who.harness,
+        model: who.model,
+        harness_session: who.session,
+        harness_subagent: who.subagent,
+    }
+}
+
 /// One [`Record`] as one [`Message`] per recipient, in stored recipient order.
 ///
 /// `viewer` is the agent asking; `None` means "resolve `read` against each copy's
@@ -603,6 +744,8 @@ pub fn send(
         in_reply_to: parent.map(|r| r.id),
         about: about.to_vec(),
         chain_hash: None,
+        // Ordinary correspondence inherits nothing: this is a handoff-only field.
+        handoff_from: None,
         harness: who.harness,
         model: who.model,
         harness_session: who.session,
@@ -1828,5 +1971,72 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].path, "something else entirely");
         assert_eq!(groups[0].count, 1);
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+
+    fn repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".pact")).unwrap();
+        tmp
+    }
+
+    /// pact-e7d: a handoff is capped, and says so rather than trailing off.
+    ///
+    /// The bound matters because of who writes these: an agent that has just
+    /// finished something, with all of it still in context, asked for "findings".
+    /// That is the exact condition that produces a wall of text — and past a point
+    /// a wall is not a message but a pointer to one, which is the measurement
+    /// `watch`'s diff cap already carries.
+    ///
+    /// Naming the cap in the text is the load-bearing half: silence and brevity
+    /// look identical at the bottom of a message, so a reader must be able to tell
+    /// a truncated handoff from a terse one.
+    #[test]
+    fn an_overlong_handoff_is_capped_and_says_where_the_rest_went() {
+        let tmp = repo();
+        let long: String = (0..500)
+            .map(|i| format!("finding {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let r = post_to_thread(tmp.path(), "finisher", "bead:m-bbb", "m-aaa", "s", &long).unwrap();
+
+        let lines = r.body.lines().count();
+        assert!(lines < 500, "it must actually be cut: {lines}");
+        assert!(r.body.contains("finding 0"), "the top survives");
+        assert!(!r.body.contains("finding 499"), "the tail does not");
+        assert!(
+            r.body.contains("truncated") && r.body.contains("500"),
+            "and it must name the cap and the original size: {}",
+            r.body.lines().next_back().unwrap_or_default()
+        );
+    }
+
+    /// The thread is the address, and the source bead is a FIELD.
+    ///
+    /// `handoff_from` exists so `pact audit`'s coverage arithmetic does not have
+    /// to regex `handoff from <id>` out of a subject line anybody could reword —
+    /// the same reason `Event::bead` is a field rather than a substring of a note.
+    #[test]
+    fn a_handoff_records_who_it_is_from_and_who_it_is_for() {
+        let tmp = repo();
+        let r = post_to_thread(tmp.path(), "finisher", "bead:m-bbb", "m-aaa", "s", "body").unwrap();
+
+        assert_eq!(r.thread, "bead:m-bbb", "addressed to the WORK");
+        assert_eq!(r.handoff_from.as_deref(), Some("m-aaa"));
+        assert_eq!(r.kind, HANDOFF);
+        assert!(
+            r.to.is_empty(),
+            "no recipient: the inheritor may not exist yet"
+        );
+
+        // And it is reachable only through the thread — `all_messages` fans out
+        // per recipient, so a record with none produces nothing at all.
+        assert!(all_messages(tmp.path()).unwrap().is_empty());
+        assert_eq!(thread_records(tmp.path(), "bead:m-bbb").unwrap().len(), 1);
     }
 }

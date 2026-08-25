@@ -106,6 +106,20 @@ pub struct AgentActivity {
     pub branch: Option<String>,
 }
 
+/// How much of the plan's inheritance actually got written.
+#[derive(Debug, Clone, Serialize)]
+pub struct HandoffCoverage {
+    /// Beads the plan gives at least one dependent.
+    pub with_dependents: usize,
+    /// Of those, how many have a handoff on record.
+    pub handed_off: usize,
+    /// The ones that have not — named, because a count nobody can act on is a
+    /// number rather than a finding. Capped at [`TOP_N`] like every other list
+    /// here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub silent: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HoldStats {
     pub completed: usize,
@@ -129,6 +143,43 @@ pub struct HoldStats {
     /// changed, and re-judging old history by today's number rewrites verdicts.
     #[serde(default)]
     pub expiry_short_ttl: usize,
+}
+
+/// Which beads with dependents left findings for them.
+///
+/// From `plan.json` and `messages.jsonl` only — no bd, no subprocess, and no
+/// guess at edges. `None` where no plan has been linted, because coverage against
+/// a graph nobody declared is not a low number, it is an unanswerable question.
+fn handoff_coverage(repo_root: &std::path::Path) -> Option<HandoffCoverage> {
+    let snapshot = crate::plan::snapshot(repo_root)?;
+    // The structured field, not the subject line: `handoff_from` exists precisely
+    // so this arithmetic does not depend on a sentence anybody could reword.
+    let sent: BTreeSet<String> = crate::msg::all_records(repo_root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| r.handoff_from)
+        .collect();
+    let with_dependents: Vec<String> = snapshot
+        .edges
+        .keys()
+        .filter(|id| !snapshot.dependents(id).is_empty())
+        .cloned()
+        .collect();
+    let mut silent: Vec<String> = with_dependents
+        .iter()
+        .filter(|id| !sent.contains(*id))
+        .cloned()
+        .collect();
+    silent.sort();
+    silent.truncate(TOP_N);
+    Some(HandoffCoverage {
+        handed_off: with_dependents
+            .iter()
+            .filter(|id| sent.contains(*id))
+            .count(),
+        with_dependents: with_dependents.len(),
+        silent,
+    })
 }
 
 /// Below this, a lapsed lease reads as a deliberate short-lived lock rather than an
@@ -203,6 +254,25 @@ pub struct Summary {
     ///
     /// Attribution, not judgment: nothing here fails a check. A fleet is allowed
     /// to declare nothing, and most do.
+    /// Beads the plan says have dependents, and how many of them left findings
+    /// for those dependents (pact-e7d).
+    ///
+    /// **A COUNT, never a verdict.** A bead with nothing worth saying should send
+    /// nothing, so a gap here is a smell to look at rather than a rule anybody
+    /// broke — which is why it lives in the summary, which never judges, rather
+    /// than in a `--check`, which always does.
+    ///
+    /// The brief this came from asked for "closed beads with dependents that sent
+    /// no handoff", computed from `plan.json` and `messages.jsonl` alone. Those two
+    /// sources cannot say which beads are CLOSED — that lives in bd, which audit
+    /// reads only through the committed interactions export and which the
+    /// constraint deliberately excludes. So this measures what they can answer:
+    /// every bead the plan gives dependents, and whether a handoff from it exists.
+    /// An open bead with no handoff is counted the same as a closed one, and it
+    /// should be — it has not sent yet, and the number is a coverage figure rather
+    /// than an accusation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_coverage: Option<HandoffCoverage>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub models_by_events: BTreeMap<String, usize>,
     #[serde(default)]
@@ -475,6 +545,7 @@ pub fn summary(
         hold_secs,
         top_contended,
         per_agent,
+        handoff_coverage: handoff_coverage(repo_root),
         models_by_events,
         model_undeclared,
         by_invoked_from,
@@ -854,6 +925,28 @@ pub fn render_summary(s: &Summary) -> String {
     // By EVENTS, not by agent: an agent that acquired once and one that ran the
     // whole build are not equal evidence about what the run was made of, and
     // counting heads would say they were.
+    // Coverage, stated as a fraction and never as a verdict. A bead with nothing
+    // worth saying should send nothing, so this is where that shows up rather than
+    // a rule anybody broke — which is also why it is here, in the summary that
+    // judges nothing, and not in a `--check` that always does.
+    if let Some(c) = &s.handoff_coverage {
+        if c.with_dependents > 0 {
+            out.push(String::new());
+            out.push(format!(
+                "handoff coverage  {} of {} bead(s) with dependents left findings",
+                c.handed_off, c.with_dependents
+            ));
+            if !c.silent.is_empty() {
+                out.push(format!("  silent: {}", c.silent.join(", ")));
+                out.push(
+                    "  (a smell, not a failure — a bead with nothing worth saying should \
+                     send nothing)"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     if !s.models_by_events.is_empty() {
         let mut by_events: Vec<_> = s.models_by_events.iter().collect();
         by_events.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));

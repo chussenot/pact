@@ -152,6 +152,63 @@ Run it when a wave has gone unusually silent. If agents really have stopped,
 `pact lease sweep --suspect` reclaims their paths and spares any that is still
 committing.
 
+## Inheritance: `pact handoff`
+
+```bash
+# closing a bead that others depend on
+pact handoff recount-hwk.31 --confidence high \
+  --findings "The scoring join owns its arena; do not free it in the caller. \
+              Verified against the 340-case corpus."
+
+# starting a claimed bead
+pact msg thread bead:recount-hwk.44
+```
+
+**In an orchestratorless run, nobody is holding the shape of the work.** An agent
+finishes a bead, closes it, and exits — and everything it learned exits with it.
+The agent that picks up the dependent bead an hour later starts from the bead
+description, the diff, and whatever it can infer. In the runs so far that
+knowledge moved through prose in a commit message, or through luck.
+
+Messaging could not fix this, and the reason is structural rather than a gap in
+messaging: **`pact msg send` needs a recipient, and the recipient does not exist
+yet.** So a handoff is addressed to the *work* — the thread `bead:<dependent-id>`
+— which outlives everyone, the way `--to-owner-of` addresses a path that outlives
+its holder. One message per dependent, along the edges
+[`pact plan lint`](plan.md) snapshotted.
+
+`--confidence` is the same three tiers `recount` reports for testimony,
+deliberately: a fleet reading `medium` on an inherited finding and `medium` on a
+joined transcript should be reading one scale rather than two it has to convert
+between.
+
+### It is inheritance, not ceremony
+
+It never blocks, never gates a close, and nothing waits on it. **A bead with
+nothing worth saying should send nothing**, and that is a legitimate outcome
+rather than a lapse.
+
+That restraint is the whole reason to expect it to survive. pact's own history is
+a list of ceremonies agents did not perform — one renewal in 153 events, four
+messages between 28 agents across three runs — and anything costing a turn while
+producing nothing the agent was asked for does not get done. A handoff is cheap,
+optional, and in the sender's own interest, because the agent it saves is usually
+a later instance of the same fleet on the same problem.
+
+`pact audit` prints a coverage line: how many beads with dependents left findings,
+and which did not. A count, never a verdict.
+
+### What pact cannot tell you
+
+**Whether anyone read it.** Read state is machine-local — `.pact/read/` is
+gitignored for the same reason lock files are — so `pact audit` reports what was
+*sent* and makes no claim about what was consumed. It would be easy to imply
+otherwise and it would be false.
+
+The only durable evidence of consumption is an agent saying so where it travels:
+a bead close reason that references the handoff, a commit message that cites it.
+If you want consumption to be auditable, that is where to put it.
+
 ## Declare what you launched
 
 ```bash

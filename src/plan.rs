@@ -459,11 +459,93 @@ fn coalesce(warns: &[&Finding]) -> Vec<String> {
 }
 
 /// Read, parse and lint. Returns the report; the caller decides the exit code.
+/// Where `plan lint` leaves the graph for runtime commands to read.
+pub const SNAPSHOT_PATH: &str = ".pact/plan.json";
+
+/// The dependency graph, as `pact plan lint` last accepted it.
+///
+/// **Only the edges, and deliberately not the manifest.** `files` and `wave` are
+/// the linter's business — they decide contention and ordering, and both are
+/// answered before any agent runs. What a runtime command needs is who depends on
+/// whom, which is the one part of a plan that stays interesting after the plan has
+/// been executed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snapshot {
+    /// RFC3339, when the lint that wrote this ran.
+    pub at: String,
+    /// `id -> depends_on`, every entry the manifest declared.
+    pub edges: BTreeMap<String, Vec<String>>,
+}
+
+impl Snapshot {
+    /// Everything that depends on `id`, in a stable order.
+    ///
+    /// The reverse of what the manifest states, computed here rather than stored:
+    /// a manifest declares what an entry needs, and a handoff has to reach what
+    /// needs IT. Storing both would be two things to keep in step.
+    pub fn dependents(&self, id: &str) -> Vec<&str> {
+        self.edges
+            .iter()
+            .filter(|(_, deps)| deps.iter().any(|d| d == id))
+            .map(|(k, _)| k.as_str())
+            .collect()
+    }
+}
+
+/// Read the snapshot, or `None` where no lint has written one.
+///
+/// `None` is not an error here: every consumer decides for itself what to do
+/// about a missing graph, and the two consumers disagree. `pact handoff` refuses
+/// outright — guessing at edges would deliver somebody's findings to the wrong
+/// bead — while `pact audit` reports that coverage could not be computed, which
+/// is the same discipline `claim-lease-divergence` follows for a missing sidecar.
+pub fn snapshot(repo_root: &Path) -> Option<Snapshot> {
+    let raw =
+        std::fs::read_to_string(crate::repo::pact_dir_path(repo_root).join("plan.json")).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Write the graph `entries` describes, for runtime commands to read.
+///
+/// Called by `plan lint` and nowhere else, and only when the lint found no
+/// ERRORS. That gate is the point: a manifest with a dependency cycle or an
+/// unknown dependency describes a graph nobody should be routing messages along,
+/// and writing it anyway would make `pact handoff` deliver against edges the
+/// linter has already refused. Warnings do not gate — an entry with no wave is a
+/// normal intermediate state and its edges are still true.
+///
+/// Best-effort by signature. `plan lint` answers a question about a manifest, and
+/// it must not start failing because it could not write a convenience for
+/// somebody else; an unwritable snapshot simply means `handoff` will refuse until
+/// the next successful lint.
+pub fn write_snapshot(repo_root: &Path, entries: &[Entry], report: &Report) {
+    if report.errors() > 0 {
+        return;
+    }
+    let Ok(dir) = crate::repo::pact_dir(repo_root) else {
+        return;
+    };
+    let snap = Snapshot {
+        at: chrono::Utc::now().to_rfc3339(),
+        edges: entries
+            .iter()
+            .map(|e| (e.id.clone(), e.depends_on.clone()))
+            .collect(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&snap) {
+        let _ = std::fs::write(dir.join("plan.json"), json + "\n");
+    }
+}
+
 pub fn run(repo_root: &Path, manifest: &Path) -> Result<Report> {
     let text = std::fs::read_to_string(manifest)
         .with_context(|| format!("reading {}", manifest.display()))?;
     let entries = parse(&text)?;
-    Ok(lint(repo_root, &entries))
+    let report = lint(repo_root, &entries);
+    // The snapshot is a by-product of a lint that PASSED, never of a lint that
+    // merely ran — see `write_snapshot`.
+    write_snapshot(repo_root, &entries, &report);
+    Ok(report)
 }
 
 #[cfg(test)]

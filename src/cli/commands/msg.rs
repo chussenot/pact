@@ -256,7 +256,55 @@ pub(in crate::cli) fn run_msg(
             });
             Ok(())
         }
+        // A thread key, not a message id — and it reads RECORDS rather than the
+        // fanned-out `Message`s every other arm here uses (pact-e7d). A handoff is
+        // addressed to nobody, because the agent who will inherit the work may not
+        // exist yet, and `fan_out` produces one `Message` per recipient: a record
+        // with none vanishes. This is the only route to one.
+        MsgAction::Thread { key } => {
+            let records = msg::thread_records(&root, &key)?;
+            if records.is_empty() {
+                // Exit 0. An empty inheritance is the normal state of most beads,
+                // and a non-zero code would teach agents that checking is a step
+                // that can fail — which is how an optional check stops happening.
+                output::emit(json, &records, |_: &Vec<msg::Record>| {
+                    format!("nothing on {key}")
+                });
+                return Ok(());
+            }
+            output::emit(json, &records, |rs: &Vec<msg::Record>| {
+                rs.iter()
+                    .map(render_record)
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            });
+            Ok(())
+        }
     }
+}
+
+/// One stored record, in full.
+///
+/// Deliberately not [`render_full`]: that takes `Message`, which a handoff never
+/// becomes. The shapes are close enough to invite sharing and different in the one
+/// way that matters — a `Message` has exactly one recipient and a handoff has
+/// none.
+fn render_record(r: &msg::Record) -> String {
+    let who = crate::harness::Attribution {
+        harness: r.harness.clone(),
+        model: r.model.clone(),
+        ..Default::default()
+    }
+    .badge()
+    .map(|b| format!(" {b}"))
+    .unwrap_or_default();
+    format!(
+        "from {}{who} at {}\n{}\n\n{}",
+        r.from,
+        r.at,
+        r.subject.as_deref().unwrap_or("(no subject)"),
+        r.body
+    )
 }
 
 /// Ceiling on the stdin read, not a latency target: a legitimate producer may be

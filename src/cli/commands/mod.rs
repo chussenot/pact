@@ -9,6 +9,8 @@ mod audit;
 mod completion;
 mod context;
 mod doctor;
+mod handoff;
+pub(in crate::cli) use handoff::run_handoff;
 mod init;
 mod lease;
 mod log;

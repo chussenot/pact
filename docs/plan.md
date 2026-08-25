@@ -159,6 +159,28 @@ Map your own `group:` names to wave numbers however your run is staged; pact onl
 cares that entries sharing a wave do not share a file. Keep the manifest as a
 build artifact, not a committed file — it is a snapshot of one run's plan.
 
+### pact keeps its own copy of the edges
+
+A lint that finds **no errors** writes `.pact/plan.json`: the dependency graph and
+nothing else — no files, no waves, no timestamps of yours. Those are the linter's
+business and are answered before any agent runs; the edges are the part that stays
+interesting after the plan has been executed.
+
+That file **is** committed, alongside `events.jsonl` and `messages.jsonl`, and it
+is the one exception to the paragraph above. The distinction is which artifact:
+your manifest is your input and describes intent, so it stays a build artifact.
+pact's linted copy is history, for the same reason the other two are — something
+has to be able to read the graph after the run. [`pact handoff`](fleet-patterns.md)
+routes along these edges, and `pact audit`'s handoff-coverage line asks which beads
+with dependents left findings, which is unanswerable from a file the clone did not
+get.
+
+A lint with **errors** writes nothing. A manifest with a cycle or an unknown
+dependency describes a graph nobody should be routing messages along, and leaving
+the last good snapshot in place is better than replacing it with one the linter
+just refused. Warnings do not gate: an entry with no wave is a normal intermediate
+state and its edges are still true.
+
 ### Derive waves from the dependency graph, not by hand
 
 **A wave must be a dependency-free set.** Every entry's `depends_on` has to live in a

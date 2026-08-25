@@ -229,6 +229,14 @@ this protocol whenever you touch shared files or hand off work to others.
   written 38 minutes after the first of them parked, and reached the NEXT
   cohort's spawn prompt only. One of those four was holding four finished fixes,
   two of them repaired regressions.
+- **Read your inheritance before you start a claimed bead**: `pact msg thread
+  bead:<id>`. Whoever finished what yours depends on may have left findings there
+  — addressed to the bead rather than to you, because when they wrote it you did
+  not exist yet. It is usually the cheapest thing you will read all session.
+- **When you close a bead that has dependents, send a handoff**: `pact handoff
+  <bead> --confidence high|medium|low --findings "<what you found>"`. Findings you
+  would want waiting for you. It never blocks and nothing waits on it; a bead with
+  nothing worth saying should send nothing.
 - **Orient with `pact log`**: one chronological feed of who leased what and
   who said what. Read it when you join, and when you need to know whether a
   peer is still moving.
@@ -679,6 +687,18 @@ const RUNTIME_IGNORE_RULES: &[&str] = &[
     // read CURSORS stay local — a read position is per-machine — which is what keeps
     // "who said what" shared without making "who has read it" a merge conflict.
     "!.pact/messages.jsonl",
+    // The third, and the only one that is not append-only (pact-e7d). It is a
+    // SNAPSHOT of the dependency graph `pact plan lint` last accepted, rewritten
+    // whole each time — so it carries no history and needs no merge driver, which
+    // is why it is listed here but absent from `APPEND_ONLY_PATHS`.
+    //
+    // Committed for the reason the two above are: something has to be able to read
+    // it after the run. `pact audit --check handoff-coverage` asks which closed
+    // beads had dependents and said nothing to them, and that question cannot be
+    // answered from a file the clone did not get. The orchestrator's own input
+    // manifest stays a build artifact, exactly as docs/plan.md says — this is
+    // pact's linted copy of it, not the manifest.
+    "!.pact/plan.json",
 ];
 
 /// The line that decides whether the rules are already present. Keyed on the
@@ -688,7 +708,7 @@ const RUNTIME_IGNORE_SENTINEL: &str = ".pact/*";
 const RUNTIME_IGNORE_COMMENT_1: &str =
     "# Everything pact or an agent writes under .pact/ is local runtime state,";
 const RUNTIME_IGNORE_COMMENT_2: &str =
-    "# EXCEPT the two append-only logs below, which are history and belong in git.";
+    "# EXCEPT the files below, which are history or graph and belong in git.";
 
 /// `.pact/events.jsonl`: the lease-event log, and the first file under `.pact/`
 /// that belonged in git.

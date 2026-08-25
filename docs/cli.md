@@ -50,7 +50,8 @@ pact merge <branch> [--verify <command>] [--ttl <duration>] [--allow-dirty]
 pact msg send (--to <agent>... | --to-owner-of <path>...) [--thread <id>] [--subject <text>] [--skip <agent>...] (<body> | --body-file <path|->)
 pact msg inbox [--unread-only] [--full] [--include-watch | --watch-only]
 pact msg sent
-pact msg read <id> [--brief]
+pact msg read <id>
+pact msg thread <key> [--brief]
 pact watch add <path>
 pact watch rm <path>
 pact watch ls
@@ -58,6 +59,7 @@ pact watch ls
 # ─── humans run these, around a run ──────────────────────────────────────────
 pact context set <key> <value>
 pact plan lint <manifest>
+pact handoff <bead> --confidence <high|medium|low> --findings <text|@file>
 pact init [--print] [--no-commit] [--force]
 pact doctor [--fix]
 pact audit [--check <double-win|stale-holds|chain-integrity|commit-correlation|merge-divergence|claim-lease-divergence|retry-storm|silent-contention|topology>] [--expect <worktrees|main|any>] [--since <rfc3339|duration>] [--include-annotated] [--compare <path>] [--export <path>] [--allow-main <agent>...]
