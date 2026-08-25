@@ -10,6 +10,18 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.13.0 - 2026-08-25
+#### Continuous Integration
+- **(release)** tell an unpushed branch apart from an orphaned tag - (8220f1b) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(activity)** liveness as a by-product of participation - (b84198a) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(beads)** close the liveness epic - (09c066c) - Clement HUSSENOT-DESENONGES
+#### Refactoring
+- **(lease)** SUSPECT means silent in every channel, not just the log - (21ab619) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.12.0 - 2026-08-20
 #### Features
 - **(doctor)** tell a stopped fleet from a working one - (54c988a) - Clement HUSSENOT-DESENONGES
