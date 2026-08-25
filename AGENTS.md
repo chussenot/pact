@@ -138,7 +138,7 @@ bd prime                # Refresh Beads context
 **Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
 <!-- END BEADS CODEX SETUP -->
 
-<!-- pact:begin hash:6b0102d5 -->
+<!-- pact:begin hash:bec01292 -->
 ## pact coordination protocol
 
 pact coordinates multiple coding agents working in this repository. Follow
@@ -182,6 +182,16 @@ this protocol whenever you touch shared files or hand off work to others.
   still corrupted the shared Beads store, because it read the protocol as being
   about editing files and a CLI wrote a second database behind it at exit 0.
   pact itself never writes to `.beads/`; the commands you run directly do.
+- **If you are the ORCHESTRATOR, this file is addressed to you too.** You have no
+  bead, no wave and no claim, so every rule here reads as somebody else's — and
+  you are the participant with the broadest write access: shared skeletons,
+  pre-wiring, merges, checkpoints. Lease the skeleton before you write it. On one
+  20-agent run `pact audit --check commit-correlation` found 12 commits no hold
+  covered and every one was the orchestrator's, breaking the rule it had written
+  into all 16 workers' prompts — which all 16 followed. `--allow-main` excuses you
+  from `--check topology`, not from holding leases. And read the handoffs for the
+  beads your skeleton serves (`pact msg thread bead:<id>`) before you write it:
+  they are addressed to a bead, not to you, so no inbox will hand them over.
 - **Ownership, and its one carve-out, stated together**: lease every file you
   edit that another agent might also touch, and release it when done. The
   single exception is a file that is yours alone by assignment (your own
@@ -217,13 +227,22 @@ this protocol whenever you touch shared files or hand off work to others.
   record of who has leased the path, so a path nobody has ever leased has no
   owner to address and the send is refused outright. You cannot pre-address work
   that has not started — for that, name the agent with `--to`.
-- **On exit 2, use the number in the refusal — do not poll.** The refusal tells you
-  how long the holder has left. Wait on THAT order of magnitude, or better, take the
-  advice pact prints with it: subscribe with `pact watch add <path>` and pick up
-  other ready work, and the next release will tell you. Measured on one fleet: an
-  agent retried every 15 seconds, 33 times, against a median 355 seconds of
-  remaining hold whose note said it would renew — and 24 refusals in that run came
-  from agents that had ALREADY subscribed and polled anyway.
+- **On exit 2, wait INSIDE the command: `pact lease acquire <path> --wait <dur>`.**
+  It blocks until the path is free and returns the moment it is, so you never end
+  your turn to wait. That matters more than it sounds: if you are a subagent, your
+  process IS your turn loop, and ending a turn to wait for a notification is the
+  same as exiting — nothing can re-enter you. Measured on one 12-agent fleet, seven
+  agents took the old advice to "subscribe and pick up other work", four never
+  resumed at all, and the three that did resumed nine hours later within fourteen
+  seconds of each other, because a human woke the parent session. One of them was
+  holding four finished, tested, committed fixes.
+  **`pact watch add <path>` is still right when you genuinely have other work
+  first** and will still be running to receive the diff. It is not a way to wait.
+  **Never poll by re-running the command yourself.** That spends a turn per
+  attempt and is what `pact audit --check retry-storm` counts: one fleet retried
+  every 15 seconds, 33 times, against a median 355 seconds of remaining hold, and
+  24 refusals in that run came from agents that had ALREADY subscribed and polled
+  anyway.
 - **A path someone else holds exits 2** — branch on that, not on the message
   text. `pact lease ls` names the holder; message them and pick up something
   else, which is what announcing early bought you. `pact lease acquire --steal`
@@ -271,6 +290,35 @@ this protocol whenever you touch shared files or hand off work to others.
   from being ignored. Across two fleet builds, three of four messages were
   never acknowledged by the agent they were addressed to — including one that
   prevented a runtime panic. `pact audit --export` lists the stragglers.
+- **A red shared branch is NEVER a reason to hold a finished merge.**
+  `pact merge --verify` asks whether YOUR merge added a failure, not whether the
+  branch is green. Arriving to a branch that is already failing for somebody
+  else's reason, it lands your work anyway, says so, and releases the mutex; only
+  a failure your merge introduced is reverted, and only then does it keep the
+  mutex. So merge when your work is done and proven, and let pact decide which of
+  those two happened.
+  This rule is here — in the block `pact init` syncs into every repository —
+  rather than in one fleet's own notes, because that is where it was and it cost
+  a run. Four agents in one 12-agent fleet independently held finished, tested,
+  committed work off a red master, each citing the mechanic correctly: *"merging
+  now would falsely go red due to their unrelated unfixed bug"*. They were not
+  defying the rule; the rule did not exist yet where they could read it. It was
+  written 38 minutes after the first of them parked, and reached the NEXT
+  cohort's spawn prompt only. One of those four was holding four finished fixes,
+  two of them repaired regressions.
+- **Gates are beads, and they are visible in `bd` like any other.** Before you
+  claim into a new wave, check that the prior wave's gates have closed. pact will
+  not stop you — no acquire is ever refused on gate grounds — but `pact audit
+  --check gate-order` reads the ledger either way, and a start it finds ahead of a
+  gate is a question somebody will ask afterwards.
+- **Read your inheritance before you start a claimed bead**: `pact msg thread
+  bead:<id>`. Whoever finished what yours depends on may have left findings there
+  — addressed to the bead rather than to you, because when they wrote it you did
+  not exist yet. It is usually the cheapest thing you will read all session.
+- **When you close a bead that has dependents, send a handoff**: `pact handoff
+  <bead> --confidence high|medium|low --findings "<what you found>"`. Findings you
+  would want waiting for you. It never blocks and nothing waits on it; a bead with
+  nothing worth saying should send nothing.
 - **Orient with `pact log`**: one chronological feed of who leased what and
   who said what. Read it when you join, and when you need to know whether a
   peer is still moving.
