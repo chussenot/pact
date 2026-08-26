@@ -1205,12 +1205,24 @@ back: a metric that returns the same answer regardless of behaviour is worse
 than no metric — and so is concluding a thing cannot be measured because the
 first field you looked at did not move.
 
-**And it moved again.** On **bd 1.2.2, measured 2026-08-25**, `bd update <id>
---claim` writes **no interaction at all** — not an assignee change, and not even
-the `in_progress` status it sets. Measured in this repository's own sidecar: a
-bead claimed with `--claim` and closed later has exactly one row, the close.
-Every assignee row in the file is from 2026-08-11/12 and none has appeared
-since.
+**And it moved again.** On **bd 1.2.2**, `bd update <id> --claim` writes **no
+interaction at all** — not an assignee change, and not even the `in_progress`
+status it sets.
+
+Measured 2026-08-26, as a controlled pair rather than an observation, because the
+paragraph above is the standing warning against generalising from the no-op path.
+A throwaway bead was created (`bd show`: no assignee), then:
+
+| command | rows written | bead after |
+|---|---|---|
+| `bd update <id> --claim` | **0** | `IN_PROGRESS`, assignee set |
+| `bd update <id> --assignee=probe-agent` | **1**, `field=assignee` | assignee changed |
+
+Same bead, same second, same environment. So this is not the idempotent no-op —
+the claim genuinely moved both fields — and it is not export lag either, because
+the control row appeared immediately. The control's `old_value` is what the
+`--claim` had silently written, which is the proof it changed the field without
+logging it.
 
 That does not retract the paragraph above; both observations are real, dated,
 and about different bd builds. It is the reason this page dates them. The
