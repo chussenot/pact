@@ -10,6 +10,28 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.16.0 - 2026-08-26
+#### Bug Fixes
+- **(audit)** tell a starved sidecar apart from a switched-off one - (b44f245) - Clement HUSSENOT-DESENONGES
+- **(audit)** qualify expired holds, and stop reporting vacuous checks as clean - (2cf96f8) - Clement HUSSENOT-DESENONGES
+- **(lease)** name the expired holds `lease ls` reclaims - (62991d6) - Clement HUSSENOT-DESENONGES
+#### Continuous Integration
+- **(release)** catch version tags that never got a release - (3dbc824) - Clement HUSSENOT-DESENONGES
+#### Documentation
+- **(audit)** confirm the --claim sidecar gap with a controlled pair - (a4de157) - Clement HUSSENOT-DESENONGES
+- **(fleet-patterns)** address the orchestrator as a participant - (20076c3) - Clement HUSSENOT-DESENONGES
+- **(harness)** state the subagent-id contract instead of predicting a consumer - (0c0d0eb) - Clement HUSSENOT-DESENONGES
+#### Features
+- **(protocol)** address the orchestrator in the managed block - (12a30fd) - Clement HUSSENOT-DESENONGES
+#### Miscellaneous Chores
+- **(beads)** close the modmill epic and record the corrected release diagnosis - (f9abadd) - Clement HUSSENOT-DESENONGES
+- **(beads)** close the modmill liveness and audit-honesty findings - (15d1922) - Clement HUSSENOT-DESENONGES
+- **(beads)** file the modmill proving-ground findings - (0e87129) - Clement HUSSENOT-DESENONGES
+- **(pact)** sync the coordination protocol block - (710e9bd) - Clement HUSSENOT-DESENONGES
+- Add the latest interactions - (34a6820) - Clement HUSSENOT-DESENONGES
+
+- - -
+
 ## 0.15.1 - 2026-08-25
 #### Continuous Integration
 - **(docs)** guard the enumerated flag values in cli.md - (1a82eb3) - Clement HUSSENOT-DESENONGES
