@@ -51,7 +51,7 @@ jobs:
   tags-without-releases:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           # Tags are the entire subject of this job, and a shallow clone has none.
           fetch-depth: 0
