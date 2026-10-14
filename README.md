@@ -213,6 +213,7 @@ The full evidence, and the design decisions each run forced, is in the studies:
 | [studies/field-runs.md](docs/studies/field-runs.md) | the four repositories built on pact — [arkanoid](https://github.com/chussenot/arkanoid), [megablast](https://github.com/chussenot/megablast), [grimcast](https://github.com/chussenot/grimcast), [crucible](https://github.com/chussenot/crucible) — what each measured and what changed |
 | [studies/dogfooding.md](docs/studies/dogfooding.md) | building pact with pact: the CLI findings, and the two protocol reversals that overshot in both directions |
 | [studies/experiments.md](docs/studies/experiments.md) | the soak, the fault injector, TLA+ and the property search — what each bounds, and why a green run alone proves nothing |
+| [studies/system-one-triage.md](docs/studies/system-one-triage.md) | whether calibrated System One verdicts help agents coordinate: one read-side use, measured on pact's own mail, and the places a probability must never replace a fact |
 
 ## Documentation
 
