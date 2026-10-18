@@ -513,14 +513,31 @@ jobs:
       # Neither a draft nor a prerelease: 0.x IS this project's release series,
       # and a draft that needs a human to press a button is a release that
       # sometimes does not happen.
+      #
+      # `--latest` is ALWAYS passed, true or false, never left to GitHub. Left
+      # unset, the newest-PUBLISHED release wins, not the highest version: 0.13.0
+      # was released late, the day after 0.16.0, took the "Latest" badge, and
+      # `mise use github:chussenot/pact@latest` installed 0.13.0 for seven weeks
+      # while every check stayed green. A late release of an old tag is exactly
+      # what `release-drift.yml` tells you to do, so this is the normal path.
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
+          # Latest iff no PUBLISHED release outranks this tag. Released, not
+          # tagged: a higher tag whose release never happened must not leave the
+          # repository with no Latest at all.
+          highest="$(
+            { gh release list --limit 200 --json tagName -q '.[].tagName'; echo "$TAG"; } \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1
+          )"
+          if [ "$highest" = "$TAG" ]; then latest=true; else latest=false; fi
+          echo "highest published version after this release: $highest (latest=$latest)"
           gh release create "$TAG" \
             --title "$TAG" \
             --notes-file /tmp/notes.md \
             --verify-tag \
+            --latest="$latest" \
             dist/*.tar.gz dist/SHA256SUMS

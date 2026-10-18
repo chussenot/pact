@@ -29,6 +29,19 @@
 # job is the backstop for when somebody forgets, which is the right shape for a
 # rule no tooling here enforces.
 #
+# ## It also checks which release GitHub calls "Latest"
+#
+# Because the remedy for the first check broke it. 0.13.0 was re-pushed on its
+# own as advised, released the day AFTER 0.16.0, and GitHub — which picks the
+# newest-published release, not the highest version, when nobody says otherwise —
+# made 0.13.0 "Latest". `mise use github:chussenot/pact@latest` then installed
+# 0.13.0 for seven weeks. Both lists agreed on every tag that mattered; the badge
+# was the only thing wrong, and nothing compared it to anything.
+#
+# `release.yml` now passes `--latest` explicitly, but a re-pushed tag runs the
+# workflow AS IT WAS AT THAT TAG, so recovering an old tag still runs the old
+# pipeline. Hence the remedy below ends with putting the badge back.
+#
 # ## Why it only reports
 #
 # It opens no release. Republishing a tag is a decision with a blast radius —
@@ -91,19 +104,49 @@ jobs:
             fi
           done
 
-          if [ -z "$missing" ]; then
+          # The highest PUBLISHED version: what "Latest" must be, and so what
+          # `@latest` installs.
+          highest="$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' <<<"$releases" | tail -n1)"
+          failed=0
+
+          if [ -n "$missing" ]; then
+            failed=1
+            echo "::error::tags on master with no GitHub release:$missing"
+            echo
+            echo "Most likely cause: more than three tags were pushed in one push, so"
+            echo "GitHub created no tag push events and release.yml never ran. Push"
+            echo "version tags one at a time."
+            echo
+            echo "To release a missed tag, re-push it on its own:"
+            for tag in $missing; do
+              echo "  git push origin :refs/tags/$tag && git push origin $tag"
+            done
+            echo
+            echo "Each re-push runs release.yml as it was AT THAT TAG, which may not"
+            echo "set --latest. When they have all finished, put the badge back:"
+            # The badge's target once the re-pushes land, which is a missing tag
+            # itself when the newest tag is the one that never released.
+            target="$(printf '%s\n' "$highest" $missing | sort -V | tail -n1)"
+            echo "  gh release edit $target --latest"
+            echo
+          else
             echo "every version tag on master has a release"
-            exit 0
           fi
 
-          echo "::error::tags on master with no GitHub release:$missing"
-          echo
-          echo "Most likely cause: more than three tags were pushed in one push, so"
-          echo "GitHub created no tag push events and release.yml never ran. Push"
-          echo "version tags one at a time."
-          echo
-          echo "To release a missed tag, re-push it on its own:"
-          for tag in $missing; do
-            echo "  git push origin :refs/tags/$tag && git push origin $tag"
-          done
-          exit 1
+          # Compared against releases, not tags: a tag still waiting on its
+          # release is the check above's problem, not this one's.
+          latest="$(gh release view --json tagName -q .tagName)"
+          if [ "$latest" != "$highest" ]; then
+            failed=1
+            echo "::error::GitHub's Latest release is $latest, but the highest published version is $highest"
+            echo
+            echo "Anything installing @latest is getting $latest. Most likely cause: an"
+            echo "older tag was released after $highest and GitHub gave it the badge."
+            echo
+            echo "To fix:"
+            echo "  gh release edit $highest --latest"
+          else
+            echo "Latest is $latest, the highest published version"
+          fi
+
+          exit "$failed"
