@@ -204,7 +204,16 @@ pub(in crate::cli) fn run_init(
         // The other half of the init trace: this one shells out to git, and it
         // is the part that is actually slow.
         let _sp = otel::span("pact.init.commit");
-        let mut targets = vec!["AGENTS.md", "CLAUDE.md", ".gitignore"];
+        // `.gitattributes` carries the `merge=union` rule for the committed logs;
+        // left out of the commit, the rule exists only in this checkout and every
+        // clone merges the logs without it (pact-f4p). Like `.gitignore`, it is
+        // committed by path, so a pre-existing file with unrelated uncommitted
+        // edits has them swept in. That is accepted rather than guarded: init
+        // already does this for `.gitignore`/`AGENTS.md`, `git diff` shows it,
+        // and a hand-edited file whose rule init cannot commit is worse than one
+        // whose neighbouring edits ride along. When init changed nothing the
+        // path stages nothing, so a clean re-run still reports nothing to commit.
+        let mut targets = vec!["AGENTS.md", "CLAUDE.md", ".gitignore", ".gitattributes"];
         targets.extend(
             instruction_files
                 .iter()

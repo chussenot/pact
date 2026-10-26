@@ -148,7 +148,8 @@ pact keeps the block current without touching anything else you've written
 in `AGENTS.md`.
 
 **`pact init` commits what it wrote**, so "commit the result" isn't a step
-you can forget. It stages exactly `AGENTS.md`, `CLAUDE.md`, `.gitignore` and any
+you can forget. It stages exactly `AGENTS.md`, `CLAUDE.md`, `.gitignore`, `.gitattributes` (the
+`merge=union` rule for the logs, which clones need too) and any
 instruction file it just pointed at `AGENTS.md`, and commits only those —
 unrelated staged work stays staged, waiting for its own
 commit. Re-running finds nothing to commit rather than piling up empties, and
