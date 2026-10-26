@@ -392,7 +392,7 @@ agent's own branch. An agent that edited a hook would run its own edit. Lease
 Use `wt land` where the default branch is kept green by something else (CI with branch
 protection, or a fix-first rule), or with no test gate in `pre-merge` at all. Everywhere
 else keep `pact merge --verify` until pact can lend its baseline verdict to a hook
-([follow-ups](#follow-ups)).
+([`pact-02v.3`](#follow-ups)).
 
 **5. Under `wt land`, the orchestrator commits its checkpoints with explicit paths,
 inside the mutex.** Either one avoids the race in
@@ -418,7 +418,7 @@ cost nothing.
   does not measure a fleet. Steps are spaced at least a second apart, because
   commit-correlation compares whole-second git dates with sub-second hold bounds, and a
   commit made in the same second as its `acquire` reads as uncovered
-  ([follow-ups](#follow-ups)).
+  ([`pact-56w`](#follow-ups)).
 - **bd's behaviour with a copied store** is inferred from bd's documentation, not
   observed.
 - **worktrunk moves fast.** Every claim about it is pinned to 0.81.0 and source commit
@@ -452,7 +452,7 @@ sleep 2          # keep the seed commit out of the first hold's window
 git worktree add -q -b agent-a ../proj.agent-a main
 cd ../proj.agent-a
 PACT_AGENT=agent-a pact lease acquire src/a.rs
-sleep 1          # git dates are whole seconds (see the follow-ups)
+sleep 1          # git dates are whole seconds (pact-56w)
 echo '// edit' >> src/a.rs
 git commit -q --trailer Pact-Agent=agent-a -m "feat: edit" -- src/a.rs
 PACT_AGENT=agent-a pact lease release --all
@@ -493,17 +493,24 @@ TOPOLOGY MISMATCH: 1 event(s) invoked from "main", which --expect worktrees does
 
 ## Follow-ups
 
-| Follow-up | What |
+| Bead | What |
 |---|---|
-| epic | pact × worktrunk: worktrunk as the lifecycle layer for worktree fleets |
-| field run | one wave on real worktrunk: `wt switch -x` spawns, the `.config/wt.toml` above, `wt land` against `pact merge`; measure merge wait and audit cleanliness |
-| `invoked_from` collision | a linked worktree named `main` or `outside` cannot be told from the main checkout by `--check topology`; distinguish them without reinterpreting old rows |
-| bare layouts | decide where the committed logs live when no checkout can commit them; stop `doctor` calling them committable; describe a bare repository in `<project>/.git` as bare |
-| trailer hook | audit.md's `prepare-commit-msg` hook gains `--if-exists doNothing` |
-| cross-worktree refresh | a same-identity re-acquire from a different worktree: refuse with exit 2 or report in `audit`, and correct leases.md's "indistinguishable" |
-| stray state | `doctor`: a linked worktree carrying its own `.pact/` runtime files or `.beads/` database |
-| `pact init` | commit the `.gitattributes` it writes: it currently writes the `merge=union` rule and leaves the file untracked (found while setting up these experiments; unrelated to worktrunk) |
-| commit-correlation precision | a commit authored in the same second as its `acquire` is reported uncovered: `w.open <= c.at` compares a nanosecond hold bound with a whole-second git date, even when the commit is inside the hold's own recorded HEAD range (unrelated to worktrunk) |
-| baseline verdict | design spike: expose `pact merge --verify`'s "did this add a failure" as a command a `pre-merge` hook can call |
-| upstream, worktrunk | add `.pact/` and `.beads/` to `copy-ignored`'s built-in tool-state excludes; carry squashed commits' trailers into the squash message |
-| squash-aware audit | only if a fleet adopts squash landing: credit a squash commit to the hold whose commit range has the same patch-id |
+| `pact-02v` | epic: worktrunk as the lifecycle layer for worktree fleets |
+| `pact-02v.1` | field run: one wave on real worktrunk (`wt switch -x` spawns, the `.config/wt.toml` above, `wt land` side by side with `pact merge`); measure merge wait and audit cleanliness |
+| `pact-02v.2` | move the composition into [fleet-patterns.md](../fleet-patterns.md) once the field run is clean (blocked by `pact-02v.1`) |
+| `pact-02v.3` | design spike: expose `pact merge --verify`'s "did this add a failure" as a command a `pre-merge` hook can call |
+| `pact-02v.4` | `doctor`: warn when a linked worktree carries its own `.pact/` runtime files or a `.beads/` database |
+| `pact-02v.5` | upstream, worktrunk: add `.pact/` and `.beads/` to `copy-ignored`'s built-in tool-state excludes; carry squashed commits' trailers into the squash message |
+| `pact-02v.6` | only if a fleet adopts squash landing: credit a squash commit to the hold whose commit range has the same patch-id |
+
+The six pact defects are filed as bugs linked `discovered-from` the epic rather than
+under it, because none is specific to worktrunk:
+
+| Bead | What |
+|---|---|
+| `pact-4ez` | a linked worktree named `main` or `outside` cannot be told from the main checkout by `--check topology`; distinguish them without reinterpreting old rows |
+| `pact-6tv` | bare layouts: decide where the committed logs live when no checkout can commit them; stop `doctor` calling them committable; describe a bare repository in `<project>/.git` as bare |
+| `pact-37o` | audit.md's `prepare-commit-msg` hook gains `--if-exists doNothing` |
+| `pact-3tg` | a same-identity re-acquire from a different worktree: refuse with exit 2 or report in `audit`, and correct leases.md's "indistinguishable" |
+| `pact-f4p` | `pact init` commits the `.gitattributes` it writes; today it writes the `merge=union` rule and leaves the file untracked |
+| `pact-56w` | a commit authored in the same second as its `acquire` is reported uncovered: `w.open <= c.at` compares a nanosecond hold bound with a whole-second git date, even when the commit is inside the hold's own recorded HEAD range |
