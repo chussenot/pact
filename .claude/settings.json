@@ -4,6 +4,11 @@
       {
         "hooks": [
           {
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-start.sh",
+            "timeout": 1800,
+            "type": "command"
+          },
+          {
             "command": "bd prime --hook-json",
             "type": "command"
           }

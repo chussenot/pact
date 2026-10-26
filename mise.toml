@@ -1,5 +1,18 @@
 [tools]
 rust = "latest"
+# The tools the gates and the workflow call besides cargo, pinned. A version bump
+# here is a bump of the version and the release URL in mise.cloud.toml too, which
+# supplies the same tools to a Claude Code cloud session (docs/development.md,
+# "Cloud sessions").
+#
+# bd (beads), the issue tracker CLAUDE.md asks for (`bd prime`), at the version
+# this project develops against: the same pin as canary.yml's "pinned" leg.
+"github:gastownhall/beads" = "1.2.2"
+# cocogitto: `cog check` is CI's conventional-commit gate (ci.yml, `commits`), and
+# a commit cog cannot parse is silently missing from the changelog.
+"cargo:cocogitto" = "7.0.0"
+# shellcheck, for `mise run lint-scripts`, which `mise run check` and CI both run.
+shellcheck = "0.11.0"
 
 [env]
 # Every feature this repo can build, in one place so the tasks cannot disagree
@@ -142,7 +155,7 @@ run = [
 ]
 
 [tasks.lint-scripts]
-description = "shellcheck every script in scripts/, at warning severity."
+description = "shellcheck every script in scripts/ and .claude/hooks/, at warning severity."
 # `--severity=warning`, not the default, and the reason is that the default
 # includes `info` — which today means SC2013 on a deliberate word-split and
 # SC2018/SC2019 on an ASCII-only `tr 'A-Z' 'a-z'` in check-docs.sh. Both are
@@ -152,7 +165,10 @@ description = "shellcheck every script in scripts/, at warning severity."
 #
 # This exists because scripts/chaos.sh is destructive, and "shellcheck-clean"
 # had to be a property something enforces rather than a sentence in its header.
-run = "shellcheck --severity=warning scripts/*.sh scripts/pw"
+#
+# .claude/hooks/ is in it because session-start.sh runs before every cloud
+# session's first command, and a broken one breaks all of them.
+run = "shellcheck --severity=warning scripts/*.sh scripts/pw .claude/hooks/*.sh"
 
 [tasks.check]
 description = "Run the full CI check locally: fmt, lint, test, otel, docs — serially, as CI does."
