@@ -102,7 +102,7 @@ jobs:
         # scripts/chaos.sh is destructive, so "shellcheck-clean" is enforced
         # rather than asserted in a comment. See mise.toml for the severity note.
         if: runner.os == 'Linux'
-        run: shellcheck --severity=warning scripts/*.sh scripts/pw
+        run: shellcheck --severity=warning scripts/*.sh scripts/pw .claude/hooks/*.sh
 
   # Conventional-commit lint, PRs only.
   #

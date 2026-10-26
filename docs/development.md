@@ -1,6 +1,6 @@
 ---
 title: Development
-description: Build, test, the CI gates and why each exists, and the upstream canary.
+description: Build, test, the CI gates and why each exists, the upstream canary, and what a cloud session installs at start.
 audience: contributors
 ---
 
@@ -110,6 +110,54 @@ State lives under `.pact/` at the repo root (found by walking up to `.git`):
 writes `.pact/*` plus `!.pact/events.jsonl` and `!.pact/messages.jsonl`, so
 everything under there is ignored except the two files that are history — and
 anything else an agent invents is covered without a new rule.
+
+## Cloud sessions
+
+A Claude Code cloud session starts from a fresh container, which has rustup's
+stable toolchain and none of the rest: no mise, so no `mise run check`; no
+shellcheck, which its `lint-scripts` leg needs; no `cog`, which CI's `commits` job
+runs; no `bd`; and no `pact`, which the protocol in `AGENTS.md` and
+`scripts/check-docs.sh` call by name. `.claude/hooks/session-start.sh`, registered
+in `.claude/settings.json` beside `bd prime`, sets that up before the session's
+first command, and only in the cloud (`CLAUDE_CODE_REMOTE=true`). The container is
+snapshotted after the hook, so a later session pays only for what changed.
+
+It runs these steps, each a no-op when already done:
+
+1. **mise, pinned, from its GitHub release.**
+2. **`MISE_ENV=cloud`**, written to the session's environment too. This is the
+   reason `mise.cloud.toml` exists: the sandbox answers 403 on `api.github.com`
+   for every repository but this one, so no mise backend that lists versions can
+   work there, while a direct release download does. `mise.cloud.toml` therefore
+   supplies the same tools at the same versions from pinned release URLs, each
+   with a sha256 that mise checks before installing, because a release asset can
+   be replaced under an unchanged URL.
+3. **The current stable toolchain, with rustfmt and clippy, through rustup.**
+   This matches what CI installs. The image's own stable lagged it by three
+   months (1.97.0 against 1.99.1 on the day this was written), and a clippy older
+   than CI's is a lint gate CI does not share.
+4. **`mise install`**, which gets `bd`, `cog` and `shellcheck`, linked into
+   `~/.local/bin` so scripts find them without mise activated.
+5. **The beads database.** `bd bootstrap` builds it from the committed
+   `.beads/issues.jsonl`, and an import then catches a snapshotted container up
+   with the export: a row is taken only when it is newer, and nothing is deleted.
+   The export is how beads travel here, because this repository has no Dolt
+   remote. So after filing or closing one, run
+   `bd export -o .beads/issues.jsonl` and commit the file.
+6. **A warm build.** It builds the test targets for the default build first and
+   then every feature, the order `mise run test` keeps, so `target/debug/pact` is
+   the all-features binary. Then `mise run install` puts this checkout's `pact` on
+   `PATH`. After changing the code, run `mise run install` again, as `CLAUDE.md`
+   asks. `PACT_SESSION_SKIP_BUILD=1` skips this step.
+7. **A probe of the hosts the work depends on**, handed to the session as
+   context. The environment's allowed domains need `index.crates.io` and
+   `static.crates.io` (cargo), `static.rust-lang.org` (rustup), `github.com` and
+   `release-assets.githubusercontent.com` (mise and the pinned tools), plus
+   `docs.rs`.
+
+On a laptop, `mise install` installs the same three tools through the backends
+`mise.toml` names. A version bump is a bump in both files, and `bd`'s pin also
+matches `canary.yml`'s `pinned` leg, the version this project develops against.
 
 ## Beyond the gates: the fleet soak
 
