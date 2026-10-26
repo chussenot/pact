@@ -259,9 +259,15 @@ without anyone remembering:
 
 ```bash
 # .git/hooks/prepare-commit-msg  (chmod +x)
-[ -n "$PACT_AGENT" ] && git interpret-trailers --in-place \
+[ -n "$PACT_AGENT" ] && git interpret-trailers --in-place --if-exists doNothing \
   --trailer "Pact-Agent=$PACT_AGENT" "$1"
 ```
+
+`--if-exists doNothing` matters: a rebase builds a message per replayed commit,
+so under a different `PACT_AGENT` the plain form adds a second trailer
+(`Pact-Agent: a,b`), which the audit reads as "cannot tell". With the flag, a
+rebased commit keeps its author's trailer; measured in
+[the worktrunk study](studies/worktrunk.md).
 
 **`pact init` does not write that hook**, deliberately. Hooks are a shared,
 user-owned file outside pact's namespace, frequently already occupied (by
