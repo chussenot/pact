@@ -1508,3 +1508,50 @@ fn audit_check_topology_fails_when_the_run_contradicts_expect() {
         );
     }
 }
+
+/// (pact-02v.4) A post-create hook that copies ignored files (worktrunk's `wt
+/// step copy-ignored`) puts `.pact/` runtime files and a bd database under a
+/// linked worktree. doctor must name them, warn rather than fail, and stay
+/// quiet in a clean worktree and in the main checkout.
+#[test]
+fn doctor_warns_when_a_worktree_carries_copied_coordination_state() {
+    if !have_git() {
+        return;
+    }
+    let (_tmp, main, wt) = repo_with_worktree("feat", "wt-copied");
+    let line = |dir: &Path| {
+        let out = pact(dir, "agent-a", &["doctor"]);
+        let text = stdout(&out);
+        let l = text
+            .lines()
+            .find(|l| l.contains("worktree carries copied state"))
+            .unwrap_or_else(|| panic!("check must always be emitted: {text}"))
+            .to_string();
+        (out, l)
+    };
+
+    // Clean worktree and main checkout: no warning.
+    let (_, clean) = line(&wt);
+    assert!(clean.contains("no pact runtime state"), "{clean}");
+    let (_, main_line) = line(&main);
+    assert!(main_line.contains("not applicable"), "{main_line}");
+
+    // Copy runtime state and a bd database into the linked worktree.
+    std::fs::create_dir_all(wt.join(".pact/leases")).unwrap();
+    std::fs::write(wt.join(".pact/leases/src%2Fapi.ts.lock"), "{}").unwrap();
+    std::fs::write(wt.join(".pact/watches.jsonl"), "").unwrap();
+    std::fs::create_dir_all(wt.join(".beads/dolt/main")).unwrap();
+    std::fs::write(wt.join(".beads/dolt/main/manifest"), "x").unwrap();
+
+    let (out, warned) = line(&wt);
+    assert!(warned.contains('!'), "must warn: {warned}");
+    for path in [".pact/leases/", ".pact/watches.jsonl", ".beads/dolt/"] {
+        assert!(warned.contains(path), "must name {path}: {warned}");
+    }
+    // A warning never fails the report on its own account.
+    assert!(!warned.contains('✗'), "must not be a failure: {warned}");
+    let _ = out;
+    // The main checkout is still quiet: its own .pact/ is the state.
+    let (_, main_line) = line(&main);
+    assert!(main_line.contains("not applicable"), "{main_line}");
+}

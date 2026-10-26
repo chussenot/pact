@@ -464,6 +464,7 @@ named here that the CLI does not emit, fails CI:
 | `state dir writable` | can pact actually write there — the shared directory of a linked worktree may not be yours |
 | `state dir isolation` | only meaningful under `PACT_STATE_DIR`; warns (`!`) when leases there look like they came from a different repository |
 | `worktree schema marker` | only meaningful with linked worktrees; warns (`!`) when the shared `.pact/` has never been touched by a worktree-aware pact, so an older binary elsewhere on PATH may still be treating it as private state |
+| `worktree carries copied state` | only meaningful in a linked worktree; warns (`!`, never fails) when that worktree's own root holds pact runtime files (`.pact/leases/`, `.pact/activity/`, `.pact/waits/`, `.pact/watches.jsonl`) that are not the state directory in use, or a bd database (`.beads/dolt/`, `.beads/embeddeddolt/`) — the footprint of a post-create hook such as worktrunk's `wt step copy-ignored`. Names the paths. Filesystem reads only |
 | `AGENTS.md block current` | does the managed block match this pact version |
 | `no duplicated instruction blocks` | a heading repeated outside pact's own block — a different tool duplicating its own section, not pact's |
 | `CLAUDE.md reaches the protocol` | Claude Code loads `CLAUDE.md`, never `AGENTS.md` |
