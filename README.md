@@ -214,6 +214,7 @@ The full evidence, and the design decisions each run forced, is in the studies:
 | [studies/dogfooding.md](docs/studies/dogfooding.md) | building pact with pact: the CLI findings, and the two protocol reversals that overshot in both directions |
 | [studies/experiments.md](docs/studies/experiments.md) | the soak, the fault injector, TLA+ and the property search — what each bounds, and why a green run alone proves nothing |
 | [studies/system-one-triage.md](docs/studies/system-one-triage.md) | whether calibrated System One verdicts help agents coordinate: one read-side use, measured on pact's own mail, and the places a probability must never replace a fact |
+| [studies/worktrunk.md](docs/studies/worktrunk.md) | whether [worktrunk](https://worktrunk.dev/) can be a fleet's worktree lifecycle layer: what composes unchanged, the four collisions to handle, and six pact defects the experiments exposed |
 
 ## Documentation
 
