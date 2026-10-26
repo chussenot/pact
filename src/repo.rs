@@ -226,6 +226,17 @@ pub fn effective_scope() -> &'static str {
 /// Which worktree of this repository the running pact process was invoked
 /// from: a linked worktree's own name, `"main"`, or `"outside"`.
 ///
+/// A linked worktree whose own name is one of those two reserved literals
+/// (worktrunk's bare layout puts the default branch in a worktree called
+/// `main`) is stamped in the escaped form `worktree:main` / `worktree:outside`
+/// instead, via [`escape_reserved`] (pact-4ez). The alternative was a separate
+/// field, but every reader (`recount`, the TUI, `audit --export`, the topology
+/// check) already keys on this one string and treats anything that is not
+/// `main`/`outside` as a worktree name, so an escaped value needs no reader
+/// change and displays as what it is. Only colliding names change spelling, and
+/// no pact before this fix could have written the `worktree:` form for them,
+/// so every committed row keeps exactly the meaning it had.
+///
 /// The literal `"main"` rather than [`RepoContext::worktree_name`], which for
 /// a main worktree is that directory's *name* (`megablast`, `pact`, …) — real
 /// data, but not comparable across repositories, and indistinguishable from a
@@ -251,12 +262,22 @@ pub fn invoked_from(ctx: &RepoContext) -> String {
         // A linked worktree always has a name (it is the `.git/worktrees/<name>`
         // component); the fallback only exists so this cannot panic on a
         // resolution that fell back.
-        return ctx
-            .worktree_name
-            .clone()
-            .unwrap_or_else(|| "linked".to_string());
+        return escape_reserved(
+            ctx.worktree_name
+                .clone()
+                .unwrap_or_else(|| "linked".to_string()),
+        );
     }
     "main".to_string()
+}
+
+/// Spell a linked worktree's name so it cannot be mistaken for the reserved
+/// `main` / `outside` stamps. Every other name passes through untouched.
+fn escape_reserved(name: String) -> String {
+    match name.as_str() {
+        "main" | "outside" => format!("worktree:{name}"),
+        _ => name,
+    }
 }
 
 /// Read a `gitdir:`-style pointer file and resolve it against `base`.
@@ -891,6 +912,14 @@ pub fn commit_paths(repo_root: &Path, paths: &[&str], message: &str) -> CommitOu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linked_names_that_collide_with_reserved_stamps_are_escaped() {
+        assert_eq!(escape_reserved("main".into()), "worktree:main");
+        assert_eq!(escape_reserved("outside".into()), "worktree:outside");
+        assert_eq!(escape_reserved("wt-a".into()), "wt-a");
+        assert_eq!(escape_reserved("mainline".into()), "mainline");
+    }
 
     #[test]
     fn finds_root_from_nested_dir() {

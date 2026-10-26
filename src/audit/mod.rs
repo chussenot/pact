@@ -251,7 +251,9 @@ impl Expect {
             Expect::Main => invoked_from == "main",
             // "outside" is not a worktree: it means pact ran somewhere that is
             // not under this repository at all, which is the one value that
-            // says the lease/edit binding cannot be assumed.
+            // says the lease/edit binding cannot be assumed. A linked worktree
+            // that happens to be named `main`/`outside` is stamped
+            // `worktree:main`/`worktree:outside` (pact-4ez), so it passes here.
             Expect::Worktrees { .. } => invoked_from != "main" && invoked_from != "outside",
         }
     }

@@ -165,6 +165,35 @@ mod tests {
         );
     }
 
+    /// A linked worktree literally named `main` or `outside` is stamped in the
+    /// escaped `worktree:` form (pact-4ez) and must read as a worktree, not as
+    /// the main checkout (which `--allow-main` would then wrongly excuse).
+    #[test]
+    fn escaped_worktree_names_count_as_worktrees() {
+        let tmp = with_log(&[
+            &ev_from(
+                "2026-08-01T10:00:00Z",
+                "a",
+                "acquired",
+                "a.rs",
+                "worktree:main",
+            ),
+            &ev_from(
+                "2026-08-01T10:01:00Z",
+                "b",
+                "acquired",
+                "b.rs",
+                "worktree:outside",
+            ),
+        ]);
+        let wt = Check::parse("topology", Some("worktrees"), &[]).unwrap();
+        let r = run_check(tmp.path(), wt, None, false).unwrap();
+        assert_eq!(r.findings(), 0, "{:?}", r.topology_mismatches);
+        assert_eq!(r.topology_allowed_from_main, 0);
+        let main = run_check(tmp.path(), Check::Topology(Expect::Main), None, false).unwrap();
+        assert_eq!(main.findings(), 2);
+    }
+
     /// `outside` is not a worktree: it means pact ran somewhere that is not
     /// under this repository at all, which is precisely the value that says
     /// the lease/edit binding cannot be assumed.
