@@ -233,10 +233,12 @@ direnv allow ../wt-auth
 ```
 
 Any mechanism works — `.envrc`, the agent's own launcher, `--agent` on each
-command. What matters is that the name differs per worktree: two agents sharing
-one `PACT_AGENT` are one agent as far as leases are concerned, so each will
-happily "re-acquire" what the other holds, which is a re-entrant refresh and not
-a conflict.
+command. What matters is that the name differs per worktree: pact reads two
+processes sharing one `PACT_AGENT` as one agent. When one of them asks for what
+the other holds from a different worktree, pact refuses it (exit 2, naming both
+worktrees) rather than treat it as a refresh, but it cannot catch two sharing
+an identity inside one worktree
+([why](leases.md#the-trust-boundary-pact_agent-is-self-asserted)).
 
 Run `pact init` once, in the main worktree. It writes `AGENTS.md` and friends,
 which are tracked files — every worktree on a branch that has them is already

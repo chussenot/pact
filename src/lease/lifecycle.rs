@@ -289,6 +289,26 @@ fn holder_liveness(repo_root: &Path, agent: &str, now: chrono::DateTime<Utc>) ->
     }
 }
 
+/// The worktree a LIVE lease of `agent` is stamped with, when `agent` is now
+/// asking from a different one and has not said `--steal` (pact-3tg).
+///
+/// `None` unless both stamps exist: `worktree_stamp` leaves them off in a repo
+/// with no linked worktrees, and a lock from an older binary never had one.
+fn split_brain_worktree(
+    existing: &LeaseInfo,
+    mine: &LeaseInfo,
+    agent: &str,
+    steal: bool,
+) -> Option<String> {
+    if steal || existing.agent != agent {
+        return None;
+    }
+    match (&existing.worktree, &mine.worktree) {
+        (Some(theirs), Some(ours)) if theirs != ours => Some(theirs.clone()),
+        _ => None,
+    }
+}
+
 /// Telemetry wrapper around [`acquire_inner`]. Separate so the span covers the
 /// whole operation — including the post-rename verify — and so the four
 /// success branches inside do not each have to remember to close the wait
@@ -577,6 +597,42 @@ pub(super) fn acquire_inner(
                     lease: new_lease,
                     stolen: true,
                 })
+            } else if let Some(theirs) = split_brain_worktree(&existing, &new_lease, agent, steal) {
+                // Same identity, DIFFERENT worktree (pact-3tg). The string
+                // comparison below cannot tell two processes apart, but the
+                // stamp can: an agent refreshes from the worktree it works in,
+                // so a refresh that changes worktree is two processes sharing
+                // one `PACT_AGENT`, not one agent resuming. Refusing it brings
+                // back none of the false positives that sank the PID check.
+                // Gated on both stamps being present, so a repo without linked
+                // worktrees (stamp absent) and a lock written by an older
+                // binary keep the plain refresh.
+                let mine = new_lease.worktree.clone().unwrap_or_default();
+                let msg = format!(
+                    "lease on {relative} is held by {agent} from worktree {theirs}, and you are \
+                     {agent} in worktree {mine}: two worktrees share one identity, which pact \
+                     cannot tell apart from one agent resuming. Give each worktree its own \
+                     PACT_AGENT (or --agent). Use --steal to take it over deliberately"
+                );
+                count_transition("conflicted");
+                events::append(
+                    repo_root,
+                    &events::Event {
+                        at: Utc::now().to_rfc3339(),
+                        agent: agent.to_string(),
+                        kind: "refused".to_string(),
+                        path: Some(relative.clone()),
+                        detail: Some(msg.clone()),
+                        ttl_secs: Some(ttl_secs),
+                        holder: Some(existing.agent.clone()),
+                        holder_branch: existing.branch.clone(),
+                        holder_worktree: existing.worktree.clone(),
+                        holder_harness: existing.harness.clone(),
+                        holder_model: existing.model.clone(),
+                        ..Default::default()
+                    },
+                );
+                Err(exit_with(2, msg))
             } else if existing.agent == agent {
                 // Re-entrant refresh: same holder, just bump acquired_at.
                 //
@@ -1038,10 +1094,28 @@ pub(super) fn renew_fs(repo_root: &Path, agent: &str, path: &str) -> Result<Leas
         ));
     }
 
+    // pact-3tg: the same split-brain check as acquire's, and only for a live
+    // lease. `renew` is a refresh too, and stamps the caller's worktree over
+    // the holder's.
+    let (branch, worktree, _) = worktree_stamp(repo_root);
+    if !is_expired(&existing, effective_now(repo_root)) {
+        if let (Some(theirs), Some(ours)) = (&existing.worktree, &worktree) {
+            if theirs != ours {
+                count_transition("conflicted");
+                return Err(exit_with(
+                    2,
+                    format!(
+                        "lease on {relative} is held by {agent} from worktree {theirs}, and you \
+                         are {agent} in worktree {ours}: two worktrees share one identity. Give \
+                         each worktree its own PACT_AGENT (or --agent)"
+                    ),
+                ));
+            }
+        }
+    }
     // Re-stamped rather than carried over: a long task can outlive a `git
     // switch`, and a lease claiming a branch the worktree left is a lie that
     // survives every renew.
-    let (branch, worktree, _) = worktree_stamp(repo_root);
     let renewed = LeaseInfo {
         acquired_at: effective_now(repo_root).to_rfc3339(),
         branch,
