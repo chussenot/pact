@@ -10,6 +10,59 @@ reasoning a commit subject cannot.
 [conventional commits]: https://www.conventionalcommits.org/
 
 - - -
+## 0.17.0 - 2026-10-27
+#### Features
+- (**doctor**) warn when a linked worktree carries copied coordination state - (66f1604) - Claude, *Claude Sonnet 5.5*
+#### Bug Fixes
+- (**audit**) commit-correlation compares at git's whole-second resolution - (953349e) - Claude, *Claude Sonnet 5.5*
+- (**audit**) stamp linked worktrees named main/outside unambiguously - (d7e6edd) - Claude, *Claude Sonnet 5.5*
+- (**init**) commit .gitattributes with the other files init writes - (17c33fd) - Claude, *Claude Sonnet 5.5*
+- (**lease**) refuse a same-identity refresh from a different worktree - (27395d0) - Claude, *Claude Sonnet 5.5*
+- (**mise**) make the no-backend test leg strip every directory bd lives in - (be99088) - Claude, *Claude Opus 5.5*
+#### Documentation
+- (**audit**) document the worktree:main and worktree:outside stamps - (a75a36d) - Claude, *Claude Sonnet 5.5*
+- (**audit**) make the prepare-commit-msg hook add the trailer only once - (f357483) - Claude, *Claude Sonnet 5.5*
+- (**development**) the build stamp is not what the cache misses on - (f04f65a) - Claude, *Claude Opus 5.5*
+- (**studies**) study how pact composes with worktrunk - (cc9f911) - Claude, *Claude Opus 5.5*
+- (**studies**) measure whether System One verdicts help agents coordinate - (a4c79aa) - Claude, *Claude Opus 5.5*
+#### Build system
+- (**deps**) bump Swatinem/rust-cache - (3444bd0) - dependabot[bot]
+#### Continuous Integration
+- (**cog**) drop the empty [packages] table that cog 7 refuses to parse - (ea0fa1b) - Claude, *Claude Opus 5.5*
+- (**cog**) drop the empty [packages] table that cog 7 refuses to parse - (7e404c1) - Claude, *Claude Opus 5.5*
+- (**release**) set --latest explicitly and check the Latest badge for drift - (cdf96e3) - Claude, *Claude Opus 5.5*
+#### Miscellaneous Chores
+- (**beads**) close pact-02v.4 and pact-3tg, merged in #30 and #34 - (32a6a72) - Claude, *Claude Sonnet 5.5*
+- (**beads**) close pact-37o, merged in #33 - (f4eafdd) - Claude, *Claude Sonnet 5.5*
+- (**beads**) close pact-56w, merged in #32 - (bfaf320) - Claude, *Claude Sonnet 5.5*
+- (**beads**) close pact-4ez, merged in #31 - (f56b072) - Claude, *Claude Sonnet 5.5*
+- (**beads**) close pact-f4p, merged in #29 - (26c65fe) - Claude, *Claude Sonnet 5.5*
+- (**beads**) file and close the cloud-session setup bead - (7c92d8e) - Claude, *Claude Opus 5.5*
+- (**beads**) file the worktrunk study's follow-ups - (58c3cab) - Claude, *Claude Opus 5.5*
+- (**beads**) file the directory-lease gap in commit-correlation - (20ccfce) - Claude, *Claude Opus 5.5*
+- (**deps**) bump Swatinem/rust-cache - (b7dbcd5) - dependabot[bot]
+- (**deps**) bump actions/download-artifact from 8.0.1 to 8.0.2 - (263d2aa) - dependabot[bot]
+- (**deps**) bump actions/upload-artifact from 4.6.2 to 7.0.2 - (a4b87a5) - dependabot[bot]
+- (**deps**) bump actions/checkout from 5 to 7 - (d71d031) - dependabot[bot]
+- (**deps**) bump actions/attest-build-provenance from 4.1.1 to 4.2.2 - (7ac0162) - dependabot[bot]
+- (**dev**) install the development tools when a cloud session starts - (2f82e0f) - Claude, *Claude Opus 5.5*
+- (**mise**) route cargo through mbx, a compile cache shared by every worktree - (0a70e80) - Claude, *Claude Opus 5.5*
+- (**pact**) checkpoint the lease log after pact-d1b - (1fd3ab6) - Claude, *Claude Opus 5.5*
+- (**pact**) checkpoint the lease log after the mbx release - (2e682a1) - Claude, *Claude Opus 5.5*
+- (**pact**) record the parallel bead run's final lease history - (c6a1865) - Claude, *Claude Sonnet 5.5*
+- (**pact**) extend the parallel bead run's lease history - (b46cffd) - Claude, *Claude Sonnet 5.5*
+- (**pact**) extend the parallel bead run's lease history - (be59cec) - Claude, *Claude Sonnet 5.5*
+- (**pact**) extend the parallel bead run's lease history - (25f9e2a) - Claude, *Claude Sonnet 5.5*
+- (**pact**) extend the parallel bead run's lease history - (f8d1bd6) - Claude, *Claude Sonnet 5.5*
+- (**pact**) checkpoint the parallel bead run's lease history - (8e8ce8c) - Claude, *Claude Sonnet 5.5*
+- (**pact**) record the cloud-session setup's lease history - (4379195) - Claude, *Claude Opus 5.5*
+- (**pact**) record the bead-filing lease history - (06d74a5) - Claude, *Claude Opus 5.5*
+- (**pact**) record the worktrunk study's lease history - (431e227) - Claude, *Claude Opus 5.5*
+- (**pact**) record the bead-filing lease - (122f69d) - Claude, *Claude Opus 5.5*
+- (**pact**) record the System One study's lease history - (ece1eb9) - Claude, *Claude Opus 5.5*
+
+- - -
+
 ## 0.16.0 - 2026-08-26
 #### Bug Fixes
 - **(audit)** tell a starved sidecar apart from a switched-off one - (b44f245) - Clement HUSSENOT-DESENONGES
