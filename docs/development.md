@@ -198,7 +198,9 @@ What to know:
   artifacts are hard links to read-only store objects. Cargo, plain or wrapped,
   still builds over them: a plain `cargo test` after an mbx restore was checked
   and is unaffected. `CARGO_BIN_EXE_pact` and `./target/debug/pact` resolve
-  through the link as before.
+  through the link as before. worktrunk's `wt step copy-ignored` would copy the
+  link itself into a new worktree; the committed `.config/wt.toml` excludes it
+  ([studies/worktrunk.md](studies/worktrunk.md#how-it-should-be-wired)).
 - **What the cache saves is the dependencies.** The pact crate and its test
   crates are compiled per checkout: their source paths differ from worktree to
   worktree, and `mbx explain --last` lists them as misses for that reason.

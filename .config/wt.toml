@@ -1,0 +1,102 @@
+# worktrunk project config for a pact fleet: one worktree per agent, created and
+# landed by wt, coordinated through pact's shared .pact/ in the main checkout.
+#
+# Project hooks and aliases run only after a human approves this file once
+# (`wt config approvals add`). Agents never pass `--yes`: it approves whatever
+# the invoking worktree's copy of this file says, and that copy is on the
+# agent's own branch. Lease this file like any shared file.
+#
+# Why each entry exists: docs/studies/worktrunk.md, "How it should be wired".
+
+# ---------------------------------------------------------------------------
+# Creating a worktree
+# ---------------------------------------------------------------------------
+
+[step.copy-ignored]
+# A new worktree must NOT receive a copy of the fleet's shared state: every
+# worktree resolves .pact/ and .beads/ to the main checkout, so a copy is a
+# second store nobody coordinates through (`pact doctor` reports it as
+# "worktree carries copied state"). target/ is excluded because it is a symlink
+# into mbx's managed store (mise.toml wraps cargo in mbx): copying the link
+# would point every worktree at ONE build directory, which is the cargo lock
+# contention mbx exists to avoid. mbx gives the new worktree its own target and
+# restores the build from the shared cache instead, measured at 11 s against
+# 30 s for a cold build.
+exclude = [".pact/", ".beads/", "target"]
+
+[[post-start]]
+# mise trusts config by path, and a worktree is a new path.
+trust = "mise trust"
+
+[[post-start]]
+# Record which agent owns this worktree, for the Agent column below and for
+# `wt list` readers who have no PACT_AGENT in their shell. `wt spawn` exports
+# it; a worktree created another way records nothing.
+agent = "[ -z \"$PACT_AGENT\" ] || wt config state vars set agent=\"$PACT_AGENT\""
+# Warm the test targets from mbx's store, in the background so `-x` starts the
+# agent at once. pact's protocol has the agent read its inbox and the lease
+# table before its first build, which is longer than this takes. A build the
+# agent starts meanwhile waits on cargo's directory lock, then restores.
+warm = "mise exec -- sh -c 'cargo test --no-run --quiet --features \"$PACT_ALL_FEATURES\"'"
+
+# ---------------------------------------------------------------------------
+# Landing and removing
+# ---------------------------------------------------------------------------
+
+# No pre-merge test gate, on purpose. A gate here is absolute: it asks whether
+# the tests pass, not whether THIS merge broke them, so one red commit on the
+# target blocks every landing until someone fixes it. `pact merge --verify`
+# asks the right question and is the orchestrator's tool; `wt land` below is
+# the agent-side alternative for a target kept green by CI.
+
+[pre-remove]
+# A branch that still holds pact leases is a claim about to outlive its agent
+# by a whole TTL. Refuse, as wt refuses a dirty tree, and name the holder. The
+# merge mutex under .pact/internal/ is not a file lease and is excluded so a
+# landing can clean up after itself. Under `wt merge` this runs AFTER the
+# fast-forward, so a refusal keeps the worktree but the work has landed.
+# Override, for a holder you know is gone: `pact lease sweep --suspect`, or
+# `wt remove --no-hooks`.
+pact-leases = """
+command -v pact >/dev/null || exit 0
+held=$(pact lease ls --json | jq -r --arg b '{{ branch }}' \
+  '.[] | select(.lease.branch == $b and (.lease.path | startswith(".pact/internal/") | not)) | "  \\(.lease.path)  held by \\(.lease.agent)"')
+[ -z "$held" ] || { printf 'branch %s still holds pact leases:\\n%s\\n' '{{ branch }}' "$held" >&2; exit 1; }
+"""
+
+# ---------------------------------------------------------------------------
+# Aliases
+# ---------------------------------------------------------------------------
+
+[aliases]
+# Start an agent in its own worktree, with pact's identity in its environment:
+#   wt spawn --agent=pact-4xh --model=claude-opus-5-5 -- -p "<prompt>"
+# Branch and agent share the name, so the "one identity, one worktree" rule
+# holds by construction: pact refuses a lease from a second worktree under the
+# same PACT_AGENT. Run each spawn in its own pane: -x holds the terminal.
+# Everything after `--` goes to claude.
+spawn = """
+PACT_AGENT='{{ agent }}' BEADS_ACTOR='{{ agent }}' PACT_HARNESS=claude-code \
+{% if model %}PACT_MODEL='{{ model }}' {% endif %}\
+wt switch --create '{{ agent }}' --no-cd -x claude -- {{ args }}
+"""
+
+# Land this worktree's branch from inside it, serialised by the same mutex
+# `pact merge` takes, with nothing committed or squashed on the agent's behalf:
+# a squash makes one new commit and drops every Pact-Agent trailer with it.
+# Release your file leases before landing; the pre-remove guard refuses
+# otherwise. The mutex TTL matches `pact merge`'s: a merge hold is bounded by a
+# test run, not a task.
+#   wt land            # rebase, fast-forward, remove
+#   wt land --no-rebase
+# The release runs from the main checkout, on purpose: `wt merge` deletes the
+# invoking worktree in the background, and a release started from a directory
+# being deleted finds no repository, reports "no lock held here", and leaves
+# the mutex to outlive the landing by its whole TTL (measured).
+land = """
+m='.pact/internal/merge-to-{{ default_branch }}'
+pact lease acquire "$m" --wait 30m --ttl 30m --note "wt merge --no-commit {{ branch }}" || exit $?
+wt merge --no-commit {{ args }}; s=$?
+cd '{{ repo_path }}' && pact lease release "$m"
+exit $s
+"""
