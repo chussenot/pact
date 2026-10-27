@@ -31,7 +31,8 @@ Four collisions need handling:
 - A test gate in `pre-merge` brings back the red-branch livelock that
   `pact merge --verify` was rewritten to escape (pact's own record).
 - `wt step copy-ignored` copies pact's lock files and bd's database into every new
-  worktree (measured below).
+  worktree (measured below), and, since the build cache made `target/` a symlink, the
+  link itself.
 - Claude Code subagents that worktrunk's plugin places in worktrees all inherit one
   `PACT_AGENT`, and pact accepts that silently (measured below).
 
@@ -94,8 +95,8 @@ pact's invariants settle these before any experiment.
 |---|---|---|---|
 | 1 | **worktrunk as the lifecycle layer**: `wt switch --create … -x <agent>` to spawn, hooks to set up, `wt list` to watch, `wt remove` and `wt step prune` to clean up | **Strong, now** | No pact code. pact's coordination space held in every layout tested. It replaces the hand-rolled `git worktree add`, `cd`, spawn and remove of the orchestrated-wave pattern |
 | 2 | **Declare identity at spawn**, beside `wt switch` | **Required** | The spawner is the only party that knows the name. Two worktrees sharing one `PACT_AGENT` both "acquire" a file with exit 0 (measured). That is the default for Claude Code subagents that worktrunk's plugin places in worktrees |
-| 3 | **Keep `.pact/` and `.beads/` out of `wt step copy-ignored`** | **Required** | worktrunk's recommended `post-start` hook for warm builds copies pact's live lock files and bd's embedded Dolt store into every new worktree. One `exclude` line fixes it here; worktrunk's built-in exclude list is the right long-term home |
-| 4 | **Land from the worktree with `wt merge --no-commit`, inside pact's merge mutex** | **Strong, with two conditions** | Self-landing from a worktree, which pact's docs call impossible. Every `Pact-Agent` trailer survives (4 of 4, even after `gc`). The mutex serialises landings and closes the race worktrunk's own source names. Conditions: never `--yes`, and no absolute test gate in `pre-merge` where the branch can be red |
+| 3 | **Keep `.pact/`, `.beads/` and `target` out of `wt step copy-ignored`** | **Required** | worktrunk's recommended `post-start` hook for warm builds copies pact's live lock files and bd's embedded Dolt store into every new worktree, and the `target` symlink mbx manages, which would point every worktree at one build directory. One `exclude` line fixes it here; worktrunk's built-in exclude list is the right long-term home for the first two |
+| 4 | **Land from the worktree with `wt merge --no-commit`, inside pact's merge mutex** | **Strong, with three conditions** | Self-landing from a worktree, which pact's docs call impossible. Every `Pact-Agent` trailer survives (4 of 4, even after `gc`). The mutex serialises landings and closes the race worktrunk's own source names. Conditions: never `--yes`, no absolute test gate in `pre-merge` where the branch can be red, and release the mutex from the main checkout, because `wt merge` is deleting the invoking worktree while the alias still runs (measured) |
 | 5 | **A lease-aware `pre-remove` guard** | **Good** | One `jq` line refuses to delete a worktree whose branch still holds a lease, the claim-level twin of `wt remove` refusing a dirty tree. Without it the claim outlives its agent by a whole TTL |
 | 6 | **`wt list --format=json` at wave end**: `default_branch.merge_conflicts` per branch, to land the clean ones first | **Optional** | Detects textual conflicts only; `merge-divergence` covers the silent ones afterwards. An orchestrator script, no code |
 | 7 | **pact reading worktrunk's activity markers** (🤖 working, 💬 waiting) in `doctor`'s fleet liveness | **Speculative** | It would separate "quiet, waiting on a human" from "quiet, working". But it couples pact to a pre-1.0 tool's private state, and the signal belongs to the harness: worktrunk only relays Claude Code's hook events. If pact wants it, it should take it from the harness |
@@ -109,6 +110,11 @@ supports. worktrunk itself was **not executed**: the session that wrote this cou
 install it. Each worktrunk operation was reproduced as the git calls its documentation
 and source describe ([limits](#what-this-does-not-say)). Claims about worktrunk's
 internals cite its source at `057037a` (0.81.0).
+
+On 2026-10-27 the wiring in [How it should be wired](#how-it-should-be-wired) was run
+under worktrunk 0.81.0 itself, against pact 0.17.0 (`c8a9582`), on throwaway branches
+of this repository. That section says what running it changed. The measurements below
+are the original, emulated ones.
 
 ### The coordination space survives every layout
 
@@ -336,38 +342,51 @@ on that path can change it. So the subagent's prompt has to carry its identity: 
 pact command it runs passes `--agent <name>`, because an `export` does not survive
 between Claude Code's separate shell calls.
 
-**2. One committed project config, `.config/wt.toml`:**
+**2. One committed project config, [`.config/wt.toml`](../../.config/wt.toml).** The
+file carries its own reasons beside each entry. What matters here is what running the
+first draft of it under worktrunk 0.81.0 changed:
 
-```toml
-# Coordination state belongs to the repository. A copy in each worktree is a
-# second store nobody coordinates through.
-[step.copy-ignored]
-exclude = [".pact/", ".beads/"]
+- **`exclude` lists `target` beside `.pact/` and `.beads/`.** Since
+  [the build cache](../development.md#the-build-cache) made `target/` a symlink into
+  mbx's store, `copy-ignored` would copy the link itself (a dry run listed it as a
+  file), pointing every worktree at one build directory. Excluded, each worktree gets
+  its own managed target, restored from the shared cache.
+- **`wt land` releases the merge mutex from `{{ repo_path }}`**, the main checkout,
+  and holds it for 30 minutes like `pact merge`. The first draft released from the
+  invoking worktree, and the release ran while `wt merge` was deleting that worktree
+  in the background: pact found no repository, printed `nothing to release … no lock
+  held here`, and the mutex stayed held for its whole TTL. Fixed and run again, the
+  acquire and the release pair up in `pact log`.
+- **The `pre-remove` guard names the path and its holder** in the refusal, and passes
+  where pact is not installed.
+- **`post-start` is a pipeline**: `mise trust` first, because mise trusts config by
+  path; then, together, the warm build (`cargo test --no-run`, through mbx because
+  `mise.toml` wraps cargo) and `wt config state vars set agent=$PACT_AGENT`, so
+  `wt list` can say who owns a worktree without pact in the reader's shell.
+- **`wt spawn --agent=<name> [--model=<model>] -- <claude arguments>`** is step 1 as
+  an alias. Branch and agent share the name, so one identity cannot hold two
+  worktrees.
+- **The Agent column and a `fleet` view are user config**: `wt config show` warns that
+  `list.custom-columns` in a project file is ignored. The operator's
+  `~/.config/worktrunk/config.toml`, scoped to this repository, carries them and makes
+  a hand-typed `wt merge` keep the trailers too (two commits landed unsquashed):
 
-[post-start]
-copy = "wt step copy-ignored"
+  ```toml
+  [projects."github.com/chussenot/pact"]
+  merge = { squash = false, commit = false }
 
-# A branch that still holds a lease is a claim about to outlive its agent by a
-# whole TTL: refuse, as wt refuses a dirty tree. The merge mutex under
-# .pact/internal/ is excluded so a landing can clean up after itself.
-[pre-remove]
-pact-leases = """
-pact lease ls --json \
-  | jq -e --arg b {{ branch }} 'map(select(.lease.branch == $b and (.lease.path | startswith(".pact/internal/") | not))) | length == 0' >/dev/null \
-  || { echo "this branch still holds pact leases: pact lease ls" >&2; exit 1; }
-"""
+  [projects."github.com/chussenot/pact".list.custom-columns.Agent]
+  template = "{{ vars.agent }}"
 
-# Land from the worktree, serialised by the key `pact merge` itself takes, with
-# nothing committed on the agent's behalf.
-[aliases]
-land = """
-pact lease acquire .pact/internal/merge-to-{{ default_branch }} --wait 30m --note "wt merge --no-commit" \
-  && { wt merge --no-commit; s=$?; pact lease release .pact/internal/merge-to-{{ default_branch }}; exit $s; }
-"""
-```
+  [projects."github.com/chussenot/pact".aliases]
+  fleet = """wt --config-set 'list.columns=["branch","Agent","status","ahead-behind","age","path"]' list {{ args }}"""
+  ```
 
-The guard was run as the command the hook renders: it refused while the branch held
-`src/a.rs`, and passed while it held only the mutex. `pre-remove` runs after the
+worktrunk executed every hook and alias. `wt remove` refused a branch holding
+`src/output.rs`, naming the holder, and passed with only the mutex held and with
+nothing held. `wt switch --create` ran the pipeline, and the new worktree had its own
+mbx target, the recorded agent, and no copied state (`pact doctor` ✓). `wt land` landed
+a trailered commit on `master` and left no lease behind. `pre-remove` runs after the
 fast-forward, so if it refuses, the branch has landed and the worktree is kept. Release
 before running `wt land`.
 
@@ -378,6 +397,13 @@ jq -r .state` prints `approved`. Agents never pass `--yes`: it approves whatever
 *invoking worktree's* `.config/wt.toml` says, for that run, and that file is on the
 agent's own branch. An agent that edited a hook would run its own edit. Lease
 `.config/wt.toml` like any shared file, and treat it as the orchestrator's.
+
+The same rule has a second edge. Hooks and aliases are read from the worktree the
+command runs in, and `wt switch --create` cuts the new branch from the *local* default
+branch without fetching. So the file, and the `mise.toml` that wraps cargo in mbx, must
+already be on that branch, and the main checkout must have fetched it
+(`git fetch origin master:master`). A worktree cut from a stale local `master` ran its
+warm build with no wrapper and left a real 1.1 GiB `target/` behind (measured).
 
 **4. Choose the landing per fleet.**
 
@@ -401,8 +427,8 @@ cost nothing.
 
 ## What this does not say
 
-- **worktrunk was emulated, not run.** Each operation is the git sequence its
-  documentation and source describe:
+- **The measurements emulated worktrunk; the wiring did not.** Each measured
+  operation is the git sequence worktrunk's documentation and source describe:
   - `wt switch --create`: `git worktree add`;
   - the squash: `reset --soft` to the merge base and one commit, with worktrunk's no-LLM
     message format;
@@ -412,8 +438,9 @@ cost nothing.
 
   worktrunk's own fast-forward is the compare-and-swap described above, not
   `merge --ff-only`, but both leave the same commits on `main`, which is all the audit
-  reads. No hook or alias was executed by worktrunk; the guard was run as the command it
-  renders.
+  reads. The hooks and aliases of [How it should be wired](#how-it-should-be-wired)
+  were later executed by worktrunk 0.81.0 itself, on throwaway branches of this
+  repository, one agent at a time. No wave has run on it yet (`pact-02v.1`).
 - **One small scenario**: two agents, two commits each. It shows the mechanisms. It
   does not measure a fleet. Steps are spaced at least a second apart, because
   commit-correlation compares whole-second git dates with sub-second hold bounds, and a
@@ -491,12 +518,29 @@ pact audit --check topology --expect worktrees
 TOPOLOGY MISMATCH: 1 event(s) invoked from "main", which --expect worktrees does not allow
 ```
 
+### With worktrunk installed
+
+The wiring, in a scratch clone of this repository named `pact`, from its main checkout,
+after approving the project config once (`wt config approvals add`):
+
+```bash
+PACT_AGENT=probe wt switch --create probe --no-cd --no-hooks
+(cd ../pact.probe && PACT_AGENT=probe pact lease acquire src/output.rs --note "probe: the guard")
+wt remove probe      # refused: branch probe still holds pact leases: src/output.rs held by probe
+(cd ../pact.probe && PACT_AGENT=probe pact lease release --all)
+(cd ../pact.probe && echo probe > probe.txt && git add probe.txt \
+  && git commit -q -m "probe: work" --trailer Pact-Agent=probe)
+(cd ../pact.probe && PACT_AGENT=probe wt land)
+git log -1 --format='%h %s %(trailers:key=Pact-Agent)' master   # the probe commit, trailer intact
+pact lease ls        # nothing held: the alias released the mutex from this checkout
+```
+
 ## Follow-ups
 
 | Bead | What |
 |---|---|
 | `pact-02v` | epic: worktrunk as the lifecycle layer for worktree fleets |
-| `pact-02v.1` | field run: one wave on real worktrunk (`wt switch -x` spawns, the `.config/wt.toml` above, `wt land` side by side with `pact merge`); measure merge wait and audit cleanliness |
+| `pact-02v.1` | field run: one wave on real worktrunk (`wt switch -x` spawns, the committed `.config/wt.toml`, `wt land` side by side with `pact merge`); measure merge wait and audit cleanliness |
 | `pact-02v.2` | move the composition into [fleet-patterns.md](../fleet-patterns.md) once the field run is clean (blocked by `pact-02v.1`) |
 | `pact-02v.3` | design spike: expose `pact merge --verify`'s "did this add a failure" as a command a `pre-merge` hook can call |
 | `pact-02v.4` | `doctor`: warn when a linked worktree carries its own `.pact/` runtime files or a `.beads/` database |
