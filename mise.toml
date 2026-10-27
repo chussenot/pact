@@ -58,11 +58,13 @@ run = [
   "cargo test",
   "cargo test --features $PACT_ALL_FEATURES",
   """
-  # Exclude exactly the directory bd lives in, rather than pattern-matching
+  # Exclude exactly the directories bd lives in, rather than pattern-matching
   # the PATH: on a machine without them this is a no-op, which is correct.
+  # Every one of them, until bd no longer resolves: a cloud session has bd both
+  # in mise's install dir and linked into ~/.local/bin, and removing only the
+  # first left this leg running with a backend while it reported none.
   p="$PATH"
-  for b in bd; do
-    d="$(command -v "$b" 2>/dev/null)" || continue
+  while d="$(PATH="$p" command -v bd 2>/dev/null)"; do
     p="$(printf '%s' "$p" | tr ':' '\n' | grep -vxF "$(dirname "$d")" | paste -sd: -)"
   done
   echo "no-backend leg: bd=$(PATH="$p" command -v bd || echo absent)"
