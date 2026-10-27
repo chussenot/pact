@@ -660,6 +660,10 @@ honest answer rather than an inconvenient one.
 under this repository at all, the one value that says the lease/edit binding
 cannot be assumed.
 
+A linked worktree named `main` or `outside` is stamped `worktree:main` or
+`worktree:outside`, and those count as worktrees: they satisfy
+`--expect worktrees` and fail `--expect main`.
+
 `--expect any` (also what a bare `--check topology` means) never fails — it
 reports the distribution. That is what `--export` records, so a stored
 retrospective does not fail on an expectation nobody declared when it was

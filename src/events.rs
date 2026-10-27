@@ -138,7 +138,10 @@ pub struct Event {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_hash: Option<String>,
     /// Which worktree of this repository pact was invoked from — a linked
-    /// worktree's name, `"main"`, or `"outside"` (pact-ler.1). See
+    /// worktree's name, `"main"`, or `"outside"` (pact-ler.1). A linked
+    /// worktree that is itself named `main` or `outside` is recorded as
+    /// `"worktree:main"` / `"worktree:outside"` so it cannot collide with
+    /// those literals (pact-4ez); older rows keep their original meaning. See
     /// [`crate::repo::invoked_from`].
     ///
     /// Stamped by [`append`] on **every** event, unconditionally, rather than

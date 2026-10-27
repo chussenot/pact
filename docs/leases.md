@@ -1227,7 +1227,7 @@ Three fields ride on **every** event, whatever its kind:
 
 | Field | Value |
 |---|---|
-| `invoked_from` | the linked worktree pact ran in, or `main`, or `outside` |
+| `invoked_from` | the linked worktree pact ran in, or `main`, or `outside`; a linked worktree *named* `main` or `outside` is written `worktree:main` or `worktree:outside` |
 | `scope` | the coordination scope actually in force: `shared` or `local` |
 | `pact_version` | the version that wrote the line |
 | `protocol_hash` | which revision of the managed `AGENTS.md` block was in force |
@@ -1238,6 +1238,12 @@ the field exists to be compared across repositories and runs. `outside` means
 the process's working directory was not under this repository at all, which is
 reachable by pointing pact at another repo with `PACT_STATE_DIR`, and is the
 one value that says the lease/edit binding cannot be assumed.
+
+A linked worktree whose own directory is called `main` or `outside` (worktrunk's
+bare-repository layout puts the default branch in one) would collide with those
+two literals, so it is written `worktree:main` or `worktree:outside`. Rows
+written before that existed read exactly as they did: no earlier pact could
+write the `worktree:` form for these names.
 
 `head` is the exception to "every event carries these". It is stamped only on
 the kinds that open or close a hold — `acquired`, `stolen`, `released`,
