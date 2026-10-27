@@ -7334,3 +7334,32 @@ fn sweep_with_nothing_to_do_says_which_nothing_it_means() {
         stdout_of(&suspect)
     );
 }
+
+/// pact-f4p: init wrote `.gitattributes` (the `merge=union` rule for the
+/// committed logs) but left it out of its own commit, so a fresh `pact init`
+/// reported a commit and left `?? .gitattributes` behind.
+#[test]
+fn init_commits_gitattributes_and_leaves_a_clean_tree() {
+    let Some(tmp) = git_repo("init_commits_gitattributes_and_leaves_a_clean_tree") else {
+        return;
+    };
+    assert_ok(&pact(tmp.path(), "init-agent", &["init"]));
+    let status = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let dirty = String::from_utf8_lossy(&status.stdout);
+    // `.pact/` runtime state is not what this asserts about.
+    let dirty: Vec<&str> = dirty.lines().filter(|l| !l.contains(".pact/")).collect();
+    assert!(dirty.is_empty(), "init left a dirty tree: {dirty:?}");
+    let tracked = Command::new("git")
+        .args(["ls-files", ".gitattributes"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&tracked.stdout).trim(),
+        ".gitattributes"
+    );
+}
