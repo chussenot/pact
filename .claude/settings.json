@@ -16,5 +16,12 @@
         "matcher": ""
       }
     ]
-  }
+  },
+  "permissions": {
+    "allow": [
+        "Bash(mbx stats:*)",
+        "Bash(mbx gc:*)",
+        "Bash(mnx cache stats:*)"
+      ]
+    }
 }
