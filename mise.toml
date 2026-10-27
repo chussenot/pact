@@ -30,6 +30,7 @@ mr-boxington = "1.22.0"
 # GitHub release binary, pinned: the join ladder is a contract between the two
 # tools, so a recount that moves under `latest` can change what an audit means.
 "github:chussenot/recount" = "0.2.0"
+worktrunk = { version = "latest", workflow = "release.yaml" }
 
 [env]
 # Every feature this repo can build, in one place so the tasks cannot disagree
