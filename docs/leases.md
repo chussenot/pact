@@ -952,13 +952,35 @@ short TTL and a different note with no warning on either side; the only trace
 is a `renewed` event in `pact log`, indistinguishable from genuine
 self-renewal.
 
-This is why **no two independent agents may ever share one `PACT_AGENT`
-value**, in the same repo, across worktrees, or across fleets running against
-it concurrently — pact has no way to catch a collision, so it has to be
-guaranteed out of band (see the [worktree-per-agent
-recipe](onboarding.md#recipe-one-agent-per-git-worktree), which already
-relies on exactly this: two worktrees sharing one `PACT_AGENT` are, on
-purpose, one agent as far as leases are concerned).
+**One collision is caught: a refresh from a different worktree.** In a
+repository with linked worktrees every lock is stamped with the worktree it was
+taken from, and an agent refreshes from the worktree it works in. So when the
+live lease is stamped with worktree `proj.agent-a` and the same identity asks
+for it again from `proj.agent-b`, that is not one agent resuming, and pact
+refuses it with exit 2, naming both worktrees:
+
+```
+error: lease on src/b.rs is held by parent from worktree proj.agent-a, and you are parent in worktree proj.agent-b: two worktrees share one identity, ...
+```
+
+`lease renew` applies the same check. The refusal is written to `pact log` as a
+`refused` row. It is not raised when:
+
+- the refresh comes from the same worktree (the ordinary case, unchanged);
+- the repository has no linked worktrees, or the lock carries no worktree stamp
+  (written by an older pact), because there is nothing to compare — those lock
+  files are byte-identical to before;
+- the lease has expired (it is a takeover, not a refresh);
+- you pass `--steal`, which stays the deliberate override.
+
+The fix is the one in the [worktree-per-agent
+recipe](onboarding.md#recipe-one-agent-per-git-worktree): give each worktree its
+own `PACT_AGENT`. This check only catches the split-brain that crosses
+worktrees. Two processes sharing one identity **inside one worktree**, or in a
+repo with no worktrees, are still indistinguishable from self-renewal, so **no
+two independent agents may share one `PACT_AGENT` value**, across fleets running
+against the repo concurrently or in the same checkout. That part has to be
+guaranteed out of band.
 
 ## Crash recovery: taking over from a dead agent
 
