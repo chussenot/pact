@@ -8,14 +8,16 @@
 # CI uses. Keep the versions in step with mise.toml.
 #
 # Each URL also carries its sha256, which mise checks before it installs: a release
-# asset can be replaced under an unchanged URL. bd's matches the checksums.txt its
-# release publishes; cocogitto, shellcheck and mr-boxington publish none, so theirs were recorded
-# from the asset when the version was pinned.
+# asset can be replaced under an unchanged URL. bd's and recount's match the
+# checksum files their releases publish; cocogitto, shellcheck and mr-boxington
+# publish none, so theirs were recorded from the asset when the version was
+# pinned.
 [settings]
-disable_tools = ["rust", "github:gastownhall/beads", "cargo:cocogitto", "shellcheck", "mr-boxington"]
+disable_tools = ["rust", "github:gastownhall/beads", "cargo:cocogitto", "shellcheck", "mr-boxington", "github:chussenot/recount"]
 
 [tools]
 "http:bd" = { version = "1.2.2", url = "https://github.com/gastownhall/beads/releases/download/v1.2.2/beads_1.2.2_linux_amd64.tar.gz", checksum = "sha256:8140098a51d3b81d5548d1c5e6db1a2d9930e5d141efe2a4bff7d079c4d321e8" }
 "http:cog" = { version = "7.0.0", url = "https://github.com/cocogitto/cocogitto/releases/download/7.0.0/cocogitto-7.0.0-x86_64-unknown-linux-musl.tar.gz", checksum = "sha256:e03938ff2c4c86d71c00c0f3284dbbe95c5ca76fe34a51f33e945c23010d59bb" }
 "http:shellcheck" = { version = "0.11.0", url = "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz", checksum = "sha256:8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198" }
 "http:mbx" = { version = "1.22.0", url = "https://github.com/jdx/mr-boxington/releases/download/v1.22.0/mbx-x86_64-unknown-linux-gnu.tar.gz", checksum = "sha256:eb3e8c74277dcc8314227ba2cd32ef00a9a362ec8a90cd06ef6580eb48a6b375" }
+"http:recount" = { version = "0.2.0", url = "https://github.com/chussenot/recount/releases/download/0.2.0/recount-0.2.0-x86_64-unknown-linux-musl.tar.gz", checksum = "sha256:ffe7883c1ae928a0625d5d41135144a67f44ccf15c7a539db4e0e9280a889e60" }

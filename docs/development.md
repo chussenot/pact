@@ -136,8 +136,12 @@ It runs these steps, each a no-op when already done:
    This matches what CI installs. The image's own stable lagged it by three
    months (1.97.0 against 1.99.1 on the day this was written), and a clippy older
    than CI's is a lint gate CI does not share.
-4. **`mise install`**, which gets `bd`, `cog`, `shellcheck` and `mbx`, linked
-   into `~/.local/bin` so scripts find them without mise activated.
+4. **`mise install`**, which gets `bd`, `cog`, `shellcheck`, `mbx` and
+   [`recount`](https://github.com/chussenot/recount), linked into
+   `~/.local/bin` so scripts find them without mise activated. recount joins
+   a `pact audit` finding to the agent transcript behind it
+   ([audit.md](audit.md#the-recount-join-ladder)), so a session can read a
+   finding's testimony instead of guessing at its motive.
 5. **The build cache** ([below](#the-build-cache)). The hook puts mbx's Cargo
    shim first on `PATH`, so a plain `cargo test <filter>` is cached too, not
    only `mise run`. It also sets the cache's disk budget explicitly, a 12 GiB
@@ -162,7 +166,7 @@ It runs these steps, each a no-op when already done:
    `release-assets.githubusercontent.com` (mise and the pinned tools), plus
    `docs.rs`.
 
-On a laptop, `mise install` installs the same four tools through the backends
+On a laptop, `mise install` installs the same five tools through the backends
 `mise.toml` names. A version bump is a bump in both files, and `bd`'s pin also
 matches `canary.yml`'s `pinned` leg, the version this project develops against.
 

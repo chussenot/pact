@@ -25,6 +25,11 @@ shellcheck = "0.11.0"
 # mbx, the cargo wrapper above. Pinned like the rest: a cache that changes its
 # key scheme under `latest` silently turns every build cold.
 mr-boxington = "1.22.0"
+# recount, the companion that joins a `pact audit` finding to the agent
+# transcript behind it (docs/audit.md, "The recount join ladder"). From its
+# GitHub release binary, pinned: the join ladder is a contract between the two
+# tools, so a recount that moves under `latest` can change what an audit means.
+"github:chussenot/recount" = "0.2.0"
 
 [env]
 # Every feature this repo can build, in one place so the tasks cannot disagree
