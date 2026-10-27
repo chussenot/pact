@@ -195,11 +195,16 @@ What to know:
   still builds over them: a plain `cargo test` after an mbx restore was checked
   and is unaffected. `CARGO_BIN_EXE_pact` and `./target/debug/pact` resolve
   through the link as before.
-- **The pact crate itself is rebuilt every time.** `build.rs` stamps
-  `PACT_BUILD_TIME` into the binary, so its compiler inputs differ on every
-  build, and mbx reports that it could not reuse incremental state. The
-  dependencies are what the cache saves. Pinning the stamp would change what
-  `pact --version` reports, which is why it has not been done.
+- **What the cache saves is the dependencies.** The pact crate and its test
+  crates are compiled per checkout: their source paths differ from worktree to
+  worktree, and `mbx explain --last` lists them as misses for that reason.
+  `build.rs` also stamps `PACT_BUILD_TIME` into the binary, a new compiler
+  input on every build, which costs the first rebuild in a checkout its
+  incremental state (8 s instead of 1.4 s). After that, mbx's learned
+  incremental state brings each edit back to about 1.5 s. Pinning the stamp
+  was measured and bought nothing: a fresh worktree took about 11 s with or
+  without it, and with or without `MBX_SHARE_WORKSPACE_ROOT`. So the stamp
+  stays, and `pact --version` keeps saying when a binary was built.
 - **`mbx stats`** reports what the cache saved and how big it is.
   `mbx gc --dry-run` previews a collection, and `mbx clean` drops this checkout's
   managed target while keeping the shared store.
