@@ -15,8 +15,9 @@
 #   3. The current stable toolchain with rustfmt and clippy, through rustup, which
 #      is what CI installs. The image's own stable lags it by months, and a
 #      clippy older than CI's is a lint gate CI does not share.
-#   4. `mise install`: bd, cog, shellcheck and mbx, linked into ~/.local/bin so
-#      a script or git hook finds them without mise being activated.
+#   4. `mise install`: bd, cog, shellcheck, mbx and recount, linked into
+#      ~/.local/bin so a script or git hook finds them without mise being
+#      activated.
 #   5. mbx, the compile cache mise.toml wraps cargo with: its Cargo shim first
 #      on PATH, so a plain `cargo` in the session is cached as well as
 #      `mise run`'s, and its disk budget set explicitly. Left at its default
@@ -95,12 +96,12 @@ log "$(cargo --version), $(cargo clippy --version)"
 # 4. The tools (mise.toml, overridden by mise.cloud.toml), each a pinned release
 #    binary with its checksum: nothing is compiled.
 mise install
-for tool in bd cog shellcheck mbx; do
+for tool in bd cog shellcheck mbx recount; do
   if path=$(mise which "$tool" 2>/dev/null) && [ -n "$path" ]; then
     ln -sfn "$path" "$HOME/.local/bin/$tool"
   fi
 done
-log "$(bd --version 2>/dev/null | head -1), $(cog --version 2>/dev/null), shellcheck $(shellcheck --version 2>/dev/null | sed -n 's/^version: //p'), $(mbx --version 2>/dev/null)"
+log "$(bd --version 2>/dev/null | head -1), $(cog --version 2>/dev/null), shellcheck $(shellcheck --version 2>/dev/null | sed -n 's/^version: //p'), $(mbx --version 2>/dev/null), $(recount --version 2>/dev/null)"
 
 # 5. The build cache. `mbx setup` outside an activated mise shell writes only
 #    its Cargo shim (MBX_SHIM_DIR, already first on PATH above) and edits no
@@ -153,6 +154,6 @@ fi
 log "network: $network"
 log "done"
 
-context="[session-start] mise, bd, cog, shellcheck, mbx and this checkout's pact are on PATH; cargo runs through mbx, a compile cache shared by every checkout and worktree (\`mbx stats\` shows what it saved); the beads database is bootstrapped from .beads/issues.jsonl. network: $network"
+context="[session-start] mise, bd, cog, shellcheck, mbx, recount and this checkout's pact are on PATH; cargo runs through mbx, a compile cache shared by every checkout and worktree (\`mbx stats\` shows what it saved); the beads database is bootstrapped from .beads/issues.jsonl. network: $network"
 printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":%s}}\n' \
   "$(printf '%s' "$context" | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" >&3
