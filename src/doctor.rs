@@ -968,6 +968,67 @@ fn worktree_checks(ctx: &repo::RepoContext, checks: &mut Vec<DoctorCheck>) {
             )
         },
     });
+
+    // Emitted unconditionally, like its siblings. Filesystem reads only: no bd
+    // and no git, and nothing is created or removed (pact-02v.4).
+    let copied = copied_state_in_worktree(ctx);
+    checks.push(DoctorCheck {
+        name: "worktree carries copied state",
+        ok: true,
+        warn: !copied.is_empty(),
+        detail: if !ctx.is_linked_worktree {
+            "not a linked worktree — not applicable".to_string()
+        } else if copied.is_empty() {
+            "no pact runtime state or bd database under this worktree's own root".to_string()
+        } else {
+            format!(
+                "this worktree's own root carries {} — usually a post-create hook that copies \
+                 ignored files from the primary worktree (e.g. worktrunk's `wt step \
+                 copy-ignored`) taking .pact/ and .beads/ with it. Under shared scope pact \
+                 ignores a copied .pact/ (live state is at {}), but under \
+                 PACT_WORKTREE_SCOPE=local or a per-worktree fallback the copy IS the state, \
+                 and a released lease can read as held. A .beads/ database here is a second \
+                 store beside the shared one. Delete the copies and exclude .pact/ and .beads/ \
+                 from the copy step.",
+                copied.join(", "),
+                ctx.state_dir.display()
+            )
+        },
+    });
+}
+
+/// Coordination runtime state a linked worktree carries under its OWN root,
+/// as repo-relative paths: pact's runtime files (only when this worktree's own
+/// `.pact/` is not the state directory in use, else they are the real state and
+/// not a copy) and a bd database (always a fault in a worktree). Reads only.
+fn copied_state_in_worktree(ctx: &repo::RepoContext) -> Vec<String> {
+    if !ctx.is_linked_worktree {
+        return Vec::new();
+    }
+    let root = &ctx.worktree_root;
+    let own_pact = root.join(".pact");
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    };
+    let non_empty_dir = |p: &Path| std::fs::read_dir(p).is_ok_and(|mut d| d.next().is_some());
+    let mut found = Vec::new();
+    if !same(&own_pact, &ctx.state_dir) {
+        for dir in ["leases", "activity", "waits"] {
+            if non_empty_dir(&own_pact.join(dir)) {
+                found.push(format!(".pact/{dir}/"));
+            }
+        }
+        if own_pact.join("watches.jsonl").is_file() {
+            found.push(".pact/watches.jsonl".to_string());
+        }
+    }
+    for db in ["dolt", "embeddeddolt"] {
+        if root.join(".beads").join(db).is_dir() {
+            found.push(format!(".beads/{db}/"));
+        }
+    }
+    found
 }
 
 /// Leases under a `PACT_STATE_DIR` override that could not have been written
@@ -1638,6 +1699,27 @@ mod tests {
     /// `repo::pact_dir` — the function that stamps the marker — to simulate a
     /// directory that predates pact-m7j.9.7 (pact-m7j.9.7's own scope note:
     /// a real cross-worktree fixture is not required).
+    #[test]
+    fn copied_state_is_only_reported_for_a_linked_worktree_with_a_foreign_state_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(wt.join(".pact/leases")).unwrap();
+        std::fs::write(wt.join(".pact/leases/a.lock"), "{}").unwrap();
+        std::fs::create_dir_all(wt.join(".beads/dolt")).unwrap();
+        let mut ctx = repo::RepoContext::resolve(&wt);
+        ctx.is_linked_worktree = true;
+        ctx.state_dir = tmp.path().join("main/.pact");
+        assert_eq!(
+            copied_state_in_worktree(&ctx),
+            vec![".pact/leases/", ".beads/dolt/"]
+        );
+        // When this worktree's own .pact/ IS the state, only the bd copy counts.
+        ctx.state_dir = wt.join(".pact");
+        assert_eq!(copied_state_in_worktree(&ctx), vec![".beads/dolt/"]);
+        ctx.is_linked_worktree = false;
+        assert!(copied_state_in_worktree(&ctx).is_empty());
+    }
+
     #[test]
     fn doctor_warns_about_an_unmarked_pact_dir_in_a_worktree_shared_repo() {
         let tmp = tempfile::tempdir().unwrap();

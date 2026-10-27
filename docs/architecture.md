@@ -439,7 +439,7 @@ cost lands only on the rare path that needed a third candidate at all. See
 
 Every one of those decisions is reported by `pact doctor` (`worktree`,
 `coordination scope`, `state placement`, `state dir writable`, `worktree
-schema marker`), because a surprising answer should be explainable without
+schema marker`, `worktree carries copied state`), because a surprising answer should be explainable without
 reading `.git` files by hand.
 
 Lock keys were already repo-root-relative, so `src/api.ts` from either checkout
