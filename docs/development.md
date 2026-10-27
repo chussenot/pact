@@ -1,6 +1,6 @@
 ---
 title: Development
-description: Build, test, the CI gates and why each exists, the upstream canary, and what a cloud session installs at start.
+description: Build, test, the CI gates and why each exists, the shared compile cache, the upstream canary, and what a cloud session installs at start.
 audience: contributors
 ---
 
@@ -136,28 +136,83 @@ It runs these steps, each a no-op when already done:
    This matches what CI installs. The image's own stable lagged it by three
    months (1.97.0 against 1.99.1 on the day this was written), and a clippy older
    than CI's is a lint gate CI does not share.
-4. **`mise install`**, which gets `bd`, `cog` and `shellcheck`, linked into
-   `~/.local/bin` so scripts find them without mise activated.
-5. **The beads database.** `bd bootstrap` builds it from the committed
+4. **`mise install`**, which gets `bd`, `cog`, `shellcheck` and `mbx`, linked
+   into `~/.local/bin` so scripts find them without mise activated.
+5. **The build cache** ([below](#the-build-cache)). The hook puts mbx's Cargo
+   shim first on `PATH`, so a plain `cargo test <filter>` is cached too, not
+   only `mise run`. It also sets the cache's disk budget explicitly, a 12 GiB
+   ceiling and a 2 GiB free-space floor, keeping any value already set. mbx's
+   default floor is 10% of the disk `df` reports, which here is far larger than
+   the session's fixed allowance. Left at that default, mbx read the disk as
+   permanently low and evicted on every build.
+6. **The beads database.** `bd bootstrap` builds it from the committed
    `.beads/issues.jsonl`, and an import then catches a snapshotted container up
    with the export: a row is taken only when it is newer, and nothing is deleted.
    The export is how beads travel here, because this repository has no Dolt
    remote. So after filing or closing one, run
    `bd export -o .beads/issues.jsonl` and commit the file.
-6. **A warm build.** It builds the test targets for the default build first and
+7. **A warm build**, through mbx. It builds the test targets for the default build first and
    then every feature, the order `mise run test` keeps, so `target/debug/pact` is
    the all-features binary. Then `mise run install` puts this checkout's `pact` on
    `PATH`. After changing the code, run `mise run install` again, as `CLAUDE.md`
    asks. `PACT_SESSION_SKIP_BUILD=1` skips this step.
-7. **A probe of the hosts the work depends on**, handed to the session as
+8. **A probe of the hosts the work depends on**, handed to the session as
    context. The environment's allowed domains need `index.crates.io` and
    `static.crates.io` (cargo), `static.rust-lang.org` (rustup), `github.com` and
    `release-assets.githubusercontent.com` (mise and the pinned tools), plus
    `docs.rs`.
 
-On a laptop, `mise install` installs the same three tools through the backends
+On a laptop, `mise install` installs the same four tools through the backends
 `mise.toml` names. A version bump is a bump in both files, and `bd`'s pin also
 matches `canary.yml`'s `pinned` leg, the version this project develops against.
+
+## The build cache
+
+`mise.toml` wraps every cargo that mise runs in
+[mbx](https://github.com/jdx/mr-boxington) (mr-boxington), through mise's
+`wrappers` key, which needs mise 2026.9.2 or newer. mbx keeps one store of
+compiler outputs per machine, keyed so that equivalent compilations match
+whatever the checkout's path. Cargo still plans and runs everything, and an
+invocation mbx does not support runs as plain cargo.
+
+It exists for the way this repository is worked on. A fleet runs one worktree
+per agent, and each new worktree starts with an empty `target/`. Measured in a
+cloud session on the all-features test build of a fresh worktree:
+
+| | wall time |
+|---|---|
+| plain cargo, empty target dir | 30 s |
+| mbx, store already warm from another worktree | 11 s (159 cache hits) |
+
+The store fills only from builds mbx itself compiles. A `target/` that existed
+before mbx was adopted as it stood, and contributes nothing to the store, so
+the first worktree after switching pays full price.
+
+What to know:
+
+- **`target/` becomes a symlink** into `~/.cache/mbx/targets/`. Restored
+  artifacts are hard links to read-only store objects. Cargo, plain or wrapped,
+  still builds over them: a plain `cargo test` after an mbx restore was checked
+  and is unaffected. `CARGO_BIN_EXE_pact` and `./target/debug/pact` resolve
+  through the link as before.
+- **What the cache saves is the dependencies.** The pact crate and its test
+  crates are compiled per checkout: their source paths differ from worktree to
+  worktree, and `mbx explain --last` lists them as misses for that reason.
+  `build.rs` also stamps `PACT_BUILD_TIME` into the binary, a new compiler
+  input on every build, which costs the first rebuild in a checkout its
+  incremental state (8 s instead of 1.4 s). After that, mbx's learned
+  incremental state brings each edit back to about 1.5 s. Pinning the stamp
+  was measured and bought nothing: a fresh worktree took about 11 s with or
+  without it, and with or without `MBX_SHARE_WORKSPACE_ROOT`. So the stamp
+  stays, and `pact --version` keeps saying when a binary was built.
+- **`mbx stats`** reports what the cache saved and how big it is.
+  `mbx gc --dry-run` previews a collection, and `mbx clean` drops this checkout's
+  managed target while keeping the shared store.
+- **To opt out for one command**, call rustup's cargo directly
+  (`~/.cargo/bin/cargo`).
+
+CI does not use it. CI runs plain cargo under `Swatinem/rust-cache`, and none of
+the gates depend on the cache.
 
 ## Beyond the gates: the fleet soak
 

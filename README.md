@@ -234,7 +234,7 @@ The full evidence, and the design decisions each run forced, is in the studies:
 | [audit.md](docs/audit.md) | `pact audit`: what each check proves, and what it deliberately cannot see |
 | [fleet-patterns.md](docs/fleet-patterns.md) | how to run a fleet: the orchestrated-wave topology, and the two rules that make its record trustworthy |
 | [testing.md](docs/testing.md) | the fleet soak and the fault injector: how to run each, and what they cannot prove |
-| [development.md](docs/development.md) | build, test, the CI gates and why each exists, the upstream canary, and what a cloud session installs at start |
+| [development.md](docs/development.md) | build, test, the CI gates and why each exists, the shared compile cache, the upstream canary, and what a cloud session installs at start |
 | [performance.md](docs/performance.md) | what the lease hot path costs, measured — and where the time actually goes |
 
 Those pages answer *what* and *how*. For *what happened when this was used for

@@ -1,3 +1,12 @@
+# Every cargo that mise runs goes through mbx (mr-boxington), a compile cache
+# shared by every checkout and worktree on the machine: equivalent compilations
+# share cache keys whatever the checkout path, so a fleet of worktrees, or the
+# default and all-features legs of `mise run test`, restore what another one
+# built instead of compiling it again. Cargo still plans and runs everything;
+# an invocation mbx does not support runs as plain cargo. Needs mise 2026.9.2 or
+# newer, which reads this key. See docs/development.md, "The build cache".
+wrappers = { cargo = { command = "mbx", env = { MBX_CARGO_SHIM_MODE = "1" } } }
+
 [tools]
 rust = "latest"
 # The tools the gates and the workflow call besides cargo, pinned. A version bump
@@ -13,6 +22,9 @@ rust = "latest"
 "cargo:cocogitto" = "7.0.0"
 # shellcheck, for `mise run lint-scripts`, which `mise run check` and CI both run.
 shellcheck = "0.11.0"
+# mbx, the cargo wrapper above. Pinned like the rest: a cache that changes its
+# key scheme under `latest` silently turns every build cold.
+mr-boxington = "1.22.0"
 
 [env]
 # Every feature this repo can build, in one place so the tasks cannot disagree
@@ -58,11 +70,13 @@ run = [
   "cargo test",
   "cargo test --features $PACT_ALL_FEATURES",
   """
-  # Exclude exactly the directory bd lives in, rather than pattern-matching
+  # Exclude exactly the directories bd lives in, rather than pattern-matching
   # the PATH: on a machine without them this is a no-op, which is correct.
+  # Every one of them, until bd no longer resolves: a cloud session has bd both
+  # in mise's install dir and linked into ~/.local/bin, and removing only the
+  # first left this leg running with a backend while it reported none.
   p="$PATH"
-  for b in bd; do
-    d="$(command -v "$b" 2>/dev/null)" || continue
+  while d="$(PATH="$p" command -v bd 2>/dev/null)"; do
     p="$(printf '%s' "$p" | tr ':' '\n' | grep -vxF "$(dirname "$d")" | paste -sd: -)"
   done
   echo "no-backend leg: bd=$(PATH="$p" command -v bd || echo absent)"
