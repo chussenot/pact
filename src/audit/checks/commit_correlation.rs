@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use serde::Serialize;
 
 use crate::audit::model::{parse_at, Hold};
@@ -137,6 +137,21 @@ pub(in crate::audit) fn detect(
 /// check whose findings depend on something other than `.pact/events.jsonl`
 /// — see the module doc comment on why that is a deliberate, narrow widening
 /// rather than a break of audit's Beads-store invariant.
+/// A hold's opening instant at the resolution git can say anything about.
+///
+/// Hold bounds are nanosecond RFC 3339; a commit's author date is whole seconds.
+/// A commit authored at 14:33:18.9 is recorded as 14:33:18, which compares
+/// *earlier* than an acquire at 14:33:18.822 although it happened after it, so a
+/// commit in the same second as its own acquire read as uncovered (pact-56w). Flooring
+/// the open to the second makes "same second" mean "inside". Closes need no
+/// adjustment: a commit's truncated stamp can only be at or before its true time, so
+/// `c.at <= close` already holds for every commit that happened by the close.
+/// The price is that a commit in the second before an acquire, within that same
+/// second, is also credited; the clock cannot distinguish them.
+fn at_git_resolution(t: DateTime<Utc>) -> DateTime<Utc> {
+    t.trunc_subsecs(0)
+}
+
 /// One hold's window plus WHO held it — the second half of which `covered` used to
 /// throw away, and the whole of pact-mqw.10's fix.
 struct HoldWindow {
@@ -210,9 +225,10 @@ fn correlate_commits(
             }
             None => {
                 report.correlated_by_time += 1;
-                by_path
-                    .get(h.path.as_str())
-                    .is_some_and(|v| v.iter().any(|c| c.at >= open && c.at <= close))
+                by_path.get(h.path.as_str()).is_some_and(|v| {
+                    v.iter()
+                        .any(|c| c.at >= at_git_resolution(open) && c.at <= close)
+                })
             }
         };
         if !has_commit {
@@ -243,7 +259,7 @@ fn correlate_commits(
                 ) else {
                     continue;
                 };
-                let overlap_start = a_open.max(b_open);
+                let overlap_start = at_git_resolution(a_open.max(b_open));
                 let overlap_end = a_close.min(b_close);
                 if overlap_start > overlap_end {
                     continue;
@@ -307,7 +323,9 @@ fn correlate_commits(
             // is what `covered` used to throw away.
             let covering: Vec<&HoldWindow> = windows
                 .iter()
-                .filter(|w| w.open <= c.at && w.close.is_none_or(|cl| cl >= c.at))
+                .filter(|w| {
+                    at_git_resolution(w.open) <= c.at && w.close.is_none_or(|cl| cl >= c.at)
+                })
                 .collect();
             if covering.is_empty() {
                 report.uncovered_commits.push(UncoveredCommit {
@@ -944,6 +962,44 @@ mod tests {
         assert_eq!(r.uncovered_commits[0].path, "a.rs");
         let text = render_check(&r);
         assert!(text.contains("UNCOVERED COMMIT"), "{text}");
+    }
+
+    /// pact-56w: git author dates are whole seconds, hold bounds are nanoseconds. A
+    /// commit authored in the same second as its own acquire (acquire 10:00:00.822,
+    /// commit dated 10:00:00) compared as EARLIER than the hold and was reported as an
+    /// uncovered commit. Both the legacy window path and the uncovered-commit check
+    /// must credit it.
+    #[test]
+    fn a_commit_in_the_same_second_as_its_acquire_is_covered() {
+        let tmp = with_git_log(&[
+            &ev("2026-08-01T10:00:00.822Z", "agent-a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:02:00.100Z", "agent-a", "released", "a.rs"),
+        ]);
+        git_commit_as(tmp.path(), "a.rs", "2026-08-01T10:00:00+00:00", "agent-a");
+
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert!(r.uncovered_commits.is_empty(), "{:?}", r.uncovered_commits);
+        assert!(r.holds_with_no_commit.is_empty());
+        assert_eq!(r.findings(), 0);
+    }
+
+    /// The other side of pact-56w: flooring the open to the second must not widen the
+    /// window by more than that second. A commit a full second before the acquire
+    /// still flags.
+    #[test]
+    fn a_commit_a_second_before_the_acquire_still_flags() {
+        // The 09:00 events on another path push the log's earliest instant back,
+        // because commits older than the log are not examined at all.
+        let tmp = with_git_log(&[
+            &ev("2026-08-01T09:00:00Z", "agent-b", "acquired", "b.rs"),
+            &ev("2026-08-01T09:01:00Z", "agent-b", "released", "b.rs"),
+            &ev("2026-08-01T10:00:00.822Z", "agent-a", "acquired", "a.rs"),
+            &ev("2026-08-01T10:02:00Z", "agent-a", "released", "a.rs"),
+        ]);
+        git_commit(tmp.path(), "a.rs", "2026-08-01T09:59:59+00:00");
+
+        let r = run_check(tmp.path(), Check::CommitCorrelation, None, false).unwrap();
+        assert_eq!(r.uncovered_commits.len(), 1, "{:?}", r.uncovered_commits);
     }
 
     /// A path nobody ever leased is a different question this check does not
